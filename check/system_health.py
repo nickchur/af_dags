@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-14 06:30 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 07:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -210,7 +210,12 @@ def check_components() -> dict:
     return {"status": status, "summary": summary, "unhealthy": bad, "heartbeat_age_sec": ages}
 
 
-# Тот же SQL, что у карточки Health: одним проходом по task_instance, отбор по индексу ti_state
+# Тот же SQL, что у карточки Health: одним проходом по task_instance, отбор по индексу ti_state.
+# Отличие одно — running без pid считается только у задач, стартовавших раньше порога.
+# Супервизор ставит running с pid = NULL (_check_and_change_state_before_execution,
+# taskinstance.py:2819, Airflow 2.11.2), а pid пишет уже raw-процесс, когда поднимется
+# (_run_raw_task, taskinstance.py:256) — это секунды импортов и разбора файла. Без порога
+# любая стартующая в момент проверки задача давала бы ложный warn
 SQL_TASKS = """
 select
     count(*) filter (where state = 'queued')                              as queued,
@@ -220,7 +225,8 @@ select
     count(*) filter (where state = 'scheduled')                           as scheduled,
     count(*) filter (where state = 'scheduled'
                        and updated_at < now() - cast(:age as interval))   as scheduled_stale,
-    count(*) filter (where state = 'running' and pid is null)             as running_no_pid
+    count(*) filter (where state = 'running' and pid is null
+                       and start_date < now() - cast(:age as interval))   as running_no_pid
 from task_instance
 where state in ('queued', 'running', 'scheduled')
 """
@@ -334,6 +340,9 @@ def check_s3_logs(slow_sec: float, run_id: str) -> dict:
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from botocore.config import Config
 
+    # Лог в S3 не пишется (локальный компоуз) — проверять нечего, и это не поломка
+    if not conf.getboolean("logging", "REMOTE_LOGGING", fallback=False):
+        return {"status": "unknown", "summary": "remote_logging выключен — лог в S3 не пишется"}
     conn_id = conf.get("logging", "REMOTE_LOG_CONN_ID")
     bucket, _, prefix = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")
     key = "/".join(p for p in (prefix.strip("/"), "_system_health", "probe.txt") if p)
