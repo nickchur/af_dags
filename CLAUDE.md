@@ -1,5 +1,5 @@
 # CLAUDE.md — правила работы в этом репозитории
-*2026-09-04 17:11 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-14 06:53 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 DAG'и и общие модули Apache Airflow для HR-платформы. Восемь каталогов — восемь
 независимых проектов; общий у них рантайм и `plugins/`, откуда остальные берут утилиты.
@@ -58,7 +58,8 @@ DAG'и и общие модули Apache Airflow для HR-платформы. �
 - **Двойной импорт `plugins`** с fallback на боевой пакет — на контурах другой путь.
 - **Ничего не выкладывается непроверенным.** Airflow локально нет, живьём код гоняется
   на тестовом стенде (`ssh testsrv`, `/opt/aftest`); для обмена с ПКАП есть полный стенд
-  на PostgreSQL — `gp_exchange/testbed/`.
+  на PostgreSQL — `testbed/gp_exchange/`. Всё стендовое — в `testbed/`, от разбора Airflow
+  его прячет `.airflowignore`.
 
 ## Поддержание контекста
 

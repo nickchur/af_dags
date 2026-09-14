@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-03 08:35 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-14 06:53 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -54,6 +54,11 @@ plugins/             # Переиспользуемые модули (импор
 GP/                  # 🐘 Снимок DDL Greenplum: то, что тракт CTL вызывает и куда пишет
 ├── srv_wf/          # Точка входа pr_swf_start_ctl, логирование pr_log_ctl, движок, отчёты
 └── srv_dq/          # ККД: Z-тест (pr_ztest_set / pr_ztest_all_diff) и его конфигурация
+
+testbed/             # 🧰 Тестовый стенд, не DAG'и: из разбора Airflow убран .airflowignore
+├── ctl_worker/      # 🎭 Эмулятор CTL API и сборщик фикстур из снимка edpetl-ctl
+├── gp_exchange/     # 🐘 Greenplum на PostgreSQL: тракт обмена ПКАП целиком
+└── vault/           # 🔐 make_vault.py — эмуляция /vault/secrets/application
 ```
 
 `GP/` — копия из `HR_Data` для чтения, а не источник истины; контракт вызова, коды
@@ -169,7 +174,7 @@ bash .githooks/install.sh
 Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —
 это дефект, который видно сравнением, а не повод переписать спеку. Так были найдены и
 закрыты два расхождения в `gp-exchange` — первая загрузка потока и публикация события на
-пустом ветвлении; оба проверены прогоном на стенде (`gp_exchange/testbed/`).
+пустом ветвлении; оба проверены прогоном на стенде (`testbed/gp_exchange/`).
 
 ```bash
 npm i -g --prefix ~/.local @fission-ai/openspec   # CLI (в /usr прав нет)

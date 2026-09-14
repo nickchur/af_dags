@@ -1,5 +1,5 @@
 # 📥 Приём универсального обмена из ПКАП
-*2026-08-31 23:20 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-14 06:53 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Файлы с JSON-пакетами приезжают через ТФС в S3, загружаются в ClickHouse, разбираются по
 потокам и раскладываются по целевым таблицам. Пакет собирает Greenplum (`pr_exchange` из
@@ -15,7 +15,7 @@
 | `tfs_exchange_sensor.py` | DAG `import_gp_ue_exchange_sensor`: раз в 30 минут смотрит бакет по маске `ue_exchange_*.csv`, при появлении файла публикует Dataset |
 | `tfs_exchange_import.py` | DAG `import_gp_ue_exchange`: загрузка, сверка, ветвление по потокам, разбор JSON в целевые таблицы |
 | `tfs_exchange_common.py` | Конфигурация тракта: сценарий ТФС, бакет, префикс, топик, подключения; сборка `TransferFileCephRq` |
-| `testbed/` | Стенд на PostgreSQL: пакет собирается по-настоящему и проезжает весь путь до `gp_vw_*` |
+| [`testbed/gp_exchange/`](../testbed/gp_exchange/) | Стенд на PostgreSQL: пакет собирается по-настоящему и проезжает весь путь до `gp_vw_*` |
 
 ## Как идёт загрузка
 
@@ -45,4 +45,4 @@ list_files → import_files → chk_load → delete_files
   где видно набор полей и образец строк, чтобы завести таблицу.
 - **Формат файла** — табы, строка заголовка, поля без кавычек. Кавычки внутри JSON
   никак не экранируются, поэтому обрамлять поля нельзя; подробности и готовая выгрузка —
-  в [`testbed/README.md`](testbed/README.md).
+  в [`testbed/gp_exchange/README.md`](../testbed/gp_exchange/README.md).
