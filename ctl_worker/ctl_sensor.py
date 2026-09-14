@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-09-04 14:03 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -8,11 +8,17 @@
 | `ctl_add_get` | Получает список активных загрузок |
 | `ctl_add_chk` | Проверяет условия и инициирует запуск |
 | `ctl_add_end` | Логирует итоговое состояние |
+
+Проверки подключений перед сбором здесь нет (до 14.09.2026 — группа `chk_conn`, шесть задач
+в `pg_pool` на каждый прогон, то есть каждую минуту; падение любой, хоть S3-архива,
+останавливало приём загрузок). Подключения проверяет `CTL.<profile>.test_conn` и закрывает
+пулы: GP недоступен — `gp_pool` = 0, и `ctl_add_get` уходит в skip «перегрузка»; CTL
+недоступен — `ctl_add_get` падает на самом вызове API.
 """
 
 from airflow import DAG, Dataset
 from airflow.datasets import DatasetAlias
-from airflow.decorators import task, task_group
+from airflow.decorators import task
 from airflow.api.common.trigger_dag import trigger_dag           
 from airflow.exceptions import DagRunAlreadyExists, DagNotFound
 from airflow.exceptions import AirflowSkipException, AirflowFailException
@@ -23,7 +29,7 @@ from airflow.utils.session import create_session
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load  # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, ctl_obj_save # type: ignore 
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry, raise_status # type: ignore
+from plugins.ctl_core import ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry, raise_status # type: ignore
 
 # from datetime import timedelta
 from psycopg2 import errors
@@ -202,43 +208,6 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
     doc_md=__doc__,
 ) as dag:
 
-    # === Task Group (не вызывается!) ===
-    @task_group(tooltip="Проверка доступности соединений",
-        # ui_color="#00FF6A",
-        # ui_fgcolor='#000000',
-        # prefix_group_id=False,
-        default_args= {            
-            'pool': 'pg_pool',
-            'max_active_runs': 1, 
-            'priority_weight':1000,
-            'execution_timeout': timedelta(seconds=10), 
-            'retries': 1000,
-            'retry_delay': timedelta(seconds=5),
-            'retry_exponential_backoff': True,  
-            'max_retry_delay': timedelta(minutes=5),
-            
-            # 'on_failure_callback': on_callback,
-            # 'on_success_callback': on_callback,
-            # 'on_retry_callback': on_callback,
-            # 'on_execute_callback': None,
-            'sla': timedelta(minutes=10),
-        },
-        # sla_miss_callback = on_callback,
-    )
-    def chk_conn():
-        """Проверка соединений"""
-        conns = get_config().get('conns', {})
-            
-        for id, data in conns.items():
-            if data.get('type') not in ['Postgres', 'S3', 'KerberosHttp']:
-                continue
-            
-            args = dict(
-                task_id=f'chk_{id}', 
-                # on_failure_callback=on_failure, 
-                doc_md=f'chk_{id} {data}'
-            )
-            chk_task = task(**args)(chk_any_conn)(id=id, data=data)
             
 
 
@@ -510,7 +479,8 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         add_note(ret, context, level='Task', title='🚀 START')
 
 
-    @task(pool='pg_pool', trigger_rule = 'none_failed')
+    # default_pool: только заметки — ни CTL, ни GP не трогает (раньше сидел в pg_pool)
+    @task(pool='default_pool', trigger_rule = 'none_failed')
     def ctl_add_end(res, **context):
         """### Сбор и логирование результатов
 
@@ -557,6 +527,5 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
     add_chk = ctl_add_chk.expand(jsn = add_get)
     add_end = ctl_add_end(add_chk)
         
-    chk_conn() >> add_get
 
     

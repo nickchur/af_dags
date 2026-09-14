@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-03 10:20 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -8,7 +8,8 @@
 | `add_note()` | Структурированные заметки в Airflow UI (DAG/Task) |
 | `add_xcom()` | Запись в XCom с обрезкой коллекций до `MAX_XCOM` элементов |
 | `on_callback()` | Обработчик событий success/failure/retry |
-| `pool_slots()` / `get_current_load()` | Управление слотами пула |
+| `pool_slots()` | Размер пула — только из сторожа подключений (`test_conn`) |
+| `pool_size()` / `get_current_load()` | Размер и загрузка пула, только чтение |
 | `ensure_pool()` | Создание пула, если его нет (существующий не трогает) |
 | `md5_hash()` | Хеш JSON-совместимых структур |
 | `readable_size()` / `readable()` | Форматирование байтов, datetime, timedelta |
@@ -82,56 +83,43 @@ def md5_hash(data):
     return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8')).hexdigest()
 
 @provide_session
-def pool_slots(pool_name, slots=None, session=None):
+def pool_slots(pool_name, slots, session=None):
+    """Задаёт размер пула; если пула нет — создаёт. Пишет в slot_pool.
+
+    Звать только из сторожа подключений (CTL.<profile>.test_conn через
+    chk_any_conn(manage_pool=True)): размер пулов меняет одно место. Раньше сюда же ходили
+    предварительные проверки из десятка задач, и три из них сидели в самом ctl_pool — при
+    сбое CTL они его обнуляли и сами больше в него не попадали.
+
+    Прочитать размер — pool_size(): эта функция всегда пишет. Диапазон [min, max] (прежняя
+    динамика «к спросу») больше не принимается: пул, растущий вслед за очередью, в пик давал
+    CTL больше одновременных вызовов именно тогда, когда тому тяжелее всего.
+    """
+    if not isinstance(slots, int) or isinstance(slots, bool):
+        raise TypeError(f"pool_slots({pool_name!r}): нужно целое число слотов, а не {slots!r}")
+    slots = max(slots, 0)
 
     pool = session.query(Pool).filter(Pool.pool == pool_name).first()
-
-    if isinstance(slots, (tuple, list)):
-        min_val, max_val = slots[0], slots[-1]
-        load = get_current_load(pool_name, pool=False, session=session)
-        
-        # Считаем текущую потребность
-        demand = load['queued'] + load['running'] + load['scheduled']
-        
-        # Берем текущие слоты (если пул существует) или min_val
-        current_slots = pool.slots if pool else min_val
-        
-        # Шагаем в сторону demand: +1, -1 или 0 (если demand == current_slots)
-        delta = demand - current_slots + 1
-        new_slots = current_slots + (int(delta/10) or sign(delta))
-        
-        # Ограничиваем диапазоном [min, max]
-        slots = max(min_val, min(max_val, new_slots))
-        
-        
     if pool:
-        # Если slots не передан, берем из существующего пула
-        if slots is None:
-            slots = pool.slots
-        else:
-            # Если передан, обновляем (с защитой от отрицательных чисел)
-            slots = 0 if slots < 0 else slots
-            pool.slots = slots
+        pool.slots = slots
     else:
-        # Если пула нет, создаем новый (минимум 0)
-        slots = 0 if (slots is None or slots < 0) else slots
-        new_pool = Pool(
-            pool=pool_name,
-            slots=slots,
-            description='CTL_worker',
-            include_deferred=False
-        )
-        session.add(new_pool)
+        session.add(Pool(pool=pool_name, slots=slots, description='CTL_worker', include_deferred=False))
         logger.warning(f'Pool {pool_name} created')
-    
-    session.commit()  # Autocommit
-    
+    session.commit()
+
     if slots > 0:
         logger.info(f'Pool {pool_name} set to {slots} slots')
     else:
         logger.warning(f'Pool {pool_name} deactivated')
-    
     return slots
+
+
+@provide_session
+def pool_size(pool_name, session=None) -> int:
+    """Размер пула, только чтение: слотов в slot_pool или 0, если пула нет. Ничего не создаёт."""
+    slots = session.query(Pool.slots).filter(Pool.pool == pool_name).scalar()
+    return int(slots or 0)
+
 
 TOOLS_POOL = 'tools_pool'
 TOOLS_POOL_SLOTS = 16  # с запасом под tools_test_dags с его max_active_tasks=12
@@ -188,7 +176,7 @@ def get_current_load(pool_name, pool=True, session=None):
     ).count()
     
     res = dict(queued=queued, running=running, scheduled=scheduled)
-    if pool: res['pool_slots'] = pool_slots(pool_name)
+    if pool: res['pool_slots'] = pool_size(pool_name, session=session)
 
     return res
     

@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-02 11:00 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -40,7 +40,7 @@ from pprint import PrettyPrinter
 from psycopg2 import OperationalError, InterfaceError, DatabaseError
 from sqlalchemy import text
 
-from plugins.utils import query_to_dict, add_note, readable_size, pool_slots # type: ignore #, on_callback
+from plugins.utils import query_to_dict, add_note, readable_size, pool_size # type: ignore #, on_callback
 from plugins.s3_utils import s3_IterStream  # type: ignore
 
 from logging import getLogger
@@ -173,10 +173,12 @@ _last_call_time = {}
 _lock = threading.Lock()
 
 def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
-    """Thread-safe throttle: гарантирует не более ctl_api_calls вызовов в секунду на pool_name.
+    """Thread-safe throttle: не более ctl_api_calls вызовов в секунду на pool_name — в этом процессе.
 
-    При необходимости блокирует поток на недостающий интервал (sleep).
-    Использует глобальный dict _last_call_time и threading.Lock.
+    При необходимости блокирует поток на недостающий интервал (sleep). Словарь
+    _last_call_time живёт в процессе, а у каждой задачи Airflow свой процесс, поэтому между
+    задачами он ничего не ограничивает. Одновременность обращений к CTL держит размер
+    ctl_pool (фиксированный, задаёт сторож подключений).
     """
     # global _last_call_time
     
@@ -259,13 +261,18 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         out = response.text
     
     if method == 'GET': 
-        if 'tmpl' not in url and 'statval' not in url and not pool_slots('gp_pool'):
+        # Журнал в GP — когда GP доступен (gp_pool открыт). С первого коммита (054ff46) здесь
+        # стояло «not pool_slots(...)», то есть журнал писался только при закрытом GP и падал в
+        # except; к тому же pool_slots пишет в slot_pool, а здесь нужно только прочитать
+        if 'tmpl' not in url and 'statval' not in url and pool_size('gp_pool') > 0:
             
             ts = time.time()
             url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
             try:
                 import json
-                gp_exe(f"select pr_log_ctl('{url}', $jsn${json.dumps(out)}$jsn$)")
+                # Параметрами, а не f-строкой: журнал теперь пишется на каждый GET, и кавычка в
+                # URL или «$jsn$» в ответе CTL ломали бы запрос (и открывали бы подстановку SQL)
+                gp_exe("select pr_log_ctl(%s, %s)", (url, json.dumps(out)))
                 logger.debug(f"{time.time()-ts:.2f} sec ✅ Записан лог в GP")
             except Exception as e:
                 logger.error(f"{time.time()-ts:.2f} sec ❌ Ошибка записи лога в GP: {str(e)}")

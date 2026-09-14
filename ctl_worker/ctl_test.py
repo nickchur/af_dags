@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-04 12:15 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -290,7 +290,9 @@ else:
             return ret if mode == 'dataset' else []
     
     
-        @task(pool='pg_pool', outlets=[DatasetAlias(f"CTL/events")],
+        # default_pool: Dataset'ы пишутся в метабазу, CTL и GP не трогаются (раньше — pg_pool,
+        # пул метабазы, который больше не нужен); одновременность держит max_active_tis_per_dag
+        @task(pool='default_pool', outlets=[DatasetAlias(f"CTL/events")],
             max_active_tis_per_dag=15, 
             map_index_template="{{ event }}"
         )

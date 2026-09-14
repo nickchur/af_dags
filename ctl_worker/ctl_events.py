@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -190,7 +190,9 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
             return PokeReturnValue(is_done=True, xcom_value=ret)        
     
     
-    @task(pool='pg_pool', outlets=[DatasetAlias(f"CTL/events")],
+    # default_pool: Dataset'ы пишутся в метабазу, CTL и GP не трогаются (раньше — pg_pool,
+    # пул метабазы, который больше не нужен); одновременность держит max_active_tis_per_dag
+    @task(pool='default_pool', outlets=[DatasetAlias(f"CTL/events")],
         max_active_tis_per_dag=15, 
         map_index_template="{{ event[0] }}"
     )

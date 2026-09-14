@@ -1,14 +1,18 @@
 """### 🔌 DAG: Проверка подключений CTL
-*2026-09-14 07:39 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 12:29 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Непрерывный сенсор (каждую минуту, `reschedule`) — проверяет доступность всех соединений из `get_config()['conns']`.
-Поддерживает типы: `Postgres`, `S3`, `KerberosHttp`. При сбое — экспоненциальный retry (до 1000 попыток).
+Поддерживает типы: `Postgres`, `S3`, `KerberosHttp`.
+
+**Единственное место, где меняется размер пулов подключений** (`ctl_pool`, `gp_pool`,
+`files_pool`): доступно — размер из `conns.<id>.pool_slots`, недоступно — 0. Сбой сенсор не
+завершает: пул закрыт, проверка идёт дальше раз в минуту и вернёт размер, когда подключение
+оживёт. Сам DAG сидит в `default_pool`, который никто не обнуляет.
 
 **Все шесть сенсоров skipped — штатный итог рана, а не деградация.** Сенсор никогда не
 возвращает «готово»: проверяет раз в минуту, пока через час его не остановит собственный
-`timeout`, и `soft_fail` делает из этого skipped. Им же становится и неудачная проверка
-(`AirflowFailException` при `soft_fail`), поэтому состояние задачи о здоровье подключения не
-говорит: сбой виден в заметке `chk_*` (❌) и в обнулённом пуле подключения (`gp_pool` и т. п.).
+`timeout`, и `soft_fail` делает из этого skipped. Состояние задачи о здоровье подключения не
+говорит: сбой виден в заметке `chk_*` (❌) и в обнулённом пуле подключения.
 Красный ран — только `dagrun_timeout`: ран не уложился в отведённое время.
 """
 
@@ -16,6 +20,7 @@ from datetime import timedelta, datetime, timezone
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.sensors.base import PokeReturnValue # type: ignore
+from airflow.exceptions import AirflowSkipException
 
 from plugins.utils import  on_callback, default_args, str2timedelta # type: ignore
 from plugins.ctl_utils import get_config, add_note # type: ignore 
@@ -35,7 +40,11 @@ with DAG(
     dag_id=f'CTL.{get_config()["profile"]}.test_conn',
     description="Проверка критически важных соединений",
     default_args={ **default_args,
-        'pool': 'pg_pool',
+        # default_pool, а не пул подключения: это единственное место, где меняется размер
+        # пулов (chk_any_conn(manage_pool=True)), и сидеть в пуле, который сам же обнуляет,
+        # сторож не может — при сбое CTL он бы запер ctl_pool и больше туда не попал.
+        # default_pool не обнуляет никто
+        'pool': 'default_pool',
         'max_active_runs': 1, 
         'priority_weight':1000,
         # 'sla': timedelta(minutes=5),
@@ -59,8 +68,9 @@ with DAG(
     # on_success_callback=on_callback,
     # sla_miss_callback = on_callback,
     # timeout (60) + 30 — запас на очередь: часовой отсчёт каждого сенсора идёт от его первой
-    # проверки, а не от старта рана, плюс ожидание слота в pg_pool перед первой и последней
-    # проверкой. Стенд 12–14.09.2026: 62 рана из 64 за 63–70 мин, первая проверка через
+    # проверки, а не от старта рана, плюс ожидание слота в пуле перед первой и последней
+    # проверкой. Замеры ниже — когда сенсоры ещё сидели в pg_pool (с 14.09 они в default_pool,
+    # а шесть задач chk_conn сенсора из pg_pool убраны). Стенд 12–14.09.2026: 62 рана из 64 за 63–70 мин, первая проверка через
     # 1–8 мин после старта; два рана ровно по 70 мин упали по прежнему timeout + 10. На альфе
     # с 12.09 13:01 не уложился ни один (21 failed подряд) — pg_pool там делят ctl_sensor и
     # ctl_events, которые идут каждую минуту. Таймаут рана нужен только чтобы зависший ран не
@@ -72,12 +82,23 @@ with DAG(
 ) as dag:
 
     def chk_any(id, data=None, **context):
+        """Одна проверка подключения. Сторож не завершается ни на успехе, ни на сбое.
+
+        Сбой обнуляет пул подключения (это делает chk_any_conn), но сенсор НЕ падает: иначе
+        soft_fail делал бы его skipped до конца рана, и пул оставался бы закрытым ещё до часа
+        после того, как подключение ожило. Стенд 14.09.2026: ctl-mock остановлен в 08:46,
+        chk_ctl обнулил ctl_pool и ушёл в skipped в 08:47, после запуска эмулятора пул стоял
+        нулём до конца рана. Раньше пул возвращали предварительные проверки из других задач,
+        теперь писатель один — значит, он обязан проверять дальше.
+        """
         try:
-            ret = chk_any_conn(id, data, **context)
-            return PokeReturnValue(is_done=False, xcom_value=ret)
+            ret = chk_any_conn(id, data, manage_pool=True, **context)
+        except AirflowSkipException:
+            raise                    # провайдер не установлен — проверять нечего
         except Exception as e:
-            # return PokeReturnValue(is_done=True, xcom_value=str(e))
-            raise e
+            # Пул уже обнулён, причина — в заметке ❌; следующая проверка через test_interval
+            return PokeReturnValue(is_done=False, xcom_value=f"{type(e).__name__}: {str(e)[:200]}")
+        return PokeReturnValue(is_done=False, xcom_value=ret)
     
     # @task_group(tooltip="Проверка доступности соединений",)
     # def chk_conn():

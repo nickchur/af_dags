@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-14 06:53 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -309,7 +309,7 @@ XCom из `ctl_monitor`: `{lid: {wid, wfn, sts, act, sch, ...}}` — перед�
   и логи с ошибкой записаться не успевают. Свой таймаут срабатывает раньше, ошибка
   попадает в лог и в письмо. Поднимать его выше серверного нельзя — см.
   [`GP/readme.md`](../GP/readme.md).
-- Пулы и лимиты: `ctl_pool_slots`, `ctl_limit`, `ctl_days`.
+- Пулы и лимиты: `conns.<id>.pool_slots` (`ctl`, `gp`, `files`), `ctl_limit`, `ctl_days`.
 - PIN-защита: сохранение требует совпадения `AIRFLOW__CTL_PIN` из `/vault/secrets/application`.
 
 ---
@@ -481,11 +481,29 @@ raise_status(st, ld_sts)
 
 ### Пулы выполнения
 
-| Пул | Назначение | Размер |
-|-----|------------|--------|
-| `ctl_pool` | Запросы к API CTL | 20 |
-| `gp_pool` | Выполнение SQL в Greenplum | 20 |
-| `pg_pool` | Операции с БД Airflow | 20 |
+Пул задачи — по внешнему ресурсу, который она тратит, а не по DAG'у:
+
+| Пул | Кто в нём | Размер |
+|-----|-----------|--------|
+| `ctl_pool` | Задачи с вызовами API CTL: `ctl_loader`, `ctl_monitor`, `ctl_add_get`/`ctl_add_chk`, `run_prm`, `run_end` | 20, фиксированный |
+| `gp_pool` | Нагрузка на Greenplum: `run_exe`, `run_tfs`; свободные слоты — сигнал перегрузки для сенсора и монитора | 20 |
+| `files_pool` | Переносы ТФС (`ctl_tfs`) | 20 |
+| `default_pool` | Сторож подключений `test_conn`, заметки (`ctl_add_end`), публикация Dataset'ов (`set_events`) | общий |
+
+**Размер пулов меняет только `CTL.<profile>.test_conn`** (`chk_any_conn(manage_pool=True)`):
+подключение доступно — пул получает размер из `conns.<id>.pool_slots`, недоступно — 0, и
+задачи этого ресурса ждут, не занимая воркеры. Сторож сидит в `default_pool`, который никто
+не обнуляет. Предварительные проверки внутри задач (`chk_any_conn` без флага) только
+проверяют. Раньше писали все — и три проверки CTL, сидевшие в самом `ctl_pool`, при сбое CTL
+запирали его вместе с собой.
+
+`ctl_pool` не растёт вслед за очередью (прежний диапазон 10–40): такой пул в пик давал CTL
+больше одновременных вызовов именно тогда, когда тому тяжелее. `rate_limit` в `ctl_api`
+действует внутри процесса задачи, между задачами одновременность держит только размер пула.
+
+После выкладки — перезапустить `ctl_config`: до этого в Variable лежит старый диапазон, и
+сторож берёт вместо него 20 с предупреждением в логе. Пулы `pg_pool`, `ppl_pool`, `s3_pool`,
+`tfs_pool` код больше не трогает — их можно удалить руками.
 
 ### XCom-ключи
 
@@ -565,8 +583,8 @@ retry = {
 |----------|----|-----|-----|---------|
 | CTL | `ctl` | KerberosHttp | `ctl_pool` | 10 мин |
 | Greenplum | `alpha-adb_dev_comm-read` | Postgres | `gp_pool` | 4 часа |
-| S3 | `s3` | S3 | `s3_pool` | — |
-| Airflow DB | `airflowdb` | Postgres | `pg_pool` | — |
+| S3 | `s3` | S3 | — | — |
+| Airflow DB | `airflowdb` | Postgres | — | — |
 
 ---
 
@@ -589,7 +607,7 @@ retry = {
 | `s3_ttl` | Время жизни объектов в S3 (дни) | `7` |
 | `ctl_conn_id` | Подключение к API CTL | `ctl` |
 | `ctl_timeout` | Таймаут запросов к API (сек) | `60` |
-| `ctl_pool_slots` | Размер пула `ctl_pool` | `20` |
+| `conns.ctl.pool_slots` | Размер пула `ctl_pool` (задаёт `test_conn`) | `20` |
 | `ctl_limit` | Лимит загрузки сущностей | `1000` |
 | `ctl_days` | Глубина выгрузки событий (дней) | `5` |
 | `ctl_url` | URL интерфейса CTL | `https://ctl-dev.dev.df.sbrf.ru:9080` |
