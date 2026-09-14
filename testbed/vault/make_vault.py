@@ -1,9 +1,9 @@
 """### 🔐 Скрипт: эмуляция /vault/secrets/application для тестового стенда
-*2026-08-13 18:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 06:53 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-НЕ DAG — консольный скрипт, лежит в check/ рядом с остальными инструментами проверки.
-Airflow разбирает файл как обычный модуль, ничего не выполняя: вся работа под
-`if __name__ == "__main__"`.
+НЕ DAG — консольный скрипт стенда, лежит в `testbed/vault/`. Каталог `testbed/` убран из
+разбора Airflow корневым `.airflowignore`; и без него файл при импорте ничего не выполняет —
+вся работа под `if __name__ == "__main__"`.
 
 Собирает файл, который на боевом контуре кладёт vault, а на стенде класть некому.
 Читает его `HrpFilesystemSecretBackend` (`hrp_secret_backend/vault_secret_backend.py`),

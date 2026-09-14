@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-04 14:13 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-14 06:53 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -88,7 +88,7 @@ ctl_worker/
 приводит к перечитыванию полной загрузки. Неудача сохранения исход не меняет: загрузка уже
 финализирована в CTL, и красный таск после этого противоречил бы её статусу.
 
-⚠️ `ctl_working/` читает сборщик фикстур эмулятора (`testbed/fixtures_from_cache.py`) —
+⚠️ `ctl_working/` читает сборщик фикстур эмулятора (`testbed/ctl_worker/fixtures_from_cache.py`) —
 поэтому итог живёт отдельным префиксом, а не рядом: иначе на стенде загрузки приезжали бы
 завершёнными и сенсору было бы нечего брать.
 
