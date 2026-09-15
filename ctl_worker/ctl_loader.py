@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-09-02 20:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-15 10:00 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут выгружает данные из CTL и сохраняет в S3 + Airflow Variables.
 
@@ -9,7 +9,7 @@
 | `ctl_categories` | Дерево категорий |
 | `ctl_workflows` | Workflow'ы с параметрами |
 | `ctl_entities` / `ctl_enames` | Иерархия сущностей + имена |
-| `ctl_events` / `ctl_ue_events` / `ctl_entity_events` | События за последние N дней |
+| `ctl_events` / `ctl_ue_events` / `ctl_entity_events` | События за последние N дней; висячие ссылки (нет сущности или профиля в CTL) отсекаются |
 
 Данные доступны через `ctl_obj_load()`.
 """
@@ -33,14 +33,59 @@ logger = getLogger('airflow.task')
 
 
 def load_obj_save(obj, data, var=False, skip=False, **context):
+    """Сохранить объект; вернуть, изменился ли он."""
     # Сохраняем в S3
     if ctl_obj_save(obj, data, var=var):
         add_note(f"🔍 {obj}: {len(data)} / {readable_size(len(str(data)))}", context, level='DAG,Task')
-    else:
-        msg = f'⚠️ {obj} не изменились'
-        add_note(msg, context, level='DAG,Task')
-        if skip:
-            raise AirflowSkipException(msg)
+        return True
+    msg = f'⚠️ {obj} не изменились'
+    add_note(msg, context, level='DAG,Task')
+    if skip:
+        raise AirflowSkipException(msg)
+    return False
+
+
+# Больше этой доли висячих — не верим ответу CTL, а не отсекаем полсписка событий.
+DANGLING_MAX_SHARE = 0.25
+
+
+def ctl_profile_names():
+    """Имена профилей CTL (`GET /v4/api/profile`) или None, если списку верить нельзя.
+
+    Регистр имеет значение: на alpha 14.09.2026 CTL отвечал «Profile with name ARNSDPCC360
+    does not exist», хотя живые ссылки того же профиля записаны `arnsdpcc360`. Список без
+    собственного профиля — не список профилей (другой формат ответа, страница), и отсева
+    по нему не будет.
+    """
+    try:
+        data = ctl_api('/v4/api/profile')
+    except Exception as e:
+        logger.warning(f"⚠️ Список профилей CTL не получен: {e}")
+        return None
+    if isinstance(data, dict):
+        data = data.get('content') or data.get('items') or []
+    names = {p.get('name') for p in data if isinstance(p, dict) and p.get('name')} if isinstance(data, list) else set()
+    if get_config()['profile'] not in names:
+        logger.warning(f"⚠️ В списке профилей CTL нет своего профиля ({len(names)} имён) — отсев по профилю пропущен")
+        return None
+    return names
+
+
+def dangling_events(events, sources, entities, profiles):
+    """Ключи событий с висячими ссылками: {ключ: (причина, [workflow])}.
+
+    Ключ — `профиль/сущность/статистика` из расписания событий workflow. Сущности нет в
+    `/v4/api/entity` или профиля нет в `/v4/api/profile` — CTL на запрос статистики
+    ответит 422, и сенсор событий будет спрашивать это на каждой проверке.
+    """
+    out = {}
+    for key in events:
+        prf, eid = key.split('/')[:2]
+        if profiles is not None and prf not in profiles:
+            out[key] = (f'профиля {prf} нет в CTL', sources.get(key, []))
+        elif int(eid) not in entities:
+            out[key] = (f'сущности {eid} нет в CTL', sources.get(key, []))
+    return out
 
 
 with DAG(f'CTL.{get_config()["profile"]}.loader',
@@ -308,13 +353,12 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         # Events
         entity_events = set()
         events = {}
+        sources = {}  # ключ события → какие workflow его ждут: для заметки о висячих
         for wf in wfs.values():
             for e in wf.get('wf_event_sched',[]):
                 entity_events.add(int(e.split('/')[1]))
                 events[e] = wf.get('scheduled', False) and events.get(e, True)
-        
-        # Сохраняем в S3
-        load_obj_save('ctl_events', events, var=True, skip=True)
+                sources.setdefault(e, []).append(f"{wf.get('id')} {wf.get('name', '')}")
 
         eids = { int(k):v for k,v in (ctl_obj_load('ctl_entities') or {}).items() }
                 
@@ -323,6 +367,26 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         load_obj_save('ctl_entities_all', data, var=False)
             
         data = { d['id']:d for d in data }
+
+        # Висячие ссылки: сущность или профиль события в CTL не существуют. Сенсор событий
+        # спрашивал бы их на каждой проверке и получал 422 — на alpha 14.09.2026 это 13 ключей
+        # из 347, и каждый ответ ctl_api дописывал заметкой к задаче и рану
+        dangling = dangling_events(events, sources, data, ctl_profile_names())
+        if dangling and len(dangling) > DANGLING_MAX_SHARE * len(events):
+            add_note(f"⚠️ Висячих ссылок на события {len(dangling)} из {len(events)} — больше "
+                     f"{DANGLING_MAX_SHARE:.0%}, ответу CTL не верим, список событий не трогаем",
+                     context, level='DAG,Task')
+        elif dangling:
+            rows = [f"| `{k}` | {r} | {'; '.join(w)} |" for k, (r, w) in sorted(dangling.items())]
+            add_note("| Событие | Почему | Кто ждёт (workflow) |\n|---|---|---|\n" + "\n".join(rows[:40]),
+                     context, level='DAG,Task',
+                     title=f"⚠️ Висячие ссылки на события: {len(dangling)} — не опрашиваются, чинить в CTL")
+            logger.warning(f"⚠️ Висячие ссылки на события: {sorted(dangling)}")
+            events = {k: v for k, v in events.items() if k not in dangling}
+
+        # Сохраняем в S3. «Без изменений» — только если не изменилось ничего из трёх: раньше
+        # неизменные события уводили задачу в skip раньше, чем обновлялись имена сущностей
+        changed = load_obj_save('ctl_events', events, var=True)
         
         eids_parents = [int(e['parentId']) for e in eids.values()]
         
@@ -336,12 +400,14 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
             for e in all_keys if e > 0
         }
         # Сохраняем в S3
-        load_obj_save('ctl_enames', enames, var=True)
+        changed = load_obj_save('ctl_enames', enames, var=True) or changed
 
         
         entity_events = { e: enames.get(int(e), '_Not_found_') for e in sorted(entity_events) }
         # Сохраняем в S3
-        load_obj_save('ctl_entity_events', entity_events, var=True)
+        changed = load_obj_save('ctl_entity_events', entity_events, var=True) or changed
+        if not changed:
+            raise AirflowSkipException('⚠️ события и имена сущностей не изменились')
 
         # return wfs
     

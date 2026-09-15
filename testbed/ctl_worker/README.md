@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-09-03 10:20 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-15 10:00 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -159,6 +159,21 @@ curl -s -X POST 'http://127.0.0.1:9080/v4/api/wf/<wf_id>/params' \
 curl -s -X POST 'http://127.0.0.1:9080/v4/api/loading/0/entity/<eid>/stat/2/statval?profile=HR_Data' \
      -H 'Content-Type: application/json' -d '["done"]'
 ```
+
+**Висячие ссылки на события.** На alpha 14.09.2026 девять workflow ждали события
+сущностей и профилей, которых в CTL нет, и CTL отвечал на их статистику 422. Снимок сам не
+знает, чего в CTL нет, поэтому это задаётся переменными окружения эмулятора (в
+`ctl-mock.env`):
+
+| Переменная | Что делает |
+| :--- | :--- |
+| `CTL_MOCK_MISSING_PROFILES` | профили через запятую, которых «нет»: их нет в `GET /v4/api/profile`, `statval/last` по ним — 422 `Profile with name … does not exist` |
+| `CTL_MOCK_MISSING_ENTITIES` | id сущностей, которых «нет»: их нет в `GET /v4/api/entity`, `statval/last` — 422 `Entity with id … does not exist` |
+
+`GET /v4/api/entity` отдаёт, как боевой CTL, все сущности, а не только дерево профиля:
+к `entities.json` добавляются все из `enames.json`, кроме `_Not_found_`. Загрузчик отсекает
+висячие ключи из `ctl_events` и перечисляет их заметкой прогона; сенсор событий их больше
+не спрашивает.
 
 ## Границы
 

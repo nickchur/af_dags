@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-14 11:34 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-15 10:00 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -45,9 +45,9 @@ ctl_worker/
 |-----------|------|------------|
 | **Worker** | `ctl_worker.py` | Динамически генерирует по одному DAG'у на каждый workflow: инициализация загрузки, выполнение SQL в GP, публикация статистики, финализация и retry. |
 | **Sensor** | `ctl_sensor.py` | Каждую минуту опрашивает CTL API, фильтрует загрузки со статусом `RUNNING`/`TIME-WAIT`/`EVENT-WAIT` и запускает нужные DAG'и. |
-| **Loader** | `ctl_loader.py` | Выгружает из CTL метаданные (workflows, сущности, события, категории) и кладёт в S3 + Airflow Variables. |
+| **Loader** | `ctl_loader.py` | Выгружает из CTL метаданные (workflows, сущности, события, категории) и кладёт в S3 + Airflow Variables. Из `ctl_events` отсекает висячие ссылки — события сущностей и профилей, которых в CTL нет, — и перечисляет их заметкой прогона: это чинится в самом CTL. |
 | **Monitor** | `ctl_monitor.py` | Анализирует активные загрузки: проверяет SLA, переводит зависшие в `Aborted`, инициирует retry и перезапуск. |
-| **Events** | `ctl_events.py` | Опрашивает события CTL и публикует Airflow Dataset'ы `CTL/{profile}/{eid}/{ename}` для запуска зависимых DAG'ов. |
+| **Events** | `ctl_events.py` | Опрашивает события CTL и публикует Airflow Dataset'ы `CTL/{profile}/{eid}/{ename}` для запуска зависимых DAG'ов. Сбой по одному ключу пишется в лог и не роняет проверку; падает она, только если упали все ключи. |
 | **Config** | `ctl_config.py` | Инициализирует и сохраняет всю конфигурацию системы в Airflow Variable `ctl_config`; защищена PIN-кодом. |
 | **Simulator** | `ctl_test.py` | Симулятор нагрузки: события сущностей, Dataset-сигналы или случайные запуски DAG'ов (ключ `simulator`). Существует только на DEV, IFT и PSI. |
 | **Checker** | `ctl_checker.py` | Ручная диагностика CTL API: произвольные HTTP-запросы (GET/POST/PUT/DELETE) с шаблонами URL (`{lid}`, `{wid}`, `{eid}`). |
