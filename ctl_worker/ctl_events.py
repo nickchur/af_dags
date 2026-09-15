@@ -122,10 +122,9 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
                     continue
                 checked += 1
             
-                try:
-                    last = ctl_api(f"/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}")
-                except:
-                    continue
+                # Без своего try: сбой запроса — это сбой ключа, его считает общий обработчик ниже.
+                # Раньше здесь был голый except: continue, и лежащий CTL выглядел как «событий нет»
+                last = ctl_api(f"/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}")
 
                 logger.debug(f"⚠️ {json.dumps(last, default=str)}")
             
