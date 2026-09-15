@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-04 14:30 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -9,7 +9,7 @@
 | `gp_conn_id` / `gp_schema` / `gp_timeout` / `gp_task_timeout` | Подключение Greenplum |
 | `s3_conn_id` / `ctl_bucket` / `ctl_ttl` | S3-хранилище |
 | `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
-| `ctl_pool_slots` / `ctl_limit` / `ctl_days` | Лимиты CTL |
+| `conns.<id>.pool_slots` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
 | `tz` / `expire` | Часовой пояс и таймаут ожидания |
 | `orchestrator` / `pause_new_dags` | Кто владеет расписаниями (`ctl`/`mixed`/`af`) и пауза при создании дага |
 | `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
@@ -55,7 +55,8 @@ conns = {
     'ctl': {
         'type': 'KerberosHttp',
         'conn_id': 'ctl',
-        'pool_slots': [10, 40],
+        # Фиксированный: диапазон «к спросу» в пик давал CTL больше вызовов, когда ему тяжелее
+        'pool_slots': 20,
         'timeout': 30, # in seconds
         'url': "https://ctl-dev.dev.df.sbrf.ru:9080",
     },
@@ -73,13 +74,11 @@ conns = {
     'pg': {
         'conn_id': 'airflowdb',
         'type': 'Postgres',
-        'pool_slots': 20,
         'default': True,
     },
     's3': {
         'type': 'S3',
         'conn_id': 's3',
-        'pool_slots': 20,
         "bucket": "edpetl-ctl",
         "ttl": 7, # days
     },
@@ -93,7 +92,6 @@ conns = {
     'tfs': {
         'type': 'S3',
         'conn_id': 's3',
-        'pool_slots': 20,
         "bucket": "edpetl-tfs",
         "ttl": 30, # days
     },

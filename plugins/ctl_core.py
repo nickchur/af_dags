@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-03 15:10 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -676,11 +676,32 @@ def ctl_loading_load(prm, save=True):
     return lids
 
 
-def chk_any_conn(id, data=None, **context):
+# Размер пула подключения, если в конфиге ещё лежит прежний диапазон [min, max] (Variable
+# ctl_config пишется DAG'ом ctl_config и до его перезапуска хранит старое значение). Пул больше
+# не «идёт за спросом» — число фиксированное, как решено 14.09.2026 для ctl_pool
+FIXED_POOL_SLOTS = 20
+
+
+def _fixed_slots(id, value) -> int:
+    """Размер пула из конфига: число как есть, устаревший диапазон — FIXED_POOL_SLOTS."""
+    if isinstance(value, (list, tuple)):
+        logger.warning(f"⚠️ conns.{id}.pool_slots = {value} — диапазон больше не поддерживается, "
+                       f"беру {FIXED_POOL_SLOTS}; перезапустите ctl_config")
+        return FIXED_POOL_SLOTS
+    return int(value)
+
+
+def chk_any_conn(id, data=None, manage_pool=False, **context):
     """Проверяет доступность соединения id (Postgres / S3 / KerberosHttp).
 
     data — dict с type/conn_id/pool_slots; при отсутствии берётся из get_config()['conns'][id].
-    При успехе обновляет pool_slots и пишет заметку в Airflow. При ошибке — обнуляет слоты и пробрасывает исключение.
+    Успех — заметка в Airflow, сбой — заметка и AirflowFailException.
+
+    manage_pool=True — только у сторожа подключений (CTL.<profile>.test_conn): успех задаёт
+    размер пула `<id>_pool`, сбой обнуляет его (кроме `default`). Остальные вызовы —
+    предварительные проверки в задачах — пулы не трогают: размер пулов меняет одно место, и оно
+    сидит в default_pool, который никто не обнуляет. Раньше писали все, и три проверки CTL
+    сидели в самом ctl_pool: при сбое CTL обнуляли его и сами больше туда не попадали.
     """
     
     data = data if data else get_config().get('conns', {}).get(id, {})
@@ -737,8 +758,8 @@ def chk_any_conn(id, data=None, **context):
         else:
             result = None
         
-        if data.get('pool_slots'):
-            pool_slots(f'{id}_pool', slots=data.get('pool_slots'))
+        if manage_pool and data.get('pool_slots'):
+            pool_slots(f'{id}_pool', slots=_fixed_slots(id, data['pool_slots']))
         
         logger.info(f"🔍 {result}")       
         msg = f"✅ {time.time()-ts:.2f} sec chk_{id}_conn"
@@ -754,7 +775,7 @@ def chk_any_conn(id, data=None, **context):
         raise AirflowSkipException(msg) from err
         
     except Exception as err:
-        if data.get('pool_slots') and not data.get('default', False):
+        if manage_pool and data.get('pool_slots') and not data.get('default', False):
             pool_slots(f'{id}_pool', slots=0)
         
         response = getattr(err, 'response', None)
