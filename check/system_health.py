@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-14 07:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-16 16:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -333,8 +333,9 @@ def check_s3_logs(slow_sec: float, run_id: str) -> dict:
     провайдер 9.22.0) — подпись и адресация, без которых шлюз отвергает запросы, молча пропали
     бы. Так же сделано в etl-core PR #35 (partial_hook).
 
-    Ключ — под префиксом логов, чтобы объект, оставшийся после сбоя на удалении, подобрал
-    log_cleanup.
+    Ключ — в папке `system_health/` в корне бакета, рядом с отбивками воркеров: там же, где
+    всё остальное «не логи» (`dag_snapshots/`, `tfs/`). Объект, оставшийся после сбоя на
+    удалении, подберёт log_cleanup — у этой папки свой срок хранения.
     """
     from airflow.configuration import conf
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -344,8 +345,8 @@ def check_s3_logs(slow_sec: float, run_id: str) -> dict:
     if not conf.getboolean("logging", "REMOTE_LOGGING", fallback=False):
         return {"status": "unknown", "summary": "remote_logging выключен — лог в S3 не пишется"}
     conn_id = conf.get("logging", "REMOTE_LOG_CONN_ID")
-    bucket, _, prefix = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")
-    key = "/".join(p for p in (prefix.strip("/"), "_system_health", "probe.txt") if p)
+    bucket = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")[0]
+    key = "system_health/probe.txt"
     limits = Config(connect_timeout=S3_CONNECT_TIMEOUT_SEC, read_timeout=S3_READ_TIMEOUT_SEC,
                     retries={"total_max_attempts": 1})
     # Подключение и клиент — отдельной цифрой: на стенде это 6 с из 6.4 (секрет-бэкенд и
