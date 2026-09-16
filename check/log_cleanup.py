@@ -260,6 +260,10 @@ def tools_log_cleanup():
 
         rows, failed = [], []
         for prefix, days in _folder_days(params).items():
+            if days <= 0:
+                # 0 — «не трогать»; правило с нулём означало бы «удалить всё», и хранилище
+                # выполнило бы его само, асинхронно и без отчёта
+                continue
             try:
                 s3_set_ttl(AWS_CONN_ID, BUCKET_NAME, days=days, prefix=prefix)
             except Exception as e:
@@ -301,8 +305,10 @@ def tools_log_cleanup():
         batch: list[str] = []
         partial = False
 
-        # Незнакомым папкам срок задан — идём по всему бакету; иначе только по известным
-        walks = [''] if other_days else sorted(folders)
+        # Незнакомым папкам срок задан — идём по всему бакету; иначе только по известным.
+        # Вложенные папки (отбивки лежат под префиксом логов) обходим раньше родителя: иначе
+        # обход родителя выберет весь бюджет времени, а до вложенной очередь не дойдёт
+        walks = [''] if other_days else sorted(folders, key=len, reverse=True)
         for walk in walks:
             _, pages = _get_paginator(prefix=walk)
             for page in pages:
