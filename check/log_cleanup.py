@@ -1,13 +1,34 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-08-27 12:00 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-16 16:35 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Ежедневно создаёт бакет (если не существует), удаляет старые объекты и логирует объём.
-Бакет и префикс берутся из `[logging] remote_base_log_folder`, то есть чистятся ровно
-логи задач, а не весь бакет.
+Ежедневно создаёт бакет (если не существует), выставляет сроки хранения по папкам, убирает
+старое и считает статистику. Бакет берётся из `[logging] remote_base_log_folder`, то есть
+обслуживается бакет логов задач.
+
+Папок в S3 нет — есть префиксы, поэтому «заводится» не каталог, а срок: на каждый префикс
+ставится правило жизненного цикла (`{префикс}DeleteAfter`). На правила не полагаемся: через
+корпоративный шлюз они раньше не работали (см. `check/pg_activity.py`), поэтому уборка всё
+равно идёт обходом, а отчёт показывает, сколько объектов старше срока нашлось при обходе.
+
+⚠️ **Правило накрывает и вложенные папки.** Фильтр правила — префикс, исключений в S3 нет:
+папка со сроком `0` внутри папки с правилом от него не защищена. Отчёт таска `layout` про
+такие случаи предупреждает. Наши папки со сроком `0` (`dag_snapshots/`, `tfs/`) лежат в корне
+бакета, где правил нет.
+
+⚠️ **Правило работает само и асинхронно.** Уменьшили срок — хранилище удалит всё лишнее
+своим сканером, без обхода и без отчёта. Проверено на стенде 16.09.2026: прогон с `days=7`
+поставил правило, и MinIO сам убрал 23,5 тыс. объектов старше недели. Поэтому разовый
+эксперимент с меньшим сроком делайте с `dry_run=True`: он покажет, что будет удалено, и не
+станет ни менять правила, ни удалять.
 
 | Параметр | Описание |
 |---|---|
-| 📅 `days`        | Возраст объектов для удаления (дни, default: `30`) |
+| 📅 `days`        | Срок хранения логов задач (дни, default: `30`) |
+| 🗂 `folders`     | Сроки остальных папок бакета: префикс → дни |
+| 🧹 `other_days`  | Срок для папок, которых нет в списке; `0` — не трогать *(default)* |
+| ♻️ `lifecycle`   | `True` — выставлять правила жизненного цикла *(default)* |
+| 🧪 `dry_run`     | `True` — ничего не удалять и правил не менять, только посчитать |
+| ⏱ `max_minutes` | Потолок обхода бакета (минуты, default: `30`) |
 | ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 5 * * *`)* |
 | 💾 `save_params` | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
@@ -17,15 +38,26 @@
 Новое расписание подхватывается со следующего парсинга DAG-а; негодное значение таск
 `params` не записывает (падает), а уже записанное битым — игнорируется в пользу кода.
 
+Папки в бакете плоские: логи задач под своим префиксом, всё остальное — в корне, и ничто не
+лежит внутри чужого. Иначе правило жизненного цикла родителя накрывало бы вложенную папку, а
+срок ей задавался бы напрасно.
+
+Соседние даги свои дампы убирают сами и знают про свои ключи больше: `pg_activity` и
+`queue_cleanup` удаляют по дате В ИМЕНИ ключа и не трогают то, что на их формат не похоже, а
+`test_dags` держит версии, пока жив сам даг. Поэтому этот DAG им страховка, а не замена:
+сроки здесь стоят не меньше их собственных `keep_days`, а снимкам дагов срок не задан вовсе —
+их возраст ничего не значит. Действующий срок папки — меньший из двух.
+
 **Таски:**
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
-- **create_bucket** — создание бакета, если его нет
-- **clean_logs** — удаление объектов старше `days`
-- **show_bucket_size** — объём и число объектов после чистки
+- **layout** — создание бакета и сроков хранения по папкам
+- **sweep** — один обход бакета: статистика по папкам и удаление всего, что старше своего срока
+- **report** — таблица по папкам в заметку и сводка в XCom
 """
 
 from datetime import datetime, timedelta, timezone
 import logging
+import time
 
 from airflow.configuration import conf
 from airflow.models import Param
@@ -34,10 +66,12 @@ from airflow.decorators import task, dag
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
+    from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
     )
 except ImportError:
+    from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
     )
@@ -68,6 +102,67 @@ def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
     )
 
 
+def _folder_days(params) -> dict:
+    """Сроки по папкам: логи задач из `days`, остальные из `folders`.
+
+    Ключ — префикс от корня бакета, всегда со слешем на конце: по нему и сверяются ключи
+    объектов при обходе.
+    """
+    folders = {PREFIX: int(params['days'])} if PREFIX else {}
+    for prefix, days in (params.get('folders') or {}).items():
+        name = str(prefix).strip().strip('/')
+        if name:
+            folders[f"{name}/"] = int(days)
+    return folders
+
+
+def _default_days(params) -> int:
+    """Срок для объектов вне известных папок — всегда `other_days`, и только он.
+
+    Раньше при пустом префиксе логов (бакет целиком под логи) сюда подставлялся срок логов:
+    мол, «прочее» — это и есть они. Но тогда `other_days=0` молча превращался в 30 дней и
+    обход шёл по всему бакету, включая чужие папки. Логи в корне бакета — случай, который
+    задаётся явно: поставьте `other_days`.
+    """
+    return int(params['other_days'])
+
+
+def _roots(s3_hook, prefix: str = '') -> list:
+    """Папки верхнего уровня одним запросом: листинг с разделителем не читает объекты.
+
+    Замер на стенде 16.09.2026: 0.06 с против четырёх минут на обход того же бакета. Нужно,
+    чтобы отчёт называл папки, которых нет в карте сроков: без этого они не осматриваются и
+    остаются невидимыми до первой аварии.
+    """
+    client = s3_hook.get_bucket(BUCKET_NAME).meta.client
+    pages = client.get_paginator('list_objects_v2').paginate(
+        Bucket=BUCKET_NAME, Prefix=prefix, Delimiter='/'
+    )
+    return [item['Prefix'] for page in pages for item in page.get('CommonPrefixes') or []]
+
+
+def _walk_order(folders: dict) -> list:
+    """Порядок обхода: папка логов последней, вложенные раньше своих родителей.
+
+    Бюджет времени ограничен, а логи задач на порядки больше всего остального и растут с
+    каждым прогоном: начав с них, до соседей очередь не дойдёт вовсе — на стенде так пропал
+    весь отчёт, кроме одной строки. Поэтому логи идут в конец, а среди остальных папка,
+    внутри которой лежит другая, — после неё.
+    """
+    parents = {outer for outer in folders for inner in folders if inner != outer and inner.startswith(outer)}
+
+    def rank(name: str) -> tuple:
+        return (name == PREFIX, name in parents, -len(name), name)
+
+    return sorted(folders, key=rank)
+
+
+def _prefix_of(key: str, folders: dict):
+    """Папка объекта: самый длинный из известных префиксов, иначе None («прочее»)."""
+    matches = [prefix for prefix in folders if key.startswith(prefix)]
+    return max(matches, key=len) if matches else None
+
+
 # Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
 # рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
 # Механика повторяет db_cleanup.py; общее на два DAG-а — чтение переменной
@@ -91,12 +186,61 @@ def _schedule():
     return None if value in (None, '', 'None') else str(value).strip()
 
 
+# Папки бакета, которые заводит не этот DAG: логи ядра пишет платформа (`_health/` — отбивки
+# воркеров), дампы кладут соседние даги. Сроки соседей не меньше их собственных keep_days:
+# страховка не должна удалять раньше хозяина
+# Все папки — от корня бакета, как их видит листинг, и ни одна не лежит внутри другой. Так
+# правило жизненного цикла на префикс логов не накрывает соседей: фильтр правила — префикс, и
+# исключений в нём нет. `system_health/` кладут ядро (отбивки воркеров) и проба этого же
+# репозитория (check/system_health.py)
+DEFAULT_FOLDERS = {
+    'system_health/': 7,
+    # Снимки дагов по возрасту чистить НЕЛЬЗЯ: test_dags держит там все версии живых дагов и
+    # удаляет только снимки дагов, которых больше нет. Даты в ключе нет, и у дага, не
+    # менявшегося полгода, единственная версия — полугодовой давности: удалив её, мы лишим
+    # сравнение базы. Ноль — «не трогать»
+    'dag_snapshots/': 0,
+    # Тракт ТФС живёт в корне этого же бакета (`plugins/tfs_utils.py`). Возраст там ничего не
+    # значит: в `tfs/queue/` лежат файлы, ждущие отправки, и в паузе отправки они ждут сколько
+    # угодно. Ноль — «не трогать»
+    'tfs/': 0,
+    'queue_cleanup/': 30,
+    'pg_activity/': 30,
+}
+
 params = {
     'days': _param(
         'days', 30,
         type='integer',
         minimum=1,
-        description='Возраст объектов для удаления (дни)',
+        description='Срок хранения логов задач (дни)',
+    ),
+    'folders': _param(
+        'folders', DEFAULT_FOLDERS,
+        type='object',
+        description='Сроки остальных папок бакета: префикс → дни',
+    ),
+    'other_days': _param(
+        'other_days', 0,
+        type='integer',
+        minimum=0,
+        description='Срок для папок, которых нет в списке; 0 — не трогать',
+    ),
+    'max_minutes': _param(
+        'max_minutes', 30,
+        type='integer',
+        minimum=1,
+        description='Потолок обхода бакета (минуты): не уложились — отчёт скажет, что обход неполный',
+    ),
+    'dry_run': _param(
+        'dry_run', False,
+        type='boolean',
+        description='True — ничего не удалять и правил не менять: только посчитать и показать',
+    ),
+    'lifecycle': _param(
+        'lifecycle', True,
+        type='boolean',
+        description='True — выставлять правила жизненного цикла на префиксы',
     ),
     'schedule': _param(
         'schedule', DEFAULT_SCHEDULE,
@@ -148,48 +292,206 @@ def tools_log_cleanup():
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку
-    @task(trigger_rule=TriggerRule.NONE_FAILED)
-    def create_bucket(**context):
+    @task(task_id='layout', trigger_rule=TriggerRule.NONE_FAILED)
+    def ensure_layout(**context):
+        """🗂 Бакет и сроки хранения по папкам."""
         s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
         if not s3_hook.check_for_bucket(BUCKET_NAME):
             s3_hook.create_bucket(bucket_name=BUCKET_NAME)
             add_note(f"Создан бакет `{BUCKET_NAME}`", context)
-        else:
-            add_note(f"Бакет `{BUCKET_NAME}` существует", context)
 
-    @task
-    def clean_logs(**context):
         params = context['params']
-        cutoff = datetime.now(timezone.utc) - timedelta(days=params['days'])
-        s3_hook, paginator = _get_paginator()
-        total = 0
-        for page in paginator:
-            if contents := page.get("Contents"):
-                # Было s3_hook._list_key_object_filter(keys=contents, to_datetime=cutoff) —
-                # приватный метод провайдера, который следующий мажор унесёт молча.
-                # Граница включающая, как в оригинале: он отбрасывал только LastModified > cutoff
-                keys = [o["Key"] for o in contents if o["LastModified"] <= cutoff]
-                if keys:
-                    total += len(keys)
-                    s3_hook.delete_objects(bucket=BUCKET_NAME, keys=keys)
-        msg = f"Удалено {total} объектов старше {params['days']}д из `{BUCKET_NAME}/{PREFIX}`"
-        add_note(msg, context)
-        return msg
+        if params['dry_run']:
+            rows = [f"| `{prefix or '/'}` | {days} |" for prefix, days in _folder_days(params).items()]
+            add_note("\n".join(["⚠️ сухой прогон: правила не менялись", "| Папка | Дней |", "|---|---|", *rows]),
+                     context, title='Сроки хранения')
+            return "Сухой прогон: правила не менялись"
+        if not params['lifecycle']:
+            return "Правила жизненного цикла не выставлялись: `lifecycle=False`"
+
+        folders = _folder_days(params)
+        rows, failed, dropped = [], [], []
+        for prefix, days in folders.items():
+            if days <= 0:
+                # 0 — «не трогать». Правило с нулём означало бы «удалить всё», а забытое
+                # правило с прошлого срока продолжало бы удалять силами хранилища — поэтому
+                # не пропускаем, а снимаем
+                try:
+                    if s3_drop_ttl(AWS_CONN_ID, BUCKET_NAME, prefix=prefix):
+                        dropped.append(prefix)
+                except Exception as e:
+                    logger.warning(f"⚠️ правило для `{prefix}` не снято: {e}")
+                    failed.append(prefix)
+                continue
+            try:
+                s3_set_ttl(AWS_CONN_ID, BUCKET_NAME, days=days, prefix=prefix)
+            except Exception as e:
+                # Правило — не главный механизм: уборку всё равно делает обход ниже.
+                # Через корпоративный шлюз PutBucketLifecycleConfiguration раньше отвечал
+                # «Missing required header» (см. pg_activity.py), поэтому падать здесь нельзя
+                logger.warning(f"⚠️ правило для `{prefix}` не выставлено: {e}")
+                failed.append(prefix)
+            else:
+                rows.append(f"| `{prefix or '/'}` | {days} |")
+
+        # Правило жизненного цикла применяется ко всему, что начинается с его префикса, а
+        # исключений в S3 нет: папка со сроком 0, лежащая внутри папки с правилом, от этого
+        # правила не защищена. Сказать об этом обязаны — молча терять данные нельзя
+        unprotected = [
+            f"`{nested}` (правило `{parent}` на {folders[parent]} дн.)"
+            for nested, days in folders.items()
+            if days <= 0
+            for parent in folders
+            if parent != nested and folders[parent] > 0 and nested.startswith(parent)
+        ]
+        note = ["| Папка | Дней |", "|---|---|", *rows]
+        if dropped:
+            note.insert(0, f"сняты правила у папок без срока: {', '.join(f'`{p}`' for p in dropped)}")
+        if unprotected:
+            note.insert(0, "⚠️ срок 0 не спасёт от правила родителя: " + ", ".join(unprotected))
+        if failed:
+            note.insert(0, f"⚠️ правила не выставились: {', '.join(f'`{p}`' for p in failed)} — уборка обходом")
+        add_note("\n".join(note), context, title='Сроки хранения')
+        return f"Правил выставлено {len(rows)}, не вышло {len(failed)}"
 
     @task
-    def show_bucket_size(**context):
-        _, paginator = _get_paginator()
-        total_size = total_objs = 0
-        for page in paginator:
-            if contents := page.get("Contents"):
-                for obj in contents:
-                    total_size += obj.get("Size", 0)
-                    total_objs += 1
-        msg = f"Объём `{BUCKET_NAME}/{PREFIX}`: {readable_size(total_size)} ({total_objs} объектов)"
-        add_note(msg, context)
-        return msg
+    def sweep(**context):
+        """🧹 Обход бакета: статистика по папкам и удаление старше своего срока.
 
-    save_params() >> create_bucket() >> clean_logs() >> show_bucket_size()
+        Обход один на всё: листинг и удаление за проход, а не два прохода подряд — на бакете
+        с сотнями тысяч объектов второй листинг стоит столько же, сколько первый (замер на
+        стенде 16.09.2026: MinIO отдавал около 100 объектов в секунду, 24 тысячи — четыре
+        минуты). Отсюда же потолок по времени: не уложились — отчёт скажет, что данные
+        неполные, а слот пула не держим до бесконечности.
+
+        Незнакомые папки листаем, только если им задан срок: осматривать то, что всё равно не
+        трогаем, — плата без пользы.
+        """
+        params = context['params']
+        folders = _folder_days(params)
+        other_days = _default_days(params)
+        now = datetime.now(timezone.utc)
+        deadline = time.monotonic() + params['max_minutes'] * 60
+
+        s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
+        # Папки бакета, которых нет в карте: их не осматриваем (если не задан other_days), но
+        # назвать обязаны — иначе о новой папке никто не узнает
+        unknown = sorted(set(_roots(s3_hook)) - {prefix.split('/')[0] + '/' for prefix in folders})
+        stats: dict[str, dict] = {}
+        batch: list[str] = []
+        partial = False
+
+        # Незнакомым папкам срок задан — идём по всему бакету; иначе только по известным.
+        # Порядок: сначала папки, внутри которых нет других — потом те, что их содержат.
+        # Причина в бюджете времени: папка логов на порядки больше остальных, и если начать
+        # с неё, до соседей очередь не дойдёт вовсе. Заодно это гарантирует, что вложенная
+        # папка обойдётся раньше родителя
+        walks = [''] if other_days else _walk_order(folders)
+        for walk in walks:
+            _, pages = _get_paginator(prefix=walk)
+            for page in pages:
+                for obj in page.get("Contents") or []:
+                    key, size, modified = obj["Key"], obj.get("Size", 0), obj["LastModified"]
+                    prefix = _prefix_of(key, folders)
+                    # Папки вложены (отбивки лежат под префиксом логов), и при обходе по
+                    # префиксам объект попался бы дважды: считаем его в самой длинной папке
+                    if walk and prefix != walk:
+                        continue
+                    days = folders[prefix] if prefix is not None else other_days
+                    row = stats.setdefault(
+                        prefix if prefix is not None else 'прочее',
+                        {'objects': 0, 'bytes': 0, 'oldest': None, 'newest': None,
+                         'types': {}, 'days': days, 'over_ttl': 0, 'deleted': 0, 'deleted_bytes': 0},
+                    )
+                    row['objects'] += 1
+                    row['bytes'] += size
+                    row['oldest'] = min(row['oldest'] or modified, modified)
+                    row['newest'] = max(row['newest'] or modified, modified)
+                    suffix = key.rsplit('.', 1)[-1][:8] if '.' in key.rsplit('/', 1)[-1] else 'без типа'
+                    row['types'][suffix] = row['types'].get(suffix, 0) + 1
+
+                    if not days or modified > now - timedelta(days=days):
+                        continue
+                    row['over_ttl'] += 1
+                    if params['dry_run']:
+                        continue
+                    row['deleted'] += 1
+                    row['deleted_bytes'] += size
+                    batch.append(key)
+                    if len(batch) >= 1_000:
+                        s3_hook.delete_objects(bucket=BUCKET_NAME, keys=batch)
+                        batch = []
+                if time.monotonic() > deadline:
+                    partial = True
+                    logger.warning(f"⚠️ обход прерван по времени на `{walk or BUCKET_NAME}`")
+                    break
+            if partial:
+                break
+        if batch:
+            s3_hook.delete_objects(bucket=BUCKET_NAME, keys=batch)
+
+        for row in stats.values():
+            row['oldest'] = row['oldest'].isoformat(timespec='seconds') if row['oldest'] else None
+            row['newest'] = row['newest'].isoformat(timespec='seconds') if row['newest'] else None
+        deleted = sum(row['deleted'] for row in stats.values())
+        over = sum(row['over_ttl'] for row in stats.values())
+        head = f"Сухой прогон: удалить нужно {over}" if params['dry_run'] else f"Удалено {deleted} объектов"
+        add_note(f"{head}, папок осмотрено {len(stats)}", context)
+        return {
+            'bucket': BUCKET_NAME,
+            'dry_run': bool(params['dry_run']),
+            'unknown_folders': unknown,
+            'checked_at': now.isoformat(timespec='seconds'),
+            'partial': partial,
+            'skipped_unknown': not other_days,
+            'folders': stats,
+        }
+
+    @task
+    def report(swept: dict, **context):
+        """📋 Таблица по папкам в заметку, сводка — в XCom.
+
+        Важное первым: заметка режется по MAX_NOTE_LEN, и в хвост должны уходить самые
+        мелкие папки, а не итог.
+        """
+        folders = swept['folders']
+        total_objects = sum(row['objects'] for row in folders.values())
+        total_bytes = sum(row['bytes'] for row in folders.values())
+        deleted = sum(row['deleted'] for row in folders.values())
+        over_ttl = {name: row['over_ttl'] for name, row in folders.items() if row['over_ttl'] and row['days']}
+
+        lines = [
+            f"`{swept['bucket']}`: {readable_size(total_bytes)}, объектов {readable_size(total_objects, 1000)}, "
+            f"удалено {deleted}" + (" (сухой прогон)" if swept.get('dry_run') else ""),
+            "",
+            "| Папка | Объектов | Объём | Старейший | Дней | Удалено |",
+            "|---|---|---|---|---|---|",
+        ]
+        for name, row in sorted(folders.items(), key=lambda item: -item[1]['objects']):
+            oldest = (row['oldest'] or '')[:10]
+            lines.append(
+                f"| `{name}` | {row['objects']} | {readable_size(row['bytes'])} | {oldest} | "
+                f"{row['days'] or '—'} | {row['deleted']} |"
+            )
+        if swept.get('partial'):
+            lines.insert(1, "⚠️ обход не закончен: данные неполные, поднимите `max_minutes` или разберитесь, "
+                            "почему листинг медленный")
+        unknown = swept.get('unknown_folders') or []
+        if unknown:
+            lines.append("")
+            lines.append(f"Папок вне карты сроков: {', '.join(f'`{name}`' for name in unknown[:10])}")
+        if swept.get('skipped_unknown'):
+            lines.append("Папки без срока (`other_days=0`) не осматривались.")
+        if over_ttl:
+            # Сколько объектов старше срока дожило до обхода. Правило жизненного цикла
+            # применяется хранилищем асинхронно, поэтому сразу после смены срока это число
+            # большое и это нормально; если оно не падает от прогона к прогону — правила на
+            # шлюзе не работают, и бакет держит обход
+            lines.insert(1, f"объектов старше срока при обходе: {over_ttl}")
+        add_note("\n".join(lines), context, title='Бакет логов', level='task,DAG')
+        return {**swept, 'totals': {'objects': total_objects, 'bytes': total_bytes, 'deleted': deleted}}
+
+    report(save_params() >> ensure_layout() >> sweep())
 
 
 tools_log_cleanup()
