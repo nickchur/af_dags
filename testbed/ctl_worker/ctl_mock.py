@@ -1,5 +1,5 @@
 """🎭 Эмулятор CTL API для тестового стенда.
-*2026-09-01 19:13 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-15 10:00 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Отвечает так, как отвечает CTL нашим дагам: справочники — из фикстур (снимок боевого
 бакета `edpetl-ctl`, развёрнутый `fixtures_from_cache.py`), состояние загрузок — в
@@ -58,6 +58,29 @@ PROFILE_OBJ = _fixture('profile.json', {'id': 1557, 'name': PROFILE})
 CATEGORIES = _fixture('categories.json', [])
 ENTITIES = {int(k): v for k, v in _fixture('entities.json', {}).items()}
 WORKFLOWS = {int(w['wf']['id']): w for w in _fixture('workflows.json', [])}
+
+
+def _env_set(name: str) -> set[str]:
+    return {v.strip() for v in os.getenv(name, '').split(',') if v.strip()}
+
+
+# Висячие ссылки, как на alpha 14.09.2026: workflow ждёт событие профиля или сущности, которых в
+# CTL нет, и CTL отвечает на statval 422. Снимок сам не знает, чего в CTL нет, поэтому задаём.
+MISSING_PROFILES = _env_set('CTL_MOCK_MISSING_PROFILES')
+MISSING_ENTITIES = {int(e) for e in _env_set('CTL_MOCK_MISSING_ENTITIES') if e.isdigit()}
+
+# /v4/api/entity боевого CTL — все сущности всех профилей, а фикстура entities.json — только
+# дерево нашего профиля. Остальные берём из enames: имя там есть у всех, что CTL отдал загрузчику,
+# а у отсутствующих — '_Not_found_'. parentId неизвестен — 0, загрузчику этого хватает.
+ENTITIES_ALL = dict(ENTITIES)
+for _eid, _name in _fixture('enames.json', {}).items():
+    if _name != '_Not_found_' and str(_eid).isdigit():
+        ENTITIES_ALL.setdefault(int(_eid), {'id': int(_eid), 'name': _name, 'parentId': 0})
+for _eid in MISSING_ENTITIES:
+    ENTITIES_ALL.pop(_eid, None)
+
+# Профили CTL: свой плюс те, чьи события лежат в затравке statval, минус «удалённые».
+PROFILES = sorted(({PROFILE} | {r['profile'] for r in _fixture('statvals.json', [])}) - MISSING_PROFILES)
 
 # Дети сущности — по parentId. Считаем один раз: дерево не меняется.
 KIDS: dict[int, list[int]] = {}
@@ -266,7 +289,21 @@ async def categories(request: Request):
 
 
 async def entities(request: Request):
-    return JSONResponse(list(ENTITIES.values()))
+    return JSONResponse(list(ENTITIES_ALL.values()))
+
+
+async def profiles(request: Request):
+    return JSONResponse([{**PROFILE_OBJ, 'name': name} if name == PROFILE else {'id': i, 'name': name}
+                         for i, name in enumerate(PROFILES, start=1)])
+
+
+def _missing(prf: str, eid: int):
+    """Ответ боевого CTL на статистику несуществующего профиля или сущности — или None."""
+    if prf not in PROFILES:
+        return JSONResponse({'message': f'Profile with name {prf} does not exist'}, status_code=422)
+    if eid not in ENTITIES_ALL:
+        return JSONResponse({'message': f'Entity with id {eid} does not exist'}, status_code=422)
+    return None
 
 
 async def entity_tree_search(request: Request):
@@ -296,7 +333,10 @@ async def entity_export(request: Request):
 
 async def statval_last(request: Request):
     eid, sid = int(request.path_params['eid']), int(request.path_params['sid'])
-    prf = request.query_params.get('profile', PROFILE)
+    prf = request.path_params.get('prf') or request.query_params.get('profile', PROFILE)
+    missing = _missing(prf, eid)
+    if missing:
+        return missing
     rows = q("""select profile, entity_id, stat_id, loading_id, value, published_dttm
                 from ctl_mock.statval
                 where profile = %s and entity_id = %s and stat_id = %s
@@ -542,6 +582,7 @@ routes = [
     *route('/permission', permission),
     *route('/permission5', permission),
     *route('/profile/name/{name}', profile_by_name),
+    *route('/profile', profiles),
     *route('/category', categories),
     *route('/category/m', categories),
     *route('/wf/extended', wf_extended),

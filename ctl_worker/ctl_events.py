@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-09-14 11:34 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-15 10:00 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -102,86 +102,99 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
         
         add_note(f"⏳ Cheking {len(res)} events", context, level='Task,DAG', add=False)
         
+        # Каждый ключ — сам по себе: сбой одного (CTL отдал странное, упал запрос статистик)
+        # не должен ронять проверку по остальным. Упали все — это уже не ключ, а связь с CTL
+        # или метабазой: падаем с последней ошибкой
+        checked, failed, last_error = 0, 0, None
         for r in res:
-            prf = r['prf']
-            eid = r['eid']
-            sid = r['sid']
-            # ts = r['ts']
-            ename = enames.get(int(eid), '')
-            CTL_sched = r['value']
-
-            logger.debug(f"🔍 {json.dumps(r, default=str)}")
-            
-            if CTL_sched:
-                logger.debug(f"🔄 skipped scheduled in CTL")
-                continue
-            
             try:
+                prf = r['prf']
+                eid = r['eid']
+                sid = r['sid']
+                # ts = r['ts']
+                ename = enames.get(int(eid), '')
+                CTL_sched = r['value']
+
+                logger.debug(f"🔍 {json.dumps(r, default=str)}")
+            
+                if CTL_sched:
+                    logger.debug(f"🔄 skipped scheduled in CTL")
+                    continue
+                checked += 1
+            
+                # Без своего try: сбой запроса — это сбой ключа, его считает общий обработчик ниже.
+                # Раньше здесь был голый except: continue, и лежащий CTL выглядел как «событий нет»
                 last = ctl_api(f"/v4/api/entity/{eid}/stat/{sid}/statval/last?profile={prf}")
-            except:
-                continue
 
-            logger.debug(f"⚠️ {json.dumps(last, default=str)}")
+                logger.debug(f"⚠️ {json.dumps(last, default=str)}")
             
-            if not last or len(last) == 0:
-                logger.debug(f"⚠️ skipped no events")
-                continue
+                if not last or len(last) == 0:
+                    logger.debug(f"⚠️ skipped no events")
+                    continue
             
-            last = (last[0] or {})
-            lid = int(last.get('loading_id', '0'))
-            ldt = last.get('published_dttm', '')
-            evn = f"{prf}/{eid}/{ename}"
-            ind = f"{lid}/{prf}/{eid}"
+                last = (last[0] or {})
+                # loading_id: null — значение без загрузки. .get('loading_id', '0') тут не спасал:
+                # ключ есть, значение None, и int(None) ронял всю проверку
+                lid = int(last.get('loading_id') or 0)
+                ldt = last.get('published_dttm', '')
+                evn = f"{prf}/{eid}/{ename}"
+                ind = f"{lid}/{prf}/{eid}"
 
-            if ldt and r['max'] and pendulum.parse(ldt, tz=get_config()['tz']) < r['max'] - timedelta(minutes=1):
-                logger.debug(f"⏳ skip {ldt} < {str(r['max'])}")
-                continue
-            elif lid:
-                whr= f"""
-                    and b.key like '{lid}/{prf}/{eid}/{sid}'
-                """
-            else:
-                whr = f"""
-                    and b.key like '0/{prf}/{eid}/dt'
-                    and  (b.value::json #>> '{ "{}" }') = '{ldt}'
-                """
-            sql= f"""
-                select a.timestamp ts
-                FROM main.dataset_event a 
-                CROSS JOIN lateral json_each(a.extra::json) b
-                join main.dataset c on a.dataset_id = c.id
-                WHERE c.uri LIKE 'CTL/%' 
-                    {whr}
-                order by 1 desc
-                limit 1
-            """
-            chk = pg_exe(sql)
-            logger.debug(f"⏳ {json.dumps(chk,default=str)}")
-            if chk:
-                logger.debug(f"⏳ skipped allredy send")
-                continue
-            
-            new = {}
-            new[f"{ind}/dt"] = ldt 
-            if len(ret) < MAX_EVENTS:
-                if lid:
-                    new[f"{ind}/url"] = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
-                    stats = ctl_api(f"/v4/api/loading/{lid}/statvals")
-                    for s in stats:
-                        if prf == s['profile'] and int(eid) == s['entity_id']:
-                            stat = f"{s['loading_id']}/{s['profile']}/{s['entity_id']}/{s['stat_id']}"
-                            new[stat] = s['value']
-                    ret[evn] = new
-                
+                if ldt and r['max'] and pendulum.parse(ldt, tz=get_config()['tz']) < r['max'] - timedelta(minutes=1):
+                    logger.debug(f"⏳ skip {ldt} < {str(r['max'])}")
+                    continue
+                elif lid:
+                    whr= f"""
+                        and b.key like '{lid}/{prf}/{eid}/{sid}'
+                    """
                 else:
-                    stat = f"0/{prf}/{eid}/{sid}"
-                    new[stat] = last['value']
-                    ret[evn] = new
+                    whr = f"""
+                        and b.key like '0/{prf}/{eid}/dt'
+                        and  (b.value::json #>> '{ "{}" }') = '{ldt}'
+                    """
+                sql= f"""
+                    select a.timestamp ts
+                    FROM main.dataset_event a 
+                    CROSS JOIN lateral json_each(a.extra::json) b
+                    join main.dataset c on a.dataset_id = c.id
+                    WHERE c.uri LIKE 'CTL/%' 
+                        {whr}
+                    order by 1 desc
+                    limit 1
+                """
+                chk = pg_exe(sql)
+                logger.debug(f"⏳ {json.dumps(chk,default=str)}")
+                if chk:
+                    logger.debug(f"⏳ skipped allredy send")
+                    continue
+            
+                new = {}
+                new[f"{ind}/dt"] = ldt 
+                if len(ret) < MAX_EVENTS:
+                    if lid:
+                        new[f"{ind}/url"] = f"{get_config()['conns']['ctl']['url']}/#/loading/{lid}"
+                        stats = ctl_api(f"/v4/api/loading/{lid}/statvals")
+                        for s in stats:
+                            if prf == s['profile'] and int(eid) == s['entity_id']:
+                                stat = f"{s['loading_id']}/{s['profile']}/{s['entity_id']}/{s['stat_id']}"
+                                new[stat] = s['value']
+                        ret[evn] = new
                 
-                logger.info(f"✳️ Event {new} ")
-            else:
-                logger.debug(f"🔒 MAX_EVENTS break")
-                break
+                    else:
+                        stat = f"0/{prf}/{eid}/{sid}"
+                        new[stat] = last['value']
+                        ret[evn] = new
+                
+                    logger.info(f"✳️ Event {new} ")
+                else:
+                    logger.debug(f"🔒 MAX_EVENTS break")
+                    break
+            except Exception as e:
+                failed += 1
+                last_error = e
+                logger.warning(f"⚠️ {r.get('key')}: {type(e).__name__}: {e}")
+        if checked and failed == checked:
+            raise last_error
         if len(ret) == 0:
             return PokeReturnValue(is_done=False, xcom_value=None)
         else:
