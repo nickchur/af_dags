@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-16 16:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-16 22:32 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -494,13 +494,17 @@ select d.dag_id from dag d
 where d.is_active and not exists (select 1 from serialized_dag s where s.dag_id = d.dag_id)
 order by d.dag_id limit :lim
 """
-# Начало прошлого рана этого DAG'а: ошибки импорта новее него — новые с прошлой проверки
-SQL_PREV_START = """
-select max(start_date) as since from dag_run
-where dag_id = :dag_id and run_id <> :run_id and start_date is not null
-"""
+# Новая ошибка импорта — со своим id, а не со свежим timestamp: разбирая файл заново,
+# Airflow обновляет ту же строку и ставит timestamp = utcnow (airflow 2.11.2,
+# dag_processing/processor.py:653), поэтому под фильтром «timestamp новее прошлого рана»
+# каждый прогон оказывались ВСЕ ещё не починенные файлы. Починенный файл строку теряет
+# (delete там же, 642), новый битый — получает новую строку с новым id из sequence,
+# значит id > запомненного и есть «появилась с прошлой проверки».
 SQL_NEW_IMPORT_ERRORS = """
-select filename from import_error where timestamp > :since order by timestamp desc limit :lim
+select id, filename from import_error where id > :since_id order by id desc limit :lim
+"""
+SQL_MAX_IMPORT_ERROR = """
+select coalesce(max(id), 0) as max_id from import_error
 """
 
 
@@ -524,6 +528,32 @@ def _last_parse_time() -> dict | None:
     return {**(value or {}), "age_h": round(_age_sec(stamp) / 3600, 1)}
 
 
+def _prev_import_error_id(dag_id: str, run_id: str) -> int | None:
+    """Наибольший id ошибки импорта, который видел предыдущий прогон этой проверки.
+
+    База сравнения хранится в своём же результате: отдельной переменной для неё заводить
+    нечего, а метабаза «когда ошибка появилась» не помнит (см. SQL_NEW_IMPORT_ERRORS).
+    Нет предыдущего прогона или в нём нет этого поля — базы нет, и о новых ошибках
+    прогон не говорит ничего.
+    """
+    from airflow.models.xcom import XCom
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        row = (session.query(XCom)
+               .filter(XCom.dag_id == dag_id, XCom.task_id == "check",
+                       XCom.key == "return_value", XCom.run_id != run_id)
+               .order_by(XCom.timestamp.desc()).first())
+        if row is None:
+            return None
+        value = row.value
+    if isinstance(value, str):
+        value = json.loads(value)
+    parsing = ((value or {}).get("checks") or {}).get("parsing") or {}
+    last = parsing.get("import_error_last_id")
+    return int(last) if isinstance(last, (int, float, str)) and str(last).isdigit() else None
+
+
 def check_parsing(dag_id: str, run_id: str) -> dict:
     """Разбор файлов по метабазе: свежесть, DAG'и без сериализации, ошибки импорта."""
     from airflow.configuration import conf
@@ -544,9 +574,10 @@ def check_parsing(dag_id: str, run_id: str) -> dict:
     stale_after = max(interval_sum, 3 * median)
     stale = _pg_rows(SQL_STALE_FILES, {"age": f"{stale_after} seconds", "lim": SHOW + 1})
     unserialized = [r["dag_id"] for r in _pg_rows(SQL_NOT_SERIALIZED, {"lim": SHOW + 1})]
-    prev_start = _pg_rows(SQL_PREV_START, {"dag_id": dag_id, "run_id": run_id})[0]["since"]
-    new_errors = ([r["filename"] for r in _pg_rows(SQL_NEW_IMPORT_ERRORS, {"since": prev_start, "lim": SHOW + 1})]
-                  if prev_start else [])
+    last_id = int(_pg_rows(SQL_MAX_IMPORT_ERROR)[0]["max_id"] or 0)
+    prev_id = _prev_import_error_id(dag_id, run_id)
+    new_errors = ([r["filename"] for r in _pg_rows(SQL_NEW_IMPORT_ERRORS, {"since_id": prev_id, "lim": SHOW + 1})]
+                  if prev_id is not None else [])
 
     status, notes = "healthy", []
     # Относительный порог не видит остановки целиком: стоит разбор — стареют все файлы
@@ -567,6 +598,7 @@ def check_parsing(dag_id: str, run_id: str) -> dict:
 
     result = {"files": files, "oldest_parse_sec": oldest, "newest_parse_sec": newest, "median_parse_sec": median,
               "import_errors": errors, "new_import_errors": len(new_errors),
+              "import_error_last_id": last_id,
               "stale_files": len(stale), "not_serialized": len(unserialized)}
     try:
         last = _last_parse_time()
