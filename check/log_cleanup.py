@@ -116,6 +116,18 @@ def _default_days(params) -> int:
     return int(params['days'] if not PREFIX else params['other_days'])
 
 
+def _roots(s3_hook, prefix: str = '') -> list:
+    """Папки верхнего уровня одним запросом: листинг с разделителем не читает объекты.
+
+    Замер на стенде 16.09.2026: 0.06 с против четырёх минут на обход того же бакета. Нужно,
+    чтобы отчёт называл папки, которых нет в карте сроков: без этого они не осматриваются и
+    остаются невидимыми до первой аварии.
+    """
+    client = s3_hook.get_bucket(BUCKET_NAME).meta.client
+    answer = client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=prefix, Delimiter='/')
+    return [item['Prefix'] for item in answer.get('CommonPrefixes') or []]
+
+
 def _prefix_of(key: str, folders: dict):
     """Папка объекта: самый длинный из известных префиксов, иначе None («прочее»)."""
     matches = [prefix for prefix in folders if key.startswith(prefix)]
@@ -159,6 +171,10 @@ DEFAULT_FOLDERS = {
     # менявшегося полгода, единственная версия — полугодовой давности: удалив её, мы лишим
     # сравнение базы. Ноль — «не трогать»
     'dag_snapshots/': 0,
+    # Тракт ТФС живёт в корне этого же бакета (`plugins/tfs_utils.py`, S3_UNDER_LOG_PREFIX =
+    # False). Возраст там ничего не значит: в `tfs/queue/` лежат файлы, ждущие отправки, и в
+    # паузе отправки они ждут сколько угодно. Ноль — «не трогать»
+    'tfs/': 0,
     'queue_cleanup/': 30,
     'pg_activity/': 30,
 }
@@ -307,6 +323,9 @@ def tools_log_cleanup():
         deadline = time.monotonic() + params['max_minutes'] * 60
 
         s3_hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
+        # Папки бакета, которых нет в карте: их не осматриваем (если не задан other_days), но
+        # назвать обязаны — иначе о новой папке никто не узнает
+        unknown = sorted(set(_roots(s3_hook)) - {prefix.split('/')[0] + '/' for prefix in folders})
         stats: dict[str, dict] = {}
         batch: list[str] = []
         partial = False
@@ -368,6 +387,7 @@ def tools_log_cleanup():
         return {
             'bucket': BUCKET_NAME,
             'dry_run': bool(params['dry_run']),
+            'unknown_folders': unknown,
             'checked_at': now.isoformat(timespec='seconds'),
             'partial': partial,
             'skipped_unknown': not other_days,
@@ -403,8 +423,11 @@ def tools_log_cleanup():
         if swept.get('partial'):
             lines.insert(1, "⚠️ обход не закончен: данные неполные, поднимите `max_minutes` или разберитесь, "
                             "почему листинг медленный")
-        if swept.get('skipped_unknown'):
+        unknown = swept.get('unknown_folders') or []
+        if unknown:
             lines.append("")
+            lines.append(f"Папок вне карты сроков: {', '.join(f'`{name}`' for name in unknown[:10])}")
+        if swept.get('skipped_unknown'):
             lines.append("Папки без срока (`other_days=0`) не осматривались.")
         if over_ttl:
             # Сколько объектов старше срока дожило до обхода. Правило жизненного цикла
