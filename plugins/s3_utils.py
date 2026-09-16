@@ -143,6 +143,39 @@ def s3_del_ttl(conn, bucket):
             return []
         raise e
 
+def s3_drop_ttl(conn, bucket, prefix=''):
+    """Снимает правило `{prefix}DeleteAfter`, остальные оставляет. True — правило было.
+
+    Нужно, когда папке перестали задавать срок: `s3_set_ttl` правила только добавляет и
+    обновляет, а забытое правило продолжает удалять объекты силами самого хранилища —
+    асинхронно и без единой строки в отчёте. `s3_del_ttl` здесь не годится: он сносит всю
+    конфигурацию бакета вместе с чужими правилами.
+    """
+
+    hook = S3Hook(aws_conn_id=conn)
+    client = hook.get_conn()
+    client.meta.events.register('before-sign.s3.PutBucketLifecycleConfiguration', _md5_instead_of_checksum)
+
+    try:
+        rules = client.get_bucket_lifecycle_configuration(Bucket=bucket).get('Rules', [])
+    except ClientError as e:
+        if e.response['Error']['Code'] == 'NoSuchLifecycleConfiguration':
+            return False
+        raise
+
+    rule_id = f'{prefix}DeleteAfter'
+    kept = [rule for rule in rules if rule.get('ID') != rule_id]
+    if len(kept) == len(rules):
+        return False
+
+    if kept:
+        client.put_bucket_lifecycle_configuration(Bucket=bucket, LifecycleConfiguration={'Rules': kept})
+    else:
+        # Пустой список правил S3 не принимает — снимаем конфигурацию целиком
+        client.delete_bucket_lifecycle(Bucket=bucket)
+    return True
+
+
 def s3_create_bucket(conn, bucket):
     """Создаёт бакет bucket в соединении conn, если он ещё не существует."""
     

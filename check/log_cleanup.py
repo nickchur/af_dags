@@ -10,6 +10,11 @@
 корпоративный шлюз они раньше не работали (см. `check/pg_activity.py`), поэтому уборка всё
 равно идёт обходом, а отчёт показывает, сколько объектов старше срока нашлось при обходе.
 
+⚠️ **Правило накрывает и вложенные папки.** Фильтр правила — префикс, исключений в S3 нет:
+папка со сроком `0` внутри папки с правилом от него не защищена. Отчёт таска `layout` про
+такие случаи предупреждает. Наши папки со сроком `0` (`dag_snapshots/`, `tfs/`) лежат в корне
+бакета, где правил нет.
+
 ⚠️ **Правило работает само и асинхронно.** Уменьшили срок — хранилище удалит всё лишнее
 своим сканером, без обхода и без отчёта. Проверено на стенде 16.09.2026: прогон с `days=7`
 поставил правило, и MinIO сам убрал 23,5 тыс. объектов старше недели. Поэтому разовый
@@ -57,12 +62,12 @@ from airflow.decorators import task, dag
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from CI06932748.tools.s3_utils import s3_set_ttl  # type: ignore
+    from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
     )
 except ImportError:
-    from plugins.s3_utils import s3_set_ttl  # type: ignore
+    from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
     )
@@ -108,12 +113,14 @@ def _folder_days(params) -> dict:
 
 
 def _default_days(params) -> int:
-    """Срок для объектов вне известных папок.
+    """Срок для объектов вне известных папок — всегда `other_days`, и только он.
 
-    Если логи задач лежат в корне бакета (префикса нет), то «прочее» — это и есть они, и
-    срок берётся их собственный, а не `other_days`.
+    Раньше при пустом префиксе логов (бакет целиком под логи) сюда подставлялся срок логов:
+    мол, «прочее» — это и есть они. Но тогда `other_days=0` молча превращался в 30 дней и
+    обход шёл по всему бакету, включая чужие папки. Логи в корне бакета — случай, который
+    задаётся явно: поставьте `other_days`.
     """
-    return int(params['days'] if not PREFIX else params['other_days'])
+    return int(params['other_days'])
 
 
 def _roots(s3_hook, prefix: str = '') -> list:
@@ -124,8 +131,17 @@ def _roots(s3_hook, prefix: str = '') -> list:
     остаются невидимыми до первой аварии.
     """
     client = s3_hook.get_bucket(BUCKET_NAME).meta.client
-    answer = client.list_objects_v2(Bucket=BUCKET_NAME, Prefix=prefix, Delimiter='/')
-    return [item['Prefix'] for item in answer.get('CommonPrefixes') or []]
+    pages = client.get_paginator('list_objects_v2').paginate(
+        Bucket=BUCKET_NAME, Prefix=prefix, Delimiter='/'
+    )
+    return [item['Prefix'] for page in pages for item in page.get('CommonPrefixes') or []]
+
+
+def _walk_order(folders: dict) -> list:
+    """Порядок обхода: сперва папки без вложенных, затем содержащие их (глубокие раньше)."""
+    parents = {outer for outer in folders for inner in folders if inner != outer and inner.startswith(outer)}
+    leaves = sorted(name for name in folders if name not in parents)
+    return leaves + sorted(parents, key=len, reverse=True)
 
 
 def _prefix_of(key: str, folders: dict):
@@ -280,11 +296,19 @@ def tools_log_cleanup():
         if not params['lifecycle']:
             return "Правила жизненного цикла не выставлялись: `lifecycle=False`"
 
-        rows, failed = [], []
-        for prefix, days in _folder_days(params).items():
+        folders = _folder_days(params)
+        rows, failed, dropped = [], [], []
+        for prefix, days in folders.items():
             if days <= 0:
-                # 0 — «не трогать»; правило с нулём означало бы «удалить всё», и хранилище
-                # выполнило бы его само, асинхронно и без отчёта
+                # 0 — «не трогать». Правило с нулём означало бы «удалить всё», а забытое
+                # правило с прошлого срока продолжало бы удалять силами хранилища — поэтому
+                # не пропускаем, а снимаем
+                try:
+                    if s3_drop_ttl(AWS_CONN_ID, BUCKET_NAME, prefix=prefix):
+                        dropped.append(prefix)
+                except Exception as e:
+                    logger.warning(f"⚠️ правило для `{prefix}` не снято: {e}")
+                    failed.append(prefix)
                 continue
             try:
                 s3_set_ttl(AWS_CONN_ID, BUCKET_NAME, days=days, prefix=prefix)
@@ -297,7 +321,21 @@ def tools_log_cleanup():
             else:
                 rows.append(f"| `{prefix or '/'}` | {days} |")
 
+        # Правило жизненного цикла применяется ко всему, что начинается с его префикса, а
+        # исключений в S3 нет: папка со сроком 0, лежащая внутри папки с правилом, от этого
+        # правила не защищена. Сказать об этом обязаны — молча терять данные нельзя
+        unprotected = [
+            f"`{nested}` (правило `{parent}` на {folders[parent]} дн.)"
+            for nested, days in folders.items()
+            if days <= 0
+            for parent in folders
+            if parent != nested and folders[parent] > 0 and nested.startswith(parent)
+        ]
         note = ["| Папка | Дней |", "|---|---|", *rows]
+        if dropped:
+            note.insert(0, f"сняты правила у папок без срока: {', '.join(f'`{p}`' for p in dropped)}")
+        if unprotected:
+            note.insert(0, "⚠️ срок 0 не спасёт от правила родителя: " + ", ".join(unprotected))
         if failed:
             note.insert(0, f"⚠️ правила не выставились: {', '.join(f'`{p}`' for p in failed)} — уборка обходом")
         add_note("\n".join(note), context, title='Сроки хранения')
@@ -331,9 +369,11 @@ def tools_log_cleanup():
         partial = False
 
         # Незнакомым папкам срок задан — идём по всему бакету; иначе только по известным.
-        # Вложенные папки (отбивки лежат под префиксом логов) обходим раньше родителя: иначе
-        # обход родителя выберет весь бюджет времени, а до вложенной очередь не дойдёт
-        walks = [''] if other_days else sorted(folders, key=len, reverse=True)
+        # Порядок: сначала папки, внутри которых нет других — потом те, что их содержат.
+        # Причина в бюджете времени: папка логов на порядки больше остальных, и если начать
+        # с неё, до соседей очередь не дойдёт вовсе. Заодно это гарантирует, что вложенная
+        # папка обойдётся раньше родителя
+        walks = [''] if other_days else _walk_order(folders)
         for walk in walks:
             _, pages = _get_paginator(prefix=walk)
             for page in pages:
