@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-04 14:08 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 08:15 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -49,6 +49,16 @@ action_icons = {
     'Skipped': '☮️', 
     'SLA': '🚨',
 }
+
+# Сводка SLA делится по возрасту. Нарушение вчерашнее и нарушение полугодовой давности —
+# разные новости: первое разбирает дежурный, второе значит, что загрузку бросили, и её
+# место в разборе расписания, а не в дежурной сводке. На альфе 17.09.2026 в одной сводке
+# лежало 144 нарушения возрастом до 160 дней — заметка режется по MAX_NOTE_LEN (1000
+# символов), то есть свежие нарушения в неё просто не попадали.
+sla_dead = str2timedelta(get_config().get('sla_dead', 'days=30'))
+sla_dead_txt = f'{sla_dead.days} д' if sla_dead.days else f'{sla_dead.seconds // 3600} ч'
+# Сколько строк показывать в заметке: как у списка ждущих паузы
+SLA_SHOW = 10
 
 monitor_interval = str2timedelta(get_config().get('monitor_interval','minutes=15'))
 timeout = timedelta(hours=24)
@@ -317,7 +327,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 if action in ['Skipped', 'New']:
                     continue
                 elif action in ['notFound', 'SLA']:
-                    sla_notes[lid] = f"{r['icon']} {r['wfn']} {r['time']}"
+                    # Третьим — сам интервал: по строке возраста («160 d 04:12» против
+                    # «12:40») старейших не отсортировать, а показывать надо их
+                    sla_notes[lid] = (f"{r['icon']} {r['wfn']} {r['time']}", t)
                     continue
                 else:
                     if len(res) < MAX_WFS:
@@ -331,8 +343,24 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         stats = { f'{status_icons[s]}  {s}': v for s,v in stats.items()}
         add_note(stats, context, level='Task,DAG', title='Status')
         
-        if sla_notes:
-            add_note(sla_notes, context, level='Task', title='SLA')
+        # Свежие нарушения — дежурному (заметка рана), брошенные — на разбор расписания
+        # (только заметка таска, иначе они вытеснят из сводки рана всё остальное).
+        # Полный список обоих — в лог: заметка обрезается, а разбираться нужно по всем.
+        for items, title, level in (
+            ({lid: v for lid, v in sla_notes.items() if v[1] <= sla_dead},
+             '🚨 SLA', 'Task,DAG'),
+            ({lid: v for lid, v in sla_notes.items() if v[1] > sla_dead},
+             f'🪦 Брошены дольше {sla_dead_txt}', 'Task'),
+        ):
+            if not items:
+                continue
+            logger.warning("%s: %d загрузок: %s", title, len(items),
+                           {lid: v[0] for lid, v in items.items()})
+            top = {lid: v[0] for lid, v in
+                   sorted(items.items(), key=lambda kv: kv[1][1], reverse=True)[:SLA_SHOW]}
+            if len(items) > len(top):
+                top['…'] = f"и ещё {len(items) - len(top)}; полный список в логе таска"
+            add_note(top, context, level=level, title=f'{title}: {len(items)}')
 
         # Один запрос на все увиденные даги: без него пришлось бы ходить в метабазу
         # на каждую загрузку, а их до ctl_limit за круг.
