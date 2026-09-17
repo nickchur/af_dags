@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-04 14:30 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 11:24 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -789,6 +789,13 @@ def build_worker_dag(w):
                     ctl_set_completed(lid, 'completed') # Completed/Aborted
                     raise AirflowSkipException(msg)
 
+                # Усечение — один раз на таблицу за прогон. Маска даёт несколько файлов
+                # (у ТФС части приходят отдельными объектами: …__1_1_0, …__1_1_50), и при
+                # заданном wf_tfs_table каждый следующий файл усекал таблицу, которую
+                # наполнил предыдущий, — в итоге оставался только последний. Когда таблица
+                # берётся из имени файла, усечение на файл как раз верно: таблицы разные.
+                truncated = set()
+
                 for key, value in keys.items():
                     new_path = f"{s3['conn_id']}://{s3['bucket']}/{key}"
                     arc_path = f"{s3['conn_id']}://{s3['bucket']}/{arc_prefix}/{key}"
@@ -797,15 +804,21 @@ def build_worker_dag(w):
                         key_tbl = Path(key).name
                         for s in [" ", "'", '"', ":", ";", "."]:
                             key_tbl = key_tbl.split(s)[0]
-                            
+
+                        tbl = table or key_tbl
+                        first = truncate and tbl not in truncated
+
                         rows = gp_upload_s3_csv(
-                            table=table or key_tbl, 
-                            key=key, 
-                            options=options, 
-                            gp_schema=schema, 
-                            truncate=truncate,
-                            timeout=int(wf_timeout.total_seconds()), 
+                            table=tbl,
+                            key=key,
+                            options=options,
+                            gp_schema=schema,
+                            truncate=first,
+                            timeout=int(wf_timeout.total_seconds()),
                         )
+                        # Отмечаем после успеха: файл, упавший до усечения, не должен
+                        # лишать следующий права очистить таблицу
+                        truncated.add(tbl)
                         
                         msg = f"✅ {value}: {readable(rows, 1000)}"
                         ctl_set_status(lid, 'RUNNING', f'TFS-OK {msg}')
