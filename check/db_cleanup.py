@@ -1,9 +1,11 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-08-27 12:00 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-16 20:48 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
 Большие таблицы (> 50 000 строк) удаляются порциями по диапазону дат.
+Порядок таблиц строится по внешним ключам — ребёнок раньше родителя, иначе каскад
+(`ON DELETE CASCADE`) утягивает детей в транзакцию родителя и батч перестаёт работать.
 
 | Параметр            | Описание                                                                                   |
 |---------------------|--------------------------------------------------------------------------------------------|
@@ -96,14 +98,20 @@ _EXTRA_COND = {
         'EXISTS (SELECT 1 FROM main.dag_run _dr'
         ' WHERE _dr.id = {p}dag_run_id AND _dr.execution_date < :cutoff)'
     ),
-    # task_id — уникальный индекс; EXISTS через external_executor_id → dag_run.execution_date
-    'celery_taskmeta': (
-        'EXISTS (SELECT 1 FROM main.task_instance ti'
-        ' JOIN main.dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id'
-        ' WHERE ti.external_executor_id = {p}task_id'
-        ' AND dr.execution_date < :cutoff)'
-    ),
+    # celery_taskmeta здесь нет намеренно: до v1.9 строка удалялась только при живом
+    # task_instance с тем же external_executor_id. Колонка хранит id ТОЛЬКО последней
+    # попытки, поэтому результаты всех ретраев, перезапусков и удалённых вручную ранов
+    # осиротевали навсегда, а сам EXISTS шёл полным сканом task_instance — индекса по
+    # external_executor_id нет ни у Airflow, ни в af_config.sql. Достаточно собственного
+    # date_done < cutoff: retention_days минимум 30, задач, живых месяц, не бывает.
 }
+
+# Каскад делает батч бессмысленным: у task_instance и task_reschedule FK на dag_run
+# стоит ON DELETE CASCADE (af_config.sql:806,808), у task_instance_history — на
+# task_instance (879). Порядок таблиц строим по FK (дети раньше родителей), но часть
+# детей в чистку не входит вовсе (task_map, rendered_task_instance_fields, заметки) —
+# их каскад остаётся, поэтому у dag_run батч дополнительно уменьшаем.
+_BATCH_DIV = {'dag_run': 10}
 
 # Таблицы без индекса на recency-колонке но с integer PK —
 # удаляем через ORDER BY pk LIMIT batch_size чтобы использовать PK-индекс.
@@ -131,6 +139,45 @@ _CUSTOM_TABLES = {
         ),
     },
 }
+
+
+def _order_children_first(names, session):
+    """Сортирует таблицы так, чтобы ребёнок чистился раньше родителя.
+
+    Порядок Airflow (`config_dict`) алфавитный: dag_run пятым, task_instance
+    тринадцатым, xcom последним. С ON DELETE CASCADE это значит, что батч в 50 000
+    ранов тянет в одну транзакцию всех их детей — миллионы строк, то есть батчинг
+    не работает ровно там, где он нужен. Связи берём из pg_constraint, а не списком:
+    состав таблиц меняется с версией Airflow, а список молча устаревает.
+    """
+    edges = session.execute(text("""
+        SELECT c.relname AS child, f.relname AS parent
+        FROM pg_constraint con
+        JOIN pg_class c ON c.oid = con.conrelid
+        JOIN pg_class f ON f.oid = con.confrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE con.contype = 'f' AND n.nspname = 'main' AND c.relname <> f.relname
+    """)).fetchall()
+
+    children = {}
+    for child, parent in edges:
+        children.setdefault(parent, set()).add(child)
+
+    ranks = {}
+
+    def rank(tbl, seen=()):
+        # Ранг = глубина дерева детей. Лист — 0, родитель всегда больше своих детей,
+        # значит при сортировке по возрастанию дети идут первыми.
+        if tbl in ranks:
+            return ranks[tbl]
+        if tbl in seen:          # цикл FK — не углубляемся, порядок тут не спасёт
+            return 0
+        kids = children.get(tbl, ())
+        ranks[tbl] = 1 + max((rank(k, seen + (tbl,)) for k in kids), default=-1)
+        return ranks[tbl]
+
+    # sorted устойчив: внутри одного ранга остаётся алфавитный порядок Airflow
+    return sorted(names, key=rank)
 
 
 def _log_sql(sql, bind, msg="SQL"):
@@ -455,7 +502,8 @@ def tools_db_cleanup():
 
             batches = 0
             if count and not dry_run:
-                n_batches = (count + batch_size - 1) // batch_size
+                tbl_batch = max(1000, batch_size // _BATCH_DIV.get(tbl, 1))
+                n_batches = (count + tbl_batch - 1) // tbl_batch
                 pk = _PK_BATCH.get(tbl)
                 if pk and n_batches > 1:
                     # Нет индекса на recency-колонке — используем PK-индекс:
@@ -466,8 +514,8 @@ def tools_db_cleanup():
                         f" ORDER BY {pk} LIMIT :lim)"
                     )
                     while True:
-                        _log_sql(pk_delete, {**bind, 'lim': batch_size}, f"🗑️ DELETE {tbl}")
-                        res = session.execute(pk_delete, {**bind, 'lim': batch_size})
+                        _log_sql(pk_delete, {**bind, 'lim': tbl_batch}, f"🗑️ DELETE {tbl}")
+                        res = session.execute(pk_delete, {**bind, 'lim': tbl_batch})
                         session.commit()
                         if res.rowcount == 0:
                             break
@@ -513,6 +561,13 @@ def tools_db_cleanup():
 
         custom = p.get('custom', False)
         table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
+        try:
+            with create_session() as session:
+                table_names = _order_children_first(table_names, session)
+            logger.info(f"📐 Порядок очистки (дети раньше родителей): {', '.join(table_names)}")
+        except Exception as e:
+            # Не смогли прочитать связи — чистим в порядке Airflow: медленнее, но не хуже прежнего
+            logger.warning(f"⚠️ Порядок по FK не построен ({e}), идём алфавитным порядком Airflow")
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()
