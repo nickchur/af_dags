@@ -1,5 +1,5 @@
 # 🛠️ CTL Plugins для Apache Airflow
-*2026-09-09 21:40 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-17 09:26 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
 
@@ -47,7 +47,11 @@ plugins/
 - **`gp_backend_busy`** — занят ли серверный процесс с этим pid запуском загрузки
   (`pg_stat_activity`); pid берётся из XCom, куда его кладёт `gp_exe`
 - **`pg_exe`** — Выполнение SQL в PostgreSQL с retry-логикой
-- **`ctl_obj_load`/`ctl_obj_save`** — Загрузка и сохранение объектов в S3 или Airflow Variables
+- **`ctl_obj_load`/`ctl_obj_save`** — Загрузка и сохранение объектов в S3 или Airflow Variables.
+  Читатель берёт сначала Variable и идёт в S3 только при её отсутствии, поэтому переменная
+  пишется **всегда**, даже когда тело в S3 не изменилось: раньше совпадение MD5 выходило из
+  функции раньше записи, и отставшая однажды переменная не догоняла никогда. Возвращаемый
+  признак по-прежнему про S3 — «записи не было»
 - **`ctl_obj_etag`** — Получение ETag (MD5-хеша) объекта из S3
 
 Функции retry используют:
