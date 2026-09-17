@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-17 09:24 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 10:41 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -73,7 +73,7 @@ def eval_delta(dt:str, delta:str)->str:
     Возвращает строку 'YYYY-MM-DD HH:mm:ss'.
     """
     if delta is None: return dt
-        
+
     new_dt = datetime.fromisoformat(dt)
     # Разбиение delta на части
     for d in [d.lower().strip() for d in delta.split(',')]:
@@ -87,27 +87,38 @@ def eval_delta(dt:str, delta:str)->str:
             else:
                 d = p[0]
                 p = ['', p[0]]
-        if p[0] == 'time':
-            kk = ['hour', 'minute', 'second', 'microsecond']
-            dtd = {'hour':0, 'minute':0, 'second':0, 'microsecond':0}
-            for k, v in enumerate(p[1].split(':')): dtd[kk[k]] = int(v)
-            new_dt = new_dt.replace(**dtd)
-        elif p[0] == 'date':
-            if '.' in p[1]:
-                kk, sp = ['day', 'month', 'year',], '.'
-            elif '-' in p[1]:
-                kk, sp = ['year', 'month', 'day',], '-'
-            for k, v in enumerate(p[1].split(sp)): 
-                new_dt = new_dt.replace(**{kk[k]: int(v)})
-        elif p[0] == 'weekday':
-            new_dt += timedelta(days=int(p[1])-new_dt.weekday())
-        elif p[0] == '' and p[1]:
-            kk = ['hours', 'minutes', 'seconds']
-            for k, v in enumerate(p[1].split(':')): 
-                new_dt += timedelta(**{kk[k]: int(v)})
-        elif p[1].lstrip('+-').isdigit():
-            new_dt += timedelta(**{p[0]: int(p[1])})
-            
+        # Неразобранный кусок — это ошибка, а не пустяк: из delta считается время
+        # следующей попытки, и молча пропущенный кусок даёт не то время без единого
+        # следа. Раньше «hours 5» (обратный порядок против рабочего «5 hours») просто
+        # не применялся, а «hours» без значения падало с int('hours') — по тексту
+        # исключения было не понять, что виновата настройка повторов.
+        try:
+            if p[0] == 'time':
+                kk = ['hour', 'minute', 'second', 'microsecond']
+                dtd = {'hour':0, 'minute':0, 'second':0, 'microsecond':0}
+                for k, v in enumerate(p[1].split(':')): dtd[kk[k]] = int(v)
+                new_dt = new_dt.replace(**dtd)
+            elif p[0] == 'date':
+                if '.' in p[1]:
+                    kk, sp = ['day', 'month', 'year',], '.'
+                elif '-' in p[1]:
+                    kk, sp = ['year', 'month', 'day',], '-'
+                for k, v in enumerate(p[1].split(sp)):
+                    new_dt = new_dt.replace(**{kk[k]: int(v)})
+            elif p[0] == 'weekday':
+                new_dt += timedelta(days=int(p[1])-new_dt.weekday())
+            elif p[0] == '' and p[1]:
+                kk = ['hours', 'minutes', 'seconds']
+                for k, v in enumerate(p[1].split(':')):
+                    new_dt += timedelta(**{kk[k]: int(v)})
+            elif p[1].lstrip('+-').isdigit():
+                new_dt += timedelta(**{p[0]: int(p[1])})
+            elif p[1]:
+                raise ValueError('кусок не разобран')
+            # пустое значение ('hours=' или лишняя запятая) применять нечего — пропускаем
+        except (ValueError, KeyError, IndexError, TypeError) as e:
+            raise ValueError(f"eval_delta: не разобрано {d!r} в {delta!r} ({e})") from None
+
     return new_dt.strftime('%Y-%m-%d %H:%M:%S')
 
 def logging(msg, action='info', obj='', log=None):
@@ -450,14 +461,20 @@ def gp_upload_s3_csv(table, key, options=None, gp_schema=None, truncate=False, t
         if key.lower().endswith(".zip"):
             from stream_unzip import stream_unzip # type: ignore
 
+            # Усечение — один раз на архив, а не на каждый файл: truncate внутри
+            # gp_from_stream идёт своей транзакцией, и в многофайловом архиве каждый
+            # следующий файл стирал загруженные до него. В таблице оставался только
+            # последний, молча и без единой ошибки.
+            first = truncate
             for f_name_byte, f_size, chunks in stream_unzip(body):
                 f_name = f_name_byte.decode('cp866', errors='replace').strip('/')
-                if not f_name or f_name.endswith('/'): 
+                if not f_name or f_name.endswith('/'):
                     continue
                 add_note(f"📥 Файл из архива {f_name} ({readable_size(f_size)})")
 
                 csv_stream = s3_IterStream(chunks)
-                gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
+                gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, first, timeout )
+                first = False
 
         elif key.lower().endswith(".gz"):
             import gzip

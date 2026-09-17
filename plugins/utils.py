@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-14 11:34 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 10:41 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -202,14 +202,28 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
     # Используем новый контекстный менеджер для чистой сессии
     try:
         with create_session() as session:
-            for l in list(set(level.upper().split(',')))[:2]:
+            # sorted, а не set: порядок блокировок должен быть одинаковым у всех тасков.
+            # Общая строка тут одна (ран), свои task_instance у каждого свои, так что
+            # взаимной блокировки не выходит, но полагаться на порядок set нельзя.
+            for l in sorted(set(level.upper().split(',')))[:2]:
                 new_note = msg.strip()
                 # Определяем объект (DagRun или TaskInstance)
                 if l == 'DAG':
                     obj = session.merge(context['dag_run'])
                 else:
                     obj = session.merge(context['task_instance'])
-                session.expire(obj)  # перечитать из БД: другой параллельный таск мог уже создать заметку
+                # Перечитываем строку под блокировкой: заметка дописывается «прочитал —
+                # склеил — записал», и без FOR UPDATE двое параллельных тасков читают
+                # одно и то же, а записывает последний — строка первого пропадает. У нас
+                # это живой случай: семь задач ctl_loader пишут в заметку одного рана.
+                # Транзакция короткая (чтение и запись одной строки), планировщик ждёт
+                # миллисекунды. Не получилось перечитать под блокировкой — работаем как
+                # раньше: потерянная строка заметки лучше упавшей задачи.
+                try:
+                    session.refresh(obj, with_for_update=True)
+                except Exception as e:
+                    logger.warning(f"note: строка не заблокирована ({e}), пишем без блокировки")
+                    session.expire(obj)
                 
                 # Логика заголовка
                 if title:
