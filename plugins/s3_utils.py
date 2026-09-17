@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-08-25 13:38 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 10:41 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -315,12 +315,22 @@ class s3_IterStream(io.RawIOBase):
         MAX_THRESHOLD = 512 * 1024 * 1024   # 512 MB - жесткая остановка (защита воркера)
 
         if size == -1:
-            data = self.buffer + b''.join(self.iterator)
-            if len(data) > MAX_THRESHOLD:
-                raise MemoryError(f"🚨 Buffer exceeded MAX_THRESHOLD: {readable_size(len(data))}")
+            # Набираем по чанку и смотрим на порог по дороге. Было
+            # b''.join(self.iterator): весь поток складывался в память, и MemoryError
+            # поднимался уже после того, как память занята — защита срабатывала, когда
+            # защищать было нечего. Порционная ветка ниже всегда считала правильно.
+            buf = bytearray(self.buffer)
             self.buffer = b''
-            self.total_read += len(data)
-            return data
+            for chunk in self.iterator:
+                if not chunk:
+                    continue
+                buf.extend(chunk)
+                if len(buf) > MAX_THRESHOLD:
+                    raise MemoryError(f"🚨 Buffer exceeded MAX_THRESHOLD: {readable_size(len(buf))}")
+            if len(buf) > WARN_THRESHOLD:
+                logger.warning(f"⚠️ IterStream buffer is large: {readable_size(len(buf))}")
+            self.total_read += len(buf)
+            return bytes(buf)
 
         while len(self.buffer) < size:
             try:
