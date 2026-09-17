@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-09-15 10:00 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 09:24 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут выгружает данные из CTL и сохраняет в S3 + Airflow Variables.
 
@@ -144,19 +144,61 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         load_obj_save('ctl_profile', data, var=True, skip=True)
 
 
-    def entity_kids(ent, entity_ids):
-        entity_ids[ent['entity']['id']] = ent['entity']
-        for j in ent['kidz']: entity_kids(j, entity_ids)
+    def entity_subtree(flat, root):
+        """Сущности поддерева root: обход вниз по parentId плоского списка CTL.
+
+        Порядок фиксирован — в ширину, дети по возрастанию id. Это важнее красоты: на
+        порядке стоит сравнение MD5 в ctl_obj_save, и стоит ему зависеть от порядка ответа
+        CTL, как объект переписывался бы каждый круг. От прежнего обхода дерева порядок
+        отличается, поэтому на первом прогоне после выкладки объект перезапишется один раз.
+        """
+        kids = {}
+        for eid, ent in flat.items():
+            parent = ent.get('parentId')
+            if parent is not None:
+                kids.setdefault(int(parent), []).append(eid)
+
+        out, queue = {}, [root]
+        while queue:
+            eid = queue.pop(0)
+            if eid in out or eid not in flat:
+                continue
+            out[eid] = flat[eid]
+            queue.extend(sorted(kids.get(eid, [])))
+        return out
 
     @task(pool='ctl_pool')
     def load_entities(**context):
-        # Entities
-        # data = ctl_api(f'/v5/api/entity/child/c/{config["root_entity"]}/export')['entityExt']
-        # data = ctl_api(f'/v4/api/entity/{config["root_entity"]}/child')
-        data = ctl_api(f'/v4/api/entity/tree?search={get_config()["root_entity"]}&offset=0&limit={get_config().get("ctl_limit", 10000)}')[1]
-        eids = {}
-        entity_kids(data, eids)  
-        
+        # Полный список сущностей, а не поиск по дереву.
+        #
+        # Раньше здесь стоял `/v4/api/entity/tree?search=<корень>&offset=0&limit=<ctl_limit>`
+        # и обход `kidz`. Ручка поисковая, и свежесозданные сущности в неё не попадают:
+        # 17.09.2026 на альфе в поддереве 941010000 было 682 сущности, а запрос устойчиво
+        # отдавал 680 — не хватало ровно двух самых новых детей NONHR_STG (941010665 и
+        # 941010666, последние id из 152). Уровни 0 и 1 приходили целыми, обрезка по
+        # limit исключена (682 < 1000) — это отставание поискового индекса CTL, и
+        # экспорт `CTL_<профиль>.yml` молча жил без этих сущностей больше суток.
+        # `/v4/api/entity` читает таблицу: те же 682 узла, обе новые на месте.
+        #
+        # Лишнего запроса нет: полный список и раньше выгружался каждый круг для
+        # `ctl_entities_all` (там его теперь читает load_events).
+        root = int(get_config()['root_entity'])
+        data = ctl_api('/v4/api/entity')
+        load_obj_save('ctl_entities_all', data, var=False)
+
+        flat = {int(d['id']): d for d in data}
+        eids = entity_subtree(flat, root)
+
+        # Сверка вместо молчания: сущности «нашего» семейства id вне поддерева. Штатно это
+        # то, что выше корня (на альфе — 941000000 HR с прямыми детьми, 20 штук). Скачок
+        # числа значит, что кому-то завели сущность мимо нашего корня.
+        family = str(root)[:4]
+        outside = sorted(i for i in flat if str(i).startswith(family) and i not in eids)
+        add_note(f"🌳 поддерево {root}: {len(eids)}; семейство {family}…: "
+                 f"{len(eids) + len(outside)}, вне поддерева {len(outside)}",
+                 context, level='DAG,Task')
+        logger.info("вне поддерева %s…: %s", family, outside[:50])
+
         # Сохраняем в S3
         load_obj_save('ctl_entities', eids, var=True, skip=True)
         
@@ -362,11 +404,14 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
 
         eids = { int(k):v for k,v in (ctl_obj_load('ctl_entities') or {}).items() }
                 
-        data = ctl_api(f'/v4/api/entity')
-        # Сохраняем в S3
-        load_obj_save('ctl_entities_all', data, var=False)
-            
-        data = { d['id']:d for d in data }
+        # Полный список сущностей выгружает load_entities этим же кругом — берём готовый
+        # из S3, а не тянем второй раз: на альфе это 399 804 записи, 80 МБ за запрос.
+        # Список идёт параллельной задачей, поэтому в худшем случае он от прошлого круга —
+        # для поиска висячих ссылок это допустимо. Пусто (первый запуск, задача упала) —
+        # спрашиваем CTL сами, иначе все события окажутся «висячими».
+        data = ctl_obj_load('ctl_entities_all') or ctl_api('/v4/api/entity')
+
+        data = { int(d['id']):d for d in data }
 
         # Висячие ссылки: сущность или профиль события в CTL не существуют. Сенсор событий
         # спрашивал бы их на каждой проверке и получал 422 — на alpha 14.09.2026 это 13 ключей

@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-14 11:34 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-17 09:24 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -603,11 +603,32 @@ def ctl_obj_etag(key, ext='json', s3_id=None, bucket=None):
     before_sleep=log_retry_attempt,
     reraise=True
 )
+def _var_set(key, data, var):
+    """Переменная Айрфлоу с меткой времени и размером в описании. var=False — ничего."""
+    if not var:
+        return
+    msg = {
+        'ts': datetime.now(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S'),
+        'len': len(data),
+        'size': readable_size(len(str(data))),
+    }
+    Variable.set(key, data, description=str(msg), serialize_json=True)
+    logger.info(f"Переменная {key} успешно обновлена в Airflow.")
+
+
 def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
     """
-    Сохраняет объект в S3 и обновляет переменную Airflow, если указано.
+    Сохраняет объект в S3 и обновляет переменную Айрфлоу, если указано.
+
+    Возвращает, изменился ли объект в S3. Переменная пишется в обоих случаях: раньше
+    совпадение MD5 выходило из функции раньше блока `if var`, и стоило переменной один раз
+    отстать от S3 (сорванная запись в метабазу, ручная правка, восстановление из старого
+    экспорта) — она не догоняла никогда: объект байт в байт тот же, писатель выходит раньше,
+    а все читатели (`ctl_obj_load`) берут сначала переменную. Проверено на стенде
+    17.09.2026: подменённая переменная после сохранения того же набора оставалась
+    подменённой. Цена возврата — один `Variable.set` за круг на объект.
     """
-    
+
     s3 = get_config().get('conns', {}).get('s3', {})
     s3_id = s3_id or s3.get('conn_id', 's3')
     bucket = bucket or s3.get('bucket', 'edpetl-ctl')
@@ -637,6 +658,7 @@ def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
             # Примечание: ETag == MD5 только для обычных (не multipart) загрузок
             if current_etag == new_md5:
                 logger.info(f"Объект {key_ext} не изменился (MD5 match). Пропускаем загрузку.")
+                _var_set(key, data, var)
                 return False
 
         # 3. Если хеши разные или файла нет — загружаем
@@ -654,16 +676,8 @@ def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
     else:
         logger.warning(f"Бакет для {key} не указан в конфигурации.")
     
-    if var:
-        msg ={
-            'ts': datetime.now(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S'),
-            'len': len(data),
-            'size': readable_size(len(str(data))),
-            # 'md5': new_md5,
-        }
-        Variable.set(key, data, description=str(msg), serialize_json=True) 
-        logger.info(f"Переменная {key} успешно обновлена в Airflow.")
-            
+    _var_set(key, data, var)
+
     logger.info(f"Объект {key_ext} успешно обновлен в S3.")
     return True
 
