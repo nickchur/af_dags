@@ -319,9 +319,13 @@ def db_reindex(table, conn_id, timeout=900):
     По таблицам, а не по схеме целиком (так было до v1.10). Список берётся из того, что
     только что чистил clean: раздувает индексы именно массовый DELETE, а REINDEX SCHEMA
     проходил ВСЕ индексы схемы, включая таблицы, которых чистка не касается, — одной
-    командой на час без обратной связи. По таблицам видно время каждой, прерывание оставляет
-    невалидным индекс одной таблицы (следующий запуск догонит остальные), а пропуск по
-    правам попадает в свою строку отчёта, а не теряется в общем потоке notices.
+    командой на час без обратной связи. По таблицам видно время каждой, а пропуск по правам
+    попадает в свою строку отчёта, а не теряется в общем потоке notices.
+
+    Про обрыв важно не обольщаться: прерванный REINDEX CONCURRENTLY оставляет невалидный
+    индекс (PostgreSQL 16 на стенде), и сам он не исчезает — его удаляют вручную. По
+    таблицам проще только тем, что испорчена одна таблица, а не «что-то в схеме»; «следующий
+    запуск догонит» — неверно, поэтому таск с таким отказом обязан краснеть.
 
     CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
     Таблицу, которой пользователь не владеет, PostgreSQL пропускает с warning'ом
@@ -839,11 +843,23 @@ def tools_db_cleanup():
         значит чистили — есть что переиндексировать, не чистили — нечего. Из переменной
         брать нельзя ещё и потому, что имя таблицы уходит в SQL подстановкой.
         """
-        from airflow.exceptions import AirflowSkipException
+        from airflow.exceptions import AirflowException, AirflowSkipException
 
         p = context['params']
+
+        # Ключ читаем из переменной ЗАНОВО, а не из формы. Форма собрана на парсинге, и у
+        # того, кто выкатил v1.10 с прежней переменной, в ней ещё лежит reindex: true —
+        # граф первого запуска соберётся с этим таском, и он отработал бы тяжёлый REINDEX
+        # ровно там, где релиз обещал его выключить. Миграция в таске params к этому
+        # моменту уже прошла, поэтому свежее чтение переменной её и подхватывает.
+        if saved_params(PARAMS_VAR).get('reindex') is None:
+            raise AirflowSkipException(f'ключа reindex в {PARAMS_VAR} нет — переиндексация выключена')
         if not p.get('reindex', False):
             raise AirflowSkipException('reindex=False — пропущено')
+        # dry_run обещает прикидку без изменений. Переиндексация — не удаление, но DDL на
+        # четверть часа на таблицу «прикидкой» назвать нельзя.
+        if p.get('dry_run', False):
+            raise AirflowSkipException('dry_run=True — переиндексацию не делаем')
 
         timeout = 15 * 60  # на таблицу, как у вакуума: час был на всю схему одной командой
         tables = context['ti'].xcom_pull(task_ids='clean') or []
@@ -853,38 +869,51 @@ def tools_db_cleanup():
         # REINDEX требует прав владельца таблиц — идём админским коннектом из Vault.
         conn_id = get_af_conn()
 
-        results, skipped = [], []
+        results, skipped, failed = [], [], []
         for tbl in tables:
             _ts = time.time()
             try:
                 db_reindex(tbl, conn_id, timeout=timeout)
             except AirflowSkipException as e:
+                # Нет прав на таблицу — это не авария, PostgreSQL её просто пропускает
                 logger.warning(f"☮️ {tbl}: {e}")
                 skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
                                 'status': f'☮️ {str(e)[:60]}'})
                 continue
             except Exception as e:
                 # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
-                # (pg_index.indisvalid = false) — его нужно удалить вручную. По таблицам
-                # это одна таблица, а не «где-то в схеме»: следующий запуск догонит остальные.
+                # (pg_index.indisvalid = false). Он не обслуживает выборки, но СУБД обязана
+                # поддерживать его при каждой записи, и сам он не рассосётся — нужен DROP
+                # руками. Поэтому цикл идёт дальше (остальные таблицы ни при чём), но таск
+                # обязан закончиться красным: зелёный таск с битым индексом никто не заметит.
                 logger.warning(f"⚠️ {tbl}: {e} — возможен невалидный индекс, проверьте pg_index")
-                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'❌ {str(e)[:60]}'})
+                failed.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
+                               'status': f'❌ {str(e)[:60]}'})
                 continue
             results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
 
+        rows = results + skipped + failed
         lines = [
             '| Таблица | Время, с | Статус |',
             '|---------|---------|--------|',
-        ] + [
-            f"| `{r['table']}` | {r['duration']} | {r['status']} |" for r in results + skipped
-        ]
-        total = round(sum(r['duration'] for r in results + skipped), 2)
+        ] + [f"| `{r['table']}` | {r['duration']} | {r['status']} |" for r in rows]
+        total = round(sum(r['duration'] for r in rows), 2)
         lines.append(f"| **Итого** | **{total} с** | **{len(results)}/{len(tables)}** |")
+        if failed:
+            lines += ['', '⚠️ После обрыва мог остаться невалидный индекс:',
+                      '`select indexrelid::regclass from pg_index where not indisvalid;`',
+                      'Такой индекс сам не исчезнет — его удаляют вручную.']
         add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
         add_note(f'{len(results)}/{len(tables)} таблиц за {total} с'
-                 + (f' | ☮️❌ {len(skipped)}' if skipped else ''),
+                 + (f' | ☮️ {len(skipped)}' if skipped else '')
+                 + (f' | ❌ {len(failed)}' if failed else ''),
                  context=context, level='DAG', title='🔁 reindex')
+
+        if failed:
+            raise AirflowException(
+                'переиндексация не прошла: ' + ', '.join(r['table'] for r in failed)
+                + ' — проверьте pg_index на невалидные индексы'
+            )
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
