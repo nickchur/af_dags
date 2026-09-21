@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-16 20:48 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 11:10 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -12,10 +12,14 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| 🔁 `reindex`        | `True` — REINDEX SCHEMA CONCURRENTLY после вакуума *(default)*, `False` — пропустить      |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 | ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
+
+🔁 **Переиндексации нет (v1.11).** `REINDEX` убран целиком — тяжёлая операция под админским
+коннектом, от которой отказались (решение 21.09.2026). Ключ `reindex`, если он остался в
+`tools_db_cleanup_params`, ничего не включает и уйдёт из переменной при следующей записи
+параметров (`save_params=True` с изменёнными значениями).
 
 Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
 иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
@@ -29,7 +33,6 @@
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
-- **reindex** — REINDEX SCHEMA CONCURRENTLY main одной командой (админский коннект из Vault)
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
 
 > `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
@@ -102,8 +105,57 @@ _EXTRA_COND = {
     # task_instance с тем же external_executor_id. Колонка хранит id ТОЛЬКО последней
     # попытки, поэтому результаты всех ретраев, перезапусков и удалённых вручную ранов
     # осиротевали навсегда, а сам EXISTS шёл полным сканом task_instance — индекса по
-    # external_executor_id нет ни у Airflow, ни в af_config.sql. Достаточно собственного
-    # date_done < cutoff: retention_days минимум 30, задач, живых месяц, не бывает.
+    # external_executor_id нет ни у Airflow, ни в af_config.sql. Условие возраста ему
+    # задаётся отдельно, см. _BASE_WHERE.
+}
+
+# Замена стандартного условия возраста `<колонка> < :cutoff` там, где его недостаточно.
+# Подставляется вместо него, а не рядом: нужен OR, а _EXTRA_COND умеет только AND.
+_BASE_WHERE = {
+    # У celery_taskmeta date_done появляется ТОЛЬКО при переходе задачи в терминальное
+    # состояние. У строки, застрявшей в STARTED (воркер умер, не закрыв задачу), его нет
+    # никогда — а это ровно те строки, ради которых чистка и затевалась. Замер 18.09.2026:
+    # из 314 820 строк дата стоит у всех SUCCESS и FAILURE и отсутствует у обеих STARTED;
+    # на альфе таких накопилось 91 при 94 в карточке Health. То есть v1.9 с её
+    # `date_done < cutoff` не удаляла их НИ РАЗУ — мой же комментарий был неверен.
+    #
+    # Возраст такой строки берём по id: он serial и растёт вместе с date_done (проверено —
+    # min=1, max=314823, count=314823, порядок совпадает). Граница — МИНИМУМ id среди строк,
+    # которые ещё НЕ вышли за срок: всё, что вставлено раньше самой ранней «свежей» строки,
+    # заведомо старое.
+    #
+    # Первым заходом здесь стоял максимум id среди уже старых — и он оставлял сироту, которая
+    # сама оказалась верхней в старом диапазоне: став сиротой, она выпала из множества «старых
+    # с датой», по которому и считается максимум, и граница ушла ниже неё. Замер на стенде
+    # (симуляция полного цикла удаления, четыре подставные сироты на разной высоте): у
+    # максимума оставалась верхняя, у минимума не осталось ни одной, живые STARTED не тронуты
+    # в обоих вариантах.
+    #
+    # Своя слабость есть и здесь: задача, начатая 40 дней назад и закончившаяся 5 дней назад,
+    # имеет маленький id и свежий date_done — она утянет минимум вниз, и часть сирот доживёт
+    # до следующего запуска. Это недоудаление, а не переудаление: осадок уйдёт, когда более
+    # новые строки перешагнут cutoff. Выбор между «иногда позже» и «никогда» очевиден.
+    #
+    # ⚠️ Всё это держится на том, что celery_taskmeta есть в _PK_BATCH. Там батч — это
+    # `ORDER BY id LIMIT n`, и строка без даты из него не выпадает. Убрать таблицу оттуда —
+    # и включится батч по диапазону дат (`date_done >= :b_s AND date_done < :b_e`), который
+    # припишется через AND и отсечёт ВСЕ строки с NULL: сироты снова перестанут удаляться,
+    # молча. Подзапрос границы при этом пересчитывается на каждом батче, и это безвредно:
+    # удаляем снизу вверх по id, а граница держится за самую раннюю свежую строку, которую
+    # мы не трогаем вовсе.
+    #
+    # Нет ни одной свежей строки — подзапрос даёт NULL, сравнение ложно, не удаляется ничего.
+    # Это и защищает живую STARTED-строку работающей задачи: у неё date_done пуст, и без
+    # границы по id её снесло бы вместе с осадком.
+    #
+    # Трёхзначная логика тут работает на нас, и её не надо «чинить» через COALESCE: у живой
+    # строки `date_done < :cutoff` даёт NULL, второй дизъюнкт — FALSE (id больше границы),
+    # и всё выражение остаётся NULL. WHERE берёт только TRUE, поэтому DELETE её не трогает.
+    # Проверено на стенде откатом: старые сироты удаляются, обе живые STARTED остаются.
+    'celery_taskmeta': (
+        '({col} < :cutoff OR ({col} IS NULL AND {p}id < '
+        '(SELECT MIN(id) FROM main.celery_taskmeta WHERE date_done >= :cutoff)))'
+    ),
 }
 
 # Каскад делает батч бессмысленным: у task_instance и task_reschedule FK на dag_run
@@ -259,37 +311,6 @@ def db_vacuum(table, conn_id, full=False, timeout=3600):
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
-def db_reindex(conn_id, schema='main', timeout=3600):
-    """REINDEX SCHEMA CONCURRENTLY по схеме целиком под коннектом conn_id.
-
-    CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
-    Таблицы, которыми пользователь не владеет, PostgreSQL пропускает с warning'ом
-    ("skipping ..."), не прерывая команду — возвращаем сообщения сервера, чтобы
-    было видно, что реально переиндексировано.
-    """
-    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
-
-    ts = time.time()
-    sql = f"REINDEX SCHEMA CONCURRENTLY {schema}"
-    logger.info(f"🔧 REINDEX: {sql} (conn={conn_id})")
-
-    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = '{timeout}s'")
-            del conn.notices[:]
-            cur.execute(sql)
-            notices = list(conn.notices)
-    finally:
-        conn.close()
-
-    for n in notices:
-        logger.info(f"📣 {n.strip()}")
-    logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
-    return notices
-
-
 def _fmt_ts(ts):
     """'HH:MM:SS' для отметок вакуума; '—' если статистики по таблице нет."""
     return ts.strftime('%H:%M:%S') if ts else '—'
@@ -334,11 +355,6 @@ params = {
         'vacuum', True,
         type='boolean',
         description='True — VACUUM ANALYZE, False — пропустить',
-    ),
-    'reindex': _param(
-        'reindex', True,
-        type='boolean',
-        description='True — REINDEX SCHEMA CONCURRENTLY main после вакуума, False — пропустить',
     ),
     'custom': _param(
         'custom', False,
@@ -475,7 +491,7 @@ def tools_db_cleanup():
                     from_clause = f"{t} base LEFT JOIN ({keep_sub}) _l ON {jc}"
                 else:
                     p = ''
-                    base_where = f"{col} < :cutoff"
+                    base_where = _BASE_WHERE.get(tbl, '{col} < :cutoff').format(col=col, p=p)
                     from_clause = t
 
                 extra_cond = _EXTRA_COND.get(tbl, '').format(p=p)
@@ -700,40 +716,6 @@ def tools_db_cleanup():
                  + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
                  context=context, level='DAG', title='🧹 vacuum')
 
-    @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
-    def reindex(**context):
-        from airflow.exceptions import AirflowSkipException
-
-        p = context['params']
-        if not p.get('reindex', True):
-            raise AirflowSkipException('reindex=False — пропущено')
-
-        timeout = 60 * 60  # схема целиком одной командой — запас по времени
-        # REINDEX требует прав владельца таблиц — идём админским коннектом из Vault.
-        conn_id = get_af_conn()
-
-        _ts = time.time()
-        try:
-            notices = db_reindex(conn_id, schema='main', timeout=timeout)
-        except Exception as e:
-            # Прерванный REINDEX CONCURRENTLY оставляет невалидные индексы
-            # (pg_index.indisvalid = false) — их нужно удалить вручную.
-            logger.warning(f"⚠️ {e} — возможны невалидные индексы, проверьте pg_index")
-            add_note(f'❌ {str(e)[:400]} ⏱ {round(time.time() - _ts, 2)}s',
-                     context=context, level='DAG,Task', title='🔁 reindex')
-            raise
-
-        duration = round(time.time() - _ts, 2)
-        skipped = [n for n in notices if 'skipping' in n.lower()]
-        lines = [f'`REINDEX SCHEMA CONCURRENTLY main` за {duration} с',
-                 f'сообщений сервера: {len(notices)}, пропущено: {len(skipped)}']
-        if notices:
-            lines += ['', '```'] + [n.strip() for n in notices[:20]] + ['```']
-        add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
-        add_note(f'схема main за {duration} с'
-                 + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
-                 context=context, level='DAG', title='🔁 reindex')
-
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
         from airflow.models import DagRun, XCom
@@ -822,6 +804,6 @@ def tools_db_cleanup():
 
         return data
 
-    save_params() >> clean() >> vacuum() >> reindex() >> report()
+    save_params() >> clean() >> vacuum() >> report()
 
 tools_db_cleanup()
