@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-18 13:28 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 11:10 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -16,10 +16,10 @@
 | ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
-🔁 **`reindex` скрыт.** `REINDEX TABLE CONCURRENTLY` по очищенным таблицам — операция
-тяжёлая и требует админского коннекта, поэтому по умолчанию её нет ни в форме, ни в графе.
-Чтобы вернуть — добавить ключ `reindex` в переменную `tools_db_cleanup_params`
-(значение `true` или `false`); тогда появятся и параметр, и таск.
+🔁 **Переиндексации нет (v1.11).** `REINDEX` убран целиком — тяжёлая операция под админским
+коннектом, от которой отказались (решение 21.09.2026). Ключ `reindex`, если он остался в
+`tools_db_cleanup_params`, ничего не включает и уйдёт из переменной при следующей записи
+параметров (`save_params=True` с изменёнными значениями).
 
 Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
 иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
@@ -33,8 +33,6 @@
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
-- **reindex** — REINDEX TABLE CONCURRENTLY по таблицам из `clean` (админский коннект из
-  Vault). Таска нет, пока в переменной нет ключа `reindex`
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
 
 > `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
@@ -313,86 +311,6 @@ def db_vacuum(table, conn_id, full=False, timeout=3600):
     logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
 
 
-def db_reindex(table, conn_id, timeout=900):
-    """REINDEX TABLE CONCURRENTLY по одной таблице схемы main под коннектом conn_id.
-
-    По таблицам, а не по схеме целиком (так было до v1.10). Список берётся из того, что
-    только что чистил clean: раздувает индексы именно массовый DELETE, а REINDEX SCHEMA
-    проходил ВСЕ индексы схемы, включая таблицы, которых чистка не касается, — одной
-    командой на час без обратной связи. По таблицам видно время каждой, а пропуск по правам
-    попадает в свою строку отчёта, а не теряется в общем потоке notices.
-
-    Про обрыв важно не обольщаться: прерванный REINDEX CONCURRENTLY оставляет невалидный
-    индекс (PostgreSQL 16 на стенде), и сам он не исчезает — его удаляют вручную. По
-    таблицам проще только тем, что испорчена одна таблица, а не «что-то в схеме»; «следующий
-    запуск догонит» — неверно, поэтому таск с таким отказом обязан краснеть.
-
-    CONCURRENTLY не может выполняться внутри транзакционного блока — нужен autocommit.
-    Таблицу, которой пользователь не владеет, PostgreSQL пропускает с warning'ом
-    ("skipping ..."), не прерывая команду, — его и ловим, как в db_vacuum.
-    """
-    from airflow.exceptions import AirflowSkipException
-    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
-
-    ts = time.time()
-    sql = f"REINDEX TABLE CONCURRENTLY main.{table}"
-
-    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
-    try:
-        conn.autocommit = True
-        with conn.cursor() as cur:
-            cur.execute(f"SET statement_timeout = '{timeout}s'")
-            logger.info(f"🔧 REINDEX: {sql} (conn={conn_id})")
-            del conn.notices[:]
-            cur.execute(sql)
-            notices = list(conn.notices)
-    finally:
-        conn.close()
-
-    for n in notices:
-        logger.info(f"📣 {table}: {n.strip()}")
-    skipped = next((n for n in notices if 'skipping' in n.lower()), None)
-    if skipped:
-        raise AirflowSkipException(skipped.strip())
-    logger.info(f"✅ {sql} за {time.time() - ts:.2f}s")
-
-
-def _migrate_params(context=None) -> list:
-    """Переводит сохранённую переменную на PARAMS_VERSION, выкидывая устаревшие ключи.
-
-    Возвращает список выкинутого. Версия совпала или переменной нет — не трогаем ничего.
-    Ошибку записи проглатываем: миграция — уборка, а не работа DAG-а, и ронять из-за неё
-    очистку метабазы незачем; в следующий раз повторится.
-    """
-    from airflow.models import Variable
-
-    if not SAVED or SAVED.get('params_version') == PARAMS_VERSION:
-        return []
-
-    drop = []
-    for version, keys in sorted(_DROP_ON_MIGRATE.items()):
-        if version <= SAVED.get('params_version', 0):
-            continue
-        drop += [k for k in keys if k in SAVED]
-
-    fresh = {k: v for k, v in SAVED.items() if k not in drop}
-    fresh['params_version'] = PARAMS_VERSION
-    try:
-        Variable.set(PARAMS_VAR, fresh, serialize_json=True,
-                     description=f'миграция параметров до v{PARAMS_VERSION}')
-    except Exception as e:
-        logger.warning(f"⚠️ {PARAMS_VAR}: миграция до v{PARAMS_VERSION} не записана: {e}")
-        return []
-
-    logger.info(f"🔀 {PARAMS_VAR}: версия {SAVED.get('params_version', '—')} → {PARAMS_VERSION}"
-                + (f", выкинуто: {', '.join(drop)}" if drop else ''))
-    if context is not None and drop:
-        add_note(f"переменная переведена на v{PARAMS_VERSION}, выкинуто: "
-                 + ', '.join(f'`{k}`' for k in drop),
-                 context=context, level='Task', title='🔀 params')
-    return drop
-
-
 def _fmt_ts(ts):
     """'HH:MM:SS' для отметок вакуума; '—' если статистики по таблице нет."""
     return ts.strftime('%H:%M:%S') if ts else '—'
@@ -420,15 +338,6 @@ def _schedule():
         return DEFAULT_SCHEDULE
     return None if value in (None, '', 'None') else str(value).strip()
 
-
-PARAMS_VERSION = 2
-
-# Что выкинуть из сохранённой переменной при переходе на новую версию параметров.
-# Ключ есть — таск reindex создаётся; у всех, кто когда-либо жал save_params, там лежит
-# reindex: true, и без миграции фича осталась бы включённой ровно у тех, кто DAG-ом
-# пользуется. Удалять переменную целиком нельзя: уедут retention_days, batch_size и
-# schedule — расписание молча вернулось бы к коду.
-_DROP_ON_MIGRATE = {2: ('reindex',)}
 
 params = {
     'retention_days': _param(
@@ -463,18 +372,6 @@ params = {
         type='string',
         description='Таймаут ожидания блокировки (например: 10min, 30s)',
     ),
-    # reindex скрыт: REINDEX TABLE CONCURRENTLY — операция тяжёлая и требует админского
-    # коннекта, поэтому по умолчанию её нет ни в форме, ни в графе. Вернуть — добавить ключ
-    # reindex в переменную tools_db_cleanup_params (значение true/false).
-    #
-    # ⚠️ saved_params при любой ошибке чтения переменной возвращает пусто (plugins/utils.py),
-    # поэтому «переменная недоступна» и «reindex выключен» снаружи неотличимы. Направление
-    # безопасное — отсутствие ключа значит «не делать», — но пропавший таск не дефект.
-    **({'reindex': _param(
-        'reindex', False,
-        type='boolean',
-        description='True — REINDEX TABLE CONCURRENTLY по очищенным таблицам, False — пропустить',
-    )} if SAVED.get('reindex') is not None else {}),
     'schedule': _param(
         'schedule', DEFAULT_SCHEDULE,
         type='string',
@@ -511,26 +408,10 @@ def tools_db_cleanup():
 
     @task(task_id='params')
     def save_params(**context):
-        """💾 Сохраняет параметры запуска в переменную как значения по умолчанию.
-
-        Перед этим — разовая миграция переменной на текущую PARAMS_VERSION, и она идёт
-        НЕЗАВИСИМО от галочки save_params: иначе ключ, из-за которого фича остаётся
-        включённой, дожил бы до первого, кто вручную попросит сохранить параметры.
-
-        На парсинге такое делать нельзя: переменную писал бы каждый процесс парсера и на
-        каждом проходе. Здесь же таск существует всегда и просто пропускает сам себя.
-        """
+        """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
         from airflow.exceptions import AirflowFailException, AirflowSkipException
 
-        # Выкинутые миграцией ключи убираем и из формы этого запуска. Иначе store_params
-        # тут же вернул бы их в переменную: он пишет context['params'] целиком, а форма
-        # собрана на парсинге, когда ключ ещё был. Версия при этом уже стояла бы новая, и
-        # миграция не повторилась бы никогда — фича осталась бы в графе навсегда.
-        for key in _migrate_params(context):
-            context['params'].pop(key, None)
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context,
-                                   extra={'params_version': PARAMS_VERSION})
+        status, msg = store_params(PARAMS_VAR, SAVED, context)
         if status == 'skip':
             raise AirflowSkipException(msg)
         if status == 'fail':
@@ -835,86 +716,6 @@ def tools_db_cleanup():
                  + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
                  context=context, level='DAG', title='🧹 vacuum')
 
-    @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
-    def reindex(**context):
-        """REINDEX TABLE CONCURRENTLY по таблицам, которые только что чистил clean.
-
-        Список берём из XCom clean, а не из переменной: индексы раздувает массовый DELETE,
-        значит чистили — есть что переиндексировать, не чистили — нечего. Из переменной
-        брать нельзя ещё и потому, что имя таблицы уходит в SQL подстановкой.
-        """
-        from airflow.exceptions import AirflowException, AirflowSkipException
-
-        p = context['params']
-
-        # Ключ читаем из переменной ЗАНОВО, а не из формы. Форма собрана на парсинге, и у
-        # того, кто выкатил v1.10 с прежней переменной, в ней ещё лежит reindex: true —
-        # граф первого запуска соберётся с этим таском, и он отработал бы тяжёлый REINDEX
-        # ровно там, где релиз обещал его выключить. Миграция в таске params к этому
-        # моменту уже прошла, поэтому свежее чтение переменной её и подхватывает.
-        if saved_params(PARAMS_VAR).get('reindex') is None:
-            raise AirflowSkipException(f'ключа reindex в {PARAMS_VAR} нет — переиндексация выключена')
-        if not p.get('reindex', False):
-            raise AirflowSkipException('reindex=False — пропущено')
-        # dry_run обещает прикидку без изменений. Переиндексация — не удаление, но DDL на
-        # четверть часа на таблицу «прикидкой» назвать нельзя.
-        if p.get('dry_run', False):
-            raise AirflowSkipException('dry_run=True — переиндексацию не делаем')
-
-        timeout = 15 * 60  # на таблицу, как у вакуума: час был на всю схему одной командой
-        tables = context['ti'].xcom_pull(task_ids='clean') or []
-        if not tables:
-            raise AirflowSkipException('нет таблиц из clean')
-
-        # REINDEX требует прав владельца таблиц — идём админским коннектом из Vault.
-        conn_id = get_af_conn()
-
-        results, skipped, failed = [], [], []
-        for tbl in tables:
-            _ts = time.time()
-            try:
-                db_reindex(tbl, conn_id, timeout=timeout)
-            except AirflowSkipException as e:
-                # Нет прав на таблицу — это не авария, PostgreSQL её просто пропускает
-                logger.warning(f"☮️ {tbl}: {e}")
-                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'☮️ {str(e)[:60]}'})
-                continue
-            except Exception as e:
-                # Прерванный REINDEX CONCURRENTLY оставляет невалидный индекс
-                # (pg_index.indisvalid = false). Он не обслуживает выборки, но СУБД обязана
-                # поддерживать его при каждой записи, и сам он не рассосётся — нужен DROP
-                # руками. Поэтому цикл идёт дальше (остальные таблицы ни при чём), но таск
-                # обязан закончиться красным: зелёный таск с битым индексом никто не заметит.
-                logger.warning(f"⚠️ {tbl}: {e} — возможен невалидный индекс, проверьте pg_index")
-                failed.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                               'status': f'❌ {str(e)[:60]}'})
-                continue
-            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
-
-        rows = results + skipped + failed
-        lines = [
-            '| Таблица | Время, с | Статус |',
-            '|---------|---------|--------|',
-        ] + [f"| `{r['table']}` | {r['duration']} | {r['status']} |" for r in rows]
-        total = round(sum(r['duration'] for r in rows), 2)
-        lines.append(f"| **Итого** | **{total} с** | **{len(results)}/{len(tables)}** |")
-        if failed:
-            lines += ['', '⚠️ После обрыва мог остаться невалидный индекс:',
-                      '`select indexrelid::regclass from pg_index where not indisvalid;`',
-                      'Такой индекс сам не исчезнет — его удаляют вручную.']
-        add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
-        add_note(f'{len(results)}/{len(tables)} таблиц за {total} с'
-                 + (f' | ☮️ {len(skipped)}' if skipped else '')
-                 + (f' | ❌ {len(failed)}' if failed else ''),
-                 context=context, level='DAG', title='🔁 reindex')
-
-        if failed:
-            raise AirflowException(
-                'переиндексация не прошла: ' + ', '.join(r['table'] for r in failed)
-                + ' — проверьте pg_index на невалидные индексы'
-            )
-
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
         from airflow.models import DagRun, XCom
@@ -1003,11 +804,6 @@ def tools_db_cleanup():
 
         return data
 
-    # Звено reindex — только когда параметр есть: без него и таска в графе нет.
-    # У vacuum и report trigger_rule=ALL_DONE, поэтому звено снимается без правок правил.
-    _chain = save_params() >> clean() >> vacuum()
-    if SAVED.get('reindex') is not None:
-        _chain = _chain >> reindex()
-    _chain >> report()
+    save_params() >> clean() >> vacuum() >> report()
 
 tools_db_cleanup()
