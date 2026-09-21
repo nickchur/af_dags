@@ -1,5 +1,5 @@
 """### 🔍 DAG: Проверка API CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск HTTP-запроса к CTL API для диагностики и отладки.
 
@@ -14,10 +14,8 @@
 | `data` | JSON-тело для POST/PUT |
 """
 
-from airflow import DAG
-from airflow.models import Param
-from airflow.decorators import task
-from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.sdk import DAG, Param, task
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import  on_callback # type: ignore
 from plugins.ctl_utils import ctl_obj_load, ctl_api # type: ignore
@@ -101,8 +99,8 @@ with DAG(
     },
     tags=["EDP_ETL", 'CTL_agent', "tools", "CTL"],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=None,
-    # schedule_interval=timedelta(minutes=11),
+    schedule=None,
+    # schedule=timedelta(minutes=11),
     catchup=False,
     render_template_as_native_obj=True,
     params=params,

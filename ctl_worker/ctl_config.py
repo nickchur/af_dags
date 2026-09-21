@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-14 11:34 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -16,9 +16,7 @@
 | `CTL_PIN` | PIN подтверждения (скрыто) |
 """
 
-from airflow import DAG
-from airflow.decorators import task
-from airflow.models import Variable, Param
+from airflow.sdk import DAG, Param, Variable, task
 
 from plugins.utils import on_callback, add_note, default_args, str2timedelta, get_conns_by_type, get_conn  # type: ignore
 from plugins.s3_utils import s3_set_ttl, s3_create_bucket  # type: ignore
@@ -38,7 +36,7 @@ def get_scrt(s: str) -> str:
     return base64.b64decode(secrets[s]).decode()
 
 
-conf = Variable.get('ctl_config', default_var={}, deserialize_json=True)
+conf = Variable.get('ctl_config', default={}, deserialize_json=True)
 
 
 def enum_default(value, allowed, fallback='off'):

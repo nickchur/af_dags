@@ -1,12 +1,17 @@
 # 🛠️ CTL Plugins для Apache Airflow
-*2026-09-17 10:41 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
+
+> **Airflow 3 (v2.0).** ORM-доступа к метабазе у задачи нет: метабаза — `af_meta.py` (SQL по
+> подключению `conns.pg`), запуск DAG-а — `af_meta.trigger_dag_run` (Execution API). Отличия от
+> Airflow 2 — в `readme.md` корня репозитория.
 
 ## 📁 Структура модуля
 
 ```
 plugins/
+├── af_meta.py       # Метабаза без ORM: SQL, заметки, пулы, пауза, запуск DAG-а (Airflow 3)
 ├── ctl_core.py      # Ядро логики управления retry, событиями, ожиданием и загрузками
 ├── ctl_utils.py     # Утилиты: API, БД, S3, логирование, сериализация
 ├── s3_utils.py      # Расширенные утилиты для работы с S3
@@ -46,7 +51,7 @@ plugins/
 - **`gp_loading_result`** — ответ по загрузке из журнала движка (`vw_swf_ctl_log`) или `None`
 - **`gp_backend_busy`** — занят ли серверный процесс с этим pid запуском загрузки
   (`pg_stat_activity`); pid берётся из XCom, куда его кладёт `gp_exe`
-- **`pg_exe`** — Выполнение SQL в PostgreSQL с retry-логикой
+- **`pg_exe`** — SQL в метабазе Airflow (через `af_meta.sql`)
 - **`ctl_obj_load`/`ctl_obj_save`** — Загрузка и сохранение объектов в S3 или Airflow Variables.
   Читатель берёт сначала Variable и идёт в S3 только при её отсутствии, поэтому переменная
   пишется **всегда**, даже когда тело в S3 не изменилось: раньше совпадение MD5 выходило из
@@ -139,7 +144,7 @@ raise_status(st, ld_sts)      # skip → AirflowSkipException, fail → AirflowF
 Общие функции для работы с Airflow:
 
 - **`pool_slots`** — Управление pool slots в Airflow
-- **`add_note`** — Добавление заметок к DAG Run / Task Instance. Строка перечитывается под блокировкой (`FOR UPDATE`): без неё параллельные задачи читают одно состояние и последний записавший затирает остальных — на стенде из восьми писателей выживали четыре.
+- **`add_note`** — Добавление заметок к DAG Run / Task Instance. Пишется SQL-ом в `dag_run_note` / `task_instance_note` (`af_meta.update_note`); строка перечитывается под блокировкой (`FOR UPDATE`): без неё параллельные задачи читают одно состояние и последний записавший затирает остальных — на стенде из восьми писателей выживали четыре.
 - **`on_callback`** — Обработчик событий (success/failed) с отправкой уведомлений
 - **`query_to_dict`** — Преобразование результатов запроса в список словарей
 - **`readable_size`** — Конвертация размера файлов в читаемый формат (KB, MB, GB...)

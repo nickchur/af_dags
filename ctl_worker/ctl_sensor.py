@@ -1,7 +1,11 @@
 """### 📡 DAG: Сенсор CTL
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
+Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через Execution API (`af_meta.trigger_dag_run`) или Asset.
+
+Airflow 3 (v2.0): метабаза — SQL через `plugins/af_meta.py` (ORM у задачи нет), запуск DAG-а —
+тем же каналом, что у `TriggerDagRunOperator`, но изнутри `ctl_add_chk`: проверка, запуск и
+перевод загрузки в `WAIT-AF` остаются одной задачей (почему — в `af_meta.trigger_dag_run`).
 
 | Задача | Описание |
 |---|---|
@@ -16,23 +20,17 @@
 недоступен — `ctl_add_get` падает на самом вызове API.
 """
 
-from airflow import DAG, Dataset
-from airflow.datasets import DatasetAlias
-from airflow.decorators import task
-from airflow.api.common.trigger_dag import trigger_dag           
-from airflow.exceptions import DagRunAlreadyExists, DagNotFound
-from airflow.exceptions import AirflowSkipException, AirflowFailException
-from airflow.models import DagModel, Log
-from airflow.models.serialized_dag import SerializedDagModel
-from airflow.utils.session import create_session
+from airflow.sdk import DAG, Asset, AssetAlias, task
+from airflow.sdk.exceptions import AirflowSkipException, AirflowFailException
 
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load  # type: ignore
+from plugins import af_meta  # type: ignore
+from plugins.af_meta import DagNotFound, DagRunAlreadyExists  # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, ctl_obj_save # type: ignore 
 from plugins.ctl_core import ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry, raise_status # type: ignore
 
 # from datetime import timedelta
-from psycopg2 import errors
 import pendulum
 import json
 from datetime import timedelta, datetime, timezone
@@ -47,8 +45,8 @@ MAX_XCOM = 500
 def dag_gone_reason(dag_id: str, wf: dict | None) -> str:
     """Почему дага нет: те же условия, по которым его строит фабрика, плюс метабаза.
 
-    `trigger_dag` берёт даг из `serialized_dag`, а UI показывает его по строке в `dag`.
-    Отсюда «даг виден, но missing from DagBag»: строка в `dag` осталась, сериализованной
+    Запуск берёт даг из `serialized_dag`, а UI показывает его по строке в `dag`.
+    Отсюда «даг виден, но не запускается»: строка в `dag` осталась, сериализованной
     нет. Разбираем оба слоя, чтобы в заметке была причина, а не DagNotFound.
     """
     bits = []
@@ -60,17 +58,13 @@ def dag_gone_reason(dag_id: str, wf: dict | None) -> str:
         if wf.get('profile') != profile:
             bits.append(f"профиль воркфлоу {wf.get('profile')}, а у нас {profile}")
     try:
-        with create_session() as session:
-            dm = session.query(DagModel.is_active, DagModel.last_parsed_time).filter(
-                DagModel.dag_id == dag_id).first()
-            sd = session.query(SerializedDagModel.dag_id).filter(
-                SerializedDagModel.dag_id == dag_id).first()
+        dm = af_meta.dag_state(dag_id)
         if dm is None:
             bits.append('в таблице dag записи нет')
         else:
-            bits.append(f"в dag есть (is_active={dm.is_active}, "
-                        f"разобран {str(dm.last_parsed_time)[:19]})")
-        bits.append('сериализован' if sd else 'в serialized_dag НЕТ — запускать нечего')
+            bits.append(f"в dag есть (is_stale={dm['is_stale']}, "
+                        f"разобран {str(dm['last_parsed_time'])[:19]})")
+        bits.append('сериализован' if dm and dm['serialized'] else 'в serialized_dag НЕТ — запускать нечего')
     except Exception as e:                       # диагност не должен ронять таск
         bits.append(f'метабазу опросить не вышло: {type(e).__name__}: {e}')
     return '; '.join(bits)
@@ -90,7 +84,7 @@ def pause_reason(dag_id: str):
       * поставил человек — в журнале метабазы есть `paused` (веб) или `cli_dag_pause`
         (командная строка) с именем и временем;
       * рубильник тракта — ключ `is_paused` в `ctl_config`: фабрика зовёт
-        `update_dag_pause`, а тот пишет прямо в `DagModel`, следа в журнале нет;
+        `update_dag_pause`, а тот пишет прямо в таблицу `dag`, следа в журнале нет;
       * пауза с создания: фабрика создаёт даг запаузенным, если воркфлоу не на расписании
         в CTL (`is_paused_upon_creation = not w['scheduled']`), потому что такому дагу
         `get_schedule` строит СОБСТВЕННОЕ расписание Airflow. Снять её значит заодно
@@ -102,22 +96,22 @@ def pause_reason(dag_id: str):
 
     Сенсор паузу не снимает ни в одном случае: он называет причину и пропускает загрузку.
     """
-    with create_session() as session:
-        dm = session.query(DagModel.is_paused).filter(DagModel.dag_id == dag_id).first()
-        if not dm or not dm.is_paused:
-            return None
+    dm = af_meta.dag_state(dag_id)
+    if not dm or not dm['is_paused']:
+        return None
 
-        row = session.query(Log.event, Log.owner, Log.dttm).filter(
-            Log.dag_id == dag_id,
-            Log.event.in_(('paused', 'unpaused', 'cli_dag_pause', 'cli_dag_unpause')),
-        ).order_by(Log.dttm.desc()).first()
+    # Airflow 3 пишет паузу из UI и REST событием `patch_dag` (эндпоинт PATCH /dags/{id};
+    # карта имён — etl-core hrp_audit_events/af3_events.py), а не `paused` Airflow 2.
+    # Направление паузы в `patch_dag` видно только по extra, поэтому его берём оттуда.
+    row = af_meta.last_event(dag_id, ('paused', 'unpaused', 'cli_dag_pause', 'cli_dag_unpause', 'patch_dag'))
 
     # Последнее событие — снятие паузы, а даг снова на паузе: значит, её поставили без
     # журнала уже после. Такой строке верить нельзя, и она отбрасывается вместе с
     # остальными «нет записи».
-    if row and row.event in ('paused', 'cli_dag_pause'):
-        when = pendulum.instance(row.dttm).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm')
-        return f"поставил {row.owner or 'неизвестно кто'} {when}"
+    if row and (row['event'] in ('paused', 'cli_dag_pause')
+                or (row['event'] == 'patch_dag' and '"is_paused": true' in (row.get('extra') or '').lower())):
+        when = pendulum.instance(row['dttm']).in_timezone(get_config()['tz']).format('YYYY-MM-DD HH:mm')
+        return f"поставил {row['owner'] or 'неизвестно кто'} {when}"
 
     if get_config().get('is_paused'):
         return ('рубильник тракта: ключ is_paused в ctl_config — на паузе весь профиль, '
@@ -138,13 +132,10 @@ def note_paused_event(dag_id: str, msg: str, every_min: int = 60):
     Ошибка записи гасится: это диагностика, ронять из-за неё штатный пропуск нельзя.
     """
     try:
-        with create_session() as session:
-            last = session.query(Log.dttm).filter(
-                Log.dag_id == dag_id, Log.event == PAUSED_EVENT,
-            ).order_by(Log.dttm.desc()).first()
-            if last and (pendulum.now('UTC') - pendulum.instance(last.dttm)).in_minutes() < every_min:
-                return False
-            session.add(Log(event=PAUSED_EVENT, dag_id=dag_id, owner='ctl_sensor', extra=msg[:1000]))
+        last = af_meta.last_event(dag_id, (PAUSED_EVENT,))
+        if last and (pendulum.now('UTC') - pendulum.instance(last['dttm'])).in_minutes() < every_min:
+            return False
+        af_meta.log_event(dag_id, PAUSED_EVENT, 'ctl_sensor', msg)
         return True
     except Exception as e:                       # диагност не должен ронять таск
         logger.warning("не записали %s для %s: %s", PAUSED_EVENT, dag_id, e)
@@ -184,7 +175,7 @@ default_args = {
 
 with DAG(f'CTL.{get_config()["profile"]}.sensor',
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=str2timedelta(get_config().get('sensor_interval','minutes=1')),
+    schedule=str2timedelta(get_config().get('sensor_interval','minutes=1')),
     default_args={ 
     'owner': 'EDP.ETL',
         'depends_on_past': False,
@@ -340,7 +331,8 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         
         return branch[:MAX_WFS]
     
-    outlets = [DatasetAlias(f"CTL/{profile}/wfs")] if get_config().get('dug_run')=='dataset' else []
+    wfs_alias = AssetAlias(f"CTL/{profile}/wfs")
+    outlets = [wfs_alias] if get_config().get('dug_run')=='dataset' else []
     @task(pool='ctl_pool', outlets=outlets,
         max_active_tis_per_dag=10, 
         map_index_template="{{ jsn['id'] }}/{{ jsn['wf_name'] }}",
@@ -356,24 +348,22 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
         При успешной проверке:
         - Обновляет статус в CTL на `WAIT-AF`.
-        - Запускает целевой DAG через `trigger_dag`.
-        - Или отправляет Dataset при активированном режиме `dug_run`.
+        - Запускает целевой DAG через Execution API (`af_meta.trigger_dag_run`).
+        - Или отправляет Asset при активированном режиме `dug_run`.
 
         **XCom:**
         - Пушит `result` и `extra` (параметры запуска).
-        - Использует `outlet_events` для Dataset-сигналов.
+        - Использует `outlet_events` для Asset-сигналов.
 
         **Режимы запуска:**
-        - `dug_run == 'dataset'`: сигнал через Dataset.
-        - Иначе: запуск через `trigger_dag`.
+        - `dug_run == 'dataset'`: сигнал через Asset.
+        - Иначе: запуск через Execution API.
 
         **Ссылка в логе:** добавляется ссылка на загрузку в интерфейсе CTL.
         """
         ti = context['task_instance']
         # return ctl_chk_loading(jsn, context)
 
-        profile = get_config()['profile']
-        
         status = jsn['status']
         log    = jsn.get('status_log') or ''
         # sdt = jsn['status_sdt']
@@ -390,7 +380,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
             add_note(msg, context, level='Task,DAG', title='⏭️ НЕТ ДАГА')
             raise AirflowSkipException(msg)
 
-        # Запаузенный даг запускать бессмысленно: trigger_dag паузу не смотрит и создаёт
+        # Запаузенный даг запускать бессмысленно: запуск паузу не смотрит и создаёт
         # ран сразу в очереди, а планировщик запаузенный даг не разбирает — ран висит
         # вечно, а загрузка в CTL молча ждёт. Пропускаем, называя причину; загрузку не
         # трогаем: снимут паузу — поедет сама, как и в случае пропавшего дага.
@@ -438,11 +428,11 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         
         # Запуск DAG
         if get_config().get('dug_run')=='dataset':
-            context['outlet_events'][f"CTL/{profile}/wfs"].add(Dataset(ds), extra=params)
+            context['outlet_events'][wfs_alias].add(Asset(ds), extra=params)
         else:
             new_dag = dict(dag_id=f'CTL.{wf_name}', run_id=run_id, conf=params, )
             try:
-                trigger_dag(**new_dag)
+                af_meta.trigger_dag_run(**new_dag)
             except DagNotFound as e:
                 # Дага нет в serialized_dag — запускать нечего. Загрузку в CTL не трогаем:
                 # вернётся даг (следующая сборка фабрики) — поедет и она
@@ -453,7 +443,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
                                                   'name': wf_name, 'msg': reason})
                 add_note(msg, context, level='Task,DAG', title='⏭️ НЕТ ДАГА')
                 raise AirflowSkipException(msg) from e
-            except errors.UniqueViolation as e:
+            except DagRunAlreadyExists as e:
                 ret = {
                     "action": "❌ already",
                     "id": lid, 
@@ -498,7 +488,13 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         **Назначение:** аудит, мониторинг, отладка.
         """
         ti = context['task_instance']
-        wfs = ti.xcom_pull(key='result', task_ids=f'ctl_add_chk') or []
+        # task_ids списком: в Airflow 3 xcom_pull с одной задачей-строкой при единственной
+        # найденной копии маппинга отдаёт само значение, а не список из одного
+        # (sdk/execution_time/task_runner.py:xcom_pull, 3.3.1) — и цикл ниже шёл бы по
+        # ключам словаря. Списком ответ всегда список, но с None на месте копий, которые
+        # результата не положили (пропущенные), — в Airflow 2 их в ответе не было вовсе.
+        # Оба случая поймал стенд 21.09.2026.
+        wfs = [r for r in (ti.xcom_pull(key='result', task_ids=['ctl_add_chk']) or []) if r]
         wfs = {
             r['id']: {
                 'action':r.get('action',''), 

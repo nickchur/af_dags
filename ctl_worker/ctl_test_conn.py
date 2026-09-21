@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка подключений CTL
-*2026-09-14 12:29 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Непрерывный сенсор (каждую минуту, `reschedule`) — проверяет доступность всех соединений из `get_config()['conns']`.
 Поддерживает типы: `Postgres`, `S3`, `KerberosHttp`.
@@ -17,10 +17,8 @@
 """
 
 from datetime import timedelta, datetime, timezone
-from airflow import DAG
-from airflow.decorators import task, task_group
-from airflow.sensors.base import PokeReturnValue # type: ignore
-from airflow.exceptions import AirflowSkipException
+from airflow.sdk import DAG, PokeReturnValue, task, task_group
+from airflow.sdk.exceptions import AirflowSkipException
 
 from plugins.utils import  on_callback, default_args, str2timedelta # type: ignore
 from plugins.ctl_utils import get_config, add_note # type: ignore 
@@ -60,8 +58,8 @@ with DAG(
         # 'on_execute_callback': None,
     },
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=test_interval,
-    # schedule_interval=None,
+    schedule=test_interval,
+    # schedule=None,
     catchup=False,
     tags=['CTL', 'CTL_agent', 'tools', 'test'],
     on_failure_callback=on_callback,
