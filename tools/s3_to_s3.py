@@ -1,5 +1,5 @@
 """### 📦 DAG: Копирование между S3-бакетами
-*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Копирует объект из одного S3-бакета в другой с опциональным сжатием.
 
@@ -17,11 +17,14 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from airflow.models import Param, Connection
+from airflow.sdk import Param, Connection
 from airflow.configuration import get_custom_secret_backend
-from airflow.decorators import dag
+from airflow.sdk import dag
 
-from hrp_operators.s3_to_s3 import HrpS3ToS3Operator  # type: ignore
+try:
+    from hrp_operators.s3_to_s3 import HrpS3ToS3Operator  # type: ignore
+except ImportError:  # hrp_operators верхнего уровня — только на контурах (plugins_folder)
+    from sber_app_dataplatform_etl_core.hrp_operators.s3_to_s3 import HrpS3ToS3Operator  # type: ignore
 from plugins.utils import add_note  # type: ignore
 
 from logging import getLogger
@@ -54,7 +57,7 @@ s3_conns = get_conns_by_type(conn_type='aws')
         'retry_delay': timedelta(seconds=30),
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule_interval=None,
+    schedule=None,
     tags=['tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,

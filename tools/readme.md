@@ -1,5 +1,7 @@
 # 🛠️ Tools — Служебные DAG'и
-*2026-08-31 23:20 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 18:45 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+
+> **Airflow 3 (21.09.2026).** Порт `af_dags@8822591`. Метабаза — через `plugins/af_meta.py`, отличия от Airflow 2 — в `readme.md` корня.
 
 Инструменты для администрирования и отладки. Все DAG'и запускаются вручную (`schedule=None`).
 

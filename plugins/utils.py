@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -619,8 +619,18 @@ def get_af_conn():
     # и закэшированный в env коннект пережил бы правку параметров подключения.
     env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
 
-    with open(VAULT_PATH) as f:
-        secrets = json.load(f)
+    try:
+        with open(VAULT_PATH) as f:
+            secrets = json.load(f)
+    except OSError:
+        secrets = {}
+    if not secrets.get('DB_HOST_1'):
+        # Нет учётки метабазы в Vault (стенд AF3: эмуляция без DB_*) — берём обычное
+        # подключение метабазы. VACUUM под ним может пропустить чужие таблицы: это видно
+        # в отчёте, db_vacuum ловит «skipping». Контуры DB_* держат — там путь прежний.
+        meta = af_meta.meta_conn_id()
+        logger.warning(f"🔑 В {VAULT_PATH} нет DB_HOST_1 — вместо учётки владельца беру {meta}")
+        return meta
 
     def _b64(s: str) -> str:
         """base64 → текст; если значение не base64 — возвращаем как есть.

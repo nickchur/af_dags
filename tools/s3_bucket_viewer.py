@@ -1,5 +1,5 @@
 """### 🪣 DAG: Просмотр бакетов S3
-*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список бакетов для выбранного S3-подключения.
 
@@ -9,10 +9,13 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from airflow.models import Param
-from airflow.decorators import dag
+from airflow.sdk import Param
+from airflow.sdk import dag
 
-from hrp_operators.s3_viewer_operator import HrpS3BucketViewerOperator  # type: ignore
+try:
+    from hrp_operators.s3_viewer_operator import HrpS3BucketViewerOperator  # type: ignore
+except ImportError:  # hrp_operators верхнего уровня — только на контурах (plugins_folder)
+    from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import HrpS3BucketViewerOperator  # type: ignore
 from plugins.utils import get_conns_by_type  # type: ignore
 
 
@@ -28,7 +31,7 @@ from plugins.utils import get_conns_by_type  # type: ignore
         'retry_delay': timedelta(seconds=30),
     },
     start_date=datetime(2026, 1, 21, tzinfo=timezone.utc),
-    schedule_interval=None,
+    schedule=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,

@@ -1,5 +1,5 @@
 """### 🗄️ Метабаза Airflow без ORM (`plugins/af_meta.py`)
-*2026-09-21 16:08 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 18:49 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 В Airflow 3 у задачи и у разбора DAG-файла нет ORM-доступа к метабазе: `create_session`
 бросает «Direct database access via the ORM is not allowed in Airflow 3.0». Всё, что даги
@@ -13,6 +13,8 @@ CTL делали через `DagModel`, `TaskInstance`, `Pool`, `Log` и зам�
 | Функция | Что делает |
 |---|---|
 | `sql()` | SQL в метабазе, строки словарями (замена `pg_exe` на `create_session`) |
+| `meta_session()` | сессия SQLAlchemy для кода на `session.execute(text(...))` (замена `create_session`) |
+| `schema()` | схема метабазы: `main` на контуре, `public` на стенде |
 | `dag_state()` | пауза, «устаревший» и наличие в `serialized_dag` одним запросом |
 | `set_paused()` | пауза DAG-а (было `DagModel.is_paused`) |
 | `set_ti_state()` | состояние соседней задачи рана (было `TaskInstance.set_state`) |
@@ -25,7 +27,7 @@ CTL делали через `DagModel`, `TaskInstance`, `Pool`, `Log` и зам�
 ставится `main, public`, а имена таблиц пишутся без схемы.
 """
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 
 from logging import getLogger
@@ -61,16 +63,17 @@ def meta_conn_id() -> str:
         return META_CONN_DEFAULT
 
 
-def sql(query, params=None, timeout=STATEMENT_TIMEOUT_SEC):
+def sql(query, params=None, timeout=STATEMENT_TIMEOUT_SEC, conn_id=None):
     """Выполняет SQL в метабазе одной транзакцией и возвращает строки списком словарей.
 
     Запрос без результата (UPDATE/INSERT без RETURNING) даёт пустой список. Без `params`
     psycopg2 строку не форматирует, поэтому `%` в `LIKE '%x%'` можно писать как есть; с
-    `params` его надо удваивать.
+    `params` его надо удваивать. `conn_id` — другое подключение к той же базе (например,
+    владельца таблиц из `utils.get_af_conn()` для чистки и `pg_terminate_backend`).
     """
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
-    hook = PostgresHook(postgres_conn_id=meta_conn_id())
+    hook = PostgresHook(postgres_conn_id=conn_id or meta_conn_id())
     with closing(hook.get_conn()) as conn:
         with conn:  # commit при выходе, rollback при исключении
             with conn.cursor() as cur:
@@ -82,6 +85,64 @@ def sql(query, params=None, timeout=STATEMENT_TIMEOUT_SEC):
                     return []
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+
+_engines = {}
+
+
+def _engine(conn_id):
+    """Движок SQLAlchemy на подключение, один на процесс. NullPool: пул нам не нужен, а
+    соединение с выставленным search_path не должно пережить задачу в чужих руках."""
+    if conn_id not in _engines:
+        from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+        from sqlalchemy.pool import NullPool
+        # search_path и в параметрах подключения: каждое новое соединение сразу видит схему
+        _engines[conn_id] = PostgresHook(postgres_conn_id=conn_id).get_sqlalchemy_engine(
+            engine_kwargs={'poolclass': NullPool,
+                           'connect_args': {'options': '-c search_path=main,public'}})
+    return _engines[conn_id]
+
+
+@contextmanager
+def meta_session(conn_id=None):
+    """Сессия SQLAlchemy к метабазе — замена `airflow.utils.session.create_session`.
+
+    Для кода, который писал `session.execute(text(...), {...})` и сам коммитил порциями
+    (`check/db_cleanup.py`): SQL и именованные параметры остаются как были.
+
+    Сессия привязана к ОДНОМУ соединению на всё время. Иначе (сессия на движке с NullPool)
+    каждый commit закрывал бы соединение, и следующая порция шла бы в новое — без
+    `SET search_path` и без `SET lock_timeout`, которые `db_cleanup` ставит один раз
+    (замечание ревью 21.09.2026; стенд его не ловил — там таблицы в `public`, схеме по
+    умолчанию). При выходе — commit, при исключении — rollback, как у `create_session`.
+    """
+    from sqlalchemy import text
+    from sqlalchemy.orm import Session
+
+    conn = _engine(conn_id or meta_conn_id()).connect()
+    session = Session(bind=conn)
+    try:
+        session.execute(text("SET search_path = main, public"))
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+        conn.close()
+
+
+def schema(conn_id=None) -> str:
+    """Схема, в которой лежит метабаза: `main` на контуре, `public` на стенде AF3.
+
+    Не `current_schema()`: та отдаёт первую существующую схему из search_path, а на стенде
+    AF3 есть пустая `main` рядом с таблицами в `public` (поймано 21.09.2026). Спрашиваем,
+    куда search_path разрешает саму `dag_run`.
+    """
+    return sql("SELECT relnamespace::regnamespace::text AS s FROM pg_class"
+               " WHERE oid = 'dag_run'::regclass", conn_id=conn_id)[0]['s']
 
 
 # === DAG-и ===

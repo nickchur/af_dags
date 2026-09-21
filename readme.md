@@ -1,6 +1,6 @@
 # af3_dags — даги HR-платформы под Airflow 3
 
-*2026-09-21 16:10 MSK · v0.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v0.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Перенос дагов из `af_dags` (Airflow 2) на Airflow 3.3.1 — этап 8 плана миграции
 `etl-core-3/openspec/changes/airflow-3-migration/tasks.md`. **Приватный**: сюда можно то, что
@@ -24,6 +24,15 @@
   `is_active` → `is_stale` (смысл обратный), `task_instance.job_id` удалён — пульс задачи в
   `task_instance.last_heartbeat_at`; `dataset*` → `asset*`.
 - SLA (`sla=`) удалён; замена в 3.1+ — Deadline Alerts (не подключены).
+- `airflow.settings.engine`/`Session` в процессе задачи сняты (`block_orm_access`,
+  `sdk/execution_time/supervisor.py:327`) — как и `create_session`.
+- У `RuntimeTaskInstance` нет `queued_dttm`, у `DagRun` в контексте — `get_task_instance`:
+  соседей по рану — `ti.get_task_states(...)`, остальное — SQL.
+- Сообщение celery — `execute_workload` с JSON `ExecuteTask` (в нём токен задачи), а не
+  `airflow tasks run`. Подключение из задачи — `airflow.sdk.Connection.get`.
+- Логи задач в S3 без gzip (`*.log`, не `*.log.gz`).
+- `current_schema()` не годится для поиска схемы метабазы: на стенде AF3 есть пустая `main`
+  рядом с таблицами в `public`; схему даёт `af_meta.schema()` (куда разрешается `dag_run`).
 
 ## `plugins/af_meta.py` — метабаза без ORM
 
@@ -43,6 +52,8 @@ SQL привязан к схеме 3.3.1 и сверяется при обнов
 |---|---|
 | `plugins/` | `utils`, `ctl_utils`, `ctl_core`, `s3_utils` (порт `af_dags@d9813ec`) + `af_meta` |
 | `ctl_worker/` | оркестрация CTL (порт `af_dags@d9813ec`), без `ctl_tfs.py` — тракт ТФС отдельно |
+| `check/` | служебные даги (порт `af_dags@8822591`): чистка метабазы, логов и очередей, сторож метабазы, отчёт журнала, здоровье, проверка подключений, Kafka; `test_dags` ещё не перенесён |
+| `tools/` | S3-инструменты, `dummy`, `test_package` (порт `af_dags@8822591`) |
 | `check/test_hrp_operators.py` | регрессионный стенд `hrp_operators` (порт `af_dags` v1.1), см. docstring |
 | `tests/` | сторож внутреннего интерфейса запуска DAG-а (`python -m pytest tests`, окружение AF3) |
 

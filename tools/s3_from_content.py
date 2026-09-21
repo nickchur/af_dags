@@ -27,9 +27,9 @@
 """
 
 
-from airflow.models import Param, Connection
+from airflow.sdk import Param, Connection
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
-from airflow.decorators import task, dag
+from airflow.sdk import task, dag
 from airflow.configuration import get_custom_secret_backend
 
 import os
@@ -75,7 +75,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
     is_paused_upon_creation=True,
     max_active_runs=1,
     max_active_tasks=1,
-    schedule_interval=None,
+    schedule=None,
     params={
         "s3_conn_id": Param('s3', type="string", examples=s3_conns),
         "bucket_name": Param('', type="string",),
@@ -99,8 +99,8 @@ def tools_s3_from_content():
 
     @task
     def s3_from_content(**context):
-        from airflow.models import Connection
-        from airflow.exceptions import AirflowNotFoundException, AirflowSkipException, AirflowFailException
+        from airflow.sdk import Connection
+        from airflow.sdk.exceptions import AirflowNotFoundException, AirflowSkipException, AirflowFailException
 
         params = context['params']
         s3_conn_id = params['s3_conn_id']
@@ -114,7 +114,7 @@ def tools_s3_from_content():
         if not s3_conn_id or not s3_conn_id.strip():
             raise AirflowSkipException("Параметр 's3_conn_id' не задан")
         try:
-            Connection.get_connection_from_secrets(s3_conn_id)
+            Connection.get(s3_conn_id)  # Airflow 3: в SDK — get, а не get_connection_from_secrets
         except AirflowNotFoundException:
             raise AirflowSkipException(f"Подключение '{s3_conn_id}' не найдено в Airflow")
 

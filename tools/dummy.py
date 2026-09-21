@@ -1,6 +1,6 @@
 """
 # Тестовый DAG
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Используется для проверки отображения Markdown в Airflow UI.
 
@@ -31,8 +31,8 @@
 """
 
 from datetime import datetime, timezone
-from airflow.operators.empty import EmptyOperator
-from airflow.decorators import dag
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.sdk import dag
 
 from plugins.utils import on_callback, default_args  # type: ignore
 

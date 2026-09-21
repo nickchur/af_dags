@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-09-16 16:35 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет сроки хранения по папкам, убирает
 старое и считает статистику. Бакет берётся из `[logging] remote_base_log_folder`, то есть
@@ -60,10 +60,10 @@ import logging
 import time
 
 from airflow.configuration import conf
-from airflow.models import Param
+from airflow.sdk import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.decorators import task, dag
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import task, dag
+from airflow.sdk import TriggerRule
 
 try:
     from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
@@ -281,7 +281,7 @@ def tools_log_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
         status, msg = store_params(PARAMS_VAR, SAVED, context)
         if status == 'skip':

@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-16 22:32 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -10,11 +10,11 @@
 
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
 |---|---|---|---|
-| `components` | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
+| `components` | то же, что `get_airflow_health()` за `/api/v2/monitor/health`, SQL-ом по `job` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
 | `s3_logs` | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
-| `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
+| `pools` | то же, что `Pool.slots_stats()`, SQL-ом: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
 | `metabase` | время `SELECT 1`, соединений против `max_connections` | > 1 с или > 80 % | > 95 % |
 | `parsing` | свежесть разбора файлов, DAG'и без сериализации, ошибки импорта, итог ночного `parse_time` | новые ошибки импорта, файл выбился из круга разбора (старше и `min_file_process_interval + dag_file_processor_timeout`, и тройной медианы), разбор стоит целиком, DAG без сериализации, у `parse_time` находки | — |
 
@@ -30,6 +30,10 @@
 | ⏰ `schedule` | Расписание (МСК): cron или пресет, пусто — только вручную *(default: `7 * * * *`)* |
 | 🐢 `s3_slow_sec` | Сколько секунд на запись, чтение и удаление вместе считать нормой *(default: `5`)* |
 | 💾 `save_params` | Сохранить параметры запуска как значения по умолчанию *(default: `False`)* |
+
+**Airflow 3 (v2.0).** У задачи нет ORM: `get_airflow_health`, `Pool.slots_stats` и чтение XCom
+повторены SQL-ом по метабазе (`af_meta.meta_session`) с той же логикой, что в Airflow 3.3.1
+(ссылки — у функций). «Активный DAG» — `not is_stale`.
 
 **Чего этот DAG не увидит:**
 
@@ -52,8 +56,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from airflow.decorators import dag, task
-from airflow.models import Param
+from airflow.sdk import Param, dag, task
 
 try:
     from CI06932748.tools.utils import (  # type: ignore
@@ -63,6 +66,11 @@ except ImportError:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
         valid_schedule)
+
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -170,10 +178,9 @@ def _run(name: str, fn, *args) -> dict:
 
 def _pg_rows(sql: str, args: dict | None = None) -> list[dict]:
     """SELECT по метабазе с потолком на запрос."""
-    from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
+    with af_meta.meta_session() as session:
         session.execute(text(f"set local statement_timeout = {DB_STATEMENT_TIMEOUT_MS}"))
         return [dict(r) for r in session.execute(text(sql), args or {}).mappings()]
 
@@ -186,10 +193,10 @@ def check_components() -> dict:
 
     Функцию зовём в процессе задачи, а не через REST: Basic-запрос к API стоит 1–3 с
     (FAB проверяет хэш пароля на каждый запрос), а здесь это чтение таблицы job.
+    Airflow 3: сама `get_airflow_health` в задаче не работает (ORM), поэтому её логика
+    повторена в `_airflow_health` SQL-ом.
     """
-    from airflow.api.common.airflow_health import get_airflow_health
-
-    health = get_airflow_health()
+    health = _airflow_health()
     bad = [n for n in ("metadatabase", "scheduler", "dag_processor")
            if (health.get(n) or {}).get("status") == "unhealthy"]
     # Triggerer у нас не поднят, и тогда статус null — это не поломка
@@ -397,8 +404,12 @@ def check_delivery(ti, dag_run) -> dict:
     Опоздание считаем только у ранов по расписанию: у ручного data_interval_end ни при чём.
     """
     delivery = None
-    if ti.queued_dttm and ti.start_date:
-        delivery = round((ti.start_date - ti.queued_dttm).total_seconds(), 1)
+    # Airflow 3: у RuntimeTaskInstance нет queued_dttm — оба момента берём из строки задачи
+    row = (_pg_rows("select queued_dttm, start_date from task_instance where id = :id",
+                    {"id": str(ti.id)}) or [{}])[0]
+    queued, started = row.get("queued_dttm"), row.get("start_date")
+    if queued and started:
+        delivery = round((started - queued).total_seconds(), 1)
     lag = None
     if getattr(dag_run, "run_type", None) == "scheduled" and dag_run.start_date and dag_run.data_interval_end:
         lag = round((dag_run.start_date - dag_run.data_interval_end).total_seconds(), 1)
@@ -417,17 +428,88 @@ def check_delivery(ti, dag_run) -> dict:
     return {"status": status, "summary": ", ".join(parts + notes), "delivery_sec": delivery, "sched_lag_sec": lag}
 
 
+# Airflow 3.3.1, api/common/airflow_health.py + jobs/job.py: самый свежий Job своего типа
+# (сначала running — most_recent_job), живой — running и пульс моложе порога своей роли
+# (health_check_threshold). Нет строки у triggerer/dag-processor — статус null, как у Airflow.
+SQL_JOBS = """
+select distinct on (job_type) job_type, state, latest_heartbeat,
+       extract(epoch from now() - latest_heartbeat) as age
+from job
+where job_type in ('SchedulerJob', 'TriggererJob', 'DagProcessorJob')
+order by job_type, case when state = 'running' then 0 else 1 end, latest_heartbeat desc nulls last
+"""
+
+
+def _airflow_health() -> dict:
+    """То, что отдаёт `get_airflow_health()` Airflow 3.3.1, — без ORM."""
+    from airflow.configuration import conf
+
+    thresholds = {
+        "SchedulerJob": conf.getint("scheduler", "scheduler_health_check_threshold"),
+        "TriggererJob": conf.getfloat("triggerer", "triggerer_health_check_threshold"),
+        "DagProcessorJob": conf.getint("dag_processor", "health_check_threshold"),
+    }
+    try:
+        jobs = {r["job_type"]: r for r in _pg_rows(SQL_JOBS)}
+        db = "healthy"
+    except Exception:
+        logger.warning("components: метабаза не ответила", exc_info=True)
+        jobs, db = {}, "unhealthy"
+
+    def one(job_type, missing):
+        job = jobs.get(job_type)
+        if not job:
+            return {"status": missing, "hb": None}
+        alive = (job["state"] == "running" and job["age"] is not None
+                 and float(job["age"]) < thresholds[job_type])
+        hb = job["latest_heartbeat"].isoformat() if job["latest_heartbeat"] else None
+        return {"status": "healthy" if alive else "unhealthy", "hb": hb}
+
+    sch, trg, dp = one("SchedulerJob", "unhealthy"), one("TriggererJob", None), one("DagProcessorJob", None)
+    return {
+        "metadatabase": {"status": db},
+        "scheduler": {"status": sch["status"], "latest_scheduler_heartbeat": sch["hb"]},
+        "triggerer": {"status": trg["status"], "latest_triggerer_heartbeat": trg["hb"]},
+        "dag_processor": {"status": dp["status"], "latest_dag_processor_heartbeat": dp["hb"]},
+    }
+
+
+# Airflow 3.3.1, models/pool.py:slots_stats — занятость по сумме pool_slots задач: running и
+# queued (и deferred, если пул их считает), open = slots − занято; slots = -1 — пул без предела
+SQL_POOLS = """
+select p.pool, p.slots, p.include_deferred,
+       coalesce(sum(ti.pool_slots) filter (where ti.state = 'running'), 0)   as running,
+       coalesce(sum(ti.pool_slots) filter (where ti.state = 'queued'), 0)    as queued,
+       coalesce(sum(ti.pool_slots) filter (where ti.state = 'scheduled'), 0) as scheduled,
+       coalesce(sum(ti.pool_slots) filter (where ti.state = 'deferred'), 0)  as deferred
+from slot_pool p
+left join task_instance ti
+       on ti.pool = p.pool and ti.state in ('running', 'queued', 'scheduled', 'deferred')
+group by p.pool, p.slots, p.include_deferred
+"""
+
+
+def _pool_stats() -> dict:
+    """То, что отдаёт `Pool.slots_stats()`, — без ORM."""
+    stats = {}
+    for r in _pg_rows(SQL_POOLS):
+        occupied = int(r["running"]) + int(r["queued"]) + (int(r["deferred"]) if r["include_deferred"] else 0)
+        total = int(r["slots"])
+        stats[r["pool"]] = {
+            "total": total, "running": int(r["running"]), "queued": int(r["queued"]),
+            "scheduled": int(r["scheduled"]), "deferred": int(r["deferred"]),
+            "open": float("inf") if total == -1 else total - occupied,
+        }
+    return stats
+
+
 def check_pools() -> dict:
     """Пулы без свободных слотов, в которых ждут задачи. Только чтение.
 
     Pool.slots_stats — та же статистика, что на странице Pools. pool_slots из plugins/utils
     не годится: он пишет в базу.
     """
-    from airflow.models import Pool
-    from airflow.utils.session import create_session
-
-    with create_session() as session:
-        stats = Pool.slots_stats(session=session)
+    stats = _pool_stats()
     starved = {name: s for name, s in stats.items() if s["open"] <= 0 and s["scheduled"] > 0}
     rows = {name: {"total": s["total"], "open": s["open"], "running": s["running"],
                    "queued": s["queued"], "scheduled": s["scheduled"]}
@@ -441,10 +523,9 @@ def check_pools() -> dict:
 
 def check_metabase() -> dict:
     """Время SELECT 1 и число соединений против max_connections. Глубже — pg_activity."""
-    from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
+    with af_meta.meta_session() as session:
         session.execute(text(f"set local statement_timeout = {DB_STATEMENT_TIMEOUT_MS}"))
         ts = time.time()
         session.execute(text("select 1")).scalar()
@@ -474,7 +555,7 @@ def check_metabase() -> dict:
 SQL_PARSING = """
 with f as (
     select fileloc, max(last_parsed_time) as parsed
-    from dag where is_active group by fileloc
+    from dag where not is_stale group by fileloc
 )
 select
     (select count(*) from f)                                                   as files,
@@ -485,13 +566,13 @@ select
 """
 SQL_STALE_FILES = """
 select fileloc, extract(epoch from now() - max(last_parsed_time)) as age
-from dag where is_active group by fileloc
+from dag where not is_stale group by fileloc
 having max(last_parsed_time) < now() - cast(:age as interval)
 order by age desc limit :lim
 """
 SQL_NOT_SERIALIZED = """
 select d.dag_id from dag d
-where d.is_active and not exists (select 1 from serialized_dag s where s.dag_id = d.dag_id)
+where not d.is_stale and not exists (select 1 from serialized_dag s where s.dag_id = d.dag_id)
 order by d.dag_id limit :lim
 """
 # Новая ошибка импорта — со своим id, а не со свежим timestamp: разбирая файл заново,
@@ -508,21 +589,21 @@ select coalesce(max(id), 0) as max_id from import_error
 """
 
 
+# Airflow 3: XCom — таблица xcom, value JSONB (ORM-чтения XCom в задаче нет)
+SQL_LAST_XCOM = """
+select value, timestamp from xcom
+where dag_id = :dag and task_id = :task and key = 'return_value' and map_index = -1 and run_id <> :run
+"""
+
+
 def _last_parse_time() -> dict | None:
     """Итог последнего parse_time из tools_test_dags: XCom return_value и его возраст."""
-    from airflow.models.xcom import XCom
-    from airflow.utils.session import create_session
-
-    with create_session() as session:
-        row = (session.query(XCom)
-               .filter(XCom.dag_id == "tools_test_dags", XCom.task_id == "parse_time",
-                       XCom.key == "return_value")
-               .order_by(XCom.timestamp.desc()).first())
-        if row is None:
-            return None
-        # value уже разобран: BaseXCom десериализует его при загрузке строки
-        # (init_on_load → orm_deserialize_value), повторный deserialize_value падает
-        value, stamp = row.value, row.timestamp
+    rows = _pg_rows(SQL_LAST_XCOM + " order by timestamp desc limit 1",
+                    {"dag": "tools_test_dags", "task": "parse_time", "run": ""})
+    if not rows:
+        return None
+    # Airflow 3: xcom.value — JSONB, драйвер отдаёт его уже разобранным
+    value, stamp = rows[0]["value"], rows[0]["timestamp"]
     if isinstance(value, str):
         value = json.loads(value)
     return {**(value or {}), "age_h": round(_age_sec(stamp) / 3600, 1)}
@@ -536,17 +617,11 @@ def _prev_import_error_id(dag_id: str, run_id: str) -> int | None:
     Нет предыдущего прогона или в нём нет этого поля — базы нет, и о новых ошибках
     прогон не говорит ничего.
     """
-    from airflow.models.xcom import XCom
-    from airflow.utils.session import create_session
-
-    with create_session() as session:
-        row = (session.query(XCom)
-               .filter(XCom.dag_id == dag_id, XCom.task_id == "check",
-                       XCom.key == "return_value", XCom.run_id != run_id)
-               .order_by(XCom.timestamp.desc()).first())
-        if row is None:
-            return None
-        value = row.value
+    rows = _pg_rows(SQL_LAST_XCOM + " order by timestamp desc limit 1",
+                    {"dag": dag_id, "task": "check", "run": run_id})
+    if not rows:
+        return None
+    value = rows[0]["value"]
     if isinstance(value, str):
         value = json.loads(value)
     parsing = ((value or {}).get("checks") or {}).get("parsing") or {}
@@ -692,7 +767,7 @@ def tools_system_health():
     @task(task_id="check", multiple_outputs=False)
     def check(**context) -> dict:
         """Семь проверок подряд, итог — в лог, XCom и заметку; error роняет задачу."""
-        from airflow.exceptions import AirflowFailException
+        from airflow.sdk.exceptions import AirflowFailException
 
         state, msg = store_params(PARAMS_VAR, SAVED, context)
         if state == "fail":

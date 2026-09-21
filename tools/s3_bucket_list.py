@@ -1,11 +1,11 @@
 """### 📋 DAG: Список бакетов S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Перечисляет все бакеты по всем S3-подключениям с размером, количеством объектов и TTL.
 """
 
 from datetime import datetime, timedelta, timezone
-from airflow.decorators import task, dag
+from airflow.sdk import task, dag
 
 from plugins.utils import get_conns_by_type, add_note, on_callback, readable_size  # type: ignore
 from plugins.s3_utils import s3_bucket_size, s3_get_ttl  # type: ignore
@@ -27,7 +27,7 @@ logger = getLogger("airflow.task")
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule_interval=None,
+    schedule=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,

@@ -1,5 +1,5 @@
 """### 🔍 DAG: Копирование/перемещение файлов S3 → S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Находит файлы по маске и копирует (или перемещает) их в целевой бакет.
 
@@ -18,12 +18,11 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from airflow.models import Param
-from airflow.decorators import task, dag
+from airflow.sdk import Param
+from airflow.sdk import task, dag
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.sensors.base import PokeReturnValue
-from airflow.datasets import DatasetAlias, Dataset
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+from airflow.sdk import PokeReturnValue
 
 from plugins.utils import readable_size, add_note, on_callback, get_conns_by_type  # type: ignore
 from plugins.s3_utils import s3_to_s3, s3_move_s3, s3_delete, s3_path_parse, s3_from_zip, s3_keys, s3_get_buckets  # type: ignore
@@ -53,7 +52,7 @@ for conn in get_conns_by_type(conn_type='aws'):
         'priority_weight': 999,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule_interval=None,
+    schedule=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,

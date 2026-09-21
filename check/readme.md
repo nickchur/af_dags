@@ -1,5 +1,7 @@
 # Инструменты тестирования и проверки
-*2026-09-21 11:10 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 18:45 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+
+> **Airflow 3 (21.09.2026).** Порт `af_dags@8822591` без `test_dags.py` (отложен); `test_hrp_operators.py` перенесён раньше (7.3). Метабаза — через `plugins/af_meta.py`, отличия от Airflow 2 — в `readme.md` корня.
 
 Данная директория содержит инструменты и DAG'и для верификации работоспособности кастомных операторов и системных компонентов платформы.
 

@@ -1,5 +1,5 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-09-04 15:30 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список всех подключений из secret backend, сгруппированных по их типу.
 Используется для аудита доступных соединений и верификации конфигурации backend'а.
@@ -18,7 +18,7 @@
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
-from airflow.decorators import dag, task
+from airflow.sdk import dag, task
 
 try:
     from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
@@ -76,8 +76,7 @@ def tools_show_connections():
         from collections import defaultdict
 
         from airflow.configuration import get_custom_secret_backend
-        from airflow.models import Connection, Variable
-
+        from airflow.sdk import Connection, Variable
         try:
             from plugins.utils import add_note  # type: ignore
         except ImportError:
