@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-17 10:41 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:27 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -256,7 +256,10 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         logger.error(error_msg)
         
         # Если это ошибка клиента (4xx, кроме таймаутов 408/429), повторы не помогут
-        if resp_text.startswith('4') or 300 <= status_code < 500:
+        # status_code пуст у таймаута и обрыва связи: сравнение с None падало TypeError-ом, и
+        # вместо повтора tenacity задача падала сразу (найдено 21.09.2026 на таймаутах
+        # эмулятора CTL при переносе на Airflow 3)
+        if resp_text.startswith('4') or (status_code is not None and 300 <= status_code < 500):
             add_note(error_msg, level='Task,DAG', title='Ошибка API')
             if skip:
                 raise AirflowSkipException(error_msg)
