@@ -1,5 +1,5 @@
 # 🛠️ CTL Plugins для Apache Airflow
-*2026-09-17 10:41 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-22 15:10 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
 
@@ -29,6 +29,7 @@ plugins/
 - **Управление статусами** (`ctl_get_status`, `ctl_chk_status`): Проверка и отображение статусов загрузок
 - **Подбор ответа после обрыва** (`ctl_exe_recover`): что стало с прошлой попыткой `run_exe`
   — см. ниже «Обрыв не останавливает работу в Greenplum»
+- **Лестница таймаутов** (`gp_timeout`, `timeout_ladder`, `cfg_delta`): потолок запроса в GP из `wf_timeout` или `gp_timeout` с предупреждением выше серверного лимита — один разбор для воркера и монитора; проверка согласованности порогов для санитара. Сама лестница — в [`ctl_worker/readme.md`](../ctl_worker/readme.md), раздел «Таймауты»
 
 Константы:
 - `MAX_HTML = 5000` — Максимальная длина фрагмента HTML для отправки
