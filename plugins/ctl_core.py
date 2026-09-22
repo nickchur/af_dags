@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-22 14:41 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -31,7 +31,7 @@ import ast
 import time
 import json
 
-from plugins.utils import query_to_dict, pool_slots, on_callback, add_note # type: ignore
+from plugins.utils import query_to_dict, pool_slots, on_callback, add_note, str2timedelta # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
 
 from logging import getLogger
@@ -974,3 +974,73 @@ def ctl_get_eids(wid, wf_prm, connected=None):
     #     wfs[wid]['entity'] = ','.join(map(str, sorted(eids)))
     return eids
 
+
+
+# ─── Лестница таймаутов (ревизия 22.09.2026, openspec ctl-timeouts-revision) ───────────────
+#
+#   GP сервер          3 ч        обрывает запрос вместе с соединением — молча, без логов
+#   gp_timeout         2 ч 55     statement_timeout по умолчанию: на 5 мин ниже сервера, чтобы
+#                                 query_canceled поймал обработчик pr_swf_start_ctl (res = -2)
+#   run_exe            потолок + 10 мин   execution_timeout: страховка от зависшего соединения
+#   zombie_after       6 ч        санитар; обязан быть больше gp_timeout + 10 мин
+#   run_stale          6 ч        монитор: RUNNING → reRunned; не меньше zombie_after
+#
+# Раньше statement_timeout по умолчанию был 3 ч — ровно серверный лимит, гонка «кто первый».
+TIMEOUT_DEFAULTS = {
+    'gp_server_limit': 'hours=3',
+    'gp_timeout': 'minutes=175',
+    'zombie_after': 'hours=6',
+    'run_stale': 'hours=6',
+}
+#: Зазор задачи над своим запросом: доехать ответу и записаться заметке
+EXE_MARGIN = timedelta(minutes=10)
+
+
+def cfg_delta(key, default=None):
+    """Интервал из ctl_config строкой `hours=6`; нет ключа — значение по умолчанию."""
+    return str2timedelta(str(get_config().get(key) or default or TIMEOUT_DEFAULTS[key]))
+
+
+def gp_timeout(params=None):
+    """Потолок запроса загрузки в Greenplum: (timedelta, предупреждение или None).
+
+    `wf_timeout` воркфлоу — минуты числом (`15`, `600`) либо интервал (`minutes=1`); нет его —
+    `gp_timeout` конфига. `wf_timeout` не урезается: раз задан, значит нужен (решение
+    22.09.2026). Но если он не ниже серверного лимита, сервер оборвёт запрос раньше и
+    молча — об этом предупреждение. Одна функция на воркер и монитор: монитор по ней же
+    решает, не рано ли перезапускать загрузку.
+    """
+    raw = (params or {}).get('wf_timeout')
+    if raw in (None, ''):
+        return cfg_delta('gp_timeout'), None
+    try:
+        to = timedelta(minutes=int(raw))
+    except (ValueError, TypeError):
+        to = str2timedelta(str(raw))
+    if not to:
+        # непонятное значение — не ноль (statement_timeout = 0 значит «без предела»)
+        return cfg_delta('gp_timeout'), f"⚠️ wf_timeout = {raw!r} не разобран — взят gp_timeout"
+    limit = cfg_delta('gp_server_limit')
+    if to >= limit:
+        return to, (f"⚠️ wf_timeout = {to} не ниже серверного лимита Greenplum {limit}: "
+                    "сервер оборвёт запрос раньше и молча, без res = -2 и лога ошибки")
+    return to, None
+
+
+def timeout_ladder():
+    """Глобальные ключи лестницы; несогласованные — AirflowFailException с объяснением.
+
+    Зовёт санитар до любой уборки: при перепутанных порогах он закрыл бы живые раны.
+    `wf_timeout` отдельных воркфлоу сюда не входит — их учитывает монитор поштучно.
+    """
+    lad = {k: cfg_delta(k) for k in TIMEOUT_DEFAULTS}
+    errors = []
+    if lad['gp_timeout'] >= lad['gp_server_limit']:
+        errors.append(f"gp_timeout {lad['gp_timeout']} не ниже серверного лимита {lad['gp_server_limit']}")
+    if lad['zombie_after'] <= lad['gp_timeout'] + EXE_MARGIN:
+        errors.append(f"zombie_after {lad['zombie_after']} не больше gp_timeout + {EXE_MARGIN}")
+    if lad['run_stale'] < lad['zombie_after']:
+        errors.append(f"run_stale {lad['run_stale']} меньше zombie_after {lad['zombie_after']}")
+    if errors:
+        raise AirflowFailException("🔥 Лестница таймаутов нарушена, поправьте ctl_config: " + "; ".join(errors))
+    return lad

@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-17 11:24 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-22 14:41 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -52,7 +52,7 @@ from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_de
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
                               ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed, ctl_loading_snapshot,
-                              ctl_exe_recover)
+                              ctl_exe_recover, gp_timeout, cfg_delta, EXE_MARGIN)
 
 from logging import  getLogger
 logger = getLogger('airflow.task')
@@ -488,15 +488,14 @@ def build_worker_dag(w):
     # prm_task_to = task_time
     # tfs_task_to = (prm_task_to + task_time) if w.get('wf_tfs_in') else prm_task_to
     
-    exe_timeout = wf_params.get('wf_timeout', get_config().get('exe_timeout', 'hours=4'))
-    try: exe_timeout = timedelta(minutes = int(exe_timeout))
-    except (ValueError, TypeError): exe_timeout = str2timedelta(exe_timeout)
-    # exe_timeout += timedelta(minutes = +10)
-    
-    # exe_task_to = tfs_task_to + exe_timeout + task_time
-    # end_task_to = exe_task_to + task_time
-    # dagrun_timeout =  end_task_to + task_time
-    sla_time = str2timedelta(get_config().get('sla_time', 'hours=2'))
+    # Потолок запроса в Greenplum и задачи вокруг него — лестница в plugins/ctl_core.py.
+    # Airflow-SLA (sla=sla_time на run_exe) снят 22.09.2026: в AF2 он считается от следующего
+    # ПО РАСПИСАНИЮ рана (dag_processing/processor.py:498) и у дагов без расписания Airflow не
+    # срабатывает вовсе, callback и почта выключены, в AF3 его нет. Зависшие загрузки
+    # показывает монитор. exe_timeout (4 ч) только печатался здесь как «TimeOut» и потолком
+    # не был — убран вместе с путаницей.
+    exe_timeout, exe_warn = gp_timeout(wf_params)
+    task_timeout = cfg_delta('task_timeout', 'hours=1')
 
             
     conf = dict(
@@ -509,9 +508,10 @@ def build_worker_dag(w):
 
     ctl_url = f"{get_config()['conns']['ctl']['url']}/#/workflow-details/{w['id']}"
     doc_md = (
-        f"###🔗 [CTL/{profile}/{wf_name}]({ctl_url})  TimeOut: {exe_timeout}\n\n"
+        f"###🔗 [CTL/{profile}/{wf_name}]({ctl_url})  TimeOut GP: {exe_timeout}\n\n"
+        + (f"{exe_warn}\n\n" if exe_warn else "")
         # f"```json\n{json.dumps(w, indent=4)}\n```"
-        f"```\n{pformat(w)}\n```\n"
+        + f"```\n{pformat(w)}\n```\n"
         f"```\n{pformat(conf)}\n```\n"
         f"```\n{pformat(w_eids)}\n```\n"
     )
@@ -528,7 +528,9 @@ def build_worker_dag(w):
             'retry_exponential_backoff': True,  
             'max_retry_delay': timedelta(minutes=10),
             'pool': 'ctl_pool',
-            # 'execution_timeout': timedelta(minutes=15),  
+            # Задачи вокруг запроса — вызовы CTL и S3 по минутам; час — с запасом.
+            # run_exe и run_tfs ставят свой, по потолку запроса
+            'execution_timeout': task_timeout,
             'on_failure_callback': on_callback,
             # 'on_success_callback': on_callback,
             # 'on_retry_callback': on_callback,
@@ -724,7 +726,9 @@ def build_worker_dag(w):
             # return params
 
         if wf_tfs_in:
-            @task(pool='gp_pool', ) #execution_timeout=tfs_task_to,)
+            # Без execution_timeout намеренно: файлов в заходе сколько угодно, и у каждого свой
+            # statement_timeout — общий потолок задачи заранее не посчитать
+            @task(pool='gp_pool', execution_timeout=None)
             def run_tfs(wf, **context):
                 """### Загрузка файлов из TFS"""
                 from pathlib import Path
@@ -741,9 +745,7 @@ def build_worker_dag(w):
                 schema  = wf_prm.get('wf_tfs_schema')
                 truncate = str(wf_prm.get('wf_tfs_truncate', False)).lower() in ['true', 'yes']
 
-                wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3'))
-                try: wf_timeout = timedelta(minutes = int(wf_timeout))
-                except (ValueError, TypeError): wf_timeout = str2timedelta(wf_timeout)
+                wf_timeout, _ = gp_timeout(wf_prm)
                 
                 if schema:
                     if not schema.startswith('s_grnplm_vd_hr_edp_'):
@@ -849,7 +851,10 @@ def build_worker_dag(w):
         # retries=1 — не для повтора ETL, а чтобы подобрать потерянный ответ: pr_swf_start_ctl
         # по-прежнему неидемпотентна, и повторная попытка её не зовёт (см. ниже). Повторами
         # самой загрузки распоряжается CTL через TIME-WAIT.
-        @task(pool='gp_pool', sla=sla_time, retries=1) # execution_timeout=exe_task_to,)
+        # execution_timeout — по потолку из метаданных воркфлоу на момент разбора дага; запрос
+        # получает statement_timeout по параметрам загрузки. Расходятся они, только если
+        # wf_timeout поменяли в CTL между разбором и запуском — разбор идёт каждые минуты.
+        @task(pool='gp_pool', retries=1, execution_timeout=exe_timeout + EXE_MARGIN)
         def run_exe(wf, **context):
             """### Выполнение бизнес-логики в Greenplum
 
@@ -881,9 +886,9 @@ def build_worker_dag(w):
             exe = wf_prm.get('wf_exe', wf_prm.get('wf_exec')) or f'pr_{wf_name}()'
             
             # Потолок времени нужен обеим ветвям: и запуску ETL, и ожиданию его в повторе.
-            wf_timeout = wf_prm.get('wf_timeout', get_config().get('gp_timeout', 'hours=3'))
-            try: wf_timeout = timedelta(minutes = int(wf_timeout))
-            except (ValueError, TypeError): wf_timeout = str2timedelta(wf_timeout)
+            wf_timeout, wf_warn = gp_timeout(wf_prm)
+            if wf_warn:
+                logger.warning(wf_warn)
 
             # Ответ достоверен потому, что функция в Greenplum атомарна и кладёт его в
             # журнал той же транзакцией (подробно — в docstring gp_loading_result). Сюда
@@ -944,7 +949,8 @@ def build_worker_dag(w):
             if wf_prm.get('wf_zt_param') is not None: val['ztp'] = wf_prm['wf_zt_param']   # ККД параметры
 
             ti.xcom_push(key='run_prm', value={**val, 'timeout': str(wf_timeout)} )
-            add_note({**val, 'timeout': str(wf_timeout)}, context, level='task', title='Run_prm')
+            add_note({**val, 'timeout': str(wf_timeout), **({'⚠️': wf_warn} if wf_warn else {})},
+                     context, level='task', title='Run_prm')
 
 
             # gp_hook = PostgresHook(postgres_conn_id=config['gp_conn_id'])
