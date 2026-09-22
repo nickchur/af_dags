@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-09-02 13:45 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-22 13:26 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -108,6 +108,14 @@ KAFKA_CONN_IDS = _kafka_conn_ids()
 
 
 tfs_interval = str2timedelta(get_config().get('tfs_interval','minutes=5'))
+# Стандарт служебных сенсоров (22.09.2026): окно 6 ч, затем ран снимается (soft_fail → skipped)
+# и следующий начинается по расписанию: лог попытки копится за всё окно, а сенсор на 12–18 ч
+# в сводке здоровья выглядел как зависшая задача. Ретраи гасят разовые сбои CTL и гонку
+# «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
+# Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
+# не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_retries = int(get_config().get('sensor_retries', 10))
 
 
 def _kafka_wait_any(conn_id: str, topic: str, timeout_min: int) -> str | None:
@@ -310,6 +318,8 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     },
     max_active_runs=1,
     catchup=False,
+    # страховка от зависшего рана: окно сенсора плюс час на задачи после него
+    dagrun_timeout=sensor_timeout + timedelta(hours=1),
     render_template_as_native_obj=True,
     params={ 
         "path": Param('', type="string", examples=list(tfs_conns.keys())), 
@@ -327,7 +337,8 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
         mode='reschedule', 
         soft_fail=True,
         poke_interval=tfs_interval,
-        timeout=pendulum.duration(hours=24),
+        timeout=sensor_timeout,
+        retries=sensor_retries,
     )
     def tfs_wait(**context):
         """Сканирует TFS-источники по маске; при ручном запуске берёт path из params."""

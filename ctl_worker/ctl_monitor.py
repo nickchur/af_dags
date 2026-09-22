@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-17 08:15 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-22 13:26 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -61,7 +61,14 @@ sla_dead_txt = f'{sla_dead.days} д' if sla_dead.days else f'{sla_dead.seconds /
 SLA_SHOW = 10
 
 monitor_interval = str2timedelta(get_config().get('monitor_interval','minutes=15'))
-timeout = timedelta(hours=24)
+# Стандарт служебных сенсоров (22.09.2026): окно 6 ч, затем ран снимается (soft_fail → skipped)
+# и следующий начинается по расписанию: лог попытки копится за всё окно, а сенсор на 12–18 ч
+# в сводке здоровья выглядел как зависшая задача. Ретраи гасят разовые сбои CTL и гонку
+# «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
+# Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
+# не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_retries = int(get_config().get('sensor_retries', 10))
 
 with DAG(f'CTL.{get_config()["profile"]}.monitor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'logger'],
@@ -96,7 +103,8 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
     },
     on_failure_callback=partial(on_callback, level='DAG'),
     on_success_callback=partial(on_callback, level='DAG'),
-    # dagrun_timeout=timeout + str2timedelta(config.get('dagrun_timeout','minutes=10')),
+    # страховка от зависшего рана: окно сенсора плюс час на задачи после него
+    dagrun_timeout=sensor_timeout + timedelta(hours=1),
     doc_md=__doc__,
 ) as dag:
     
@@ -105,7 +113,8 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         mode='reschedule', 
         soft_fail=True,
         poke_interval=monitor_interval,
-        timeout=timeout,
+        timeout=sensor_timeout,
+        retries=sensor_retries,
     )
     def ctl_monitor(**context):
         """Sensor: опрашивает активные загрузки категории и принимает решения по каждой.
