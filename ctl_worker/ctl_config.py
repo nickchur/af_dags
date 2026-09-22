@@ -1,12 +1,13 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-14 11:34 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-22 14:41 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
 | Параметр | Описание |
 |---|---|
 | `profile` / `root_category` / `root_entity` / `ue_category` | Профиль и иерархия CTL |
-| `gp_conn_id` / `gp_schema` / `gp_timeout` / `gp_task_timeout` | Подключение Greenplum |
+| `gp_conn_id` / `gp_schema` | Подключение Greenplum |
+| `gp_server_limit` / `gp_timeout` / `task_timeout` / `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` / `sensor_timeout` / `sensor_retries` | Лестница таймаутов — `ctl_worker/readme.md`, раздел «Таймауты» |
 | `s3_conn_id` / `ctl_bucket` / `ctl_ttl` | S3-хранилище |
 | `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
 | `conns.<id>.pool_slots` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
@@ -117,9 +118,19 @@ config = {
     'ue_category': "p1080.sdpue",
     "archive_category": "p1080.ARCHIVE",
     "event_expire": "time=0:00",
-    'task_timeout': 'hours=1', 
-    'exe_timeout': 'hours=4',
-    'sla_time': 'hours=1', 
+    # Лестница таймаутов (plugins/ctl_core.py): сервер GP рвёт запрос через 3 ч, наш
+    # statement_timeout на 5 мин ниже. exe_timeout и sla_time убраны 22.09.2026: первый
+    # потолком не был, второй (Airflow-SLA) не срабатывал
+    'gp_server_limit': 'hours=3',
+    'gp_timeout': 'minutes=175',   # statement_timeout, если у воркфлоу нет wf_timeout
+    'task_timeout': 'hours=1',     # execution_timeout задач воркера, кроме run_exe/run_tfs
+    'zombie_after': 'hours=6',     # санитар: > gp_timeout + 10 мин
+    'run_stale': 'hours=6',        # монитор: RUNNING → reRunned, >= zombie_after
+    'lock_stale': 'hours=5',       # монитор: LOCK / LOCK-WAIT → reStarted
+    'new_grace': 'minutes=60',     # монитор: моложе — загрузка «новая»
+    'wait_grace': 'minutes=15',    # монитор: просрочка TIME-WAIT → reStarted
+    'sensor_timeout': 'hours=6',   # служебные сенсоры: events, monitor, tfs_sensor
+    'sensor_retries': 10,
     'ctl_limit': 1000,  #сколько записей запросить из CTL
     'ctl_days': 5, #сколько дней назад запросить из CTL
     # 'ctl_task_timeout': 'hours=+5',
