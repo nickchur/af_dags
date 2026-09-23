@@ -1,11 +1,13 @@
 # 🚀 ER Export Framework
-*2026-09-01 09:14 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-23 14:49 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Фреймворк на базе Airflow для автоматизированной выгрузки данных из **ClickHouse** в **S3** с последующей нотификацией системы **TFS** через **Kafka**.
 
 Построен на принципах **Metadata-driven development**: для добавления новой таблицы не требуется написание кода — достаточно добавить запись в управляющую таблицу ClickHouse.
 
 > 👉 **Первый раз здесь?** Начните с [QUICKSTART.md](QUICKSTART.md) — пять шагов и готовые тексты для копирования. Этот файл — справочник: он отвечает на «как устроено», а не на «что нажимать».
+
+> 🤖 **Навык агента** — [`skill/er-export.md`](skill/er-export.md): как разбирать пакеты через MCP. Контур отдаёт его сам, ресурсом `airflow://skill/er-export` (его публикует даг `tools_mcp_skills`). Меняется поведение пакета — правится и навык.
 
 ---
 
