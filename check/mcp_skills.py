@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-09-23 14:33 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-23 15:25 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -17,6 +17,18 @@ dag-processor'а и воркера; у вебсервера каталог да�
 Имя навыка — имя файла без `.md`. Переменная переписывается, только если файл изменился;
 навык, чей файл исчез, снимается вместе со своей переменной. Два файла с одним именем —
 ошибка таска: какой из них отдавать, решать не нам.
+
+**Документация дагов** — второй таск, `publish_docs`, тем же путём: все остальные `.md`
+(README каталогов, QUICKSTART, ТЗ) для пункта UI Docs → DAG Docs (etl-core,
+`plugins/dag_docs_plugin.py`).
+
+| Что | Где |
+|---|---|
+| Текст документа `<путь>` | Variable `af_doc__<путь, где / заменён на __>` |
+| Оглавление: путь → sha256, размер, заголовок | Variable `af_docs` (JSON) |
+
+Не публикуются: навыки (`*/skill/*.md` — они уже есть), `CLAUDE.md` и `CONTEXT.md`
+(правила и карта для агента), `openspec/`, `testbed/`, скрытые каталоги.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -42,6 +54,14 @@ SKILL_NAME_RE = r'^[a-z0-9][a-z0-9-]{0,63}$'
 #: Навык ctl-worker — 20 КБ. Потолок — от случайно подложенного бинарника, а не от
 #: навыков: агенту больше и не прочитать за раз.
 SKILL_MAX_BYTES = 256 * 1024
+
+#: Документация дагов для страницы Docs → DAG Docs. Тоже контракт с etl-core
+#: (``plugins/dag_docs_plugin.py``).
+DOC_PREFIX = 'af_doc__'
+DOC_INDEX = 'af_docs'
+#: Файлы для агента, а не для людей: правила репозитория и собранная карта.
+DOC_SKIP_FILES = {'CLAUDE.md', 'CONTEXT.md'}
+DOC_SKIP_DIRS = {'testbed', 'openspec', 'skill', '__pycache__'}
 
 ensure_pool(TOOLS_POOL)
 
@@ -73,10 +93,42 @@ def find_skills(root):
     return found
 
 
-def plan(found, index, root, max_bytes=SKILL_MAX_BYTES):
+def find_docs(root):
+    """``{путь: путь-файл}`` по ``**/*.md`` под ``root``, кроме навыков и файлов для агента.
+
+    Ключ — путь от корня дагов через ``/``: он же имя документа на странице и в ссылках.
+    """
+    from pathlib import Path
+
+    found = {}
+    for path in sorted(Path(root).glob('**/*.md')):
+        rel = path.relative_to(root)
+        if path.name in DOC_SKIP_FILES or any(
+            p.startswith('.') or p in DOC_SKIP_DIRS for p in rel.parts[:-1]
+        ):
+            continue
+        found[rel.as_posix()] = path
+    return found
+
+
+def doc_key(rel: str) -> str:
+    """Ключ Variable документа: ``er_export/README.md`` → ``af_doc__er_export__README.md``."""
+    return DOC_PREFIX + rel.replace('/', '__')
+
+
+def doc_title(text: str, fallback: str) -> str:
+    """Первый заголовок ``# …``, иначе имя файла."""
+    for line in text.splitlines():
+        if line.startswith('# '):
+            return line[2:].strip()
+    return fallback
+
+
+def plan(found, index, root, max_bytes=SKILL_MAX_BYTES, titles=False):
     """Что сделать: ``(новое оглавление, {имя: текст на запись}, [имена на снятие], [пропущено])``.
 
-    Отдельно от записи — чтобы решение проверялось тестом без Airflow.
+    Отдельно от записи — чтобы решение проверялось тестом без Airflow. ``titles`` — класть
+    в оглавление заголовок документа (для страницы DAG Docs).
     """
     import hashlib
 
@@ -88,6 +140,8 @@ def plan(found, index, root, max_bytes=SKILL_MAX_BYTES):
             continue
         sha = hashlib.sha256(raw).hexdigest()
         new_index[name] = {'sha256': sha, 'path': str(path.relative_to(root)), 'bytes': len(raw)}
+        if titles:
+            new_index[name]['title'] = doc_title(raw.decode('utf-8'), path.name)
         if (index.get(name) or {}).get('sha256') != sha:
             to_write[name] = raw.decode('utf-8')
     to_delete = sorted(set(index) - set(new_index))
@@ -159,7 +213,40 @@ def tools_mcp_skills():
             raise ValueError("Навыки пропущены: " + "; ".join(skipped))
         return {'skills': sorted(new_index), 'written': sorted(to_write), 'deleted': to_delete}
 
+    @task
+    def publish_docs(**context):
+        from airflow.configuration import conf
+        from airflow.models import Variable
+
+        try:
+            from plugins.utils import add_note  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note  # type: ignore
+
+        root = conf.get('core', 'dags_folder')
+        index = Variable.get(DOC_INDEX, default_var={}, deserialize_json=True) or {}
+        new_index, to_write, to_delete, skipped = plan(find_docs(root), index, root, titles=True)
+
+        for rel, text in to_write.items():
+            Variable.set(doc_key(rel), text,
+                         description=f"Документация дагов для Docs → DAG Docs: {rel}")
+        for rel in to_delete:
+            Variable.delete(doc_key(rel))
+        # Оглавление — последним: страница верит ему и ссылаться оно должно на записанное
+        if new_index != index:
+            Variable.set(DOC_INDEX, new_index, serialize_json=True,
+                         description="Оглавление документации дагов (Docs → DAG Docs): путь → sha256, размер, заголовок")
+
+        title = f"DAG Docs: {len(new_index)}, записано {len(to_write)}, снято {len(to_delete)}"
+        rows = [f"✏️ `{r}`" for r in sorted(to_write)] + [f"🗑️ `{r}`" for r in to_delete]
+        rows += [f"❌ {s}" for s in skipped]
+        add_note("\n".join(rows) or "без изменений", context, level='DAG,task', title=title)
+        if skipped:
+            raise ValueError("Документы пропущены: " + "; ".join(skipped))
+        return {'docs': len(new_index), 'written': sorted(to_write), 'deleted': to_delete}
+
     publish()
+    publish_docs()
 
 
 tools_mcp_skills()
