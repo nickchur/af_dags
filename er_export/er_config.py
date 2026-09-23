@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-09-01 09:14 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-23 20:30 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -179,6 +179,15 @@ DEF_ARGS = {
     "retries":          3,
     "retry_delay":      timedelta(minutes=5),
     "pool":             POOL_NAME,
+    # Вес задачи для шедулера. Он берёт готовые задачи по убыванию веса по 16 за цикл и
+    # дальше не идёт, если среди них есть что запустить. У бизнес-дагов по умолчанию вес
+    # 1–24 (downstream), а у raw_to_stable_* доходит до сотен. Сигма 23.09.2026: пока они
+    # забивали очередь, тракт ТФС по часу стоял при свободных слотах; выгрузка ЕР —
+    # из той же цепочки и ждала бы так же.
+    # 950 — выше диагностики (900), ниже агента CTL (999/1000).
+    # absolute обязателен: downstream сложил бы вес вниз по цепочке.
+    "priority_weight":  950,
+    "weight_rule":      "absolute",
     "email_on_failure": False,
     "email_on_retry":   False,
     "on_failure_callback": on_callback,

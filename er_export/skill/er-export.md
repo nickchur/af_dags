@@ -5,7 +5,7 @@ description: Разбор выгрузок ЕР на Airflow сигмы — па
 
 # Выгрузки ЕР на сигме
 
-*2026-09-23 14:47 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-23 20:30 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow сигмы (`af-sigma-*`). Дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `export_er*`.
@@ -103,7 +103,7 @@ task_id, try_number)` — у задач в TaskGroup `task_id` составно�
 |---|---|---|
 | новый пакет не ходит | пауза дага | **новые пакеты создаются на паузе**; `is_paused=1` у группы синк держит на паузе |
 | `make_ts` висит в `queued` | `get_pool("datalab_export_er_ts__<реплика>")` | пула нет — его заводит синк; после пересоздания метабазы нужен прогон `export_er_setup` с «Синхронизировать принудительно». Ошибки при этом нет — молча стоит |
-| задачи ждут в `scheduled` | `get_pool("datalab_export_er")` | пул выгрузок занят другими пакетами |
+| задачи ждут в `scheduled` | `get_pool("datalab_export_er")`; `get_system_health` → `platform.scheduled` | пул выгрузок занят другими пакетами; пул свободен — шедулер отдаёт задачи по убыванию `priority_weight`, и чужие даги с большим весом забивают очередь (навык `airflow-health`). С 23.09.2026 у выгрузок вес 950 (`weight_rule: absolute`) |
 | `config_error` | заметка задачи | раздел 4 |
 | `init` failed | заметка, лог | нет коннекта `dlab-click` / `s3-tfs-hrplt` или бакета; сняты флаги всех таблиц; `date_from`/`date_to` заданы не парой или не по формату |
 | `build_meta` failed | лог | колонки запроса разошлись с `fields`; квалификатор таблицы в имени колонки (в ошибке — готовая строка замены); описание в `descriptions` для несуществующей колонки |

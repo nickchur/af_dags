@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-09-16 16:58 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-23 20:30 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, по той же причине, что `ctl_utils` и `ctl_core`:
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -835,6 +835,15 @@ DEF_ARGS = {
     "owner":            "DataLab (CI02420667)",
     "retries":          1,
     "retry_delay":      timedelta(minutes=2),
+    # Вес задачи для шедулера. Он берёт готовые задачи по убыванию веса по 16 за цикл и
+    # дальше не идёт, если среди них есть что запустить. У бизнес-дагов по умолчанию вес
+    # 1–24 (downstream), а у raw_to_stable_* доходит до сотен. Сигма 23.09.2026: пока они
+    # забивали очередь, раны tfs_kafka_snd по часу стояли без единой запущенной задачи
+    # и падали по dagrun_timeout при свободных слотах.
+    # 950 — выше диагностики (900), ниже агента CTL (999/1000).
+    # absolute обязателен: downstream сложил бы вес вниз по цепочке.
+    "priority_weight":  950,
+    "weight_rule":      "absolute",
     "email_on_failure": False,
     "email_on_retry":   False,
     "on_failure_callback": on_callback,
