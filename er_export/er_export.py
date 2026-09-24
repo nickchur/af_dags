@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-09-01 08:48 MSK · v3.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 13:00 MSK · v3.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -43,7 +43,7 @@ from airflow.models import Param
 from airflow.utils.task_group import TaskGroup
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
+    from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params,
         norm_group, ts_pool,
         build_meta, ch_source_columns, check_descriptions, check_fields,
@@ -51,7 +51,7 @@ try:
         unnamed_fields,
     )
 except ImportError:
-    from er_export.er_config import (  # type: ignore
+    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, add_note, get_params,
         norm_group, ts_pool,
         build_meta, ch_source_columns, check_descriptions, check_fields,

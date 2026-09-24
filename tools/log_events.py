@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-24 11:18 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 13:00 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -60,10 +60,10 @@ from airflow.models import Param
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from CI06932748.tools.utils import (  # type: ignore
+    from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
 except ImportError:
-    from plugins.utils import (  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
 
 logger = logging.getLogger("airflow.task")

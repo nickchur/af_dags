@@ -4,14 +4,14 @@ from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor # pyright: ignor
 
 # Двойной импорт — см. пояснение в tfs_exchange_import.py.
 try:
-    from CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common import ( # type: ignore
+    from gp_exchange.tfs_exchange_common import ( # type: ignore
         TFS_IN_DATASET,
         TFS_IN_BUCKET,
         TFS_IN_PREFIX,
         default_args,
     )
 except ImportError:
-    from gp_exchange.tfs_exchange_common import ( # type: ignore
+    from CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common import ( # type: ignore
         TFS_IN_DATASET,
         TFS_IN_BUCKET,
         TFS_IN_PREFIX,

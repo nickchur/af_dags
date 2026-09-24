@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-24 11:52 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 13:00 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -56,11 +56,11 @@ from airflow.decorators import dag, task
 from airflow.models import Param
 
 try:
-    from CI06932748.tools.utils import (  # type: ignore
+    from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
         saved_schedule)
 except ImportError:
-    from plugins.utils import (  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
         saved_schedule)
 

@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-09-01 09:14 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 13:00 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -154,7 +154,7 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException
 from airflow.models.param import Param
 
 try:
-    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
+    from er_export.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         dag_id_for, norm_group, ts_pool, update_dag_pause,
         ch_error, clean_row, parse_params, explicit_schedule, check_table, check_group_names,
@@ -163,7 +163,7 @@ try:
         merge_params, probe_sql, query_columns, sql_sources, unnamed_fields, valid_schedule,
     )
 except ImportError:
-    from er_export.er_config import (  # type: ignore
+    from CI06932748.analytics.datalab.export_er.er_config import (  # type: ignore
         get_config, get_dict_from_ch, obj_load, obj_save, add_note, ensure_pool,
         dag_id_for, norm_group, ts_pool, update_dag_pause,
         ch_error, clean_row, parse_params, explicit_schedule, check_table, check_group_names,
