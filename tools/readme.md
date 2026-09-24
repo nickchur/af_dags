@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-24 11:24 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:36 MSK · v1.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -242,6 +242,26 @@ DAG'а — лента здоровья: ❌ — был `error`.
     которого boto3 больше не шлёт.
 *   **Отчётность**: сводка в заметку, при `alert=True` таск краснеет и уходит уведомление.
 
+### [paused_runs_cleanup.py](paused_runs_cleanup.py)
+**Зависшие раны запаузенных дагов (`tools_paused_runs_cleanup`, раз в час, создаётся на паузе).**
+
+Шедулер запаузенный даг не разбирает, а `trigger_dag` паузу не смотрит: ран в `queued` /
+`running` у такого дага не начнётся и не кончится (`runs.paused_active` в `get_system_health`).
+Даг находит такие раны старше `older_than_hours` (24 ч) и при `close=True` помечает их
+failed — как кнопка Mark failed: незавершённые задачи → `skipped`.
+
+*   **Возраст**: `queued` — от `queued_at`; `running` — от последнего движения задач
+    (`max(end_date)`), иначе от `start_date`. Ран с задачей в `running` не трогается: она
+    доработает, и ран попадёт в следующий проход. Правило то же, что у санитара `ctl_monitor`.
+*   **Отчёт** (`find`) — заметка на ран: даги, раны, возраст, задачи по состояниям и
+    последняя запись о паузе в журнале `log` (UI, API, CLI; пауза из кода записи не оставляет).
+*   **Закрытие** (`close`) — только при `close=True` и числе ранов не больше `max_runs` (200),
+    иначе таск красный и не закрыто ничего. Без сериализованного дага — запросом к метабазе.
+    На ран — заметка, в журнал — событие `paused_run_failed`. Паузу даг не снимает.
+*   **Параметры** `older_than_hours`, `states`, `dag_id_like`, `close`, `max_runs`, `schedule`
+    сохраняются в `tools_paused_runs_cleanup_params`. `close` сохраняемый: чтобы закрывали и
+    плановые запуски, один раз запустить с `close` и `save_params`.
+
 ### [queue_cleanup.py](queue_cleanup.py)
 **Чистка очереди celery от сообщений без задач (`tools_queue_cleanup`).**
 
@@ -342,7 +362,7 @@ S3-инструментах альфы.
 ## Сохраняемые параметры
 
 `db_cleanup`, `log_cleanup`, `log_events`, `system_health`, `pg_activity`, `mcp_skills`,
-`show_connections`, `test_connections` и `test_dags` берут значения по умолчанию из своей Airflow
+`paused_runs_cleanup`, `show_connections`, `test_connections` и `test_dags` берут значения по умолчанию из своей Airflow
 Variable (`tools_<имя>_params`; у `pg_activity` — `tools_pg_activity_cfg`), а при её отсутствии —
 из кода. Механизм общий — `saved_params`, `saved_schedule` и `store_params_task` в
 `plugins/utils.py`; сохраняет отдельный таск `params` галочкой `save_params`. Variable записывается только запуском с галочкой
