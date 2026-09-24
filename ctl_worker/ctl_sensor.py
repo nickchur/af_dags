@@ -75,7 +75,7 @@ def dag_gone_reason(dag_id: str, wf: dict | None) -> str:
         bits.append(f'метабазу опросить не вышло: {type(e).__name__}: {e}')
     return '; '.join(bits)
 
-# Имя события для журнала метабазы: по нему отчёт check/log_events считает, сколько раз
+# Имя события для журнала метабазы: по нему отчёт tools/log_events считает, сколько раз
 # сенсор упёрся в паузу. Своё, не айрфлоуское: их имена — константы планировщика.
 PAUSED_EVENT = 'ctl dag paused'
 
@@ -398,7 +398,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
             msg = f"⏸️ Загрузка {lid} ({wf_name}): даг на паузе, {reason}"
             add_note(msg, context, level='Task,DAG', title='⏸️ ДАГ НА ПАУЗЕ')
             # Запись в журнал метабазы — чтобы такие пропуски считались числом
-            # (check/log_events.py), а не оставались строкой в логе сенсора.
+            # (tools/log_events.py), а не оставались строкой в логе сенсора.
             note_paused_event(f'CTL.{wf_name}', msg)
             raise AirflowSkipException(msg)
         

@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов задач
-*2026-09-16 16:35 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:52 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет сроки хранения по папкам, убирает
 старое и считает статистику. Бакет берётся из `[logging] remote_base_log_folder`, то есть
@@ -7,7 +7,7 @@
 
 Папок в S3 нет — есть префиксы, поэтому «заводится» не каталог, а срок: на каждый префикс
 ставится правило жизненного цикла (`{префикс}DeleteAfter`). На правила не полагаемся: через
-корпоративный шлюз они раньше не работали (см. `check/pg_activity.py`), поэтому уборка всё
+корпоративный шлюз они раньше не работали (см. `tools/pg_activity.py`), поэтому уборка всё
 равно идёт обходом, а отчёт показывает, сколько объектов старше срока нашлось при обходе.
 
 ⚠️ **Правило накрывает и вложенные папки.** Фильтр правила — префикс, исключений в S3 нет:
@@ -43,7 +43,7 @@
 срок ей задавался бы напрасно.
 
 Соседние даги свои дампы убирают сами и знают про свои ключи больше: `pg_activity` и
-`queue_cleanup` удаляют по дате В ИМЕНИ ключа и не трогают то, что на их формат не похоже, а
+`queue_analyze` удаляют по дате В ИМЕНИ ключа и не трогают то, что на их формат не похоже, а
 `test_dags` держит версии, пока жив сам даг. Поэтому этот DAG им страховка, а не замена:
 сроки здесь стоят не меньше их собственных `keep_days`, а снимкам дагов срок не задан вовсе —
 их возраст ничего не значит. Действующий срок папки — меньший из двух.
@@ -68,12 +68,12 @@ from airflow.utils.trigger_rule import TriggerRule
 try:
     from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, saved_schedule,
     )
 except ImportError:
     from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, valid_schedule,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -177,22 +177,13 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
-def _schedule():
-    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
-    value = SAVED.get('schedule', DEFAULT_SCHEDULE)
-    if not valid_schedule(value):
-        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
-        return DEFAULT_SCHEDULE
-    return None if value in (None, '', 'None') else str(value).strip()
-
-
 # Папки бакета, которые заводит не этот DAG: логи ядра пишет платформа (`_health/` — отбивки
 # воркеров), дампы кладут соседние даги. Сроки соседей не меньше их собственных keep_days:
 # страховка не должна удалять раньше хозяина
 # Все папки — от корня бакета, как их видит листинг, и ни одна не лежит внутри другой. Так
 # правило жизненного цикла на префикс логов не накрывает соседей: фильтр правила — префикс, и
 # исключений в нём нет. `system_health/` кладут ядро (отбивки воркеров) и проба этого же
-# репозитория (check/system_health.py)
+# репозитория (tools/system_health.py)
 DEFAULT_FOLDERS = {
     'system_health/': 7,
     # Снимки дагов по возрасту чистить НЕЛЬЗЯ: test_dags держит там все версии живых дагов и
@@ -267,7 +258,7 @@ params = {
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule=_schedule(),
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=['DataLab', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,

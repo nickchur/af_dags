@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 15:53 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:18 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -61,10 +61,10 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, valid_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
 except ImportError:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, valid_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
 
 logger = logging.getLogger("airflow.task")
 
@@ -124,15 +124,6 @@ def names_drifted() -> str:
 def _param(key, default, **kwargs):
     """Param со значением по умолчанию из переменной, если оно там есть."""
     return Param(SAVED.get(key, default), **kwargs)
-
-
-def _schedule():
-    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
-    value = SAVED.get('schedule', DEFAULT_SCHEDULE)
-    if not valid_schedule(value):
-        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
-        return DEFAULT_SCHEDULE
-    return None if value in (None, '', 'None') else str(value).strip()
 
 
 def _fetch(sql: str, args: dict) -> list:
@@ -270,7 +261,7 @@ SELECT event, count(*) AS cnt
     # Часовой пояс DAG-а берётся из start_date.tzinfo, поэтому расписание московское —
     # как у соседей по каталогу (show_connections, test_connections).
     start_date=datetime(2026, 9, 4, tzinfo=MSK),
-    schedule=_schedule(),
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
     tags=['DataLab', 'tools', 'check'],
     catchup=False,

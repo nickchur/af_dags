@@ -197,7 +197,7 @@ def tfs_kafka_setup_dag():
 
         Решатели тракта возвращают (status, message) и сами ничего не бросают — разбор
         статуса стоит здесь, рядом с trigger_rule следующего таска и с текстом, который
-        увидит человек. Та же договорённость, что у таска params в check/db_cleanup.py.
+        увидит человек. Та же договорённость, что у таска params в tools/db_cleanup.py.
         """
         p       = context['params']
         action  = (p.get('action') or SHOW).strip()

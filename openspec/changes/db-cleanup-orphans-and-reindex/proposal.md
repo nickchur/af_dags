@@ -25,7 +25,7 @@
 
 ## Impact
 
-- `check/db_cleanup.py` (v1.11), `check/readme.md`. `plugins/utils.py` не меняется.
+- `tools/db_cleanup.py` (v1.11), `tools/readme.md`. `plugins/utils.py` не меняется.
 - Ключ `reindex`, оставшийся в `tools_db_cleanup_params` у тех, кто сохранял параметры,
   ничего не включает и уйдёт при следующей записи параметров; миграция не нужна.
 - Карточка Health на альфе покажет меньше сирот только после прогона чистки — сам счётчик

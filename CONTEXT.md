@@ -30,14 +30,14 @@
 
 | Каталог | Как устроено | Обновлён | Что обязано работать | Обновлена | Код |
 |---|---|---|---|---|---|
-| `check/` | `check/readme.md` | 2026-09-23 | `openspec/specs/check/spec.md` | 2026-09-17 ⚠️ | 2026-09-23 |
-| `ctl_worker/` | `ctl_worker/readme.md` | 2026-09-22 | `openspec/specs/ctl-worker/spec.md` | 2026-09-17 ⚠️ | 2026-09-22 |
-| `er_export/` | `er_export/README.md` | 2026-09-23 | `openspec/specs/er-export/spec.md` | 2026-09-01 | 2026-09-01 |
+| `ctl_worker/` | `ctl_worker/readme.md` | 2026-09-24 | `openspec/specs/ctl-worker/spec.md` | 2026-09-17 ⚠️ | 2026-09-24 |
+| `er_export/` | `er_export/README.md` | 2026-09-23 | `openspec/specs/er-export/spec.md` | 2026-09-01 ⚠️ | 2026-09-24 |
 | `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 | 2026-09-02 |
-| `plugins/` | `plugins/readme.md` | 2026-09-22 | `openspec/specs/plugins/spec.md` | 2026-09-17 ⚠️ | 2026-09-22 |
-| `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-23 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 | 2026-08-28 |
-| `tools/` | `tools/readme.md` | 2026-08-31 | `openspec/specs/tools/spec.md` | 2026-08-31 | 2026-09-02 |
+| `plugins/` | `plugins/readme.md` | 2026-09-22 | `openspec/specs/plugins/spec.md` | 2026-09-17 ⚠️ | 2026-09-24 |
+| `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 | `openspec/specs/s3-tools/spec.md` | 2026-09-24 | 2026-09-24 |
+| `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-24 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 ⚠️ | 2026-09-24 |
+| `tools/` | `tools/readme.md` | 2026-09-24 | `openspec/specs/tools/spec.md` | 2026-09-24 | 2026-09-24 |
 | `xs_export/` | `xs_export/readme.md` | 2026-08-31 | `openspec/specs/xs-export/spec.md` | 2026-08-31 | 2026-09-02 |
 | `GP/` | `GP/readme.md` | 2026-09-22 | снимок `HR_Data` @ `279e52a` | 2026-09-10 | 2026-09-22 |
 
-*Собрано 2026-09-23 скриптом `sync_context.py`*
+*Собрано 2026-09-24 скриптом `sync_context.py`*

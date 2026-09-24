@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-14 06:53 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:53 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -21,7 +21,7 @@ ctl_worker/          # DAG'и Airflow
 ├── ctl_test.py      # 🧪 Симулятор: тестовые события / Dataset-сигналы / случайные триггеры
 └── ctl_test_conn.py # 🔌 Мониторинг подключений (CTL, GP, PG, S3) с backoff
 
-tools/                   # Служебные DAG'и (ручной запуск) → tools/readme.md
+s3_tools/                # S3-инструменты альфы (ручной запуск) → s3_tools/readme.md
 ├── s3_from_content.py   # 📤 Загрузка текстового контента в S3
 ├── s3_to_s3.py          # 📦 Копирование объекта между S3-бакетами
 ├── s3_to_s3_test.py     # 🔍 Поиск по маске и копирование/перемещение S3→S3
@@ -29,16 +29,24 @@ tools/                   # Служебные DAG'и (ручной запуск)
 ├── s3_set_ttl.py        # ⏱️ Управление TTL-правилами S3-бакета
 ├── s3_bucket_list.py    # 📋 Список всех бакетов по всем S3-подключениям
 ├── s3_bucket_viewer.py  # 🪣 Список бакетов через HrpS3BucketViewerOperator
-├── s3_viewer.py         # 🗂️ Список ключей и чтение файлов через HrpS3*Operator
-└── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
+└── s3_viewer.py         # 🗂️ Список ключей и чтение файлов через HrpS3*Operator
 
-check/                   # DAG'и проверки и обслуживания → check/readme.md
+tools/                   # Служебные DAG'и: проверка и обслуживание → tools/readme.md
 ├── show_connections.py  # 🔌 Подключения из secret backend, сгруппированные по типу
 ├── test_connections.py  # 🔎 Проверка доступности всех подключений + serialized_dag
 ├── test_hrp_operators.py # 🧪 Функциональный стенд для hrp_operators (pg↔s3↔ch)
 ├── test_kafka.py        # 📨 Проверка Kafka: продюсер и консьюмер тестовых сообщений
+├── test_dags.py         # 🧬 Проверка сериализации DAG'ов, снимки версий
 ├── db_cleanup.py        # 🧹 Очистка метадаты Airflow старше N дней
-└── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
+├── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
+├── log_events.py        # 📊 Сбои доставки задач: отчёт по журналу метабазы
+├── system_health.py     # 🩺 Снимок состояния контура раз в час
+├── pg_activity.py       # 🐘 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
+├── queue_analyze.py     # 🔬 Разбор очереди: почему задачи ждут; чистка брокера по галочке
+├── paused_runs_cleanup.py # ⏸️ Зависшие раны запаузенных дагов: отчёт и Mark failed
+├── mcp_skills.py        # 🧭 Навыки агента и документация дагов → Variables для MCP
+├── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
+└── skill/tools.md       # 🤖 Навык агента: служебные даги
 
 gp_exchange/                 # Приём универсального обмена из ПКАП: S3 → ClickHouse
 ├── tfs_exchange_sensor.py   # 📡 S3KeySensor на ue_exchange_*.csv, публикует Dataset
@@ -167,8 +175,8 @@ bash .githooks/install.sh
 | `er_export/` | `openspec/specs/er-export/spec.md` | полная |
 | `tfs_kafka/` | `openspec/specs/tfs-kafka/spec.md` | полная |
 | `xs_export/` | `openspec/specs/xs-export/spec.md` | полная |
+| `s3_tools/` | `openspec/specs/s3-tools/spec.md` | полная |
 | `tools/` | `openspec/specs/tools/spec.md` | полная |
-| `check/` | `openspec/specs/check/spec.md` | полная |
 | `gp_exchange/` | `openspec/specs/gp-exchange/spec.md` | полная |
 
 Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —

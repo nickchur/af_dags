@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-12 15:24 MSK · v2.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:19 MSK · v2.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -35,6 +35,7 @@ DAG'ов разом. Версии записываются все, а сравн
 | Параметр | По умолчанию | Значение |
 |---|---|---|
 | `snapshot_limit` | `0` | Сколько DAG'ов обходить за прогон. `0` — все. Ненулевое включает ротацию: изменившиеся → без копии → с самой старой копией, полное покрытие за `ceil(всего / limit)` суток |
+| `schedule` | `0 23 * * *` | Расписание; пусто — только вручную. Сохраняется вместе со `snapshot_limit` галочкой `save_params` |
 | `cleanup_deleted` | `False` | Удалять ли версии DAG'ов, которых больше нет в `serialized_dag`. Выключено намеренно: пропажа чаще временная (Broken DAG, неудачный парсинг, `dag_stale_not_seen_duration`), и копия как раз тогда и нужна |
 
 **Хранилище версий:**
@@ -92,9 +93,13 @@ from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 try:
-    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 except ImportError:
-    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 
 logger = getLogger("airflow.task")
 
@@ -104,6 +109,14 @@ MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
+
+# Параметры формы — в переменной, меняются запуском с save_params, без выкладки (как у
+# db_cleanup): расписание и snapshot_limit. cleanup_deleted — разовое действие, не
+# настройка: в переменную не пишется
+PARAMS_VAR = "tools_test_dags_params"
+SAVED = saved_params(PARAMS_VAR)
+DEFAULT_SCHEDULE = "0 23 * * *"
+ONE_SHOT = ("cleanup_deleted",)
 
 # Соединение и бакет берём из настроек логирования, а не именем: на DEV бакет подменяет
 # airflow_entrypoint (REMOTE_BASE_LOG_FOLDER), и хардкод туда не поедет. conf читается из
@@ -344,7 +357,7 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
     # [core] default_timezone = utc не мешает: 23:00 — московские
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
-    schedule="0 23 * * *",
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Дефолт из airflow.cfg — max_active_tasks_per_dag = 4, а recheck при RECHECK_LIMIT=25
     # растянулся бы на семь волн ожидания (до пары часов). Таски почти всё время спят
     # в ожидании парсинга, так что нагрузки это не добавляет — только занятые слоты
@@ -358,11 +371,19 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
         # 0 — без ограничения, копируем все DAG'и. Ненулевое значение включает ротацию
         # (изменившиеся и самые старые копии вперёд): полное покрытие набирается за
         # ceil(всего / snapshot_limit) суток
-        "snapshot_limit": Param(0, type="integer", minimum=0),
+        "snapshot_limit": Param(int(SAVED.get("snapshot_limit", 0)), type="integer", minimum=0),
         # Удаление копий DAG'ов, которых больше нет в serialized_dag — только вручную:
         # пропажа чаще временная (Broken DAG, неудачный парсинг, деактивация по
         # dag_stale_not_seen_duration), и копия как раз тогда и нужна
         "cleanup_deleted": Param(False, type="boolean"),
+        "schedule": Param(
+            SAVED.get("schedule", DEFAULT_SCHEDULE), type=["string", "null"], title="Расписание",
+            description="cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора",
+        ),
+        "save_params": Param(
+            False, type="boolean", title="Сохранить параметры",
+            description=f"Записать schedule и snapshot_limit в {PARAMS_VAR} (cleanup_deleted — нет)",
+        ),
     },
 )
 def tools_test_dags():
@@ -1302,6 +1323,15 @@ def tools_test_dags():
                 "parse_time": parsed}
 
     summary_task = summary()
+
+    # Без потомков: пропуск (save_params=False) ни на что не влияет; summary смотрит
+    # только свои ветки по task_id
+    @task(task_id="params")
+    def save_params(**context):
+        """💾 Сохраняет schedule и snapshot_limit как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
+
+    save_params()
 
     # Таски объявлены выше, а в группы попадают в момент вызова: оператор создаётся
     # именно здесь, TaskGroupContext читается тогда же.

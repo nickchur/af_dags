@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-17 10:41 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:18 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -69,7 +69,7 @@ def env_stand() -> str:
     """Контур, на котором мы работаем: `DEV`, `IFT`, `PSI`, `PROM` или пустая строка.
 
     Сначала `ENV_STAND` — её читают платформенные операторы и `tools/`, — при отсутствии
-    `ENVIRONMENT`: там, где выставлена только она (`check/`), поведение не должно
+    `ENVIRONMENT`: там, где выставлена только она (`tools/`), поведение не должно
     отличаться. Обе не выставлены — контур неизвестен, и вызывающий обязан считать это
     самым строгим случаем, а не стендом: переменная есть на всех контурах, включая
     тестовый (`/opt/aftest/airflow.env`).
@@ -523,6 +523,53 @@ def valid_schedule(value) -> bool:
         logger.warning(f"⚠️ расписание {value!r}: {e}")
         return False
     return True
+
+
+def saved_schedule(saved, default, var_name=''):
+    """⏰ Расписание DAG-а из сохранённых параметров: годное — оно, битое — из кода.
+
+    Пара к valid_schedule(). Зовётся на парсинге в ``schedule=``: битое значение в
+    переменной не должно ронять разбор файла, иначе из UI пропадёт сама форма, через которую
+    расписание и чинят. Пусто или ``None`` — даг без расписания, только ручной запуск.
+
+    Args:
+        saved: Словарь из saved_params().
+        default: Расписание из кода — запасной вариант и значение по умолчанию.
+        var_name: Имя переменной — только для текста предупреждения.
+    """
+    value = saved.get('schedule', default)
+    if not valid_schedule(value):
+        logger.warning(f"⚠️ {var_name}: расписание '{value}' не разобрано — беру {default}")
+        return default
+    return None if value in (None, '', 'None') else str(value).strip()
+
+
+def store_params_task(var_name, saved, context=None, one_shot=(), flag='save_params'):
+    """💾 Тело таска ``params``: store_params() и решение по его статусу.
+
+    ``skip`` → AirflowSkipException, ``fail`` → AirflowFailException, ``ok`` → сообщение.
+    Следующие таски обязаны стоять на ``trigger_rule=NONE_FAILED`` (или таск ``params`` —
+    без потомков), иначе штатный пропуск утянет в skip всю цепочку.
+
+    Args:
+        var_name: Имя переменной Airflow с параметрами.
+        saved: Что лежало в переменной на парсинге.
+        context: Контекст таска; по умолчанию текущий.
+        one_shot: Разовые галочки формы (удалить, закрыть, убить) — в переменную не пишутся.
+        flag: Галочка «сохранить».
+    """
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+    context = context or get_current_context()
+    if one_shot:
+        context = dict(context)
+        context['params'] = {k: v for k, v in context['params'].items() if k not in one_shot}
+    status, msg = store_params(var_name, saved, context, flag)
+    if status == 'skip':
+        raise AirflowSkipException(msg)
+    if status == 'fail':
+        raise AirflowFailException(msg)
+    return msg
 
 
 def saved_params(var_name) -> dict:

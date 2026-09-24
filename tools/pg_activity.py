@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-04 10:25 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:23 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -28,18 +28,22 @@
 | `save_s3` | Писать снимки в S3 *(default: `True`)* |
 | `keep_days` | Сколько дней держим снимки, старше — удаляем *(default: `30`)* |
 | `dry_run` | При `terminate=True` только показать кандидатов *(default: `True`)* |
-| `save_to_var` | Записать значения формы в Variable `tools_pg_activity_cfg` *(default: `False`)* |
+| `schedule` | Расписание: cron или пресет, пусто — только вручную *(default: `*/10 * * * *`)* |
+| `save_params` | Записать значения формы в Variable `tools_pg_activity_cfg` *(default: `False`)* |
 | `terminate` | Убивать найденные сессии. **В Variable не сохраняется** *(default: `False`)* |
 
-**Таски:** `collect` → `save` / `terminate` → `report`, рядом `prune` — чистка снимков.
+**Таски:** `collect` → `save` / `terminate` → `report`, рядом `prune` — чистка снимков и
+`params` — сохранение формы.
 
 Снимки лежат в бакете логов, в своей папке: `pg_activity/<YYYY-MM-DD>/<HHMMSS>.json`.
 Пустые снимки не пишутся — счётчики и так уходят в лог каждый запуск. Старые снимки
 даг убирает сам: наш S3-шлюз не принимает lifecycle-правило (`PutBucketLifecycleConfiguration`
 требует заголовок `Content-MD5`, которого boto3 больше не шлёт).
 
-> Пороги берутся из Variable `tools_pg_activity_cfg`, форма запуска ими предзаполняется.
-> Поменять порог для расписания — запуск с галкой «Сохранить настройки».
+> Пороги и расписание берутся из Variable `tools_pg_activity_cfg`, форма запуска ими
+> предзаполняется. Поменять их для плановых запусков — запуск с галкой `save_params`
+> (общий механизм `saved_params` / `store_params` из `plugins/utils.py`; до v1.6 галка
+> называлась `save_to_var`, переменная та же). Расписание применяется со следующего разбора.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -48,20 +52,24 @@ import logging
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
-from airflow.models import Param, Variable
+from airflow.models import Param
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 except ImportError:
-    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 
 logger = logging.getLogger("airflow.task")
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
 
-# Бакет и коннект — те же, что у логов задач (см. check/log_cleanup.py), но папка своя:
+# Бакет и коннект — те же, что у логов задач (см. tools/log_cleanup.py), но папка своя:
 # снимки не должны попасть под чистку логов и не должны мешаться с ними в выдаче.
 AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
@@ -85,13 +93,13 @@ DEFAULTS = {
     "dry_run": True,
 }
 
-# default_var={} обязателен: без него отсутствующая переменная роняет разбор файла
-# и вешает Broken DAG на весь даг, а не на один запуск.
-try:
-    _cfg = {**DEFAULTS, **(Variable.get(CFG_VAR, default_var={}, deserialize_json=True) or {})}
-except Exception:  # битый JSON в переменной не должен ломать разбор
-    logger.warning("Variable %s не разобрана, берём значения по умолчанию", CFG_VAR, exc_info=True)
-    _cfg = dict(DEFAULTS)
+DEFAULT_SCHEDULE = '*/10 * * * *'
+#: Разовая галочка: в переменную не сохраняется (см. выше)
+ONE_SHOT = ('terminate',)
+
+# Битая или недоступная переменная разбор не роняет: saved_params вернёт пусто
+SAVED = saved_params(CFG_VAR)
+_cfg = {**DEFAULTS, **SAVED}
 
 
 SQL_ACTIVITY = r"""
@@ -250,7 +258,7 @@ def _fetch(sql: str) -> list:
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
-    schedule_interval='*/10 * * * *',
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, CFG_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
     tags=['DataLab', 'tools', 'check'],
     catchup=False,
@@ -282,7 +290,10 @@ def _fetch(sql: str) -> list:
                            description='Сколько дней держим снимки в S3, старше — удаляем'),
         'dry_run': Param(_cfg['dry_run'], type='boolean',
                          description='При «Убивать сессии» — только показать кандидатов'),
-        'save_to_var': Param(False, type='boolean',
+        'schedule': Param(SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'],
+                          description='cron или пресет (@daily); пусто — только вручную. '
+                                      'Применяется со следующего разбора'),
+        'save_params': Param(False, type='boolean',
                              description=f'Сохранить настройки формы в Variable {CFG_VAR}'),
         'terminate': Param(False, type='boolean',
                            description='Убивать найденные сессии (в Variable не сохраняется)'),
@@ -294,12 +305,6 @@ def tools_pg_activity():
     def collect(**context) -> dict:
         """📸 Снимок pg_stat_activity, разбор находок и опознание владельцев."""
         p = context['params']
-
-        if p.get('save_to_var'):
-            saved = {k: p[k] for k in DEFAULTS}
-            Variable.set(CFG_VAR, saved, serialize_json=True)
-            logger.info("💾 Настройки сохранены в Variable %s: %s", CFG_VAR, saved)
-            add_note(f"💾 настройки сохранены в `{CFG_VAR}`: {saved}", level='task', context=context)
 
         rows = _fetch(SQL_ACTIVITY)
         owners_rows = _fetch(SQL_OWNERS)
@@ -527,6 +532,16 @@ def tools_pg_activity():
             raise AirflowFailException(f"⚠️ {head} · {counts}\n" + "\n".join(lines))
         return head
 
+    @task(task_id='params')
+    def save_params(**context) -> str:
+        """💾 Сохраняет форму (кроме terminate) в переменную как значения по умолчанию.
+
+        Сам по себе, без потомков: сорванное сохранение (битое расписание) краснит ран, но
+        снимок и отчёт от него не зависят.
+        """
+        return store_params_task(CFG_VAR, SAVED, context, one_shot=ONE_SHOT)
+
+    save_params()
     snapshot = collect()
 
     # prune не про находки: его дело — папка в S3. В цепочке до report он стоял зря,

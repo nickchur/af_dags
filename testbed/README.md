@@ -1,5 +1,5 @@
 # 🧰 Тестовый стенд
-*2026-09-14 06:53 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 12:17 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 То, что нужно, чтобы гонять DAG'и репозитория живьём на стенде (`ssh testsrv`,
 `/opt/aftest`): эмуляторы внешних систем, схемы, фикстуры, скрипты разворачивания. Здесь нет
@@ -16,9 +16,12 @@ DAG'ов, и на контуры это не нужно.
 | [`ctl_worker/`](ctl_worker/README.md) | Эмулятор CTL API (без Kerberos и Greenplum) и сборщик фикстур из снимка `edpetl-ctl`: полный цикл `run_prm → run_exe → run_end` на стенде |
 | [`gp_exchange/`](gp_exchange/README.md) | Greenplum на PostgreSQL: пакет обмена собирается по-настоящему и проезжает весь путь до `gp_vw_*` |
 | [`vault/`](vault/make_vault.py) | `make_vault.py` — эмуляция `/vault/secrets/application`: payload в формате боевого sigma DEV, секреты только из переменных окружения |
+| [`check_status_contract.py`](check_status_contract.py) | Линтер контракта `(status, payload)`: находит вызовы решателей `ctl_chk_*`, результат которых не разобран |
+| [`sql_standardize.py`](sql_standardize.py) | Разбивает монолитный `.sql` задачи на структуру папок SQL-репозитория |
 
 Раньше каталоги лежали внутри своих проектов (`ctl_worker/testbed/`, `gp_exchange/testbed/`),
-а `make_vault.py` — в `check/`, среди DAG'ов проверки. Сервисы на стенде от переезда не
+а `make_vault.py` — в `tools/`, среди служебных DAG'ов. Два скрипта-утилиты лежали в корне
+репозитория, откуда синхронизация увозила их в бакет дагов. Сервисы на стенде от переезда не
 зависят: эмулятор CTL запущен из своей копии в `/opt/aftest/ctl-mock`.
 
 ## make_vault.py

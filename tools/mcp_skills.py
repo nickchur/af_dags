@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-09-23 15:25 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:23 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -24,8 +24,19 @@ dag-processor'а и воркера; у вебсервера каталог да�
 
 | Что | Где |
 |---|---|
-| Текст документа `<путь>` | Variable `af_doc__<путь, где / заменён на __>` |
-| Оглавление: путь → sha256, размер, заголовок | Variable `af_docs` (JSON) |
+| Текст документа `<путь>` | Variable `af_doc__<путь, где / заменён на __>` — только при `store_docs` |
+| Оглавление: путь → sha256, размер, заголовок, `stored` | Variable `af_docs` (JSON) — всегда |
+
+**Хранить ли тексты — решает контур** (форма запуска, `store_docs`, по умолчанию нет).
+Вебсервер альфы читает тексты прямо из бакета дагов по `path` из оглавления, ему нужна
+только оглавление; ~400 КБ документации в метабазе там ни к чему. Вебсерверу сигмы S3
+запрещён — там тексты едут через Variables, и флаг включают запуском с `store_docs` и
+`save_params`. `stored` в записи оглавления — лежит ли в Variables текст **этой** версии
+файла: страница показывает из Variables только такие. `purge_docs` — разово удалить все
+`af_doc__*` (например, на альфе после перехода на S3).
+
+Расписание — параметр `schedule` (по умолчанию раз в 30 минут), сохраняется так же;
+пусто — только ручной запуск.
 
 Не публикуются: навыки (`*/skill/*.md` — они уже есть), `CLAUDE.md` и `CONTEXT.md`
 (правила и карта для агента), `openspec/`, `testbed/`, скрытые каталоги.
@@ -35,11 +46,17 @@ from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 from airflow.decorators import dag, task
+from airflow.models.param import Param
+from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 except ImportError:
-    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 
 logger = getLogger("airflow.task")
 
@@ -64,6 +81,16 @@ DOC_SKIP_FILES = {'CLAUDE.md', 'CONTEXT.md'}
 DOC_SKIP_DIRS = {'testbed', 'openspec', 'skill', '__pycache__'}
 
 ensure_pool(TOOLS_POOL)
+
+# Значения формы по умолчанию: код — запасной вариант, переменная — рабочий. Пишет
+# переменную только запуск с save_params=True (таск params)
+PARAMS_VAR = 'tools_mcp_skills_params'
+SAVED = saved_params(PARAMS_VAR)
+#: Разовые галочки: в переменную не сохраняются
+ONE_SHOT = ('purge_docs',)
+# Раз в 30 минут: настолько навык на эндпоинте может отстать от выложенных дагов.
+# Работа дешёвая — без изменений в файлах записи нет вовсе
+DEFAULT_SCHEDULE = '*/30 * * * *'
 
 
 def find_skills(root):
@@ -148,6 +175,25 @@ def plan(found, index, root, max_bytes=SKILL_MAX_BYTES, titles=False):
     return new_index, to_write, to_delete, skipped
 
 
+def docs_plan(found, index, root, store, purge=False):
+    """План для документов: ``(оглавление, {путь: текст на запись}, [пути на снятие], [пропущено])``.
+
+    Записи оглавления получают ``stored`` — лежит ли в Variables текст этой версии. Записи
+    старого формата (до ``stored``) считаются сохранёнными: их тексты писал прежний даг.
+    При ``purge`` сохранённого нет вовсе: всё удаляется до записи.
+    """
+    known = {} if purge else {k: v for k, v in index.items() if (v or {}).get('stored', True)}
+    new_index, to_write, to_delete, skipped = plan(found, known, root, titles=True)
+    if not store:
+        # Не храним: писать нечего, а прежние тексты этой версии остаются валидными
+        for rel, meta in new_index.items():
+            meta['stored'] = (known.get(rel) or {}).get('sha256') == meta['sha256']
+        return new_index, {}, [], skipped
+    for meta in new_index.values():
+        meta['stored'] = True
+    return new_index, to_write, to_delete, skipped
+
+
 @dag(
     doc_md=__doc__,
     default_args={
@@ -162,19 +208,43 @@ def plan(found, index, root, max_bytes=SKILL_MAX_BYTES, titles=False):
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
-    # Раз в 30 минут: настолько навык на эндпоинте может отстать от выложенных дагов.
-    # Работа дешёвая — без изменений в файлах записи нет вовсе.
-    schedule='*/30 * * * *',
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=['DataLab', 'tools', 'mcp'],
     catchup=False,
     is_paused_upon_creation=False,
+    params={
+        'store_docs': Param(
+            bool(SAVED.get('store_docs', False)), type='boolean', title='Хранить тексты документов',
+            description='Класть тексты .md в Variables af_doc__*. Нужно, где вебсервер не читает '
+                        'S3 (сигма). Оглавление af_docs пишется всегда.',
+        ),
+        'purge_docs': Param(
+            False, type='boolean', title='Удалить сохранённые тексты',
+            description='Разово удалить все af_doc__* (в переменную не сохраняется).',
+        ),
+        'schedule': Param(
+            SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'], title='Расписание',
+            description='cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора',
+        ),
+        'save_params': Param(
+            False, type='boolean', title='Сохранить параметры',
+            description=f'Записать store_docs и schedule в {PARAMS_VAR}: по ним пойдут и плановые запуски.',
+        ),
+    },
     max_active_runs=1,
     dagrun_timeout=timedelta(minutes=15),
     on_failure_callback=on_callback,
 )
 def tools_mcp_skills():
 
-    @task
+    @task(task_id='params')
+    def save_params(**context):
+        """💾 Сохраняет store_docs и schedule в переменную как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
+
+    # NONE_FAILED: params штатно пропускает себя без save_params, а пропуск апстрима по
+    # ALL_SUCCESS утянул бы в skip и публикацию
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish(**context):
         from airflow.configuration import conf
         from airflow.models import Variable
@@ -213,7 +283,7 @@ def tools_mcp_skills():
             raise ValueError("Навыки пропущены: " + "; ".join(skipped))
         return {'skills': sorted(new_index), 'written': sorted(to_write), 'deleted': to_delete}
 
-    @task
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish_docs(**context):
         from airflow.configuration import conf
         from airflow.models import Variable
@@ -224,9 +294,12 @@ def tools_mcp_skills():
             from CI06932748.tools.utils import add_note  # type: ignore
 
         root = conf.get('core', 'dags_folder')
+        p = context['params']
+        store, purge = bool(p.get('store_docs')), bool(p.get('purge_docs'))
         index = Variable.get(DOC_INDEX, default_var={}, deserialize_json=True) or {}
-        new_index, to_write, to_delete, skipped = plan(find_docs(root), index, root, titles=True)
+        new_index, to_write, to_delete, skipped = docs_plan(find_docs(root), index, root, store, purge)
 
+        purged = _purge_docs() if purge else 0
         for rel, text in to_write.items():
             Variable.set(doc_key(rel), text,
                          description=f"Документация дагов для Docs → DAG Docs: {rel}")
@@ -237,16 +310,31 @@ def tools_mcp_skills():
             Variable.set(DOC_INDEX, new_index, serialize_json=True,
                          description="Оглавление документации дагов (Docs → DAG Docs): путь → sha256, размер, заголовок")
 
-        title = f"DAG Docs: {len(new_index)}, записано {len(to_write)}, снято {len(to_delete)}"
-        rows = [f"✏️ `{r}`" for r in sorted(to_write)] + [f"🗑️ `{r}`" for r in to_delete]
+        stored = sum(1 for m in new_index.values() if m['stored'])
+        title = (f"DAG Docs: {len(new_index)}, тексты {'хранятся' if store else 'не хранятся'} "
+                 f"({stored}), записано {len(to_write)}, снято {len(to_delete)}")
+        rows = [f"🧹 удалено сохранённых текстов: {purged}"] if purge else []
+        rows += [f"✏️ `{r}`" for r in sorted(to_write)] + [f"🗑️ `{r}`" for r in to_delete]
         rows += [f"❌ {s}" for s in skipped]
         add_note("\n".join(rows) or "без изменений", context, level='DAG,task', title=title)
         if skipped:
             raise ValueError("Документы пропущены: " + "; ".join(skipped))
-        return {'docs': len(new_index), 'written': sorted(to_write), 'deleted': to_delete}
+        return {'docs': len(new_index), 'stored': stored, 'written': sorted(to_write),
+                'deleted': to_delete, 'purged': purged}
 
-    publish()
-    publish_docs()
+    def _purge_docs():
+        """Удаляет все Variables ``af_doc__*``. Возвращает, сколько удалено."""
+        from airflow.models import Variable
+        from airflow.utils.session import create_session
+
+        with create_session() as session:
+            rows = session.query(Variable).filter(Variable.key.like(f'{DOC_PREFIX}%')).all()
+            for row in rows:
+                session.delete(row)
+            return len(rows)
+
+    params_done = save_params()
+    params_done >> [publish(), publish_docs()]
 
 
 tools_mcp_skills()

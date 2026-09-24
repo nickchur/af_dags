@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-21 11:10 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:18 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -54,12 +54,12 @@ import logging
 try:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
-        saved_params, store_params, valid_schedule,
+        saved_params, store_params, saved_schedule,
     )
 except ImportError:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
-        saved_params, store_params, valid_schedule,
+        saved_params, store_params, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -330,15 +330,6 @@ def _param(key, default, **kwargs):
 DEFAULT_SCHEDULE = '0 2 * * *'
 
 
-def _schedule():
-    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
-    value = SAVED.get('schedule', DEFAULT_SCHEDULE)
-    if not valid_schedule(value):
-        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
-        return DEFAULT_SCHEDULE
-    return None if value in (None, '', 'None') else str(value).strip()
-
-
 params = {
     'retention_days': _param(
         'retention_days', 180,
@@ -400,7 +391,7 @@ params = {
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    schedule=_schedule(),
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     on_failure_callback=on_callback,
     params=params,
 )

@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-16 22:32 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:52 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -58,11 +58,11 @@ from airflow.models import Param
 try:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
-        valid_schedule)
+        saved_schedule)
 except ImportError:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
-        valid_schedule)
+        saved_schedule)
 
 logger = logging.getLogger("airflow.task")
 
@@ -238,7 +238,7 @@ def _queue_lengths(app, names) -> dict:
 
     Длину спрашиваем по короткому имени: kombu сам допишет global_keyprefix к LLEN
     (у нас `{dataplatform}`), а к LRANGE — нет (GlobalKeyPrefixMixin, kombu 5.6.2; подробно —
-    check/queue_cleanup.py, _read_queues). Здесь нужна только длина, так что это безопасно.
+    tools/queue_analyze.py, _read_queues). Здесь нужна только длина, так что это безопасно.
     """
     out = {}
     with app.connection_for_read() as conn:
@@ -640,15 +640,6 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
-def _schedule():
-    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
-    value = SAVED.get("schedule", DEFAULT_SCHEDULE)
-    if not valid_schedule(value):
-        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
-        return DEFAULT_SCHEDULE
-    return None if value in (None, "", "None") else str(value).strip()
-
-
 @dag(
     doc_md=__doc__,
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
@@ -656,7 +647,7 @@ def _schedule():
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,
         "retries": 0,
-        # Как у остальных коротких проверок (check/readme.md): выше регрессионных прогонов
+        # Как у остальных коротких проверок (tools/readme.md): выше регрессионных прогонов
         # того же пула, ниже агента CTL; absolute — чтобы вес не складывался по цепочке
         "priority_weight": 900,
         "weight_rule": "absolute",
@@ -667,7 +658,7 @@ def _schedule():
     },
     # Часовой пояс DAG-а берётся из start_date.tzinfo — расписание московское
     start_date=datetime(2026, 9, 14, tzinfo=MSK),
-    schedule=_schedule(),
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools: служебный DAG — ролевка ограничивает запуск (HRPDATALAB-15421), а
     # get_system_health показывает его в разделе служебных
     tags=["DataLab", "tools", "check"],

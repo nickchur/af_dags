@@ -1,9 +1,10 @@
 """SQL Script Standardization Utility
+*2026-09-24 12:17 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Разбивает монолитный .sql файл задачи на стандартную структуру папок репозитория.
 
 Использование:
-    python sql_standardize.py <input.sql> <task_dir> [опции]
+    python testbed/sql_standardize.py <input.sql> <task_dir> [опции]
 
 | Аргумент         | Описание                                                             |
 |------------------|----------------------------------------------------------------------|
