@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-09-24 10:02 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:23 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -35,6 +35,9 @@ dag-processor'а и воркера; у вебсервера каталог да�
 файла: страница показывает из Variables только такие. `purge_docs` — разово удалить все
 `af_doc__*` (например, на альфе после перехода на S3).
 
+Расписание — параметр `schedule` (по умолчанию раз в 30 минут), сохраняется так же;
+пусто — только ручной запуск.
+
 Не публикуются: навыки (`*/skill/*.md` — они уже есть), `CLAUDE.md` и `CONTEXT.md`
 (правила и карта для агента), `openspec/`, `testbed/`, скрытые каталоги.
 """
@@ -47,10 +50,12 @@ from airflow.models.param import Param
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback, saved_params, store_params  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, saved_params, store_params,
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -83,6 +88,9 @@ PARAMS_VAR = 'tools_mcp_skills_params'
 SAVED = saved_params(PARAMS_VAR)
 #: Разовые галочки: в переменную не сохраняются
 ONE_SHOT = ('purge_docs',)
+# Раз в 30 минут: настолько навык на эндпоинте может отстать от выложенных дагов.
+# Работа дешёвая — без изменений в файлах записи нет вовсе
+DEFAULT_SCHEDULE = '*/30 * * * *'
 
 
 def find_skills(root):
@@ -200,9 +208,7 @@ def docs_plan(found, index, root, store, purge=False):
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
-    # Раз в 30 минут: настолько навык на эндпоинте может отстать от выложенных дагов.
-    # Работа дешёвая — без изменений в файлах записи нет вовсе.
-    schedule='*/30 * * * *',
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=['DataLab', 'tools', 'mcp'],
     catchup=False,
     is_paused_upon_creation=False,
@@ -216,9 +222,13 @@ def docs_plan(found, index, root, store, purge=False):
             False, type='boolean', title='Удалить сохранённые тексты',
             description='Разово удалить все af_doc__* (в переменную не сохраняется).',
         ),
+        'schedule': Param(
+            SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'], title='Расписание',
+            description='cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора',
+        ),
         'save_params': Param(
             False, type='boolean', title='Сохранить параметры',
-            description=f'Записать store_docs в {PARAMS_VAR}: по нему пойдут и плановые запуски.',
+            description=f'Записать store_docs и schedule в {PARAMS_VAR}: по ним пойдут и плановые запуски.',
         ),
     },
     max_active_runs=1,
@@ -229,18 +239,8 @@ def tools_mcp_skills():
 
     @task(task_id='params')
     def save_params(**context):
-        """💾 Сохраняет store_docs в переменную как значение по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        # Разовые галочки в переменную не уезжают: store_params пишет всю форму
-        ctx = dict(context)
-        ctx['params'] = {k: v for k, v in context['params'].items() if k not in ONE_SHOT}
-        status, msg = store_params(PARAMS_VAR, SAVED, ctx)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        return msg
+        """💾 Сохраняет store_docs и schedule в переменную как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     # NONE_FAILED: params штатно пропускает себя без save_params, а пропуск апстрима по
     # ALL_SUCCESS утянул бы в skip и публикацию
