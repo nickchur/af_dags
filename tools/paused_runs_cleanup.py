@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-09-24 11:26 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 14:46 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Находит раны в `running` / `queued` у дагов на паузе и, если попросили, закрывает их —
 как кнопка **Mark failed** в UI.
@@ -22,9 +22,18 @@
 закрывает такие раны CTL-дагов: отсчёт от движения, а не от старта, иначе ран, шедший пять
 часов и запаузенный сейчас, закрылся бы через час.
 
-**Закрытие** (`close=True`) — `set_dag_run_state_to_failed` (`airflow/api/common/mark_tasks.py`),
-тот же вызов, что у кнопки: незавершённые задачи → `skipped`, ран → `failed`. Если даг
-пропал из сериализации (файл удалён), то же делается запросом к метабазе. На ран пишется
+**Закрытие** (`close=True`) — результат как у кнопки: незавершённые задачи → `skipped`, ран →
+`failed`. Делается одним запросом в одной сессии на ран, а не вызовом кнопки
+`set_dag_run_state_to_failed` (`airflow/api/common/mark_tasks.py`). У того два дефекта,
+оба пойманы на сигме 24.09.2026:
+
+* ищет каждую задачу рана в текущем коде дага — у старого рана задачи, которых в коде уже
+  нет, дают `KeyError` (`reload_adapt_1_pers_static_data_daily`, ран от 05.05);
+* ставит `skipped` каждой задаче своей сессией. В таске пул соединений выключен, то есть
+  это новое подключение к метабазе на задачу; одно повисло на переборе хостов, и таск
+  упал по `execution_timeout`.
+
+На ран пишется
 заметка, в журнал `log` — событие `paused_run_failed`. **Паузу даг не снимает** и сами даги
 не трогает. Задачи в `scheduled` у таких ранов лежат внутри `running` и уходят в `skipped`;
 у рана своего состояния `scheduled` нет.
@@ -311,18 +320,19 @@ def tools_paused_runs_cleanup():
 
 
 def _close_run(r, me):
-    """Закрывает один ран: как Mark failed, а без сериализованного дага — запросом.
+    """Закрывает один ран одной сессией: задачи → skipped одним UPDATE, ран → failed.
+
+    Не через `set_dag_run_state_to_failed` — почему, см. шапку модуля.
 
     Returns:
-        Как закрыт: `mark failed` или `ORM` (даг не сериализован), со счётом задач.
+        Сколько задач ушло в skipped, или «уже <состояние>».
     """
     import json
 
-    from sqlalchemy import and_, or_
+    from sqlalchemy import or_
 
-    from airflow.api.common.mark_tasks import set_dag_run_state_to_failed
     from airflow.models import DagRun, Log, TaskInstance
-    from airflow.models.serialized_dag import SerializedDagModel
+    from airflow.utils import timezone as af_tz
     from airflow.utils.session import create_session
     from airflow.utils.state import DagRunState, State, TaskInstanceState
 
@@ -332,31 +342,18 @@ def _close_run(r, me):
         if dr is None or dr.state not in (DagRunState.RUNNING, DagRunState.QUEUED):
             return f"уже {dr.state if dr else 'удалён'}"
 
-        dag = SerializedDagModel.get_dag(r['dag_id'], session=session)
-        how = 'ORM'
-        if dag is not None:
-            changed = set_dag_run_state_to_failed(dag=dag, run_id=r['run_id'], commit=True, session=session)
-            how = f"mark failed, задач {len(changed)}"
-        # Добор: задачи, которых нет в текущей версии дага, mark_tasks не видит; без дага —
-        # всё здесь. Задачу в running не трогаем: find такие раны не отдаёт
-        left = (session.query(TaskInstance)
-                .filter(TaskInstance.dag_id == r['dag_id'], TaskInstance.run_id == r['run_id'],
-                        or_(TaskInstance.state.is_(None),
-                            and_(TaskInstance.state.notin_(list(State.finished)),
-                                 TaskInstance.state != TaskInstanceState.RUNNING)))
-                .all())
-        for ti in left:
-            ti.set_state(TaskInstanceState.SKIPPED, session=session)
-        if left:
-            how += f", добрано skipped {len(left)}"
-        # Перечитать, а не refresh: mark_tasks ставит skipped своей сессией (ti.set_state без
-        # session) и коммитит сам, наш объект рана после этого отсоединён
-        session.flush()
-        session.expire_all()
-        dr = (session.query(DagRun)
-              .filter(DagRun.dag_id == r['dag_id'], DagRun.run_id == r['run_id']).one())
-        if dr.state != DagRunState.FAILED:
-            dr.set_state(DagRunState.FAILED)
+        ti = TaskInstance
+        mine = (ti.dag_id == r['dag_id'], ti.run_id == r['run_id'])
+        # Задача в running: find такие раны не отдаёт, но она могла стартовать между find и
+        # close. Не трогаем — доработает, и ран закроется в следующий проход
+        if session.query(ti.task_id).filter(*mine, ti.state == TaskInstanceState.RUNNING).first():
+            return "оставлен: задача в running"
+        n = (session.query(ti)
+             .filter(*mine, or_(ti.state.is_(None), ti.state.notin_(list(State.finished))))
+             .update({ti.state: TaskInstanceState.SKIPPED, ti.end_date: af_tz.utcnow()},
+                     synchronize_session=False))
+        how = f"skipped задач {n}"
+        dr.set_state(DagRunState.FAILED)  # и end_date рана
 
         note = (f"Закрыт {me}: даг на паузе ({r['paused']}), ран висел в {r['state']} "
                 f"{r['age_h']} ч")
