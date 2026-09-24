@@ -1,13 +1,13 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-24 11:38 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:58 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
 выясняли руками по логу шедулера и ответам health, — а чистка брокера стала одним таском
 по галочке `purge`.
 
-**Таски:** `params` → `broker` / `scheduler` / `capacity` → `purge` (только при `purge`) →
-`report`; рядом `prune` — чистка дампов.
+**Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` (только при
+`purge`) ждёт `broker`; `report` — всех, при любом их исходе; `prune` — чистка дампов, сам по себе.
 
 | Таск | Что смотрит |
 |---|---|

@@ -5,7 +5,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 # Служебные даги (`tools/`)
 
-*2026-09-24 11:54 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:58 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -41,9 +41,11 @@ description: Служебные даги Airflow (каталог tools/, на с
 - **Разовые галочки не сохраняются никогда**: `purge` (`queue_analyze`), `terminate`
   (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение
   — `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
-- **Даги, которые что-то меняют, создаются на паузе** (`is_paused_upon_creation=True`):
-  `db_cleanup`, `log_cleanup`, `pg_activity`, `queue_analyze`, `paused_runs_cleanup`, `log_events`.
-  Даг на паузе на контуре — обычно решение человека, а не авария.
+- **Создаются на паузе** (`is_paused_upon_creation=True`): `db_cleanup`, `log_cleanup`,
+  `log_events`, `pg_activity`, `queue_analyze`, `paused_runs_cleanup`, а также ручные
+  `test_kafka_*` и `dummy`. Включены сразу: `system_health`, `mcp_skills`, `show_connections`,
+  `test_connections`, `test_dags`, `test_hrp_operators`. Даг на паузе на контуре — обычно
+  решение человека, а не авария.
 - **Итог — в заметках** рана и задач (`add_note`): ✅ / ❌ / ☮️. XCom тебе недоступен.
 
 ## 2. Даги
@@ -56,7 +58,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 | `tools_system_health` | `7 * * * *` | Снимок Health раз в час: компоненты, celery, бакет логов, пулы, метабаза, разбор файлов | ничего |
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log`: `stuck in queued`, `heartbeat timeout`, `state mismatch` | ничего |
 | `tools_db_cleanup` | `0 2 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
-| `tools_log_cleanup` | `17 5 * * *` | Сроки хранения по папкам бакета логов | **удаляет**; правило жизненного цикла работает само |
+| `tools_log_cleanup` | `17 5 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и выставляет правило жизненного цикла — по нему хранилище удаляет само, без отчёта |
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора файлов | ничего; никогда не падает |
 | `tools_show_connections` | `0 23 * * *` | Подключения secret backend по типам → Variable `local_connections` | Variable |
 | `tools_test_connections` | `15 23 * * *` | Доступность каждого подключения, ✅/❌/☮️ | ничего |
@@ -67,7 +69,8 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 ## 3. `tools_queue_analyze` — как читать отчёт
 
-Таски: `params` → `broker` / `scheduler` / `capacity` → `purge` → `report`, рядом `prune`.
+Таски: после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` ждёт только
+`broker`; `report` — всех (идёт при любом их исходе); `prune` (чистка дампов) сам по себе.
 Заметка `🔬 Разбор очереди` на ране: сначала **выводы**, потом таблица по разделам.
 
 У каждой живой задачи в `scheduled` (даг не на паузе, ран `running`), которая ждёт дольше
