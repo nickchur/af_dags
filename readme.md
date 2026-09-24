@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-24 11:16 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:53 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -29,16 +29,24 @@ s3_tools/                # S3-инструменты альфы (ручной з
 ├── s3_set_ttl.py        # ⏱️ Управление TTL-правилами S3-бакета
 ├── s3_bucket_list.py    # 📋 Список всех бакетов по всем S3-подключениям
 ├── s3_bucket_viewer.py  # 🪣 Список бакетов через HrpS3BucketViewerOperator
-├── s3_viewer.py         # 🗂️ Список ключей и чтение файлов через HrpS3*Operator
-└── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
+└── s3_viewer.py         # 🗂️ Список ключей и чтение файлов через HrpS3*Operator
 
 tools/                   # Служебные DAG'и: проверка и обслуживание → tools/readme.md
 ├── show_connections.py  # 🔌 Подключения из secret backend, сгруппированные по типу
 ├── test_connections.py  # 🔎 Проверка доступности всех подключений + serialized_dag
 ├── test_hrp_operators.py # 🧪 Функциональный стенд для hrp_operators (pg↔s3↔ch)
 ├── test_kafka.py        # 📨 Проверка Kafka: продюсер и консьюмер тестовых сообщений
+├── test_dags.py         # 🧬 Проверка сериализации DAG'ов, снимки версий
 ├── db_cleanup.py        # 🧹 Очистка метадаты Airflow старше N дней
-└── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
+├── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
+├── log_events.py        # 📊 Сбои доставки задач: отчёт по журналу метабазы
+├── system_health.py     # 🩺 Снимок состояния контура раз в час
+├── pg_activity.py       # 🐘 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
+├── queue_analyze.py     # 🔬 Разбор очереди: почему задачи ждут; чистка брокера по галочке
+├── paused_runs_cleanup.py # ⏸️ Зависшие раны запаузенных дагов: отчёт и Mark failed
+├── mcp_skills.py        # 🧭 Навыки агента и документация дагов → Variables для MCP
+├── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
+└── skill/tools.md       # 🤖 Навык агента: служебные даги
 
 gp_exchange/                 # Приём универсального обмена из ПКАП: S3 → ClickHouse
 ├── tfs_exchange_sensor.py   # 📡 S3KeySensor на ue_exchange_*.csv, публикует Dataset

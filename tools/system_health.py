@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-24 11:18 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:52 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -238,7 +238,7 @@ def _queue_lengths(app, names) -> dict:
 
     Длину спрашиваем по короткому имени: kombu сам допишет global_keyprefix к LLEN
     (у нас `{dataplatform}`), а к LRANGE — нет (GlobalKeyPrefixMixin, kombu 5.6.2; подробно —
-    tools/queue_cleanup.py, _read_queues). Здесь нужна только длина, так что это безопасно.
+    tools/queue_analyze.py, _read_queues). Здесь нужна только длина, так что это безопасно.
     """
     out = {}
     with app.connection_for_read() as conn:

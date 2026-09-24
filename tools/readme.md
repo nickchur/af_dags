@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-24 11:36 MSK · v1.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:53 MSK · v1.24 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -86,8 +86,8 @@ DAG автоматически обнаруживает все подключе�
 *   **Таски**: `params` → `layout` → `sweep` → `report`; каждая пишет заметку.
 *   **Папки бакета плоские**: логи задач под своим префиксом, всё остальное — в корне:
     `system_health/` (отбивки воркеров от ядра платформы и проба этого репозитория), дампы соседних
-    дагов (`dag_snapshots/`, `queue_cleanup/`, `pg_activity/`) и тракт ТФС (`tfs/`). Соседи убирают своё сами и по
-    своим правилам: `pg_activity` и `queue_cleanup` — по дате в имени ключа, `test_dags` —
+    дагов (`dag_snapshots/`, `queue_cleanup/` — папка `queue_analyze`, `pg_activity/`) и тракт ТФС (`tfs/`). Соседи убирают своё сами и по
+    своим правилам: `pg_activity` и `queue_analyze` — по дате в имени ключа, `test_dags` —
     по тому, жив ли ещё даг. Здесь для них страховка со сроком не меньше их собственного, а
     снимкам дагов и тракту ТФС срок не задан вовсе: их возраст ничего не значит — единственная
     версия редко меняющегося дага может быть полугодовой давности, а файлы в `tfs/queue/` ждут
@@ -262,11 +262,33 @@ failed — как кнопка Mark failed: незавершённые зада�
     сохраняются в `tools_paused_runs_cleanup_params`. `close` сохраняемый: чтобы закрывали и
     плановые запуски, один раз запустить с `close` и `save_params`.
 
-### [queue_cleanup.py](queue_cleanup.py)
-**Чистка очереди celery от сообщений без задач (`tools_queue_cleanup`).**
+### [queue_analyze.py](queue_analyze.py)
+**Разбор очереди: почему задачи ждут, и мусор в брокере (`tools_queue_analyze`, вручную).**
 
-Обходит очереди брокера, размечает каждое сообщение по метабазе и точечно удаляет мусор.
-Расписания нет: инструмент разбора, а не регулярная чистка.
+До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`), только брокер. Теперь даг прежде
+всего разбирает очередь, а чистка брокера — один таск по разовой галочке `purge`. Таски:
+`params` → `broker` / `scheduler` / `capacity` → `purge` → `report`, рядом `prune`.
+
+*   **`scheduler`** — каждая живая задача в `scheduled` (даг не на паузе, ран `running`),
+    ждущая дольше `stale_min` (5 мин), получает одну причину по порядку: **лимит дага**
+    (`queued`+`running` ≥ `max_active_tasks`) → **пул** исчерпан → **приоритет** (вес ниже
+    медианы задач, ушедших в работу за час) → **прочее**. Отдельно: задачи на парковке (даг на
+    паузе или ран не `running`), раны за сутки, закрытые без единого старта (след
+    `dagrun_timeout` при голодании), раны запаузенных дагов (→ `tools_paused_runs_cleanup`).
+*   **`capacity`** — `queued`+`running` против `parallelism` × живые шедулеры (`job`,
+    хартбит свежее `scheduler_health_check_threshold`); слоты воркеров из снимка отбивок
+    (etl-core `health_beacon`), если он есть на контуре. `parallelism` — из конфига
+    воркера: у шедулера он может быть другим, его значение даёт MCP `get_config_value`.
+*   **`report`** — заметка на ран, сначала **выводы словами**, потом таблица по разделам.
+    Правила вывода — в шапке модуля; они из разбора 23–24.09.2026 на сигме: 297 задач в
+    `scheduled` были лимитом `max_active_tasks` дагов `raw_to_stable_*`, а не утечкой слотов;
+    `tfs_kafka_snd` с весом 1 проигрывал весам 22–1921 и закрывался по `dagrun_timeout` без
+    старта. Разбор целиком — `queue_cleanup/<дата>/<время>_analyze.json` в бакете логов.
+*   **Параметры**: `stale_min`, `queues`, `min_junk_share`, `max_delete`, `keep_days`,
+    `schedule` (по умолчанию пусто — вручную) сохраняются в `tools_queue_analyze_params`;
+    пока её нет, умолчания берутся из прежней `tools_queue_cleanup_cfg`. `purge` не сохраняется.
+
+**`broker` и `purge`** — прежняя разметка и чистка, перенесены без изменений:
 
 *   **Что считается мусором**: сообщение, чья задача отсутствует в метабазе или уже в
     терминальном состоянии (`success`, `failed`, `skipped`, `upstream_failed`, `removed`).
@@ -362,7 +384,7 @@ S3-инструментах альфы.
 ## Сохраняемые параметры
 
 `db_cleanup`, `log_cleanup`, `log_events`, `system_health`, `pg_activity`, `mcp_skills`,
-`paused_runs_cleanup`, `show_connections`, `test_connections` и `test_dags` берут значения по умолчанию из своей Airflow
+`paused_runs_cleanup`, `queue_analyze`, `show_connections`, `test_connections` и `test_dags` берут значения по умолчанию из своей Airflow
 Variable (`tools_<имя>_params`; у `pg_activity` — `tools_pg_activity_cfg`), а при её отсутствии —
 из кода. Механизм общий — `saved_params`, `saved_schedule` и `store_params_task` в
 `plugins/utils.py`; сохраняет отдельный таск `params` галочкой `save_params`. Variable записывается только запуском с галочкой
@@ -375,11 +397,12 @@ Variable (`tools_<имя>_params`; у `pg_activity` — `tools_pg_activity_cfg`)
 а уже записанное битым игнорируется в пользу кода — иначе разбор файла упал бы и убрал из
 UI саму форму, через которую это чинят.
 
-`queue_cleanup` устроен так же (Variable `tools_queue_cleanup_cfg`), но параметра `schedule`
-у него нет: расписания у чистки брокера быть не должно.
+`queue_analyze` устроен так же (Variable `tools_queue_analyze_params`); расписание у него
+по умолчанию пустое, а удаление из брокера (`purge`) — разовое, так что плановый запуск только
+разбирает.
 
 Разрушительные галки в Variable **не сохраняются** никогда — ни убийство сессий в
-`pg_activity`, ни удаление из очереди в `queue_cleanup`: следующий запуск ничего не сделает
+`pg_activity`, ни удаление из очереди в `queue_analyze`, ни `purge_docs` в `mcp_skills`: следующий запуск ничего не сделает
 сам.
 
 ## Индикаторы статусов
