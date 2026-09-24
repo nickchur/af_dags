@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-22 14:41 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 18:37 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -118,11 +118,11 @@ config = {
     'ue_category': "p1080.sdpue",
     "archive_category": "p1080.ARCHIVE",
     "event_expire": "time=0:00",
-    # Лестница таймаутов (plugins/ctl_core.py): сервер GP рвёт запрос через 3 ч, наш
-    # statement_timeout на 5 мин ниже. exe_timeout и sla_time убраны 22.09.2026: первый
-    # потолком не был, второй (Airflow-SLA) не срабатывал
-    'gp_server_limit': 'hours=3',
-    'gp_timeout': 'minutes=175',   # statement_timeout, если у воркфлоу нет wf_timeout
+    # Лестница таймаутов (plugins/ctl_core.py): сервер GP рвёт запрос через 4 ч 30 (правило
+    # GPCC «Query Time 4,5H (GLOBAL)»), наш statement_timeout на 5 мин ниже. exe_timeout и
+    # sla_time убраны 22.09.2026: первый потолком не был, второй (Airflow-SLA) не срабатывал
+    'gp_server_limit': 'minutes=270',
+    'gp_timeout': 'minutes=265',   # statement_timeout, если у воркфлоу нет wf_timeout
     'task_timeout': 'hours=1',     # execution_timeout задач воркера, кроме run_exe/run_tfs
     'zombie_after': 'hours=6',     # санитар: > gp_timeout + 10 мин
     'run_stale': 'hours=6',        # монитор: RUNNING → reRunned, >= zombie_after

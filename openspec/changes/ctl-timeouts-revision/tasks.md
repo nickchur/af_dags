@@ -3,8 +3,8 @@
 ## 1. Потолок запроса в Greenplum
 
 - [x] 1.1 `plugins/ctl_core.py`: `gp_timeout(params)` — `wf_timeout` (минуты числом или
-      `str2timedelta`), иначе `gp_timeout` из конфига (`minutes=175`), и признак «не ниже
-      `gp_server_limit`». Проверка: 15 → 15 мин, `minutes=1` → 1 мин, пусто → 2 ч 55,
+      `str2timedelta`), иначе `gp_timeout` из конфига (`minutes=265`; до 24.09.2026 — `minutes=175`), и признак «не ниже
+      `gp_server_limit`». Проверка: 15 → 15 мин, `minutes=1` → 1 мин, пусто → 4 ч 25,
       600 → 10 ч с предупреждением.
 - [x] 1.2 `ctl_worker.py`: три копии разбора (`run_tfs`, `run_exe` дважды) → `gp_timeout`;
       предупреждение в лог и заметку `Run_prm`. Проверка: заметка показывает потолок и
