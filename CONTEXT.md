@@ -32,7 +32,7 @@
 |---|---|---|---|---|---|
 | `ctl_worker/` | `ctl_worker/readme.md` | 2026-09-24 | `openspec/specs/ctl-worker/spec.md` | 2026-09-17 ⚠️ | 2026-09-24 |
 | `er_export/` | `er_export/README.md` | 2026-09-23 | `openspec/specs/er-export/spec.md` | 2026-09-01 ⚠️ | 2026-09-24 |
-| `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 | 2026-09-02 |
+| `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 ⚠️ | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 ⚠️ | 2026-09-24 |
 | `plugins/` | `plugins/readme.md` | 2026-09-22 | `openspec/specs/plugins/spec.md` | 2026-09-17 ⚠️ | 2026-09-24 |
 | `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 | `openspec/specs/s3-tools/spec.md` | 2026-09-24 | 2026-09-24 |
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-24 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 ⚠️ | 2026-09-24 |
