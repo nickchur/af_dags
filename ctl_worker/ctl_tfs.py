@@ -181,7 +181,7 @@ def _on_delivery_tfs(err, msg) -> None:
 # Путь собираем из __name__, а не пишем строкой: имя модуля у DAG-файла Airflow
 # придумывает сам (unusual_prefix_<hash>_ctl_tfs) и кладёт модуль в sys.modules, поэтому
 # import_string находит функцию и в шедулере, и в воркере — оба сначала разбирают файл.
-# Тот же приём в check/test_kafka.py; прибитые пути на CI06932748 (xs_export, gp_exchange)
+# Тот же приём в tools/test_kafka.py; прибитые пути на CI06932748 (xs_export, gp_exchange)
 # работают только на контуре и на стенде не резолвятся.
 _ON_DELIVERY_TFS = f"{__name__}._on_delivery_tfs"
 

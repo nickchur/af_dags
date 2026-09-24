@@ -238,7 +238,7 @@ def _queue_lengths(app, names) -> dict:
 
     Длину спрашиваем по короткому имени: kombu сам допишет global_keyprefix к LLEN
     (у нас `{dataplatform}`), а к LRANGE — нет (GlobalKeyPrefixMixin, kombu 5.6.2; подробно —
-    check/queue_cleanup.py, _read_queues). Здесь нужна только длина, так что это безопасно.
+    tools/queue_cleanup.py, _read_queues). Здесь нужна только длина, так что это безопасно.
     """
     out = {}
     with app.connection_for_read() as conn:
@@ -656,7 +656,7 @@ def _schedule():
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,
         "retries": 0,
-        # Как у остальных коротких проверок (check/readme.md): выше регрессионных прогонов
+        # Как у остальных коротких проверок (tools/readme.md): выше регрессионных прогонов
         # того же пула, ниже агента CTL; absolute — чтобы вес не складывался по цепочке
         "priority_weight": 900,
         "weight_rule": "absolute",

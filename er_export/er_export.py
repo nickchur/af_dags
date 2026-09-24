@@ -1255,7 +1255,7 @@ def _dag_params(gp: dict, tables: dict) -> dict:
         # <option value="{{ option }}">, и None превращается в 'None', которую схема
         # потом отвергает («'None' is not one of [None, 'FULL_UK', ...]»). Строковый
         # 'None' — принятая в репозитории договорённость, key_map отбрасывает его
-        # наравне с пустотой, см. tools/s3_checker.py.
+        # наравне с пустотой, см. s3_tools/s3_checker.py.
         'strategy': Param(
             'None', type=['string'], title='Strategy',
             enum=['None', 'FULL_UK', 'FULL_NO_UK', 'INC', 'APPEND'],

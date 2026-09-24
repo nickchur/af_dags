@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-14 06:53 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:16 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -21,7 +21,7 @@ ctl_worker/          # DAG'и Airflow
 ├── ctl_test.py      # 🧪 Симулятор: тестовые события / Dataset-сигналы / случайные триггеры
 └── ctl_test_conn.py # 🔌 Мониторинг подключений (CTL, GP, PG, S3) с backoff
 
-tools/                   # Служебные DAG'и (ручной запуск) → tools/readme.md
+s3_tools/                # S3-инструменты альфы (ручной запуск) → s3_tools/readme.md
 ├── s3_from_content.py   # 📤 Загрузка текстового контента в S3
 ├── s3_to_s3.py          # 📦 Копирование объекта между S3-бакетами
 ├── s3_to_s3_test.py     # 🔍 Поиск по маске и копирование/перемещение S3→S3
@@ -32,7 +32,7 @@ tools/                   # Служебные DAG'и (ручной запуск)
 ├── s3_viewer.py         # 🗂️ Список ключей и чтение файлов через HrpS3*Operator
 └── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
 
-check/                   # DAG'и проверки и обслуживания → check/readme.md
+tools/                   # Служебные DAG'и: проверка и обслуживание → tools/readme.md
 ├── show_connections.py  # 🔌 Подключения из secret backend, сгруппированные по типу
 ├── test_connections.py  # 🔎 Проверка доступности всех подключений + serialized_dag
 ├── test_hrp_operators.py # 🧪 Функциональный стенд для hrp_operators (pg↔s3↔ch)
@@ -167,8 +167,8 @@ bash .githooks/install.sh
 | `er_export/` | `openspec/specs/er-export/spec.md` | полная |
 | `tfs_kafka/` | `openspec/specs/tfs-kafka/spec.md` | полная |
 | `xs_export/` | `openspec/specs/xs-export/spec.md` | полная |
+| `s3_tools/` | `openspec/specs/s3-tools/spec.md` | полная |
 | `tools/` | `openspec/specs/tools/spec.md` | полная |
-| `check/` | `openspec/specs/check/spec.md` | полная |
 | `gp_exchange/` | `openspec/specs/gp-exchange/spec.md` | полная |
 
 Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —

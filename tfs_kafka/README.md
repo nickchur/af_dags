@@ -1,5 +1,5 @@
 # 📡 Тракт Kafka ↔ ТФС
-*2026-09-23 14:49 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:16 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Приём обратных квитанций и отправка уведомлений с соблюдением темпа. Общий контур:
 сейчас им пользуется ЕР, следующим переезжает xStream.
@@ -283,7 +283,7 @@ TFS_ROUTES = {
 ## Кто ещё трогает этот топик
 
 Никто не должен. Единственный законный конкурент — `tools_test_kafka_rcv` в режиме
-`wait` (`ctl/check/test_kafka.py`): он работает в той же consumer group и уводит
+`wait` (`tools/test_kafka.py`): он работает в той же consumer group и уводит
 сообщения. Запускать его на `TFS.HRPLT.OUT` можно только при остановленном
 `tfs_kafka_rcv`. Для разбора инцидентов обычно достаточно `export.tfs_receipts`.
 

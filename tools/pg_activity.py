@@ -61,7 +61,7 @@ logger = logging.getLogger("airflow.task")
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
 
-# Бакет и коннект — те же, что у логов задач (см. check/log_cleanup.py), но папка своя:
+# Бакет и коннект — те же, что у логов задач (см. tools/log_cleanup.py), но папка своя:
 # снимки не должны попасть под чистку логов и не должны мешаться с ними в выдаче.
 AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]

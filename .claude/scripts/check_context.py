@@ -36,8 +36,9 @@ PROJECTS = {
     'er_export': 'er-export',
     'tfs_kafka': 'tfs-kafka',
     'xs_export': 'xs-export',
+    # tools/ — служебные даги (до 24.09.2026 check/), s3_tools/ — S3-инструменты альфы
     'tools': 'tools',
-    'check': 'check',
+    's3_tools': 's3-tools',
     'gp_exchange': 'gp-exchange',
 }
 

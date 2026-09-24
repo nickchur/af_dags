@@ -1,8 +1,13 @@
 """
-# Тестовый DAG
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+### 🧪 DAG: Проверка отображения Markdown
+*2026-09-24 11:17 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Используется для проверки отображения Markdown в Airflow UI.
+Пустой даг: одна задача `EmptyOperator`. Нужен, чтобы посмотреть, как Airflow UI рисует
+`doc_md` — таблицы, цитаты, списки, ссылки, блоки кода — и проверить колбэки
+(`on_callback`) на ране, который ничего не делает. Запускается только вручную.
+
+С 24.09.2026 лежит среди служебных дагов `tools/` (раньше — в S3-инструментах альфы) и
+оформлен по их стандарту: владелец DataLab, пул `TOOLS_POOL`, приоритет 900.
 
 ---
 
@@ -30,32 +35,46 @@
 ```
 """
 
-from datetime import datetime, timezone
-from airflow.operators.empty import EmptyOperator
-from airflow.decorators import dag
+from datetime import datetime, timedelta, timezone
 
-from plugins.utils import on_callback, default_args  # type: ignore
+from airflow.decorators import dag
+from airflow.operators.empty import EmptyOperator
+
+try:
+    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 
 @dag(
+    dag_id='tools_dummy',
     doc_md=__doc__,
-    tags=['HR_Data', 'tools', 'dummy'],
-    owner_links={'HR_Data (CI02750757)': 'https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=1774392110'},
-    default_args=default_args,
+    owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
+    default_args={
+        'owner': 'DataLab (CI02420667)',
+        'pool': TOOLS_POOL,
+        'retries': 0,
+        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. show_connections.py)
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
+        'execution_timeout': timedelta(minutes=5),
+        'on_failure_callback': on_callback,
+        'on_success_callback': on_callback,
+    },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule=None,
+    tags=['DataLab', 'tools', 'dummy'],
     catchup=False,
     is_paused_upon_creation=True,
+    max_active_runs=1,
     on_failure_callback=on_callback,
     on_success_callback=on_callback,
 )
-def dummy_dag():
-    EmptyOperator(
-        task_id='dummy_task',
-        on_failure_callback=on_callback,
-        on_success_callback=on_callback,
-        doc_md=__doc__,
-    )
+def tools_dummy():
+    EmptyOperator(task_id='dummy_task', doc_md=__doc__)
 
 
-dummy_dag()
+tools_dummy()

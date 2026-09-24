@@ -1,5 +1,5 @@
 # 🧰 Тестовый стенд
-*2026-09-14 06:53 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 11:16 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 То, что нужно, чтобы гонять DAG'и репозитория живьём на стенде (`ssh testsrv`,
 `/opt/aftest`): эмуляторы внешних систем, схемы, фикстуры, скрипты разворачивания. Здесь нет
@@ -18,7 +18,7 @@ DAG'ов, и на контуры это не нужно.
 | [`vault/`](vault/make_vault.py) | `make_vault.py` — эмуляция `/vault/secrets/application`: payload в формате боевого sigma DEV, секреты только из переменных окружения |
 
 Раньше каталоги лежали внутри своих проектов (`ctl_worker/testbed/`, `gp_exchange/testbed/`),
-а `make_vault.py` — в `check/`, среди DAG'ов проверки. Сервисы на стенде от переезда не
+а `make_vault.py` — в `tools/`, среди служебных DAG'ов. Сервисы на стенде от переезда не
 зависят: эмулятор CTL запущен из своей копии в `/opt/aftest/ctl-mock`.
 
 ## make_vault.py
