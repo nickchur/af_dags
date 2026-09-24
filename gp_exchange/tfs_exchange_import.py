@@ -30,7 +30,7 @@ from airflow.utils.task_group import TaskGroup
 # пакетом, на стенде и в свежем клоне — соседним файлом каталога. Жёсткий импорт держался
 # на заглушке CI06932748 в PYTHONPATH стенда; без неё файл не разбирался вовсе.
 try:
-    from CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common import ( # type: ignore
+    from gp_exchange.tfs_exchange_common import ( # type: ignore
         ON_CLUSTER,
         REPLICATED,
         TFS_IN_DATASET,
@@ -43,7 +43,7 @@ try:
         GP_EXCHANGE
     )
 except ImportError:
-    from gp_exchange.tfs_exchange_common import ( # type: ignore
+    from CI06932748.analytics.datalab.gp_exchange.tfs_exchange_common import ( # type: ignore
         ON_CLUSTER,
         REPLICATED,
         TFS_IN_DATASET,
