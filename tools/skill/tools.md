@@ -5,7 +5,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 # Служебные даги (`tools/`)
 
-*2026-09-24 11:58 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 20:43 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -122,9 +122,10 @@ description: Служебные даги Airflow (каталог tools/, на с
 | Таски умирают с обрывом метабазы, блокировки | заметки `tools_pg_activity`: `owner_alive=false` — брошенная сессия |
 | Файлы дагов не разбираются, ошибки импорта | `tools_system_health` (новые ошибки импорта по id), `tools_test_dags` (`parse_time`) |
 | Подключение не работает | `tools_test_connections` (❌ по `conn_id`); список — `tools_show_connections` |
-| На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills`: навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |
+| На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый или обновлённый навык появляется на сервере до получаса спустя после выкладки дагов, это не новая версия core; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |
-| `tools_*` ❌ только на таске `params` | негодное `schedule` в форме запуска; остальное отработало |
+| `tools_*` ❌ на таске `params`, есть `start_date` и лог с «не cron и не пресет» | негодное `schedule` в форме **ручного** запуска с `save_params`; переменная не тронута, остальные таски — `upstream_failed` |
+| `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди (`stuck in queued`, упавший воркер, затор). Расписание ни при чём: у плановых ранов (`scheduled__…`) `save_params` не стоит, а битое сохранённое значение `params` не проверяет. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable `*_params` не трогать |
 
 ## 6. Норма, а не тревога
 
