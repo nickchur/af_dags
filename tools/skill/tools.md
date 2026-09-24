@@ -5,7 +5,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 # Служебные даги (`tools/`)
 
-*2026-09-24 20:43 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 21:19 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -120,6 +120,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 | Задачи висят в `queued` | `tools_log_events` (`stuck in queued`), вывод 📭 в `queue_analyze`, карточка Health |
 | `runs.paused_active` > 0 | `tools_paused_runs_cleanup` без `close` — список и кто поставил паузу |
 | Таски умирают с обрывом метабазы, блокировки | заметки `tools_pg_activity`: `owner_alive=false` — брошенная сессия |
+| `tools_pg_activity` ❌ на `collect`: `canceling statement due to statement timeout` | его запрос не уложился в 30 с. Не объясняй это блокировкой или `idle in transaction`: SELECT в PostgreSQL блокировок строк не ждёт. До v1.8 модуля запрос сканировал весь `task_instance` (ift, 1,3 млн строк, падал с 01.09.2026); с v1.8 он идёт по индексам. Падает и после выкладки — метабаза перегружена или таблицы раздуты: человеку `EXPLAIN` запроса из заметки и `n_dead_tup`, `last_autoanalyze` в `pg_stat_user_tables` для `task_instance` и `job` |
 | Файлы дагов не разбираются, ошибки импорта | `tools_system_health` (новые ошибки импорта по id), `tools_test_dags` (`parse_time`) |
 | Подключение не работает | `tools_test_connections` (❌ по `conn_id`); список — `tools_show_connections` |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый или обновлённый навык появляется на сервере до получаса спустя после выкладки дагов, это не новая версия core; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |

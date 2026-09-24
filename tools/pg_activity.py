@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-24 13:00 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 21:19 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -132,6 +132,15 @@ SELECT a.pid,
 # join к main.job: state='running' в task_instance ставится один раз и живёт до конца,
 # а бьётся LocalTaskJob, и только его latest_heartbeat говорит, жив ли владелец сейчас.
 # Окно в шесть часов — чтобы не читать всю таблицу ради недавних покойников.
+#
+# Две части, и обе по индексам: running — через ti_state, недавние — от свежих
+# LocalTaskJob (job_type_heart), к задаче через ti_job_id. Прежний фильтр
+# «state = 'running' OR end_date > now() - 6 ч» индекса не имел: у task_instance нет
+# индекса по end_date, и шёл Parallel Seq Scan всей таблицы. На ift (1,3 млн строк) он
+# с 01.09.2026 не укладывался в statement_timeout 30 с, и collect падал на каждом запуске.
+# Замер на стенде (AF 2.11, 98 тыс. строк): 0,5 с → 15 мс, результат совпал.
+# «Кончилась за 6 ч» теперь значит «её LocalTaskJob бился за 6 ч»: хартбит идёт до конца
+# задачи, разница — только у задачи, снятой как зомби через 6 ч после последнего удара.
 SQL_OWNERS = r"""
 SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
        round(extract(epoch FROM now() - ti.start_date))       AS age,
@@ -139,8 +148,16 @@ SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.s
        round(extract(epoch FROM now() - j.latest_heartbeat))  AS hb_age
   FROM main.task_instance ti
   LEFT JOIN main.job j ON j.id = ti.job_id
- WHERE ti.pid IS NOT NULL
-   AND (ti.state = 'running' OR ti.end_date > now() - interval '6 hours')
+ WHERE ti.state = 'running' AND ti.pid IS NOT NULL
+UNION
+SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
+       round(extract(epoch FROM now() - ti.start_date)),
+       j.state,
+       round(extract(epoch FROM now() - j.latest_heartbeat))
+  FROM main.job j
+  JOIN main.task_instance ti ON ti.job_id = j.id
+ WHERE j.job_type = 'LocalTaskJob' AND j.latest_heartbeat > now() - interval '6 hours'
+   AND ti.pid IS NOT NULL
 """
 
 
