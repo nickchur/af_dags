@@ -1,5 +1,5 @@
 # Инструменты тестирования и проверки
-*2026-09-23 15:31 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 10:03 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Данная директория содержит инструменты и DAG'и для верификации работоспособности кастомных операторов и системных компонентов платформы.
 
@@ -324,10 +324,15 @@ DAG'а — лента здоровья: ❌ — был `error`.
     QUICKSTART, ТЗ) в Variable `af_doc__<путь, / → __>`, оглавление с заголовками — в `af_docs`.
     Их показывает пункт UI **Docs → DAG Docs** (etl-core, `plugins/dag_docs_plugin.py`).
     Не публикуются навыки (они уже есть), `CLAUDE.md`, `CONTEXT.md`, `openspec/`, `testbed/`.
+*   **Тексты документов — только по флагу `store_docs`** (по умолчанию нет, сохраняемый:
+    `tools_mcp_skills_params`). Оглавление `af_docs` пишется всегда, у записи поле `stored` —
+    лежит ли в Variables текст этой версии. Вебсервер альфы читает тексты из бакета дагов по
+    `path` (etl-core, `webserver.hrp_dag_docs_s3_conn`), сигме флаг нужен. Разовая галочка
+    `purge_docs` удаляет все `af_doc__*`.
 
 ## Сохраняемые параметры
 
-`db_cleanup`, `log_cleanup` и `pg_activity` берут значения по умолчанию из своей Airflow
+`db_cleanup`, `log_cleanup`, `pg_activity` и `mcp_skills` берут значения по умолчанию из своей Airflow
 Variable, а при её отсутствии — из кода. Variable записывается только запуском с галочкой
 сохранения и только при изменившихся значениях: разовый эксперимент в UI ночное окно не
 двигает, а осознанная правка двигает — без выкладки.
