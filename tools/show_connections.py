@@ -1,5 +1,5 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-09-04 15:30 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:19 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список всех подключений из secret backend, сгруппированных по их типу.
 Используется для аудита доступных соединений и верификации конфигурации backend'а.
@@ -19,11 +19,16 @@ from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 from airflow.decorators import dag, task
+from airflow.models.param import Param
 
 try:
-    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 except ImportError:
-    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 
 logger = getLogger("airflow.task")
 
@@ -33,6 +38,12 @@ MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
+
+# Расписание — параметр формы: меняется запуском с save_params, без выкладки (как у
+# db_cleanup). Пусто — только ручной запуск
+PARAMS_VAR = 'tools_show_connections_params'
+SAVED = saved_params(PARAMS_VAR)
+DEFAULT_SCHEDULE = '0 23 * * *'
 
 
 @dag(
@@ -59,7 +70,7 @@ ensure_pool(TOOLS_POOL)
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
     # Ежедневно в 23:00 MSK: срез соединений обновляется перед ночным tools_test_connections
     # (23:15), который берёт список из Variable local_connections
-    schedule='0 23 * * *',
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=['DataLab', 'tools', 'conn', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=False,
@@ -68,8 +79,26 @@ ensure_pool(TOOLS_POOL)
     # прогон закрывает дорогу всем следующим.
     dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
+    params={
+        'schedule': Param(
+            SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'], title='Расписание',
+            description='cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора',
+        ),
+        'save_params': Param(
+            False, type='boolean', title='Сохранить параметры',
+            description=f'Записать параметры этого запуска в {PARAMS_VAR} как значения по умолчанию',
+        ),
+    },
 )
 def tools_show_connections():
+
+    # Без потомков: пропуск (save_params=False) ни на что не влияет
+    @task(task_id='params')
+    def save_params(**context):
+        """💾 Сохраняет параметры запуска (в т. ч. расписание) как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context)
+
+    save_params()
 
     @task
     def show_connections(**context):

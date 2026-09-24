@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-04 15:30 MSK · v2.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 11:19 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -36,13 +36,18 @@ from typing import Optional
 
 from airflow.decorators import dag, task
 from airflow.models import Connection, Variable
+from airflow.models.param import Param
 from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from plugins.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 except ImportError:
-    from CI06932748.tools.utils import TOOLS_POOL, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+    )
 
 logger = getLogger("airflow.task")
 
@@ -52,6 +57,13 @@ MSK = timezone(timedelta(hours=3))
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
+
+# Расписание — параметр формы: меняется запуском с save_params, без выкладки (как у
+# db_cleanup). Пусто — только ручной запуск. По умолчанию — через 15 минут после
+# tools_show_connections: тот обновляет local_connections, отсюда список соединений
+PARAMS_VAR = "tools_test_connections_params"
+SAVED = saved_params(PARAMS_VAR)
+DEFAULT_SCHEDULE = "15 23 * * *"
 
 
 # Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
@@ -418,7 +430,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
     # Ежедневно в 23:15 MSK, через 15 минут после tools_show_connections: тот обновляет
     # Variable local_connections, из которой этот DAG набирает список соединений на парсинге
-    schedule="15 23 * * *",
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=["DataLab", "tools", "conn", "AutoQA"],
     catchup=False,
     is_paused_upon_creation=False,
@@ -427,8 +439,26 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     # прогон закрывает дорогу всем следующим.
     dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
+    params={
+        "schedule": Param(
+            SAVED.get("schedule", DEFAULT_SCHEDULE), type=["string", "null"], title="Расписание",
+            description="cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора",
+        ),
+        "save_params": Param(
+            False, type="boolean", title="Сохранить параметры",
+            description=f"Записать параметры этого запуска в {PARAMS_VAR} как значения по умолчанию",
+        ),
+    },
 )
 def tools_test_connections():  # noqa: PLR0915
+
+    # Без потомков: пропуск (save_params=False) ни на что не влияет; summary его не считает
+    @task(task_id="params")
+    def save_params(**context):
+        """💾 Сохраняет параметры запуска (в т. ч. расписание) как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context)
+
+    save_params()
 
     groups = []
 
@@ -516,7 +546,8 @@ def tools_test_connections():  # noqa: PLR0915
         icons = []
 
         for ti in tis:
-            if ti.task_id == "summary":
+            # params — служебный таск формы, а не проверка соединения
+            if ti.task_id in ("summary", "params"):
                 continue
 
             state = ti.state
