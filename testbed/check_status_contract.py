@@ -1,5 +1,5 @@
 """### 🔎 Линтер контракта решателей CTL
-*2026-08-27 13:48 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 12:17 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Решатели `ctl_chk_*` (`plugins/ctl_core.py`) таск не останавливают: они возвращают
 `('ok'|'skip'|'fail', payload)`, а решение принимает вызывающий таск — обычно через
@@ -14,13 +14,14 @@
     return ctl_chk_new(...)       проброс статуса вызывающему
     ...  # status ignored         явное решение проигнорировать
 
-Запуск из корня репозитория: `python3 check_status_contract.py`
+Запуск из любого места: `python3 testbed/check_status_contract.py` — корень репозитория
+скрипт находит сам, на уровень выше своего каталога.
 """
 import ast
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent
+ROOT = Path(__file__).resolve().parent.parent
 FILES = sorted(ROOT.glob('ctl_worker/*.py')) + sorted(ROOT.glob('plugins/*.py'))
 RESOLVERS = {'ctl_chk_status', 'ctl_chk_wait', 'ctl_chk_new', 'ctl_chk_expire'}
 
