@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-24 18:37 MSK · v3.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 19:30 MSK · v3.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -82,7 +82,7 @@ ctl_worker/
    Итог попытки кладётся снимком в `ctl_done/` (см. ниже) — до ветвления на пропуск и
    падение, иначе как раз самые интересные исходы в хранилище бы не попали.
 
-**Снимки загрузок в бакете CTL** (`edpetl-ctl`, срок хранения — правило бакета, 7 дней):
+**Снимки загрузок — в папке `ctl/` бакета логов** (с 25.09.2026; соединение и бакет — логов, срок хранения — общий на бакет, 120 дней, на деве 30; до этого — отдельный бакет `edpetl-ctl` на 7 дней). Агент читает их через MCP: `ctl_loading` и `get_log_object("ctl/…")`:
 
 | Префикс | Что лежит | Кто пишет |
 |---|---|---|
@@ -189,7 +189,7 @@ ctl_worker/
 
 ### `ctl_loader.py` — Загрузчик метаданных
 
-Частота: по `loader_interval` (по умолчанию 15 мин).
+Частота: по `loader_interval` (по умолчанию 5 мин).
 
 **Сохраняет в S3 и Airflow Variables:**
 - `ctl_profile` — метаданные профиля.
@@ -683,9 +683,6 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 | `task_timeout` | `execution_timeout` задач воркера, кроме `run_exe` и `run_tfs` | `hours=1` |
 | `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` | Пороги санитара и монитора | см. «Таймауты» |
 | `sensor_timeout` / `sensor_retries` | Окно и ретраи служебных сенсоров | `hours=6` / `10` |
-| `s3_conn_id` | Подключение к S3 | `s3` |
-| `s3_bucket` | Бакет для хранения метаданных | `ctl` |
-| `s3_ttl` | Время жизни объектов в S3 (дни) | `7` |
 | `ctl_conn_id` | Подключение к API CTL | `ctl` |
 | `conns.ctl.timeout` | Таймаут запроса к API (сек) | `30` |
 | `conns.ctl.pool_slots` | Размер пула `ctl_pool` (задаёт `test_conn`) | `20` |

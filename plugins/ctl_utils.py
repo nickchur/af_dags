@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-21 16:27 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-25 19:29 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -528,6 +528,18 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
         raise AirflowFailException(msg)
 
 
+#: Папка снимков CTL в корне бакета логов. Своей настройки S3 у CTL нет с 25.09.2026: снимки —
+#: те же логи, живут по сроку бакета логов, а всё нужное дагам лежит в Variables
+CTL_S3_ROOT = 'ctl'
+
+
+def _ctl_s3():
+    """(conn_id, bucket, prefix) снимков CTL: соединение и бакет логов, папка `ctl/` в корне."""
+    from airflow.configuration import conf
+    base = conf.get('logging', 'remote_base_log_folder')
+    return conf.get('logging', 'remote_log_conn_id'), base.split('://', 1)[1].split('/', 1)[0], CTL_S3_ROOT
+
+
 @retry(
     stop=stop_after_attempt(3), # Максимум 3 попытки
     wait=wait_exponential(multiplier=1, min=2, max=10), # Паузы 2с, 4с, 8с
@@ -535,15 +547,13 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_load(key, s3_id=None, bucket=None):
+def ctl_obj_load(key):
     """Загружает объект по ключу: сначала из Airflow Variable, затем из S3 (JSON).
 
     Возвращает dict или {} при отсутствии объекта.
     Retry на любые исключения (до 3 раз, пауза 2–10 сек).
     """
     
-    key_ext = f'{key}.json'
-
     data  = Variable.get(key, default_var={}, deserialize_json=True)
     if data:
         logger.info(f'Объект {key} загружен из Airflow.')
@@ -551,10 +561,8 @@ def ctl_obj_load(key, s3_id=None, bucket=None):
         # new_md5 = hashlib.md5(content).hexdigest()
         return data #, new_md5
     
-    s3 = get_config().get('conns', {}).get('s3', {})
-    s3_id = s3_id or s3.get('conn_id', 's3')
-    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
-
+    s3_id, bucket, prefix = _ctl_s3()
+    key_ext = f'{prefix}/{key}.json'
     if bucket:
         hook = S3Hook(aws_conn_id=s3_id)
         try:
@@ -590,19 +598,15 @@ def ctl_obj_load(key, s3_id=None, bucket=None):
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_etag(key, ext='json', s3_id=None, bucket=None):
+def ctl_obj_etag(key, ext='json'):
     """
     Возвращает только ETag (md5) объекта из S3 без загрузки тела файла.
     """
     from botocore.exceptions import ClientError
 
-    s3 = get_config().get('conns', {}).get('s3', {})
-    s3_id = s3_id or s3.get('conn_id', 's3')
-    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
-
+    s3_id, bucket, prefix = _ctl_s3()
     hook = S3Hook(aws_conn_id=s3_id)
-    # key_ext = f'{key}.json'
-    key_ext = f'{key}.{ext}'
+    key_ext = f'{prefix}/{key}.{ext}'
     try:
         # head_object возвращает только заголовки (метаданные)
         response = hook.get_conn().head_object(Bucket=bucket, Key=key_ext)
@@ -636,7 +640,7 @@ def _var_set(key, data, var):
     logger.info(f"Переменная {key} успешно обновлена в Airflow.")
 
 
-def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
+def ctl_obj_save(key, data, var=False, ext='json'):
     """
     Сохраняет объект в S3 и обновляет переменную Айрфлоу, если указано.
 
@@ -649,13 +653,10 @@ def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
     подменённой. Цена возврата — один `Variable.set` за круг на объект.
     """
 
-    s3 = get_config().get('conns', {}).get('s3', {})
-    s3_id = s3_id or s3.get('conn_id', 's3')
-    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
-
+    s3_id, bucket, prefix = _ctl_s3()
+    key_ext = f'{prefix}/{key}.{ext}'
     if bucket:
         hook = S3Hook(aws_conn_id=s3_id)
-        key_ext = f'{key}.{ext}'
             
         # 1. Готовим контент в памяти
         if ext in ['json','jsn']:

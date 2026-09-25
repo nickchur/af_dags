@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-09-25 12:13 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 19:33 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -20,8 +20,14 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 `ctl_entities`, `ctl_enames`, `ctl_categories`, `ctl_events`, `ctl_entity_events`,
 `ctl_profile`, `ctl_ue_category`, `ctl_workflows_stat`. Снимок, а не живой CTL: свежесть — в `description`.
 Крупные (`ctl_entities`, `ctl_enames`) приходят обрезанными со списком `items` — проси один
-элемент: `item="<id>"`. Если на контуре есть инструменты `ctl_*` (живой CTL), текущее
-состояние загрузки бери у них, а снимок — чтобы понять, что видел `ctl_sensor`.
+элемент: `item="<id>"`. Если на контуре есть инструменты `ctl_*` (AF_CTL_logs), состояние
+загрузки бери у `ctl_loading`, а снимок Variables — чтобы понять, что видел `ctl_sensor`.
+
+`ctl_loading` сначала смотрит снимки тракта в папке `ctl/` бакета логов: `ctl_done/{id}_{попытка}`
+(итог попытки) и `ctl_working/{id}` (состояние на входе в шаг). Если загрузка закончена или
+снимок моложе 2 минут, в CTL он не ходит — поле `source: snapshot`. У CTL лимит на запросы:
+`live=true` ставь, только когда нужен именно живой CTL (снимок устарел, а статус важен сейчас).
+Сырой снимок — `get_log_object("ctl/ctl_working/<id>.json")`.
 
 ## 0. Когда этот навык
 

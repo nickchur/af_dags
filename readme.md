@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-24 11:53 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 19:34 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -76,7 +76,7 @@ testbed/             # 🧰 Тестовый стенд, не DAG'и: из ра�
 
 ## Как работает система
 
-1. **`ctl_loader`** (каждые 15 мин) — выгружает из CTL метаданные: workflows, сущности, события — кладёт в S3 и Airflow Variables.
+1. **`ctl_loader`** (каждые 5 мин, `loader_interval`) — выгружает из CTL метаданные: workflows, сущности, события — кладёт в Airflow Variables и S3 (папка `ctl/` бакета логов).
 2. **`ctl_sensor`** (каждую минуту) — опрашивает CTL, фильтрует активные загрузки (`RUNNING`, `TIME-WAIT`, `EVENT-WAIT`), запускает нужные DAG'и.
 3. **`ctl_worker`** (per workflow) — выполняет цикл:
    - `run_prm` → инициализация загрузки в CTL
