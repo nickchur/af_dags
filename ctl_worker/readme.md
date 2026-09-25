@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-24 11:16 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 18:37 MSK · v3.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -637,13 +637,16 @@ retry = {
 
 ## ⏱️ Таймауты
 
-Всё выстраивается от одного факта: **Greenplum обрывает запрос через 3 часа** — вместе с
-соединением, так что ни `pr_log_error`, ни ответ `pr_swf_start_ctl` записаться не успевают.
+Всё выстраивается от одного факта: **Greenplum обрывает запрос через 4 ч 30 мин** (правило GPCC «Query Time 4,5H (GLOBAL)») —
+вместе с соединением, так что ни `pr_log_error`, ни ответ `pr_swf_start_ctl` записаться не
+успевают. В логе задачи это `AdminShutdown: terminating connection due to administrator command`
+с именем правила, затем `SSL connection has been closed unexpectedly`. До 24.09.2026 лимит
+считался равным 3 ч.
 
 | Ступень | Ключ | По умолчанию | Что делает |
 |---|---|---|---|
-| сервер GP | `gp_server_limit` | 3 ч | факт, не рычаг; нужен для проверок |
-| запрос загрузки | `wf_timeout` воркфлоу, иначе `gp_timeout` | 2 ч 55 | `statement_timeout` сессии: на 5 мин раньше сервера, чтобы `query_canceled` поймал обработчик (`res = -2`, лог, письмо) |
+| сервер GP | `gp_server_limit` | 4 ч 30 | факт, не рычаг; нужен для проверок |
+| запрос загрузки | `wf_timeout` воркфлоу, иначе `gp_timeout` | 4 ч 25 | `statement_timeout` сессии: на 5 мин раньше сервера, чтобы `query_canceled` поймал обработчик (`res = -2`, лог, письмо) |
 | `run_exe` | — | потолок + 10 мин | `execution_timeout`: страховка от зависшего соединения |
 | прочие задачи воркера | `task_timeout` | 1 ч | `execution_timeout`; у `run_tfs` его нет — файлов в заходе сколько угодно |
 | монитор, `RUNNING` | `run_stale` | 6 ч | `reRunned`, но не раньше `wf_timeout` + 10 мин |
@@ -675,8 +678,8 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 | `ue_category` | Категория внешних событий (UE) | `p1080.sdpue` |
 | `gp_conn_id` | ID подключения к Greenplum | `alpha-adb_dev_comm-read` |
 | `gp_schema` | Схема GP для выполнения логики | `s_grnplm_vd_hr_edp_srv_wf` |
-| `gp_server_limit` | Серверный лимит запроса в Greenplum (факт, не рычаг) | `hours=3` |
-| `gp_timeout` | `statement_timeout` загрузки, если у воркфлоу нет `wf_timeout` | `minutes=175` |
+| `gp_server_limit` | Серверный лимит запроса в Greenplum (факт, не рычаг) | `minutes=270` |
+| `gp_timeout` | `statement_timeout` загрузки, если у воркфлоу нет `wf_timeout` | `minutes=265` |
 | `task_timeout` | `execution_timeout` задач воркера, кроме `run_exe` и `run_tfs` | `hours=1` |
 | `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` | Пороги санитара и монитора | см. «Таймауты» |
 | `sensor_timeout` / `sensor_retries` | Окно и ретраи служебных сенсоров | `hours=6` / `10` |

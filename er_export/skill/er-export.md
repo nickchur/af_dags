@@ -5,7 +5,7 @@ description: Разбор выгрузок ЕР на Airflow сигмы — па
 
 # Выгрузки ЕР на сигме
 
-*2026-09-24 09:16 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 12:13 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow сигмы (`af-sigma-*`). Дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `export_er*`.
@@ -15,6 +15,12 @@ description: Разбор выгрузок ЕР на Airflow сигмы — па
 
 У тебя только чтение через MCP. В ClickHouse и S3 ты не ходишь — там говоришь, **что
 проверить человеку** (раздел 9).
+
+Настройки выгрузок читай MCP-инструментом `get_variable_value(key, item)`: `datalab_er_wfs` —
+группы и таблицы, из которых собраны даги (`item="export_er__<реплика>__<группа>"`),
+`datalab_er_wf_meta` — список для формы `export_er_setup`, `datalab_er_config` — общие
+настройки, `datalab_er_wf_hash` — когда и с чем прошла последняя синхронизация. Это копия
+таблицы `export.er_wf_meta` на момент синка, а не сама таблица.
 
 ## 0. Когда этот навык
 

@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-22 14:41 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-24 18:37 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -978,17 +978,20 @@ def ctl_get_eids(wid, wf_prm, connected=None):
 
 # ─── Лестница таймаутов (ревизия 22.09.2026, openspec ctl-timeouts-revision) ───────────────
 #
-#   GP сервер          3 ч        обрывает запрос вместе с соединением — молча, без логов
-#   gp_timeout         2 ч 55     statement_timeout по умолчанию: на 5 мин ниже сервера, чтобы
+#   GP сервер          4 ч 30     обрывает запрос вместе с соединением — молча, без логов
+#   gp_timeout         4 ч 25     statement_timeout по умолчанию: на 5 мин ниже сервера, чтобы
 #                                 query_canceled поймал обработчик pr_swf_start_ctl (res = -2)
 #   run_exe            потолок + 10 мин   execution_timeout: страховка от зависшего соединения
 #   zombie_after       6 ч        санитар; обязан быть больше gp_timeout + 10 мин
 #   run_stale          6 ч        монитор: RUNNING → reRunned; не меньше zombie_after
 #
 # Раньше statement_timeout по умолчанию был 3 ч — ровно серверный лимит, гонка «кто первый».
+# Лимит сервера — правило GPCC «Query Time 4,5H (GLOBAL)»: pg_terminate_backend, у клиента AdminShutdown
+# и «SSL connection has been closed unexpectedly» (замер pg_sleep 22.09.2026). До 24.09.2026
+# здесь стояли 3 ч: загрузки резались на полтора часа раньше, чем мог бы сервер.
 TIMEOUT_DEFAULTS = {
-    'gp_server_limit': 'hours=3',
-    'gp_timeout': 'minutes=175',
+    'gp_server_limit': 'minutes=270',
+    'gp_timeout': 'minutes=265',
     'zombie_after': 'hours=6',
     'run_stale': 'hours=6',
 }

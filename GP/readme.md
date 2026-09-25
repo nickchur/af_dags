@@ -1,5 +1,5 @@
 # GP — скрипты Greenplum, которые трогает ctl_worker
-*2026-09-22 14:40 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-24 18:37 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимок DDL тех объектов Greenplum, вокруг которых крутится тракт CTL. Скопировано из
 `HR_Data`, чтобы не ходить туда за каждой мелочью на связанных задачах. Откуда именно и
@@ -253,7 +253,7 @@ msg = coalesce(m_jsn->>'msg', m_jsn::text, translate(wf_ret, '"', ''''));
 
 `statement_timeout` ставит `gp_exe` (`plugins/ctl_utils.py:308`) на время сессии.
 Значение приходит из `wf_timeout` воркфлоу, а при его отсутствии — из `gp_timeout` в
-`ctl_config` (по умолчанию 2 ч 55 мин при серверном лимите 3 ч). До 22.09.2026 здесь
+`ctl_config` (по умолчанию 4 ч 25 мин при серверном лимите 4 ч 30 мин; до 24.09.2026 — 2 ч 55 и 3 ч). До 22.09.2026 здесь
 было написано «`exe_timeout`, 4 часа» — неправда: `exe_timeout` потолком не был, а
 `gp_timeout` по умолчанию стоял ровно на серверных 3 ч. Разбор — `gp_timeout()` в
 `plugins/ctl_core.py`, вся лестница — в [`ctl_worker/readme.md`](../ctl_worker/readme.md).
@@ -298,8 +298,14 @@ Postgres), дисковый ввод-вывод, размер spill-файлов
   соединение рвётся, в логах тракта пусто. Именно ради этого случая наш таймаут и
   держится ниже: успеть отмениться самим, пока не пришли снаружи.
 
-Правилами с `pg_terminate_backend` обычно гасят простаивающие сессии, а не работающие
-запросы, но проверять это стоит на своём контуре: набор правил живёт в GPCC, а не в базе.
+Серверный лимит запроса — как раз такое правило: «Query Time 4,5H (GLOBAL)». Замер
+22.09.2026 (`pg_sleep` из Jupyter): ровно через 4 ч 30 мин клиент получил
+`AdminShutdown: terminating connection due to administrator command: "Прерывание процесса
+<pid>, в соответствие с правилом Query Time 4,5H (GLOBAL) (1)"` (SQLSTATE 57P01), затем
+`SSL connection has been closed unexpectedly`. По имени правила в тексте отличается от
+нашего `statement_timeout` (57014, соединение живо). psycopg2 на Python 3.8 может показать
+это как `SystemError` в `utf_8_decode` — сбой разбора русского текста, не отдельная беда.
+Другие правила GPCC на своём контуре проверять отдельно: набор живёт в GPCC, а не в базе.
 
 ### Как узнать, что загрузку убил GPCC
 
