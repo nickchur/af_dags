@@ -5,7 +5,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 # Служебные даги (`tools/`)
 
-*2026-09-25 12:13 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 12:38 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -129,6 +129,8 @@ description: Служебные даги Airflow (каталог tools/, на с
 | Таски умирают с обрывом метабазы, блокировки | заметки `tools_pg_activity`: `owner_alive=false` — брошенная сессия |
 | `tools_pg_activity` ❌ на `collect`: `canceling statement due to statement timeout` | его запрос не уложился в 30 с. Не объясняй это блокировкой или `idle in transaction`: SELECT в PostgreSQL блокировок строк не ждёт. До v1.8 модуля запрос сканировал весь `task_instance` (ift, 1,3 млн строк, падал с 01.09.2026); с v1.8 он идёт по индексам. Падает и после выкладки — метабаза перегружена или таблицы раздуты: человеку `EXPLAIN` запроса из заметки и `n_dead_tup`, `last_autoanalyze` в `pg_stat_user_tables` для `task_instance` и `job` |
 | `tools_test_dags` · `check_serialized.recheck_serialized_dag` в `running` часами | задача сама кончается за `min_file_process_interval` + `dag_file_processor_timeout` (у нас ~20 мин). Часами — это зомби, который шедулер не снял: `platform.zombies` и строка «Зомби не снимаются» навыка `airflow-health`. Закрыть — Mark failed в UI, это делает человек. Сигма-ифт 25.09.2026: три экземпляра висели 10 ч |
+| `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «сериализация переписана снова» | разбор файла недетерминирован: в коде дага порядок из `set`/словаря, время, случайность или внешний вызов. Разница `Было → Стало` в заметке называет поле. Правит автор дага |
+| `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «два файла на один dag_id» | это не ложное срабатывание: один `dag_id` объявлен в двух файлах, каждый разбор переписывает сериализацию другого, и в UI и у шедулера задачи и теги то есть, то нет. Разница из заметки и лога (`Было → Стало`) показывает, какая версия урезана: тег `QA`, меньше задач. Лечит владелец дага — удалить дубль или переименовать `dag_id`; путь в заметке называет чужой каталог (не `tools/`) — это не наш код, даг не перезапускать и `test_dags` не править. Сигма-ифт 24.09.2026: `reload_core_person_position_action` в `CI06884356/analytics/datalab/` и `CI06932748/analytics/datalab/` |
 | Файлы дагов не разбираются, ошибки импорта | `tools_system_health` (новые ошибки импорта по id), `tools_test_dags` (`parse_time`) |
 | Подключение не работает | `tools_test_connections` (❌ по `conn_id`); список — `tools_show_connections` |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый или обновлённый навык появляется на сервере до получаса спустя после выкладки дагов, это не новая версия core; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |
@@ -140,7 +142,9 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 - ☮️ `params` — запуск без `save_params` или без изменений.
 - ☮️ `purge` / `close` — галочка не стояла: отчёт без изменений.
-- `tools_test_dags` зелёный при найденном дрожании — он никогда не падает, итог в сводке.
+- `tools_test_dags`: подозрение на дрожание само по себе не авария. Красный
+  `recheck_serialized_dag` означает, что перепроверка его подтвердила (§5), и тогда
+  красная и сводка.
 - ☮️ у проверок `tools_test_connections` — проверка пропущена (нет библиотеки, выключенное подключение).
 - Даг `tools_*`, которого нет в списке, но есть в старых ранах: `tools_queue_cleanup` с
   24.09.2026 — это `tools_queue_analyze`; `dummy_dag` — `tools_dummy`.
