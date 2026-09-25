@@ -1,5 +1,5 @@
 """### 🗄️ Метабаза Airflow без ORM (`plugins/af_meta.py`)
-*2026-09-21 18:49 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 14:48 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 В Airflow 3 у задачи и у разбора DAG-файла нет ORM-доступа к метабазе: `create_session`
 бросает «Direct database access via the ORM is not allowed in Airflow 3.0». Всё, что даги
@@ -14,7 +14,7 @@ CTL делали через `DagModel`, `TaskInstance`, `Pool`, `Log` и зам�
 |---|---|
 | `sql()` | SQL в метабазе, строки словарями (замена `pg_exe` на `create_session`) |
 | `meta_session()` | сессия SQLAlchemy для кода на `session.execute(text(...))` (замена `create_session`) |
-| `schema()` | схема метабазы: `main` на контуре, `public` на стенде |
+| `schema()` | схема метабазы: `main_3` на альфе, `public` на стенде |
 | `dag_state()` | пауза, «устаревший» и наличие в `serialized_dag` одним запросом |
 | `set_paused()` | пауза DAG-а (было `DagModel.is_paused`) |
 | `set_ti_state()` | состояние соседней задачи рана (было `TaskInstance.set_state`) |
@@ -23,8 +23,9 @@ CTL делали через `DagModel`, `TaskInstance`, `Pool`, `Log` и зам�
 | `update_note()` | заметка рана или задачи: прочитал — изменил — записал под блокировкой |
 | `trigger_dag_run()` | запуск DAG-а изнутри задачи через Execution API |
 
-Схема: на контуре метабаза в `main`, на стенде AF3 — в `public`, поэтому `search_path`
-ставится `main, public`, а имена таблиц пишутся без схемы.
+Схема: `search_path` = `[database] sql_alchemy_schema` и `public`, имена таблиц без схемы. На
+альфе метабаза AF3 в `main_3`, а в `main` рядом лежит метабаза AF2 (для отката) — её в пути
+быть не должно, иначе чтение и запись молча уйдут в AF2. На стенде AF3 — `public`.
 """
 
 from contextlib import closing, contextmanager
@@ -35,6 +36,12 @@ logger = getLogger("airflow.task")
 
 META_CONN_DEFAULT = 'airflowdb'
 STATEMENT_TIMEOUT_SEC = 60
+
+
+def search_path() -> str:
+    """`main_3,public` на альфе, `public,public` на стенде: схема из настроек Airflow."""
+    from airflow.configuration import conf
+    return f"{conf.get('database', 'sql_alchemy_schema', fallback='') or 'public'},public"
 
 
 class DagNotFound(Exception):
@@ -77,7 +84,7 @@ def sql(query, params=None, timeout=STATEMENT_TIMEOUT_SEC, conn_id=None):
     with closing(hook.get_conn()) as conn:
         with conn:  # commit при выходе, rollback при исключении
             with conn.cursor() as cur:
-                cur.execute("SET LOCAL search_path = main, public")
+                cur.execute("SELECT set_config('search_path', %s, true)", (search_path(),))
                 if timeout:
                     cur.execute("SELECT set_config('statement_timeout', %s, true)", (f"{int(timeout)}s",))
                 cur.execute(query, params)
@@ -100,7 +107,7 @@ def _engine(conn_id):
         # search_path и в параметрах подключения: каждое новое соединение сразу видит схему
         _engines[conn_id] = PostgresHook(postgres_conn_id=conn_id).get_sqlalchemy_engine(
             engine_kwargs={'poolclass': NullPool,
-                           'connect_args': {'options': '-c search_path=main,public'}})
+                           'connect_args': {'options': f'-c search_path={search_path()}'}})
     return _engines[conn_id]
 
 
@@ -123,7 +130,7 @@ def meta_session(conn_id=None):
     conn = _engine(conn_id or meta_conn_id()).connect()
     session = Session(bind=conn)
     try:
-        session.execute(text("SET search_path = main, public"))
+        session.execute(text("SELECT set_config('search_path', :p, false)"), {'p': search_path()})
         yield session
         session.commit()
     except Exception:
@@ -135,7 +142,7 @@ def meta_session(conn_id=None):
 
 
 def schema(conn_id=None) -> str:
-    """Схема, в которой лежит метабаза: `main` на контуре, `public` на стенде AF3.
+    """Схема, в которой лежит метабаза: `main_3` на альфе, `public` на стенде AF3.
 
     Не `current_schema()`: та отдаёт первую существующую схему из search_path, а на стенде
     AF3 есть пустая `main` рядом с таблицами в `public` (поймано 21.09.2026). Спрашиваем,
@@ -281,7 +288,7 @@ def update_note(kind: str, key, change) -> None:
     with closing(hook.get_conn()) as conn:
         with conn:
             with conn.cursor() as cur:
-                cur.execute("SET LOCAL search_path = main, public")
+                cur.execute("SELECT set_config('search_path', %s, true)", (search_path(),))
                 cur.execute("SELECT set_config('statement_timeout', '30s', true)")
                 if kind == 'dag':
                     cur.execute("SELECT id FROM dag_run WHERE dag_id = %s AND run_id = %s", key)
