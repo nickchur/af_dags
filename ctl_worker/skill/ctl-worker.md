@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-09-24 20:10 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 12:13 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -13,6 +13,15 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 У тебя только чтение через MCP. В CTL и Greenplum ты не ходишь — там говоришь, **что
 проверить человеку** (раздел 11).
+
+Что тракт хранит в Variables, читай MCP-инструментом `get_variable_value(key, item)`:
+`ctl_config` — настройки тракта (профиль, таймауты, пулы, `orchestrator`, `test_mode`; PIN
+туда не попадает), снимок CTL от последнего `ctl_loader` — `ctl_workflows` (воркфлоу по id),
+`ctl_entities`, `ctl_enames`, `ctl_categories`, `ctl_events`, `ctl_entity_events`,
+`ctl_profile`, `ctl_ue_category`, `ctl_workflows_stat`. Снимок, а не живой CTL: свежесть — в `description`.
+Крупные (`ctl_entities`, `ctl_enames`) приходят обрезанными со списком `items` — проси один
+элемент: `item="<id>"`. Если на контуре есть инструменты `ctl_*` (живой CTL), текущее
+состояние загрузки бери у них, а снимок — чтобы понять, что видел `ctl_sensor`.
 
 ## 0. Когда этот навык
 

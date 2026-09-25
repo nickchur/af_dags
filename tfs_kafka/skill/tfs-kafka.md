@@ -5,7 +5,7 @@ description: Разбор тракта отправки в ТФС через Kaf
 
 # Тракт Kafka ↔ ТФС
 
-*2026-09-24 09:16 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 12:13 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow сигмы (`af-sigma-*`). Тракт общий: сейчас им
 пользуются выгрузки ЕР (навык **`er-export`**, `airflow://skill/er-export`), xStream пока шлёт
@@ -14,6 +14,9 @@ description: Разбор тракта отправки в ТФС через Kaf
 
 У тебя только чтение через MCP. В Kafka, S3 и ClickHouse ты не ходишь, паузу не ставишь и не
 снимаешь — там говоришь, **что проверить или сделать человеку** (раздел 8).
+
+Пульт и реестр читай MCP-инструментом `get_variable_value`: `tfs_snd_pause` — стоит ли пауза
+отправки и до когда, `tfs_snd_scenarios` — реестр сценариев.
 
 ## 0. Когда этот навык
 
