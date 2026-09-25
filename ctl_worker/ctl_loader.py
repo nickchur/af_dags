@@ -1,7 +1,7 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-09-17 09:24 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-25 19:33 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Каждые 15 минут выгружает данные из CTL и сохраняет в S3 + Airflow Variables.
+Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
 | Объект | Описание |
 |---|---|

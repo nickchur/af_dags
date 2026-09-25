@@ -38,6 +38,6 @@
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-24 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 ⚠️ | 2026-09-24 |
 | `tools/` | `tools/readme.md` | 2026-09-24 | `openspec/specs/tools/spec.md` | 2026-09-24 | 2026-09-24 |
 | `xs_export/` | `xs_export/readme.md` | 2026-08-31 | `openspec/specs/xs-export/spec.md` | 2026-08-31 | 2026-09-02 |
-| `GP/` | `GP/readme.md` | 2026-09-22 | снимок `HR_Data` @ `279e52a` | 2026-09-10 | 2026-09-22 |
+| `GP/` | `GP/readme.md` | 2026-09-24 | снимок `HR_Data` @ `279e52a` | 2026-09-10 | 2026-09-24 |
 
-*Собрано 2026-09-24 скриптом `sync_context.py`*
+*Собрано 2026-09-25 скриптом `sync_context.py`*

@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-09-24 11:23 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 19:32 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -18,22 +18,22 @@ dag-processor'а и воркера; у вебсервера каталог да�
 навык, чей файл исчез, снимается вместе со своей переменной. Два файла с одним именем —
 ошибка таска: какой из них отдавать, решать не нам.
 
-**Документация дагов** — второй таск, `publish_docs`, тем же путём: все остальные `.md`
-(README каталогов, QUICKSTART, ТЗ) для пункта UI Docs → DAG Docs (etl-core,
-`plugins/dag_docs_plugin.py`).
+**Документация дагов** — второй таск, `publish_docs`: все остальные `.md` (README каталогов,
+QUICKSTART, ТЗ) для пункта UI Docs → DAG Docs и ресурсов MCP `airflow://doc/{path}` (etl-core,
+`dag_docs.py`).
 
 | Что | Где |
 |---|---|
-| Текст документа `<путь>` | Variable `af_doc__<путь, где / заменён на __>` — только при `store_docs` |
-| Оглавление: путь → sha256, размер, заголовок, `stored` | Variable `af_docs` (JSON) — всегда |
+| Текст документа `<путь>` | `docs/<путь>` в корне бакета логов |
+| Оглавление: путь → sha256, размер, заголовок, `at` (когда записан текст) | Variable `af_docs` (JSON) |
 
-**Хранить ли тексты — решает контур** (форма запуска, `store_docs`, по умолчанию нет).
-Вебсервер альфы читает тексты прямо из бакета дагов по `path` из оглавления, ему нужна
-только оглавление; ~400 КБ документации в метабазе там ни к чему. Вебсерверу сигмы S3
-запрещён — там тексты едут через Variables, и флаг включают запуском с `store_docs` и
-`save_params`. `stored` в записи оглавления — лежит ли в Variables текст **этой** версии
-файла: страница показывает из Variables только такие. `purge_docs` — разово удалить все
-`af_doc__*` (например, на альфе после перехода на S3).
+Тексты — в бакете логов с 25.09.2026: вебсервер читает их через лог-сервер воркера одним
+путём на обоих контурах (до этого — Variables `af_doc__*` на сигме по флагу `store_docs` и
+бакет дагов на альфе). У бакета один срок хранения на всё (`tools_log_cleanup`), поэтому текст
+переписывается не только при смене файла, но и когда записи в оглавлении больше
+`DOC_REFRESH_DAYS` (7 дней). `purge_docs` — разово удалить оставшиеся `af_doc__*`.
+
+Навыки остаются в Variables: навык нужен и тогда, когда воркеров нет, а метабаза жива.
 
 Расписание — параметр `schedule` (по умолчанию раз в 30 минут), сохраняется так же;
 пусто — только ручной запуск.
@@ -72,10 +72,15 @@ SKILL_NAME_RE = r'^[a-z0-9][a-z0-9-]{0,63}$'
 #: навыков: агенту больше и не прочитать за раз.
 SKILL_MAX_BYTES = 256 * 1024
 
-#: Документация дагов для страницы Docs → DAG Docs. Тоже контракт с etl-core
-#: (``plugins/dag_docs_plugin.py``).
+#: Документация дагов для страницы Docs → DAG Docs. Тоже контракт с etl-core (``dag_docs.py``):
+#: оглавление в Variable, тексты в ``docs/`` бакета логов. ``af_doc__*`` — прежнее место
+#: текстов, только для ``purge_docs``.
 DOC_PREFIX = 'af_doc__'
 DOC_INDEX = 'af_docs'
+DOCS_ROOT = 'docs'
+#: Срок хранения бакета логов один на всё (120 дней, на деве 30): текст старше этого
+#: переписываем, чтобы живой документ не ушёл по сроку
+DOC_REFRESH_DAYS = 7
 #: Файлы для агента, а не для людей: правила репозитория и собранная карта.
 DOC_SKIP_FILES = {'CLAUDE.md', 'CONTEXT.md'}
 DOC_SKIP_DIRS = {'testbed', 'openspec', 'skill', '__pycache__'}
@@ -138,11 +143,6 @@ def find_docs(root):
     return found
 
 
-def doc_key(rel: str) -> str:
-    """Ключ Variable документа: ``er_export/README.md`` → ``af_doc__er_export__README.md``."""
-    return DOC_PREFIX + rel.replace('/', '__')
-
-
 def doc_title(text: str, fallback: str) -> str:
     """Первый заголовок ``# …``, иначе имя файла."""
     for line in text.splitlines():
@@ -175,23 +175,29 @@ def plan(found, index, root, max_bytes=SKILL_MAX_BYTES, titles=False):
     return new_index, to_write, to_delete, skipped
 
 
-def docs_plan(found, index, root, store, purge=False):
+def docs_plan(found, index, root, now):
     """План для документов: ``(оглавление, {путь: текст на запись}, [пути на снятие], [пропущено])``.
 
-    Записи оглавления получают ``stored`` — лежит ли в Variables текст этой версии. Записи
-    старого формата (до ``stored``) считаются сохранёнными: их тексты писал прежний даг.
-    При ``purge`` сохранённого нет вовсе: всё удаляется до записи.
+    На запись — изменившиеся и те, чей текст записан раньше ``now - DOC_REFRESH_DAYS``
+    (поле ``at``): иначе неизменный документ ушёл бы по сроку хранения бакета.
     """
-    known = {} if purge else {k: v for k, v in index.items() if (v or {}).get('stored', True)}
-    new_index, to_write, to_delete, skipped = plan(found, known, root, titles=True)
-    if not store:
-        # Не храним: писать нечего, а прежние тексты этой версии остаются валидными
-        for rel, meta in new_index.items():
-            meta['stored'] = (known.get(rel) or {}).get('sha256') == meta['sha256']
-        return new_index, {}, [], skipped
-    for meta in new_index.values():
-        meta['stored'] = True
+    new_index, to_write, to_delete, skipped = plan(found, index, root, titles=True)
+    stale = (now - timedelta(days=DOC_REFRESH_DAYS)).isoformat()
+    for rel, meta in new_index.items():
+        at = (index.get(rel) or {}).get('at')
+        if rel not in to_write and (not at or at < stale):
+            to_write[rel] = found[rel].read_text(encoding='utf-8')
+        meta['at'] = now.isoformat() if rel in to_write else at
     return new_index, to_write, to_delete, skipped
+
+
+def _docs_s3():
+    """(S3Hook, bucket) бакета логов: соединение и бакет — из настроек логирования."""
+    from airflow.configuration import conf
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+    base = conf.get('logging', 'remote_base_log_folder')
+    return S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')), base.split('://', 1)[1].split('/', 1)[0]
 
 
 @dag(
@@ -213,14 +219,9 @@ def docs_plan(found, index, root, store, purge=False):
     catchup=False,
     is_paused_upon_creation=False,
     params={
-        'store_docs': Param(
-            bool(SAVED.get('store_docs', False)), type='boolean', title='Хранить тексты документов',
-            description='Класть тексты .md в Variables af_doc__*. Нужно, где вебсервер не читает '
-                        'S3 (сигма). Оглавление af_docs пишется всегда.',
-        ),
         'purge_docs': Param(
             False, type='boolean', title='Удалить сохранённые тексты',
-            description='Разово удалить все af_doc__* (в переменную не сохраняется).',
+            description='Разово удалить прежние тексты af_doc__* из Variables (в переменную не сохраняется).',
         ),
         'schedule': Param(
             SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'], title='Расписание',
@@ -228,7 +229,7 @@ def docs_plan(found, index, root, store, purge=False):
         ),
         'save_params': Param(
             False, type='boolean', title='Сохранить параметры',
-            description=f'Записать store_docs и schedule в {PARAMS_VAR}: по ним пойдут и плановые запуски.',
+            description=f'Записать schedule в {PARAMS_VAR}: по нему пойдут и плановые запуски.',
         ),
     },
     max_active_runs=1,
@@ -239,7 +240,7 @@ def tools_mcp_skills():
 
     @task(task_id='params')
     def save_params(**context):
-        """💾 Сохраняет store_docs и schedule в переменную как значения по умолчанию."""
+        """💾 Сохраняет schedule в переменную как значение по умолчанию."""
         return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     # NONE_FAILED: params штатно пропускает себя без save_params, а пропуск апстрима по
@@ -294,33 +295,31 @@ def tools_mcp_skills():
             from CI06932748.tools.utils import add_note  # type: ignore
 
         root = conf.get('core', 'dags_folder')
-        p = context['params']
-        store, purge = bool(p.get('store_docs')), bool(p.get('purge_docs'))
+        purge = bool(context['params'].get('purge_docs'))
         index = Variable.get(DOC_INDEX, default_var={}, deserialize_json=True) or {}
-        new_index, to_write, to_delete, skipped = docs_plan(find_docs(root), index, root, store, purge)
+        new_index, to_write, to_delete, skipped = docs_plan(
+            find_docs(root), index, root, datetime.now(timezone.utc))
 
-        purged = _purge_docs() if purge else 0
+        hook, bucket = _docs_s3()
         for rel, text in to_write.items():
-            Variable.set(doc_key(rel), text,
-                         description=f"Документация дагов для Docs → DAG Docs: {rel}")
-        for rel in to_delete:
-            Variable.delete(doc_key(rel))
+            hook.load_string(text, key=f'{DOCS_ROOT}/{rel}', bucket_name=bucket, replace=True)
+        if to_delete:
+            hook.delete_objects(bucket=bucket, keys=[f'{DOCS_ROOT}/{rel}' for rel in to_delete])
+        purged = _purge_docs() if purge else 0
         # Оглавление — последним: страница верит ему и ссылаться оно должно на записанное
         if new_index != index:
             Variable.set(DOC_INDEX, new_index, serialize_json=True,
-                         description="Оглавление документации дагов (Docs → DAG Docs): путь → sha256, размер, заголовок")
+                         description="Оглавление документации дагов (Docs → DAG Docs): путь → sha256, размер, "
+                                     "заголовок, at; тексты — docs/<путь> в бакете логов")
 
-        stored = sum(1 for m in new_index.values() if m['stored'])
-        title = (f"DAG Docs: {len(new_index)}, тексты {'хранятся' if store else 'не хранятся'} "
-                 f"({stored}), записано {len(to_write)}, снято {len(to_delete)}")
-        rows = [f"🧹 удалено сохранённых текстов: {purged}"] if purge else []
+        title = f"DAG Docs: {len(new_index)}, записано в бакет {len(to_write)}, снято {len(to_delete)}"
+        rows = [f"🧹 удалено af_doc__*: {purged}"] if purge else []
         rows += [f"✏️ `{r}`" for r in sorted(to_write)] + [f"🗑️ `{r}`" for r in to_delete]
         rows += [f"❌ {s}" for s in skipped]
         add_note("\n".join(rows) or "без изменений", context, level='DAG,task', title=title)
         if skipped:
             raise ValueError("Документы пропущены: " + "; ".join(skipped))
-        return {'docs': len(new_index), 'stored': stored, 'written': sorted(to_write),
-                'deleted': to_delete, 'purged': purged}
+        return {'docs': len(new_index), 'written': sorted(to_write), 'deleted': to_delete, 'purged': purged}
 
     def _purge_docs():
         """Удаляет все Variables ``af_doc__*``. Возвращает, сколько удалено."""

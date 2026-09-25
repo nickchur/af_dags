@@ -1,5 +1,5 @@
 """🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
-*2026-08-28 17:10 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 19:33 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь, а разгребает её этот даг — в темпе, который декларирует ТФС.
@@ -452,7 +452,7 @@ def tfs_kafka_snd_dag():
 
         logger.warning("📭 Без квитанции старше %d мин: %d файлов", STALE_MIN, len(stale))
         add_note({f"📭 Нет квитанции старше {STALE_MIN} мин ({len(stale)})":
-                  [f"{r['file_name']} · {r['scenario_id']} · ждём {r['waiting_min']} мин"
+                  [f"{r['file_name']} · {r['scenario_id']} · {r['rq_uid']} · ждём {r['waiting_min']} мин"
                    for r in stale[:10]]},
                  level='dag', context=context, title='🚚 tfs_kafka_snd')
 

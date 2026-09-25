@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-24 11:19 MSK · v2.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-25 19:31 MSK · v2.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -51,8 +51,11 @@ dag_snapshots/<dag_id>/00002.<dag_hash>.json.gz
 пришлось бы качать последнюю копию, чтобы понять, изменилось ли что-нибудь.
 
 Бакет и соединение — те же, что у логов задач (`[logging] remote_log_conn_id` /
-`remote_base_log_folder`), но префикс в корне, а не под логами: иначе версии удалял бы
-`log_cleanup`.
+`remote_base_log_folder`), префикс в корне бакета. Срок хранения у бакета один на всё
+(`tools_log_cleanup`), поэтому последнюю версию неизменившегося DAG'а старше
+`SNAP_REFRESH_DAYS` (7 дней) прогон переписывает на месте — номер и содержимое те же, дата
+новая. Старые версии уходят по сроку сами. При ненулевом `snapshot_limit` полный круг
+обхода обязан укладываться в 7 дней.
 
 **Вердикты `compare_changed`** (сравниваются два неизменяемых объекта в S3, поэтому
 результат воспроизводим — перезапуск таска через неделю покажет то же самое):
@@ -123,10 +126,15 @@ ONE_SHOT = ("cleanup_deleted",)
 # файла и переменных окружения — в метабазу на уровне модуля этот вызов не ходит
 SNAP_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 SNAP_BUCKET = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
-# Префикс намеренно в корне бакета, а НЕ под префиксом логов: log_cleanup удаляет всё
-# старше 30 дней ровно под remote_base_log_folder, и копия редко меняющегося DAG'а
-# попала бы под эту метлу
+# Префикс в корне бакета, рядом с остальными папками «на память»; под префиксом логов — только логи
 SNAP_PREFIX = "dag_snapshots/"
+# У бакета логов один срок хранения на всё (tools_log_cleanup: 120 дней, на деве 30), и
+# единственная версия редко меняющегося DAG'а ушла бы по сроку. Поэтому копию, которой больше
+# SNAP_REFRESH_DAYS, переписываем на месте (copy_object сам в себя): содержимое и номер версии
+# те же, LastModified новый. Старые версии никто не освежает — они уходят по сроку сами.
+# 7 дней — с запасом меньше девовых 30; при snapshot_limit полный круг обязан укладываться
+# в это окно: ceil(всего / snapshot_limit) ≤ SNAP_REFRESH_DAYS
+SNAP_REFRESH_DAYS = 7
 SNAP_EXT = ".json.gz"
 
 # DAG'и, чей id начинается с одного из этих префиксов, не проверяем вовсе: ни в
@@ -786,7 +794,8 @@ def tools_test_dags():
         logger.info("📦 всего DAG'ов %d, с копиями %d (версий %d), к обходу %d (лимит %s)",
                     len(all_dags), len(snaps), len(all_keys), len(targets), limit or "нет")
 
-        written = first = unchanged = total_bytes = 0
+        written = first = unchanged = refreshed = total_bytes = 0
+        refresh_before = datetime.now(timezone.utc) - timedelta(days=SNAP_REFRESH_DAYS)
         pairs: list[dict] = []
         captured_at = datetime.now(timezone.utc).isoformat()
         for dag_id in targets:
@@ -800,6 +809,12 @@ def tools_test_dags():
                     # Содержимое то же — новую версию не плодим, история остаётся читаемой:
                     # в ней ровно те точки, где DAG менялся
                     unchanged += 1
+                    if last["at"] < refresh_before:
+                        hook.get_conn().copy_object(
+                            Bucket=SNAP_BUCKET, Key=last["key"], MetadataDirective="REPLACE",
+                            CopySource={"Bucket": SNAP_BUCKET, "Key": last["key"]},
+                        )
+                        refreshed += 1
                     continue
                 # JSON забираем внутри сессии: data — свойство модели, оно распакует zlib.
                 # dag_hash тоже кладём в локальную — за пределами сессии инстанс отцеплен
@@ -869,7 +884,7 @@ def tools_test_dags():
             f"| из них первых | {first} |",
             f"| на сравнение | {len(pairs)} |",
             *([f"| без сравнения (лимит {COMPARE_LIMIT}) | {len(not_compared)} |"] if not_compared else []),
-            f"| без изменений | {unchanged} |",
+            f"| без изменений | {unchanged} (освежено {refreshed}) |",
             f"| объём выгрузки | {readable_size(total_bytes)} |",
             f"| покрытие | {covered} из {len(all_dags)} ({covered * 100 / total:.0f}%) |",
             f"| версий в хранилище | {versions} |",
@@ -886,7 +901,7 @@ def tools_test_dags():
                     written, readable_size(total_bytes), unchanged, covered, len(all_dags), len(pairs))
 
         add_xcom("snapshot_stats",
-                 {"written": written, "first": first, "unchanged": unchanged,
+                 {"written": written, "first": first, "unchanged": unchanged, "refreshed": refreshed,
                   "bytes": total_bytes, "covered": covered, "total": len(all_dags),
                   "versions": versions, "pairs": len(pairs), "not_compared": len(not_compared),
                   "deleted": len(deleted),

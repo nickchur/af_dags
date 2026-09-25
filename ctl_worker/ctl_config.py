@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-24 18:37 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-25 19:29 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -8,7 +8,6 @@
 | `profile` / `root_category` / `root_entity` / `ue_category` | Профиль и иерархия CTL |
 | `gp_conn_id` / `gp_schema` | Подключение Greenplum |
 | `gp_server_limit` / `gp_timeout` / `task_timeout` / `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` / `sensor_timeout` / `sensor_retries` | Лестница таймаутов — `ctl_worker/readme.md`, раздел «Таймауты» |
-| `s3_conn_id` / `ctl_bucket` / `ctl_ttl` | S3-хранилище |
 | `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
 | `conns.<id>.pool_slots` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
 | `tz` / `expire` | Часовой пояс и таймаут ожидания |
@@ -77,12 +76,8 @@ conns = {
         'type': 'Postgres',
         'default': True,
     },
-    's3': {
-        'type': 'S3',
-        'conn_id': 's3',
-        "bucket": "edpetl-ctl",
-        "ttl": 7, # days
-    },
+    # Своего S3 у CTL нет с 25.09.2026: снимки (ctl_obj_save) лежат в папке ctl/ бакета логов
+    # и живут по его сроку (plugins/ctl_utils.py, _ctl_s3)
     'files': {
         'type': 'S3',
         'conn_id': 's3-archive',
@@ -227,8 +222,7 @@ with DAG(f'CTL.{config["profile"]}.config',
         # загрузкам некуда писать, и об этом надо знать сразу. А вот lifecycle-правило
         # к моменту вызова уже ничего не решает — конфигурация сохранена выше, и ронять
         # из-за него таск незачем: красный таск после успешного сохранения сбивает с толку.
-        for name, bucket_key, ttl_key in (('s3', 'ctl_bucket', 'ctl_ttl'),
-                                          ('files', 'files_bucket', 'files_ttl')):
+        for name, bucket_key, ttl_key in (('files', 'files_bucket', 'files_ttl'),):
             s3_id = config.get('conns',{}).get(name,{}).get('conn_id')
             bucket = config.get(bucket_key)
             ttl = config.get(ttl_key)

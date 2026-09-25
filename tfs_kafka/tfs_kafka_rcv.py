@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-08-28 14:02 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-25 19:33 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,
@@ -93,6 +93,8 @@ MAX_MESSAGES = 5000
 # в конце окна. Между опросами процесс умирает, память не годится, а обычный xcom_push
 # стирается перед каждым опросом, поэтому держим через run_state_* (см. tfs_utils).
 SEEN_KEY = 'seen'
+# Отказов ТФС поимённо в заметке за один опрос: остальные — числом, заметка режется по длине
+NOTE_FAILED_MAX = 5
 
 
 @dag(
@@ -268,7 +270,14 @@ def tfs_kafka_rcv_dag():
                 line += f", ❌ StatusCode != 0: {len(failed)}"
             if unknown:
                 line += f", ⚠️ не разобрано: {len(unknown)}"
-            add_note({f"📨 {topic}": line}, level='task,dag', context=context, title='📨 tfs_kafka_rcv')
+            note = {f"📨 {topic}": line}
+            # Отказы — поимённо с RqUID: по нему квитанция целиком лежит в tfs/receipts/<RqUID>.json
+            # бакета логов (MCP get_log_object). Первые NOTE_FAILED_MAX: заметка режется по длине
+            if failed:
+                note["❌ Отказы ТФС (файл · RqUID · код)"] = [
+                    f"{r['file_name']} · {r['rq_uid']} · {r['status_code']}" for r in failed[:NOTE_FAILED_MAX]
+                ]
+            add_note(note, level='task,dag', context=context, title='📨 tfs_kafka_rcv')
 
         # Окно считаем от старта рана: оно общее для всех топиков и переживает reschedule.
         elapsed = (datetime.now(timezone.utc) - context['dag_run'].start_date).total_seconds()
