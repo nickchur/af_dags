@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-26 13:28 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 21:26 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -540,13 +540,16 @@ def ctl_send_html(html_content, lid, eid):
     Логика:
     - Если сообщение ≤ MAX_HTML — отправляется целиком.
     - Если > MAX_HTML и ≤ MAX_HTML * 10 — разбивается с сохранением <tr>.
-    - Очень длинные (> MAX_HTML * 10) — пропускаются.
+    - Очень длинные (> MAX_HTML * 10) — пропускаются: CTL режет статистику. Номера и длины
+      пропущенных возвращаются списком — вызывающий пишет заметку (полная копия отчёта лежит
+      в бакете логов, `ctl_reports/{lid}`).
     """
 
     max_len = get_config().get('max_html', MAX_HTML)
     max_total = max_len * 10
     profile = get_config()['profile']
     stat_id = 12
+    skipped = []
 
     try:
         # Приводим к списку строк
@@ -600,13 +603,17 @@ def ctl_send_html(html_content, lid, eid):
                     hd = '</td></tr>' if ft else ''
                     pos += cut_pos
 
-            # Сообщения длиннее max_total — пропускаем
+            # Сообщения длиннее max_total — пропускаем, но не молча
             else:
+                logger.warning("ctl_send_html: раздел %s длиной %s длиннее %s — в CTL не отправлен",
+                               n, length, max_total)
+                skipped.append((n, length))
                 continue
 
     except Exception as err:
         logger.error(f"[ERROR] Failed to send HTML to statval: {err}")
         raise
+    return skipped
 
 
 def ctl_loading_norm(wf_name, data):

@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-26 19:33 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 21:26 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -51,7 +51,7 @@ from tenacity import stop_after_attempt
 
 
 from plugins.utils import add_note, env_stand, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
+from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_obj_save, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
                               ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed, ctl_loading_snapshot,
@@ -370,11 +370,49 @@ def _publish_stats(lid, eid, result):
     return logs
 
 
+def _html_list(html):
+    """HTML ответа шага → список разделов: JSON-массив строкой (так отдают pr_mail_*) либо один раздел."""
+    if isinstance(html, str):
+        try:
+            html = json.loads(html)
+        except ValueError:
+            return [html]
+    return html if isinstance(html, list) else [html]
+
+
+def _save_report(lid, result, context):
+    """Полная копия HTML-отчёта в бакет логов: `ctl/ctl_reports/{lid}.json`.
+
+    CTL режет статистику: `ctl_send_html` дробит раздел на фрагменты по `max_html`, а
+    раздел длиннее десяти фрагментов не отправляет вовсе — на объёмах прода это «CTL All
+    Active» и «CTL All WF» отчёта статуса (≈245 тыс. символов, стенд 26.09.2026). Копию
+    читает MCP `ctl_report`; повторная попытка загрузки её перезаписывает. Ошибка
+    сохранения исход загрузки не меняет.
+    """
+    html = _html_list(result.get('html'))
+    try:
+        ctl_obj_save(f"ctl_reports/{lid}", {
+            'loading_id': lid, 'dag_id': context['dag'].dag_id, 'run_id': context['run_id'],
+            'at': pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss'),
+            'res': result.get('res'), 'msg': result.get('msg'), 'html': html,
+        }, var=False)
+        return f"ctl/ctl_reports/{lid}.json"
+    except Exception as e:
+        logger.warning("Полная копия отчёта %s не сохранена: %s", lid, e, exc_info=True)
+        add_note(f"⚠️ Полная копия отчёта не сохранена: {type(e).__name__}: {e}", context, level='task')
+        return None
+
+
 def _emit_datasets(lid, eids, result, context):
     res = int(result['res']) if result.get('res') is not None else -99
-    if result.get('html') and eids:
-        ctl_send_html(result['html'], lid, int(eids[0].split('/')[0]))
-        result['html'] = ''
+    if result.get('html'):
+        copy = _save_report(lid, result, context)
+        if eids:
+            skipped = ctl_send_html(_html_list(result['html']), lid, int(eids[0].split('/')[0]))
+            if skipped:
+                add_note({'не отправлено в CTL (раздел: длина)': dict(skipped), 'полная копия': copy},
+                         context, level='task', title='⚠️ Отчёт длиннее предела CTL')
+            result['html'] = ''
     msg = {}
     for eid_str in eids:
         eid = int(eid_str.split('/')[0])
