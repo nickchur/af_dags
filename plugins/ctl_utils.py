@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-26 21:38 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 22:31 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -228,11 +228,20 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=None):
             _last_call_time[pool_name] = current_time
     
 
+class CtlTooManyRequests(Exception):
+    """CTL ответил 429: запрос не выполнен, его можно повторить после паузы."""
+
+
 @retry(
-    stop=stop_after_attempt(3), # Максимум 3 попытки
-    wait=wait_exponential(multiplier=1, min=1, max=5), # Паузы 1с, 2с, 4с
+    stop=stop_after_attempt(3), # 3 попытки: первая + 2 повтора
+    wait=wait_exponential(multiplier=1, min=1, max=5), # Две паузы, 1–5 с
     # retry=retry_if_exception_type(Exception), # Ре траим на любые ошибки, кроме AirflowFailException
-    retry=retry_if_exception_type((ReadTimeout, ConnectTimeout, ConnectionError)),
+    # 429 — тоже повтор, а не отказ: окно лимита CTL — секунда, две паузы по 1–5 с его переживают.
+    # Повтор безопасен и для POST: отвергнутый по лимиту запрос CTL не выполнял.
+    # До 26.09.2026 429 шёл в общую ветку 4xx → AirflowSkipException: на стенде run_end
+    # отчёта ушёл в skipped посреди отправки фрагментов (11 запросов/с при лимите 10),
+    # итог в CTL не попал, загрузка осталась висеть
+    retry=retry_if_exception_type((ReadTimeout, ConnectTimeout, ConnectionError, CtlTooManyRequests)),
     before_sleep=log_retry_attempt,
     reraise=True
 )
@@ -240,7 +249,7 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
     """HTTP-клиент к CTL API через KerberosHttpHook с rate-limiting и retry.
 
     4xx → AirflowSkipException (skip=True) или AirflowFailException (skip=False).
-    5xx / таймаут → retry tenacity (до 3 раз, пауза 1–5 сек).
+    429 (лимит частоты), 5xx / таймаут → retry tenacity (3 попытки, паузы 1–5 сек).
     GET-запросы (кроме /statval, /tmpl) логируются в Greenplum через pr_log_ctl.
     Возвращает распарсенный JSON или текст ответа.
     """
@@ -269,6 +278,9 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         
         # Логируем ошибку с деталями
         error_msg = f"{resp_text[:200]} ❌ Error: {status_code} HTTP {method} {url}"
+        if status_code == 429:
+            logger.warning(error_msg)
+            raise CtlTooManyRequests(error_msg) from e
         logger.error(error_msg)
         
         # Если это ошибка клиента (4xx, кроме таймаутов 408/429), повторы не помогут
