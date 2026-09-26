@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-26 19:33 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 21:38 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -10,7 +10,7 @@
 | `gp_server_limit` / `gp_timeout` / `task_timeout` / `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` / `sensor_timeout` / `sensor_retries` | Лестница таймаутов — `ctl_worker/readme.md`, раздел «Таймауты» |
 | `ue_stale` / `ue_run_max` / `ue_grace` | Пороги монитора для потоков `ue_category` — `ctl_worker/readme.md`, раздел «Потоки UE» |
 | `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
-| `conns.<id>.pool_slots` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
+| `conns.<id>.pool_slots` / `ctl_rps` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
 | `tz` / `expire` | Часовой пояс и таймаут ожидания |
 | `orchestrator` / `pause_new_dags` | Кто владеет расписаниями (`ctl`/`mixed`/`af`) и пауза при создании дага |
 | `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
@@ -132,6 +132,7 @@ config = {
     'ue_grace': 'minutes=30',      # монитор UE: просрочка расписания/события → reStarted/Started
     'sensor_timeout': 'hours=6',   # служебные сенсоры: events, monitor, tfs_sensor
     'sensor_retries': 10,
+    'ctl_rps': 10,      # запросов к CTL в секунду из одного процесса (rate_limit); эмулятор держит тот же порог
     'ctl_limit': 1000,  #сколько записей запросить из CTL
     'ctl_days': 5, #сколько дней назад запросить из CTL
     # 'ctl_task_timeout': 'hours=+5',

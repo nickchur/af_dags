@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-26 13:28 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 21:38 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -13,7 +13,7 @@
 | `ctl_obj_load/save()` | JSON/YAML объекты в S3 + Airflow Variables |
 | `add_note()` | Заметки в UI Airflow (DAG run / task instance) |
 | `eval_delta()` | Временные смещения (`+1 hour`, `weekday=1`) |
-| `rate_limit()` | Ограничение частоты вызовов API (≤100/сек) |
+| `rate_limit()` | Ограничение частоты вызовов API (`ctl_rps` из `ctl_config`, по умолчанию 10/сек) |
 | `category_recursive()` | Иерархия задач по категориям CTL |
 
 > Импортируйте `get_config`, а не `config` напрямую.
@@ -183,8 +183,17 @@ import threading
 _last_call_time = {}
 _lock = threading.Lock()
 
-def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
+#: Запросов к CTL в секунду из одного процесса, если в ctl_config нет ctl_rps
+CTL_RPS_DEFAULT = 10
+
+
+def rate_limit(pool_name='ctl_pool', ctl_api_calls=None):
     """Thread-safe throttle: не более ctl_api_calls вызовов в секунду на pool_name — в этом процессе.
+
+    Порог — `ctl_rps` в `ctl_config` (по умолчанию 10; до 26.09.2026 был зашит 100). Общего
+    для всех задач счётчика нет: суммарно тракт может превысить порог в число одновременных
+    задач `ctl_pool`. Это ловит эмулятор CTL на стенде — он считает все запросы и отвечает 429
+    сверх `CTL_MOCK_RPS` (testbed/ctl_worker/ctl_mock.py).
 
     При необходимости блокирует поток на недостающий интервал (sleep). Словарь
     _last_call_time живёт в процессе, а у каждой задачи Airflow свой процесс, поэтому между
@@ -195,7 +204,14 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
     
     # Интервал между запросами (например, 1/100 = 0.01 сек)
     # Если нужно учитывать кол-во слотов, можно оставить вашу логику
-    min_interval = 1.0 / ctl_api_calls 
+    if ctl_api_calls is None:
+        try:
+            ctl_api_calls = float(get_config().get('ctl_rps') or CTL_RPS_DEFAULT)
+        except (TypeError, ValueError):
+            ctl_api_calls = CTL_RPS_DEFAULT
+    if ctl_api_calls <= 0:   # ноль или минус — не «без ограничения», а ошибка конфигурации
+        ctl_api_calls = CTL_RPS_DEFAULT
+    min_interval = 1.0 / ctl_api_calls
 
     with _lock:
         current_time = time.time()
@@ -206,8 +222,8 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
             wait_time = min_interval - elapsed
             logger.debug(f"🕒 Throttling {pool_name}: ждем {wait_time:.3f} сек")
             time.sleep(wait_time)
-            # Обновляем время после сна
-            _last_call_time[pool_name] = current_time
+            # Отметка — после сна: иначе следующий вызов считал бы интервал от начала ожидания
+            _last_call_time[pool_name] = time.time()
         else:
             _last_call_time[pool_name] = current_time
     

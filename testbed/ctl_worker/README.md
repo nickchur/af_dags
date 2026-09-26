@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-09-26 20:11 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 21:38 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -183,6 +183,12 @@ curl -s -X POST 'http://127.0.0.1:9080/v4/api/loading/0/entity/<eid>/stat/2/stat
 - **Не эмулируются**: права (`/permission*` отвечают «всё можно»), блокировки,
   зависимости воркфлоу (`lastactions`, `stateWithDependencies`), `bulkOperation*`.
   `filtered-compact` есть (поиск для MCP `ctl_workflow`/`ctl_search`), но фильтрует у себя.
+- **Лимит частоты — есть.** Все запросы считаются вместе, окно 1 с; сверх `CTL_MOCK_RPS`
+  (по умолчанию 10 — как `ctl_rps` в `ctl_config`) эмулятор отвечает 429 и пишет
+  предупреждение в свой лог (`CTL_MOCK_RPS_MODE=warn` — только предупреждение). Нужен, чтобы
+  видеть суммарную частоту тракта: `rate_limit()` держит порог только внутри процесса. Пики
+  за прошлое — по журналу: `select date_trunc('second', ts), count(*) from ctl_mock.api_log …`.
+  26.09.2026 пик был 15/с — `ctl_send_html` слал фрагменты отчёта вместе с действиями монитора.
 - **Kerberos не проверяется** — на стенде его нет.
 - **Боевые процедуры GP** — с 26.09.2026 настоящие: движок `pr_swf_start_ctl` и отчёты
   собираются из снимка `GP/` (`testbed/gp_engine/`). Заглушки из `schema.sql` он заменяет.

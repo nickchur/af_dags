@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-26 21:26 MSK · v3.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 21:38 MSK · v3.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -743,6 +743,7 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 | `ctl_conn_id` | Подключение к API CTL | `ctl` |
 | `conns.ctl.timeout` | Таймаут запроса к API (сек) | `30` |
 | `conns.ctl.pool_slots` | Размер пула `ctl_pool` (задаёт `test_conn`) | `20` |
+| `ctl_rps` | Запросов к CTL в секунду из одного процесса (`rate_limit`); эмулятор стенда отвечает 429 сверх того же порога по всем клиентам вместе | `10` |
 | `ctl_limit` | Лимит загрузки сущностей | `1000` |
 | `ctl_days` | Глубина выгрузки событий (дней) | `5` |
 | `ctl_url` | URL интерфейса CTL | `https://ctl-dev.dev.df.sbrf.ru:9080` |

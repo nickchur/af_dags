@@ -23,7 +23,10 @@ postgres, схема `ctl_mock` (`schema.sql`). Ничего, кроме наш�
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +42,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 DSN = os.getenv('CTL_MOCK_DSN', 'postgresql://airflow:airflow@127.0.0.1:5432/gp_test')
+logger = logging.getLogger('ctl_mock')
+
 FIXTURES = Path(os.getenv('CTL_MOCK_FIXTURES', Path(__file__).with_name('fixtures')))
 PROFILE = os.getenv('CTL_MOCK_PROFILE', 'HR_Data')
 MOCK_TZ = os.getenv('CTL_MOCK_TZ', 'Europe/Moscow')   # в этой зоне CTL отдаёт все отметки
@@ -597,8 +602,38 @@ async def _json(request: Request):
         return json.loads(raw) if raw else None
 
 
+# Лимит CTL на частоту запросов: сверх него — 429. Считаются все клиенты вместе, окно 1 с —
+# так видно, что тракт суммарно (задачи ctl_pool в своих процессах) превышает порог, который
+# rate_limit() держит только внутри процесса. Порог — тот же, что ctl_rps в ctl_config.
+RPS_LIMIT = int(os.getenv('CTL_MOCK_RPS', '10'))
+RPS_MODE = os.getenv('CTL_MOCK_RPS_MODE', 'reject')      # reject — 429; warn — только ругаться
+_hits: deque = deque()
+
+
+def _over_limit() -> int | None:
+    """Порог за последнюю секунду уже выбран — число принятых запросов; иначе None и запрос учтён.
+
+    Считаются только принятые: иначе при постоянной перегрузке окно не опустело бы никогда, и
+    эмулятор отказывал бы во всём, а не в избытке сверх порога.
+    """
+    now = time.monotonic()
+    while _hits and now - _hits[0] > 1.0:
+        _hits.popleft()
+    if RPS_LIMIT > 0 and len(_hits) >= RPS_LIMIT:
+        return len(_hits) + 1
+    _hits.append(now)
+    return None
+
+
 async def log_requests(request: Request, call_next):
-    response = await call_next(request)
+    rps = _over_limit()
+    if rps is not None:
+        logger.warning('ctl-mock: %s запросов за 1 с при лимите %s — %s %s', rps, RPS_LIMIT,
+                       request.method, request.url.path)
+    if rps is not None and RPS_MODE == 'reject':
+        response = JSONResponse({'error': f'Too Many Requests: {rps} req/s, limit {RPS_LIMIT}'}, status_code=429)
+    else:
+        response = await call_next(request)
     try:
         q("""insert into ctl_mock.api_log (method, path, query, status)
              values (%s,%s,%s,%s)""",
