@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-26 14:30 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 21:10 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -117,29 +117,6 @@ def time_wait_action(lid, log, wf, sdt, now, grace, context):
                  context, level='Task', title=f'reStarted {lid}')
         return 'reStarted'
     return 'Skipped'
-
-
-def ue_event_missed(wf, now):
-    """Событие потока UE пришло, а загрузки после него нет — dict с подробностями или None.
-
-    На первом этапе переноса оркестрации события обрабатывает CTL: пришло событие — CTL
-    создаёт загрузку. Точка отсчёта — старт последней загрузки потока: события после неё
-    ещё никого не запустили. Истории нет вовсе — молчим: поток мог ни разу не работать
-    намеренно, и первым запуском распоряжается человек. Выдержку в полчаса после события и
-    стратегию AND/OR даёт ctl_events_mon — тот же разбор, что у EVENT-WAIT.
-    """
-    if not any((wf.get('wf_event_sched') or {}).values()):
-        return None
-    found = ctl_api('/v5/api/loading/filtered-compact', data={
-        'wfNamesLike': json.dumps([wf.get('name')]), 'limit': 5, 'ordering': 'desc'}) or {}
-    items = found.get('items', []) if isinstance(found, dict) else found
-    starts = [str(i.get('start_dttm') or '')[:19] for i in items or []
-              if isinstance(i, dict) and str(i.get('wf_id')) == str(wf.get('id'))]
-    since = max([x for x in starts if x], default=None)
-    if not since:
-        return None
-    chk = ctl_events_mon(since, wf, now)
-    return None if chk.get('chk', True) else {**chk, 'since': since}
 
 
 def ue_action(lid, sts, log, sdt, now, wf, prm, context):
@@ -458,16 +435,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 if w.get('deleted', False) or wid in ue_active or ctl_wf_owner(w, ue_names, prf) != 'ue':
                     continue
                 if not w.get('scheduled'):
-                    # Не на расписании, но с событиями: на первом этапе события обрабатывает
-                    # CTL — пришло событие, он создаёт загрузку. Нет её через ue_grace — сорвалось
-                    ev = ue_event_missed(w, now)
-                    if ev and len(res) < MAX_WFS:
-                        actions['Started'] = actions.get('Started', 0) + 1
-                        res[f'wf:{wid}'] = {
-                            'time': '', 'sdt': ev.get('since', ''), 'SLA': '', 'sch': False, 'sts': None,
-                            'log': False, 'act': 'Started', 'icon': action_icons['Started'],
-                            'wid': wid, 'wfn': w.get('name', ''), 'ue': True, 'event': ev,
-                        }
+                    # Не на расписании — CTL ждущую загрузку не держит, и её отсутствие
+                    # штатно. Пришедшее событие у потока на расписании ловит EVENT-WAIT
+                    # (ue_action); у снятого с расписания стартовать по событию нечему —
+                    # так решил владелец. Замер прода 26.09.2026: у всех 58 UE-потоков
+                    # CTL держит EVENT-WAIT и создаёт следующую за 0,2–0,6 с после конца.
                     continue
                 lost[wid] = seen.get(wid) or now.to_datetime_string()
                 t = now - pendulum.parse(lost[wid], tz=tz)
