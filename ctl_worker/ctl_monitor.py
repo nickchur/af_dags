@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-22 14:41 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 14:30 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -9,23 +9,30 @@
 | 🚫 `Aborted` | Остановка при исчерпании попыток |
 | ✅ `Completed` | Успешное завершение |
 | ⚠️ `reStarted` | Перезапуск зависшей задачи |
+| ▶️ `Started` | Новая загрузка потока UE, у которого сорвалось расписание |
 | 🚨 `SLA` | Нарушение времени выполнения |
 | 🛑 `Stopped` | Остановка вручную |
 | ☮️ `Skipped` | Пропуск без изменений |
+
+Две ветки. Свои потоки (профиль контура + оркестратор `dummy`) — логика Airflow и GP.
+Потоки `ue_category` на других профилях и оркестраторах — наши, но исполняет их не
+Airflow: пороги `ue_stale` / `ue_run_max` / `ue_grace`, вместо `reRunned` — `reStarted`,
+а поток на расписании без активной загрузки получает новую (`Started`).
 """
 
 from airflow import DAG
 from airflow.decorators import task, task_group
 from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.models import DagModel, Param
+from airflow.models import DagModel, Param, Variable
 from airflow.utils.session import create_session
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
 from plugins.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN  # type: ignore
+from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN, ctl_wf_owner, ctl_subtree_names  # type: ignore
 
 import ast
+import json
 import re
 import sys
 from functools import partial
@@ -48,6 +55,7 @@ action_icons = {
     'New':'⏳' ,
     'Skipped': '☮️', 
     'SLA': '🚨',
+    'Started': '▶️',
 }
 
 # Сводка SLA делится по возрасту. Нарушение вчерашнее и нарушение полугодовой давности —
@@ -72,8 +80,100 @@ wait_grace = cfg_delta('wait_grace', 'minutes=15')          # просрочка
 # «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
 # Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
 # не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
+# Потоки ue_category исполняет не Airflow: соединения с GP, которое рвётся через 4 ч 30, у
+# них нет, и пороги свои — сутки на зависание и работу, полчаса на просрочку запуска.
+ue_stale = cfg_delta('ue_stale', 'hours=24')
+ue_run_max = cfg_delta('ue_run_max', 'hours=24')
+ue_grace = cfg_delta('ue_grace', 'minutes=30')
+# Потоки UE на расписании, у которых нет активной загрузки: {wf_id: когда заметили}.
+# Между проверками сенсор в reschedule теряет и память, и XCom — держим в Variable
+UE_LOST_VAR = 'ctl_ue_lost'
 sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
 sensor_retries = int(get_config().get('sensor_retries', 10))
+
+def time_wait_action(lid, log, wf, sdt, now, grace, context):
+    """Действие по загрузке в TIME-WAIT: reStarted, если срок старта прошёл больше `grace`.
+
+    Время старта достаём общим разбором: наш словарь, старый текст CTL 'Start scheduled
+    on …' либо расписание воркфлоу. Раньше здесь понимался ТОЛЬКО текст CTL, а всё
+    остальное считалось мусором и уходило в Aborted — то есть повтор, поставленный нами
+    же, монитор отменял. CTL этот текст больше не пишет, так что разбор идёт по остальным.
+    """
+    wait_to = ctl_wait_until(log)
+    if not wait_to:
+        # Лог молчит — смотрим условие запуска. Оно приходит ТОЛЬКО в полной загрузке
+        # (в списке /loading/extended его нет), поэтому дотягиваем её здесь, а не для
+        # каждой ожидающей. Спрашивать условие ДО расписания обязательно: при заданном
+        # startCondition CTL игнорирует wf_time_sched, и посчитанное по нему время было
+        # бы неправдой.
+        cond = (ctl_api(f'/v4/api/loading/{lid}') or {}).get('startCondition')
+        wait_to = ctl_wait_until(log, wf=wf, sdt=sdt, cond=cond)
+    if not wait_to:
+        # Время неизвестно НАМ, но известно CTL: он и разбудит загрузку. Пропускаем, а
+        # залипшую поймает проверка SLA и покажет человеку — лучше, чем отменить молча.
+        return 'Skipped'
+    if pendulum.parse(wait_to, tz=get_config()['tz']) + grace <= now:
+        add_note({'log': log, 'старт был назначен на': wait_to},
+                 context, level='Task', title=f'reStarted {lid}')
+        return 'reStarted'
+    return 'Skipped'
+
+
+def ue_event_missed(wf, now):
+    """Событие потока UE пришло, а загрузки после него нет — dict с подробностями или None.
+
+    На первом этапе переноса оркестрации события обрабатывает CTL: пришло событие — CTL
+    создаёт загрузку. Точка отсчёта — старт последней загрузки потока: события после неё
+    ещё никого не запустили. Истории нет вовсе — молчим: поток мог ни разу не работать
+    намеренно, и первым запуском распоряжается человек. Выдержку в полчаса после события и
+    стратегию AND/OR даёт ctl_events_mon — тот же разбор, что у EVENT-WAIT.
+    """
+    if not any((wf.get('wf_event_sched') or {}).values()):
+        return None
+    found = ctl_api('/v5/api/loading/filtered-compact', data={
+        'wfNamesLike': json.dumps([wf.get('name')]), 'limit': 5, 'ordering': 'desc'}) or {}
+    items = found.get('items', []) if isinstance(found, dict) else found
+    starts = [str(i.get('start_dttm') or '')[:19] for i in items or []
+              if isinstance(i, dict) and str(i.get('wf_id')) == str(wf.get('id'))]
+    since = max([x for x in starts if x], default=None)
+    if not since:
+        return None
+    chk = ctl_events_mon(since, wf, now)
+    return None if chk.get('chk', True) else {**chk, 'since': since}
+
+
+def ue_action(lid, sts, log, sdt, now, wf, prm, context):
+    """Действие монитора по загрузке потока UE (исполняет не Airflow, мы — владельцы).
+
+    Действуем теми же вызовами CTL, что и для своих, но без предположений об Airflow и
+    GP: RUNNING у чужого исполнителя — это работа, а не оборванное соединение, поэтому
+    порог сутки (или `wf_timeout` воркфлоу), а вместо reRunned — reStarted: вернуть
+    загрузку в RUNNING умеет только наш сенсор.
+    """
+    since = pendulum.parse(sdt, tz=get_config()['tz'])
+    if sts == 'ERROR':
+        return 'Aborted' if wf.get('faultTolerance', {}).get('abortOnFailure', False) else 'Completed'
+    if sts == 'SUCCESS':
+        return 'Completed'
+    if sts == 'ABORTING':
+        act = (log or '').split(' ')[0].strip()
+        return act if act in action_icons else 'Aborted'
+    if sts == 'TIME-WAIT':
+        return time_wait_action(lid, log, wf, sdt, now, ue_grace, context)
+    if sts == 'EVENT-WAIT':
+        # ctl_events_mon сам даёт событию полчаса форы, прежде чем счесть его пропущенным
+        chk = ctl_events_mon(sdt, wf, now)
+        if not chk['chk']:
+            add_note(chk, context, level='Task', title=f'reStarted {lid}')
+            return 'reStarted'
+        return 'Skipped'
+    if sts == 'RUNNING':
+        raw = prm.get('wf_timeout') or wf['params'].get('wf_timeout')
+        limit = gp_timeout({'wf_timeout': raw})[0] if raw else ue_run_max
+        return 'reStarted' if since + limit <= now else 'Skipped'
+    # INIT, PREREQ, PARAM, START, LOCK, LOCK-WAIT, ERRORCHECK — стоять сутки им незачем
+    return 'reStarted' if since + ue_stale <= now else 'Skipped'
+
 
 with DAG(f'CTL.{get_config()["profile"]}.monitor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'logger'],
@@ -150,17 +250,24 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         actions = {}
         stats = {}
 
-        for c in ctl_obj_load('ctl_categories').keys():
-            
-            data={
-                    'alive': '["ACTIVE"]', 
-                    'engines': '["dummy"]',
-                    # 'profile_ids': f'[{profile_id}]', 
-                    'category_ids': f'[{c}]'
-                    # 'category_ids': str(category_ids),
-                    # 'status': '["SUCCESS","ERROR","LOCK","RUNNING","TIME-WAIT","EVENT-WAIT"]',
-            }
+        # Две ветки. Свои (профиль контура + dummy) — во всём дереве, логика Airflow и GP.
+        # Потоки ue_category — любой профиль и оркестратор: исполняет не Airflow, пороги
+        # свои (ue_action). До 26.09.2026 фильтр был только по dummy: чужие оркестраторы
+        # монитор не видел вовсе, а dummy чужого профиля разбирал как свой.
+        prf = get_config()['profile']
+        profile_id = (ctl_obj_load('ctl_profile') or {}).get('id')
+        ue_names = ctl_subtree_names(get_config().get('ue_category'))
+        ue_active = set()      # воркфлоу UE, у которых есть активная загрузка
+        ue_complete = True     # ответ CTL по UE не обрезан лимитом — можно искать пропавших
+
+        for c, cat in ctl_obj_load('ctl_categories').items():
+            is_ue = cat.get('name') in ue_names
+            data = {'alive': '["ACTIVE"]', 'category_ids': f'[{c}]'}
+            if not is_ue:
+                data.update({'engines': '["dummy"]', 'profile_ids': f'[{profile_id}]'})
             tsk = ctl_loading_load(data, save=False)
+            if is_ue and get_config().get('ctl_limit', 0) and len(tsk) >= get_config()['ctl_limit']:
+                ue_complete = False
             
             for ld in sorted(tsk, key=lambda x: int(x['id'])):
                 
@@ -173,6 +280,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 # wf = wfs[wid]
                 wf = ctl_api(f'/v4/api/wf/{wid}')
                 wf = ctl_wf_norm(wf, None)
+                # double (свой профиль + dummy внутри ue_category) исполняет Airflow — ему своя логика
+                ue_ld = is_ue and ctl_wf_owner(wf, ue_names, prf) == 'ue'
+                if is_ue:
+                    ue_active.add(wid)
 
                 # ctl_obj_save(f"ctl_working/{lid}", jsn, var=False)
                 
@@ -213,7 +324,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 # status "INIT", "TIME-WAIT", "EVENT-WAIT", "LOCK-WAIT", "PREREQ", "LOCK", "PARAM", "START", "RUNNING", "SUCCESS", "ERROR", "ERRORCHECK", "ABORTING"
                 tst = pendulum.parse(eval_delta(sdt, new_grace), tz=get_config()['tz'])
                 
-                if tst <= now and not action:
+                if tst <= now and ue_ld:
+                    action = ue_action(lid, sts, log, sdt, now, wf, prm, context)
+                    r['ue'] = True
+                elif tst <= now and not action:
                     if sts == 'RUNNING' and not log:
                         action = 'Skipped'
 
@@ -233,8 +347,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                         action = 'Completed'
 
                     elif sts == 'ABORTING':
-                        action = log.split(' ').strip()
-                        action = action if status_icons.get(action) else 'Aborted'
+                        # Недоделанное действие монитора (лог '<действие> {…}') повторяем,
+                        # остальное закрываем. До 26.09.2026 ветка падала на list.strip(),
+                        # а сверка шла со статусами, а не с действиями
+                        action = (log or '').split(' ')[0].strip()
+                        action = action if action in action_icons else 'Aborted'
 
                     elif sts in ['LOCK-WAIT', 'LOCK']:
                         # if datetime.strptime(eval_delta(sdt, 'hours=5'), "%Y-%m-%d %H:%M:%S") <= now:
@@ -258,37 +375,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                             action = 'Skipped'
 
                     elif sts == 'TIME-WAIT' and not running:
-                        # Время старта достаём общим разбором: наш словарь, старый текст
-                        # CTL 'Start scheduled on …' либо расписание воркфлоу. Раньше здесь
-                        # понимался ТОЛЬКО текст CTL, а всё остальное считалось мусором и
-                        # уходило в Aborted — то есть повтор, поставленный нами же, монитор
-                        # отменял. CTL этот текст больше не пишет, так что ветка else стала
-                        # основной.
-                        # Сначала только лог: наш словарь либо старый текст CTL.
-                        wait_to = ctl_wait_until(log)
-
-                        if not wait_to:
-                            # Лог молчит — смотрим условие запуска. Оно приходит ТОЛЬКО
-                            # в полной загрузке (в списке /loading/extended его нет),
-                            # поэтому дотягиваем её здесь, а не для каждой ожидающей.
-                            #
-                            # Спрашивать условие ДО расписания обязательно: при заданном
-                            # startCondition CTL игнорирует wf_time_sched, и посчитанное
-                            # по нему время было бы неправдой.
-                            cond = (ctl_api(f'/v4/api/loading/{lid}') or {}).get('startCondition')
-                            wait_to = ctl_wait_until(log, wf=wf, sdt=sdt, cond=cond)
-
-                        if not wait_to:
-                            # Время неизвестно НАМ, но известно CTL: он и разбудит загрузку.
-                            # Пропускаем, а залипшую поймает проверка SLA ниже и покажет
-                            # человеку — это лучше, чем отменить молча.
-                            action = 'Skipped'
-                        elif pendulum.parse(wait_to, tz=get_config()['tz']) + wait_grace <= now:
-                            add_note({'log': log, 'старт был назначен на': wait_to},
-                                     context, level='Task', title=f'reStarted {lid}')
-                            action = 'reStarted'
-                        else:
-                            action = 'Skipped'
+                        action = time_wait_action(lid, log, wf, sdt, now, wait_grace, context)
 
                     elif sts == 'EVENT-WAIT' and not running:
                         chk = ctl_events_mon(sdt, wf, now)
@@ -355,6 +442,48 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     else:
                         continue
             
+        # Поток UE на расписании без активной загрузки — расписание сорвалось: по нему CTL
+        # сам больше ничего не создаст. Не раньше ue_grace с момента, как заметили: между
+        # концом загрузки и созданием следующей CTL нужно время. Обрезанный лимитом ответ
+        # CTL не годится — недостающие загрузки выглядели бы пропавшими потоками.
+        if ue_complete:
+            tz = get_config()['tz']
+            try:
+                seen = json.loads(Variable.get(UE_LOST_VAR, default_var='{}'))
+            except Exception:
+                seen = {}
+            lost = {}
+            for wid, w in (ctl_obj_load('ctl_workflows') or {}).items():
+                wid = str(wid)
+                if w.get('deleted', False) or wid in ue_active or ctl_wf_owner(w, ue_names, prf) != 'ue':
+                    continue
+                if not w.get('scheduled'):
+                    # Не на расписании, но с событиями: на первом этапе события обрабатывает
+                    # CTL — пришло событие, он создаёт загрузку. Нет её через ue_grace — сорвалось
+                    ev = ue_event_missed(w, now)
+                    if ev and len(res) < MAX_WFS:
+                        actions['Started'] = actions.get('Started', 0) + 1
+                        res[f'wf:{wid}'] = {
+                            'time': '', 'sdt': ev.get('since', ''), 'SLA': '', 'sch': False, 'sts': None,
+                            'log': False, 'act': 'Started', 'icon': action_icons['Started'],
+                            'wid': wid, 'wfn': w.get('name', ''), 'ue': True, 'event': ev,
+                        }
+                    continue
+                lost[wid] = seen.get(wid) or now.to_datetime_string()
+                t = now - pendulum.parse(lost[wid], tz=tz)
+                if t >= ue_grace and len(res) < MAX_WFS:
+                    actions['Started'] = actions.get('Started', 0) + 1
+                    res[f'wf:{wid}'] = {
+                        'time': (f'{t.days} d ' if t.days else '') + f'{t.hours:02}:{t.minutes:02}',
+                        'sdt': lost[wid], 'SLA': '', 'sch': True, 'sts': None, 'log': False,
+                        'act': 'Started', 'icon': action_icons['Started'],
+                        'wid': wid, 'wfn': w.get('name', ''), 'ue': True,
+                    }
+                    # следующая попытка — не раньше, чем через ue_grace
+                    lost[wid] = now.to_datetime_string()
+            if lost != seen:
+                Variable.set(UE_LOST_VAR, json.dumps(lost))
+
         actions = { f'{action_icons[a]}  {a}': v for a,v in actions.items()}
         add_note(actions, context, level='Task,DAG', title='Action', add=False)
         
@@ -433,6 +562,23 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             raise AirflowSkipException('Notheng to do')
         
         for lid, r in res.items():
+            if r['act'] == 'Started':
+                # Загрузки нет — ключ wf:<id>. Перед созданием ещё раз спрашиваем CTL:
+                # решение принято по снимку воркфлоу, а загрузка могла появиться с тех пор
+                wid = r['wid']
+                add_note(r, context, level='Task', title=f"▶️ wf {wid} {r['wfn']}")
+                try:
+                    live = ctl_api('/v5/api/loading/extended', data={
+                        'alive': '["ACTIVE"]', 'wfNamesLike': json.dumps([r['wfn']])}) or []
+                    if any(str(x.get('wf_id')) == wid for x in live):
+                        continue
+                    # поток на расписании возвращаем в расписание, поток по событию — нет
+                    after = 'true' if r.get('sch') else 'false'
+                    if active: ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={after}", "post", json={})
+                except Exception as e:
+                    logger.error(f"ctl_action Started failed for wf={wid}: {e}")
+                continue
+
             lid = int(lid)
             wid = r['wid']
             action = r['act']

@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-25 19:29 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 13:28 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -358,8 +358,8 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
         raise
 
 
-def gp_backend_busy(pid: int, timeout: int = 15) -> bool:
-    """Занят ли backend Greenplum с этим pid запуском загрузки.
+def gp_backend_busy(lid: int, timeout: int = 15) -> list:
+    """pid серверных процессов Greenplum, которые сейчас выполняют запуск загрузки `lid`.
 
     Нужна, чтобы отличить «работа ещё идёт» от «работы не было». По журналу это не
     различить: пока транзакция не закоммичена, её записи не видны другим сессиям. А
@@ -367,18 +367,26 @@ def gp_backend_busy(pid: int, timeout: int = 15) -> bool:
     (проверено на боевом кластере), поэтому после падения воркера ETL продолжает работать
     и закоммитится сам.
 
-    Смотрим `pg_stat_activity` на мастере: pid оттуда же, откуда его берёт `gp_exe`
-    (`pg_backend_pid()`). Отдельно сверяем текст запроса — pid переиспользуются, и без
-    этого чужая сессия сошла бы за нашу.
+    Ищем по номеру загрузки в тексте запроса, а не по pid прошлой попытки: pid жил в XCom,
+    а Airflow 2.11 стирает XCom задачи в начале каждой попытки (taskinstance.py:3127,
+    `clear_xcom_data`) — на повторе, ради которого pid и сохраняли, его уже не было.
+    `run_exe` ставит `lid` первым полем JSON, так что `track_activity_query_size` его не
+    обрежет; ищем регуляркой `"lid"\\s*:\\s*<номер>[^0-9]`. Свой процесс исключаем: в
+    тексте этого запроса тот же образец.
     """
     sql = """
-        select count(*)
+        select string_agg(pid::text, ',')
           from pg_stat_activity
-         where pid = %s
-           and query ilike '%%pr_swf_start_ctl%%'
+         where query ilike '%%pr_swf_start_ctl%%'
+           and query ~ %s
+           and pid <> pg_backend_pid()
     """
+    # Регулярка, а не like: пробелы вокруг двоеточия зависят от сериализатора, а промах
+    # здесь дорог — «запуска нет» отдаёт загрузку на повтор при идущем ETL. Граница после
+    # номера обязательна, иначе 1234 нашёлся бы в 12345
     ask = gp_exe.retry_with(stop=stop_after_attempt(2), wait=wait_fixed(2))
-    return bool(ask(sql=sql, val=(int(pid),), timeout=timeout))
+    res = ask(sql=sql, val=(f'"lid"\\s*:\\s*{int(lid)}[^0-9]',), timeout=timeout)
+    return [int(p) for p in res.split(',')] if res else []
 
 
 def gp_loading_result(lid: int, timeout: int = 30) -> dict | None:

@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-09-25 19:33 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 14:20 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
@@ -21,7 +21,7 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException, Airfl
 
 from plugins.utils import add_note, on_callback, readable_size, str2timedelta, md5_hash # type: ignore
 from plugins.ctl_utils import get_config,  ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
-from plugins.ctl_core import ctl_loading_load, ctl_wf_norm, chk_any_conn # type: ignore
+from plugins.ctl_core import ctl_loading_load, ctl_wf_norm, chk_any_conn, ctl_wf_owner, ctl_subtree_names, AF_ENGINE # type: ignore
 
 
 from functools import partial
@@ -43,6 +43,29 @@ def load_obj_save(obj, data, var=False, skip=False, **context):
     if skip:
         raise AirflowSkipException(msg)
     return False
+
+
+def wf_coverage(wfs, categories, profile):
+    """Потоки дерева, за которые никто не отвечает (`orphan`) или отвечают двое (`double`).
+
+    Каждый наш поток должен быть либо Airflow (свой профиль + dummy), либо в `ue_category`
+    (исполняет другой, следит монитор). Ничей поток теряется молча: дага нет, монитор не
+    смотрит. Удалённые и архив (`archive_category`) не в счёт — их не исполняет никто
+    намеренно. Зато архивный поток на расписании — аномалия: в архиве старые потоки, и
+    запускаться им незачем (`archive_live`).
+    Возвращает {'orphan': {wf_id: описание}, 'double': {...}, 'archive_live': {...}}.
+    """
+    ue = ctl_subtree_names(get_config().get('ue_category'), categories)
+    archive = ctl_subtree_names(get_config().get('archive_category', 'p1080.ARCHIVE'), categories)
+    out = {'orphan': {}, 'double': {}, 'archive_live': {}}
+    for wid, w in wfs.items():
+        if w.get('deleted', False):
+            continue
+        kind = ('archive_live' if w.get('scheduled') else None) if w.get('category') in archive \
+            else ctl_wf_owner(w, ue, profile)
+        if kind in out:
+            out[kind][wid] = f"{w.get('name')} · {w.get('profile')}/{w.get('engine')} · {w.get('category')}"
+    return out
 
 
 # Больше этой доли висячих — не верим ответу CTL, а не отсекаем полсписка событий.
@@ -310,15 +333,34 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         # Счётчик для фабрики: она читает его отдельной Variable и сверяет с тем, что
         # прочитала сама. Если ctl_workflows подменился копией из S3, расхождение видно
         prf = get_config()['profile']
+        cover = wf_coverage(wfs, category_ids, prf)
+        # Тот же отбор, что у фабрики (ctl_worker._wf_eligible): свой профиль и dummy
         eligible = sum(1 for w in wfs.values()
-                       if w.get('profile') == prf and not w.get('deleted', False))
+                       if w.get('profile') == prf and w.get('engine') == AF_ENGINE
+                       and not w.get('deleted', False))
         ctl_obj_save('ctl_workflows_stat', {
             'count': len(wfs),
             'eligible': eligible,
+            'orphan': len(cover['orphan']),
+            'double': len(cover['double']),
+            'archive_live': len(cover['archive_live']),
             'profile': prf,
             'md5': md5,
             'saved': str(pendulum.now(get_config()['tz']))[:19],
         }, var=True)
+
+        # Потоки вне присмотра — в заметку рана, полный список в лог. Таск не роняем: один
+        # криво заведённый поток остановил бы обновление снимков, от которых живут сенсор
+        # и фабрика дагов
+        for kind, title in (('orphan', '⚠️ Потоки вне присмотра'),
+                            ('double', '⚠️ Потоки и в Airflow, и в UE'),
+                            ('archive_live', '⚠️ Архивные потоки на расписании')):
+            if cover[kind]:
+                logger.warning("%s: %d: %s", title, len(cover[kind]), cover[kind])
+                top = dict(list(cover[kind].items())[:10])
+                if len(cover[kind]) > len(top):
+                    top['…'] = f"и ещё {len(cover[kind]) - len(top)}; полный список в логе таска"
+                add_note(top, context, level='DAG,Task', title=f'{title}: {len(cover[kind])}')
 
         # Сохраняем в S3
         load_obj_save('ctl_workflows', wfs, var=True, skip=True)

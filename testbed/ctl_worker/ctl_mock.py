@@ -501,6 +501,35 @@ async def loading_extended(request: Request):
     return JSONResponse(out)
 
 
+async def loading_filtered_compact(request: Request):
+    """GET /loading/filtered-compact (v1) — поиск загрузок, как в MCP ``ctl_workflow``/``ctl_search``.
+
+    Ответ ``{total, items}``, у загрузки — ``workflow`` и ``loading_status`` целиком (в
+    отличие от /loading/extended). Фильтры: ``loadingIds``, ``wfNamesLike`` (подстрока
+    имени), ``ctlStates`` (alive), ``orchestratorStates`` (status), ``startDateFrom``.
+    """
+    p = request.query_params
+    ids = [int(x) for x in as_list(p.get('loadingIds')) if str(x).isdigit()]
+    names = as_list(p.get('wfNamesLike'))
+    ctl_states, orch = as_list(p.get('ctlStates')), as_list(p.get('orchestratorStates'))
+    since, limit = p.get('startDateFrom') or '', int(p.get('limit') or 100)
+    order = 'asc' if p.get('ordering') == 'asc' else 'desc'
+    # ponytail: объект собирается на каждую строку; при десятках тысяч загрузок — фильтр в SQL
+    rows = (q(f'select id from ctl_mock.loading where id = any(%s) order by id {order}', (ids,)) if ids
+            else q(f'select id from ctl_mock.loading order by id {order}'))
+    items = []
+    for r in rows:
+        ld = loading_obj(r['id'])
+        name = (ld.get('workflow') or {}).get('name') or ''
+        if (names and not any(n in name for n in names)) or (ctl_states and ld['alive'] not in ctl_states) \
+                or (orch and ld['status'] not in orch) or (since and (ld.get('start_dttm') or '') < since):
+            continue
+        items.append(ld)
+        if len(items) >= limit:
+            break
+    return JSONResponse({'total': len(items), 'items': items})
+
+
 async def loading_one(request: Request):
     ld = loading_obj(int(request.path_params['lid']))
     return JSONResponse(ld) if ld else JSONResponse({'error': 'not found'}, status_code=404)
@@ -595,6 +624,7 @@ routes = [
     *route('/entity/{eid:int}', entity_one),
     *route('/entity', entities),
     *route('/loading/extended', loading_extended),
+    *route('/loading/filtered-compact', loading_filtered_compact),
     *route('/loading/{lid:int}/status', loading_status_put, ('PUT',)),
     *route('/loading/{lid:int}/entity/{eid:int}/stat/{sid:int}/statval', statval_post, ('POST',)),
     *route('/loading/{lid:int}/statvals', loading_statvals),

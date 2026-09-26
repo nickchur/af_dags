@@ -1,5 +1,5 @@
 # GP — скрипты Greenplum, которые трогает ctl_worker
-*2026-09-24 18:37 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 14:31 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимок DDL тех объектов Greenplum, вокруг которых крутится тракт CTL. Скопировано из
 `HR_Data`, чтобы не ходить туда за каждой мелочью на связанных задачах. Откуда именно и
@@ -194,6 +194,7 @@ CTL это `ctl`, у отчётов — `mail`; в базе есть и друг
 | `pr_mail_sdpue_report` | `SDPUE Last`, `SDPUE logged Last`, `SDPUE Errors`, `SDPUE logged Errors` |
 | `pr_mail_informatica_report` | `Informatica Last`, `Informatica Log` |
 | `pr_check_bd4ds` | одна таблица на группу, конфигурация — в `tb_bd4ds`, лог — в `tb_swf_chk_log` (слот `chk`) |
+| `pr_mail_ctl_alerts` | `CTL Alerts` — SLA-алерты потоков по параметрам `wf_alert` / `wf_alert_data` / `wf_alert_group`; заведённые алерты — в `tb_ctl_alerts`; `res = -6` — есть новые, CTL шлёт письмо (HR_Data E360-6367, инструкция `tasks/E360-6367/SLA_alerts.md`) |
 
 Вёрстка: `pr_tbl2html` — таблица из запроса; `pr_tbl2html_style` — то же с раскраской
 по значению; `pr_tbl2html_loop` — сравнение двух наборов строк.
