@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-26 13:28 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 19:33 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -14,6 +14,7 @@
 | `tz` / `expire` | Часовой пояс и таймаут ожидания |
 | `orchestrator` / `pause_new_dags` | Кто владеет расписаниями (`ctl`/`mixed`/`af`) и пауза при создании дага |
 | `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
+| `test_real` | Префиксы имён потоков, которые и в тестовом режиме выполняются по-настоящему (по умолчанию отчёты `pc1080.mail_`, `pc1080.check_`) |
 | `CTL_PIN` | PIN подтверждения (скрыто) |
 """
 
@@ -139,6 +140,9 @@ config = {
     'simulator': 'off',        # генератор нагрузки, ctl_test.py: off/event/dataset/trigger
     'test_mode': 'off',        # фиктивное выполнение, ctl_worker.py: off/ok/ok-no/ok-no-error
     'test_sleep': 'minutes=45',# верхняя граница ожидания вместо процедуры воркфлоу
+    # Потоки с этими префиксами имени и в тестовом режиме выполняются по-настоящему: отчёты
+    # строятся поверх журнала, который наполняют тестовые прогоны остальных потоков
+    'test_real': ['pc1080.mail_', 'pc1080.check_'],
     'tz': 'Europe/Moscow',
     'conns': conns,
     **conf,

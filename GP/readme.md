@@ -1,10 +1,14 @@
 # GP — скрипты Greenplum, которые трогает ctl_worker
-*2026-09-26 14:31 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 20:11 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимок DDL тех объектов Greenplum, вокруг которых крутится тракт CTL. Скопировано из
 `HR_Data`, чтобы не ходить туда за каждой мелочью на связанных задачах. Откуда именно и
 на какой ревизии — в [`source.json`](source.json); его же читают скрипты, поэтому
 ревизия здесь не дублируется, чтобы не разъехаться.
+
+Снимок читает и стенд: `testbed/gp_engine/build.py` собирает из него движок и отчёты для
+PostgreSQL. Поэтому здесь лежат и служебные объекты, которые нужны отчётам (`pr_log_*`,
+`tb_log_workflow*`, `pr_mail_style`, `try_cast2*`, `is_valid_json`).
 
 **Это копия, а не источник истины.** Править — в базе и в `HR_Data`; здесь читают.
 Правка, сделанная тут, никуда не уедет, и `check_context.py` о ней скажет (см. конец

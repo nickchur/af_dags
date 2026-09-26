@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-09-15 10:00 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 20:11 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -181,9 +181,13 @@ curl -s -X POST 'http://127.0.0.1:9080/v4/api/loading/0/entity/<eid>/stat/2/stat
   не касаемся, приезжают из снимка как есть, но у выдуманных объектов (новая загрузка)
   их нет. Расхождение с боем ловится сверкой ответа со снимком, а не эмулятором.
 - **Не эмулируются**: права (`/permission*` отвечают «всё можно»), блокировки,
-  зависимости воркфлоу, `bulkOperation*`, серверная фильтрация `filtered-compact`.
+  зависимости воркфлоу (`lastactions`, `stateWithDependencies`), `bulkOperation*`.
+  `filtered-compact` есть (поиск для MCP `ctl_workflow`/`ctl_search`), но фильтрует у себя.
 - **Kerberos не проверяется** — на стенде его нет.
-- **Боевые процедуры GP не выполняются**: только заглушка, разбирающая `exe`.
+- **Боевые процедуры GP** — с 26.09.2026 настоящие: движок `pr_swf_start_ctl` и отчёты
+  собираются из снимка `GP/` (`testbed/gp_engine/`). Заглушки из `schema.sql` он заменяет.
+- **Потоки-отчёты** (`pc1080.mail_*`) в снимке с боя отсутствуют — они в
+  `workflows_extra.json`, эмулятор подмешивает их к фикстурам.
 - **`ctl_tfs.py` на стенде не собирается**: `ProduceToTopicOperator` в
   `apache-airflow-providers-apache-kafka` 1.15 требует `delivery_callback` строкой-путём,
   а не функцией. На контуре провайдер старше, и там это работает.

@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-09-26 14:31 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 19:34 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -122,6 +122,8 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 | HR_Data/941010123/2 | pc1080.parent | ✅ ok, parent_ran_no_stat | 26.09 08:40 |
 **Чьё:** воркфлоу / CTL / платформа
 ```
+
+Просят показать отчёт (`pc1080.mail_*`, `pc1080.check_*`) — это навык `ctl-reports`.
 
 Потоки категории `p1080.ARCHIVE` — старые: отсутствие у них загрузок норма, «не отработал»
 для них не вопрос.

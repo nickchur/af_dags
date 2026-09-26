@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-26 13:28 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 19:33 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -14,7 +14,8 @@
 
 🧪 Тестовый режим (`test_mode` в `ctl_config`, только контуры DEV и IFT): вместо процедуры
 воркфлоу выполняется ожидание, а код результата берётся из профиля — `ok`, `ok-no` или
-`ok-no-error`. Параметр воркфлоу из CTL режим не включает.
+`ok-no-error`. Параметр воркфлоу из CTL режим не включает. Потоки с префиксами из
+`test_real` (по умолчанию отчёты `pc1080.mail_`, `pc1080.check_`) выполняются по-настоящему.
 """
 # Airflow 2.10.1
 
@@ -142,8 +143,17 @@ TEST_LEGACY = ('true', '1', 'yes', 'event', 'dataset', 'trigger')
 TEST_OFF = ('', 'off', 'false', 'none', '0')
 
 
-def test_profile(context=None):
+# Отчёты и проверки строятся поверх журнала движка — подделывать их незачем: на стенде они
+# показывают то, что накопили тестовые прогоны остальных потоков (решение 26.09.2026)
+TEST_REAL_DEFAULT = ('pc1080.mail_', 'pc1080.check_')
+
+
+def test_profile(context=None, wf_name=''):
     """Профиль тестового режима: имя из `TEST_PROFILES` или None, если режима нет.
+
+    Поток, чьё имя начинается с префикса из `test_real` (`ctl_config`), выполняется
+    по-настоящему и при включённом режиме — выключить режим для потока можно только там же,
+    где его включают; из CTL — нельзя.
 
     Источник один — `ctl_config`; параметр воркфлоу из CTL режим не включает. Контур не
     из `TEST_STANDS` гасит режим, и это не должно быть молчаливым: иначе «почему на бою
@@ -158,6 +168,13 @@ def test_profile(context=None):
         logger.warning(f"test_mode = {mode}: устаревшее значение, читаем как ok-no. "
                        f"Новые значения: {', '.join(TEST_PROFILES)}")
         mode = 'ok-no'
+
+    real = get_config().get('test_real', TEST_REAL_DEFAULT) or ()
+    if isinstance(real, str):   # форма конфига могла сохранить строкой через запятую
+        real = [p.strip() for p in real.split(',') if p.strip()]
+    if wf_name and str(wf_name).startswith(tuple(real)):
+        if context: add_note(f"🧪 test_real: {wf_name} выполняется по-настоящему", context, level='task')
+        return None
 
     if mode not in TEST_PROFILES:
         msg = f"⚠️ test_mode = {mode}: неизвестный профиль, тестовый режим выключен"
@@ -927,7 +944,7 @@ def build_worker_dag(w):
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             # 🧪 Тестовый режим: только из ctl_config и только на разрешённых контурах
-            test_mode = test_profile(context)
+            test_mode = test_profile(context, wf.get('name', ''))
 
             if test_mode:
                 # Вместо процедуры воркфлоу — ожидание случайной длины. Куб смещает выборку

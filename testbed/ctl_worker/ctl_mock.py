@@ -57,7 +57,11 @@ def _fixture(name, default):
 PROFILE_OBJ = _fixture('profile.json', {'id': 1557, 'name': PROFILE})
 CATEGORIES = _fixture('categories.json', [])
 ENTITIES = {int(k): v for k, v in _fixture('entities.json', {}).items()}
-WORKFLOWS = {int(w['wf']['id']): w for w in _fixture('workflows.json', [])}
+# Снимок с боя плюс стендовые потоки из репозитория (workflows_extra.json): потоки-отчёты
+# pc1080.mail_*, которых в снимке нет, а на стенде они строятся по-настоящему (test_real)
+_EXTRA = Path(__file__).with_name('workflows_extra.json')
+WORKFLOWS = {int(w['wf']['id']): w for w in _fixture('workflows.json', [])
+             + (json.loads(_EXTRA.read_text(encoding='utf-8')) if _EXTRA.exists() else [])}
 
 
 def _env_set(name: str) -> set[str]:
