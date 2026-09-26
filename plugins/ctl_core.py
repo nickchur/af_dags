@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-24 18:37 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 13:28 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -11,6 +11,7 @@
 | `ctl_chk_wait` / `ctl_chk_new` | Управление TIME-WAIT и готовностью к запуску |
 | `ctl_events_mon` / `ctl_chk_expire` | Мониторинг EVENT-WAIT (OR/AND), таймаут ожидания |
 | `ctl_wf_norm` / `ctl_get_eids` | Нормализация workflow, список участвующих сущностей |
+| `ctl_wf_owner` / `ctl_subtree_names` | Кто исполняет поток: Airflow, UE, оба или никто |
 | `ctl_send_html` | Потоковая отправка HTML-отчётов в CTL |
 | `chk_any_conn` | Проверка доступности Postgres / S3 / KerberosHttp |
 | `raise_status` | Превращает статус решателя (`ctl_chk_*`) в исключение Airflow |
@@ -127,24 +128,24 @@ def ctl_get_status(ld):
     }
 
 
-def ctl_exe_recover(lid, gp_pid=None, deadline=None, poll=30):
+def ctl_exe_recover(lid, deadline=None, poll=30):
     """🔎 Подбирает ответ по загрузке после обрыва: ждёт, если работа ещё идёт.
 
     Зовётся на повторной попытке `run_exe`. Отвечает на вопрос «что стало с прошлой
-    попыткой» и возвращает пару ``('ok', ответ)`` либо ``('fail', сообщение)`` —
-    решение принимает таск через `raise_status`.
+    попыткой» и возвращает пару:
 
-    Различать приходится три исхода, а не два:
+    - ``('ok', ответ)`` — **ответ в журнале есть**: работа выполнена и закоммичена;
+    - ожидание — **ответа нет, но Greenplum выполняет запуск этой загрузки**: обрыв
+      клиента запрос не останавливает, ETL продолжает работать. Ждём его: объявить работу
+      несостоявшейся значило бы отдать загрузку на повтор и получить второй ETL
+      параллельно первому;
+    - ``('lost', сообщение)`` — **ответа нет и запуска нет**: транзакция откачена, работы
+      не было. Исход достоверный, и загрузку можно сразу отдать CTL на повтор;
+    - ``('fail', сообщение)`` — запуск идёт дольше `deadline`: исход неизвестен.
 
-    - **ответ в журнале есть** — работа выполнена и закоммичена, отдаём его;
-    - **ответа нет, но backend занят нашей процедурой** — обрыв клиента запрос в Greenplum
-      не останавливает, значит ETL продолжает работать. Ждём его: упасть здесь значило бы
-      отдать загрузку на повтор в CTL и получить второй ETL параллельно первому;
-    - **ответа нет и backend свободен** — транзакция откачена, работы не было.
-
-    Без `gp_pid` (его пушит `gp_exe` в XCom) второй исход неотличим от третьего, и тогда
-    неизвестность трактуется в пользу «работа могла быть выполнена»: падаем, а не
-    запускаем ETL заново.
+    Запуск ищется по номеру загрузки (`gp_backend_busy`), а не по pid из XCom: Airflow
+    стирает XCom задачи в начале каждой попытки, и до 26.09.2026 повтор всегда заканчивался
+    «pid неизвестен». Недоступный Greenplum — исключение из справок, его разбирает таск.
     """
     from plugins.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
 
@@ -154,17 +155,19 @@ def ctl_exe_recover(lid, gp_pid=None, deadline=None, poll=30):
         if done:
             return 'ok', done
 
-        pid = (gp_pid or {}).get('pid') if isinstance(gp_pid, dict) else gp_pid
-        if not pid:
-            return 'fail', (f"ответа по загрузке {lid} в журнале Greenplum нет, а pid прошлой "
-                            "попытки неизвестен — идёт ли работа, определить нечем")
-        if not gp_backend_busy(pid):
-            return 'fail', (f"ответа по загрузке {lid} в журнале Greenplum нет, backend {pid} "
-                            "свободен — транзакция откачена, работа не выполнялась")
+        pids = gp_backend_busy(lid)
+        if not pids:
+            # Между двумя справками запуск мог закоммититься: журнал спрашиваем ещё раз,
+            # иначе выполненную работу объявили бы несостоявшейся и повторили
+            done = gp_loading_result(lid)
+            if done:
+                return 'ok', done
+            return 'lost', (f"ответа по загрузке {lid} в журнале Greenplum нет и запуска "
+                            "с этим номером нет — прошлая попытка откачена, работа не выполнена")
 
         if deadline and waited >= deadline:
-            return 'fail', (f"загрузка {lid} всё ещё выполняется в Greenplum (backend {pid}), "
-                            f"ждали {waited} с и не дождались")
+            return 'fail', (f"загрузка {lid} всё ещё выполняется в Greenplum (backend "
+                            f"{', '.join(map(str, pids))}), ждали {waited} с и не дождались")
         time.sleep(poll)
         waited += poll
 
@@ -785,6 +788,39 @@ def chk_any_conn(id, data=None, manage_pool=False, **context):
         raise AirflowFailException(f"{msg}: {err}") from err
 
         
+# Кто исполняет наши потоки (всё дерево root_category). Airflow — только профиль контура
+# с оркестратором dummy; потоки на других профилях и оркестраторах — наши же, но их
+# исполняет не Airflow: они лежат в ue_category, и за ними следит монитор (ветка UE).
+AF_ENGINE = 'dummy'
+
+
+def ctl_subtree_names(root_name, categories=None) -> set:
+    """Имена категории `root_name` и всех её потомков по дереву `ctl_categories`."""
+    cats = {str(k): c for k, c in (categories if categories is not None
+                                   else ctl_obj_load('ctl_categories') or {}).items()}
+    ids = {k for k, c in cats.items() if c.get('name') == root_name}
+    while True:
+        more = {k for k, c in cats.items() if str(c.get('parentId')) in ids} - ids
+        if not more:
+            return {cats[k]['name'] for k in ids}
+        ids |= more
+
+
+def ctl_wf_owner(wf, ue_names, profile) -> str:
+    """Кто отвечает за воркфлоу: `af`, `ue`, `double` (оба) или `orphan` (никто).
+
+    `af` — профиль контура и оркестратор dummy: даг строит фабрика, загрузки ведёт монитор
+    по своей логике. `ue` — лежит в `ue_category`: исполняет не Airflow, монитор только
+    следит. `double` — оба признака сразу: Airflow исполняет, ветка UE его не трогает.
+    `orphan` — ни то ни другое: дага нет, монитор не смотрит, поток потерян.
+    """
+    af = wf.get('profile') == profile and wf.get('engine') == AF_ENGINE
+    ue = wf.get('category') in ue_names
+    if af:
+        return 'double' if ue else 'af'
+    return 'ue' if ue else 'orphan'
+
+
 def ctl_wf_norm(wf, connectedEntities=None):
     """Нормализует workflow dict из API: разворачивает param→params, statusNotifications, wf_event_sched.
 
