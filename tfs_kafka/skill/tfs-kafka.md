@@ -5,7 +5,7 @@ description: Разбор тракта отправки в ТФС через Kaf
 
 # Тракт Kafka ↔ ТФС
 
-*2026-09-25 19:33 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 10:37 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow сигмы (`af-sigma-*`). Тракт общий: сейчас им
 пользуются выгрузки ЕР (навык **`er-export`**, `airflow://skill/er-export`), xStream пока шлёт
@@ -24,6 +24,9 @@ description: Разбор тракта отправки в ТФС через Kaf
 - Даги `tfs_kafka_snd`, `tfs_kafka_rcv`, `tfs_kafka_setup` — сюда.
 - Пакет ЕР упал на `wait_confirm` или ушёл в ☮️ из-за паузы — продолжение разбора здесь.
 - Общий вопрос «что с сигмой» — сначала `get_system_health` по навыку `airflow-health`.
+- Альфа: тракта там нет, квитанций и очереди в её бакете тоже; контуры независимы (навык
+  `airflow-health`, раздел 0): ключи и объекты бакета ищи только сервером своего контура, а нет
+  инструмента — пакет на контуре старее, сервером другого контура его не подменяй.
 
 ## 1. Устройство за минуту
 
