@@ -51,15 +51,18 @@ def wf_coverage(wfs, categories, profile):
     Каждый наш поток должен быть либо Airflow (свой профиль + dummy), либо в `ue_category`
     (исполняет другой, следит монитор). Ничей поток теряется молча: дага нет, монитор не
     смотрит. Удалённые и архив (`archive_category`) не в счёт — их не исполняет никто
-    намеренно. Возвращает {'orphan': {wf_id: описание}, 'double': {...}}.
+    намеренно. Зато архивный поток на расписании — аномалия: в архиве старые потоки, и
+    запускаться им незачем (`archive_live`).
+    Возвращает {'orphan': {wf_id: описание}, 'double': {...}, 'archive_live': {...}}.
     """
     ue = ctl_subtree_names(get_config().get('ue_category'), categories)
     archive = ctl_subtree_names(get_config().get('archive_category', 'p1080.ARCHIVE'), categories)
-    out = {'orphan': {}, 'double': {}}
+    out = {'orphan': {}, 'double': {}, 'archive_live': {}}
     for wid, w in wfs.items():
-        if w.get('deleted', False) or w.get('category') in archive:
+        if w.get('deleted', False):
             continue
-        kind = ctl_wf_owner(w, ue, profile)
+        kind = ('archive_live' if w.get('scheduled') else None) if w.get('category') in archive \
+            else ctl_wf_owner(w, ue, profile)
         if kind in out:
             out[kind][wid] = f"{w.get('name')} · {w.get('profile')}/{w.get('engine')} · {w.get('category')}"
     return out
@@ -340,6 +343,7 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
             'eligible': eligible,
             'orphan': len(cover['orphan']),
             'double': len(cover['double']),
+            'archive_live': len(cover['archive_live']),
             'profile': prf,
             'md5': md5,
             'saved': str(pendulum.now(get_config()['tz']))[:19],
@@ -349,7 +353,8 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         # криво заведённый поток остановил бы обновление снимков, от которых живут сенсор
         # и фабрика дагов
         for kind, title in (('orphan', '⚠️ Потоки вне присмотра'),
-                            ('double', '⚠️ Потоки и в Airflow, и в UE')):
+                            ('double', '⚠️ Потоки и в Airflow, и в UE'),
+                            ('archive_live', '⚠️ Архивные потоки на расписании')):
             if cover[kind]:
                 logger.warning("%s: %d: %s", title, len(cover[kind]), cover[kind])
                 top = dict(list(cover[kind].items())[:10])

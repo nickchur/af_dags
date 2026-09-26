@@ -111,6 +111,7 @@ SHALL получать новую загрузку (`Started`), если CTL п�
 `root_category` исполняет Airflow (профиль контура + `dummy`) либо он лежит в
 `ue_category`. Потоки ни там ни там (`orphan`) и в обеих группах сразу (`double`) SHALL
 показываться в заметке рана и считаться в `ctl_workflows_stat`; загрузчик из-за них не падает.
+Архивный поток (`archive_category`) на расписании SHALL показываться отдельно (`archive_live`).
 
 #### Scenario: Поток своего профиля на чужом оркестраторе вне ue_category
 
@@ -121,3 +122,9 @@ SHALL получать новую загрузку (`Started`), если CTL п�
 
 - **WHEN** workflow `HR_Data` + `dummy` лежит в `ue_category`
 - **THEN** он в «⚠️ Потоки и в Airflow, и в UE»; монитор ведёт его как свой, ветка UE не трогает
+
+#### Scenario: Архивный поток на расписании
+
+- **WHEN** workflow лежит в `archive_category` и `scheduled = true`
+- **THEN** он в «⚠️ Архивные потоки на расписании», `archive_live` в `ctl_workflows_stat` растёт;
+  архивный поток без расписания в проверке не участвует
