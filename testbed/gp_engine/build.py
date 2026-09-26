@@ -1,5 +1,5 @@
 """Движок srv_wf и отчёты CTL для стенда: GP/*.sql → PostgreSQL.
-*2026-09-26 19:55 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru*
+*2026-09-26 20:25 MSK · v1.1 · Nick Churkin · NSChurkin@sber.ru*
 
 Источник — снимок боевого SQL в `GP/srv_wf/` (его не правим). Сборщик берёт файлы как есть
 и механически убирает то, чего в PostgreSQL нет: `DISTRIBUTED …`, параметры хранения
@@ -40,7 +40,7 @@ ORDER = [
 # Что убираем. Регистр в боевом SQL разный ('DISTRIBUTED RANDOMLY' в DDL, 'distributed
 # randomly' во временных таблицах функций) — все шаблоны без учёта регистра.
 _GP_ONLY = [
-    (re.compile(r'\s*WITH\s*\(\s*appendonly[^)]*\)', re.I), ''),
+    (re.compile(r'\s*WITH\s*\([^)]*appendonly[^)]*\)', re.I), ''),
     (re.compile(r'\s*DISTRIBUTED\s+(RANDOMLY|REPLICATED|BY\s*\([^)]*\))', re.I), ''),
     (re.compile(r'\s*EXECUTE\s+ON\s+(ANY|MASTER|ALL\s+SEGMENTS)', re.I), ''),
 ]
@@ -49,7 +49,9 @@ _GP_ONLY = [
 # COMMENT ON вырезаем: описания объектов стенду не нужны, а в части файлов они с дефектом —
 # неэкранированные кавычки внутри строки (vw_log_ctl_entity: obj = 'entity'), и файл падает.
 # Конец комментария — «';» в конце строки: внутренняя кавычка идёт с другим знаком после.
-_COMMENT = re.compile(r"^\s*comment\s+on\s+.*?';\s*$", re.I | re.S | re.M)
+# Через «;» шаблон не шагает: комментарий без «';» на конце строки не утащит за собой
+# следующие операторы, а останется в сборке и упадёт на прогоне — это видно сразу.
+_COMMENT = re.compile(r"^\s*comment\s+on\s+[^;]*?';\s*$", re.I | re.M)
 
 
 def to_pg(sql: str) -> str:

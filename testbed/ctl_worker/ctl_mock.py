@@ -492,17 +492,17 @@ async def loading_extended(request: Request):
         wids = [wid for wid, w in WORKFLOWS.items()
                 if (not engines or w['wf'].get('engine') in engines)
                 and (not cats or str(_cat_id(w['wf'])) in cats)]
-        where.append('wf_id = any(%s)')
+        where.append('wf_id = any(%s::bigint[])')
         args.append(wids)
     # Профиль в загрузке приходит именем, а фильтр — идентификатором: сопоставляем
     # через справочник профиля (в снимке он один, чужих профилей на стенде нет).
     if profiles:
         names = [PROFILE_OBJ.get('name')] if str(PROFILE_OBJ.get('id')) in profiles else []
-        where.append('profile = any(%s)')
+        where.append('profile = any(%s::text[])')
         args.append(names)
     for col, val in (('alive', alive), ('status', statuses)):
         if val:
-            where.append(f'{col} = any(%s)')
+            where.append(f'{col} = any(%s::text[])')
             args.append(val)
     rows = q(f"select id from ctl_mock.loading where {' and '.join(where)} order by id limit %s", (*args, limit))
     return JSONResponse([loading_brief(loading_obj(r['id'])) for r in rows])
@@ -527,8 +527,9 @@ async def loading_filtered_compact(request: Request):
     if names and not wids:
         return JSONResponse({'total': 0, 'items': []})
     where, args = ['true'], []
-    for cond, val in (('id = any(%s)', ids), ('wf_id = any(%s)', wids), ('alive = any(%s)', ctl_states),
-                      ('status = any(%s)', orch), ('start_dttm >= %s::date', since)):
+    for cond, val in (('id = any(%s::bigint[])', ids), ('wf_id = any(%s::bigint[])', wids),
+                      ('alive = any(%s::text[])', ctl_states), ('status = any(%s::text[])', orch),
+                      ('start_dttm >= %s::date', since)):
         if val:
             where.append(cond)
             args.append(val)
