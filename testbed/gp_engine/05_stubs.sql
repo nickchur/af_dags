@@ -15,7 +15,8 @@ BEGIN
     FOR r IN SELECT n.nspname, c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
              WHERE c.relkind = 'r' AND (
                    (n.nspname = 's_grnplm_vd_hr_edp_srv_wf'
-                    AND c.relname IN ('vw_log_ctl_loading', 'vw_log_ctl_entity', 'vw_log_ctl_wf', 'vw_swf_ctl_log'))
+                    AND c.relname IN ('vw_log_ctl_loading', 'vw_log_ctl_entity', 'vw_log_ctl_wf', 'vw_swf_ctl_log',
+                                      'vw_log_workflow', 'vw_swf_chk_log', 'vw_exchange_log_ids'))
                 OR (n.nspname = 's_grnplm_vd_hr_edp_srv_dq' AND c.relname = 'vw_ztest'))
     LOOP
         EXECUTE format('DROP TABLE %I.%I CASCADE', r.nspname, r.relname);

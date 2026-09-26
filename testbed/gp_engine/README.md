@@ -1,5 +1,5 @@
 # Движок srv_wf и отчёты CTL на стенде (PostgreSQL)
-*2026-09-26 19:55 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-26 20:36 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Настоящий движок загрузок (`pr_swf_start_ctl` и его журналы) и отчёты CTL (`pr_mail_*`,
 `pr_check_*`) в базе `gp_test` тестового стенда. Зачем: стенд работает постоянно в тестовом
@@ -33,15 +33,29 @@ bash testbed/gp_engine/deploy.sh
 | `pr_mail_ctl_status` | HTML отчёта |
 | `pr_mail_ctl_alerts` | «no new alerts», пока у потоков нет `wf_alert` |
 | `pr_check_ctl` / `pr_check_etl` | развёрнуты: без них `pc1080.check_sberchat` в `test_real` падал бы с `-7` |
+| `pr_mail_ctl_report`, `_work_load_report`, `_ztest_report`, `_informatica_report`, `_sdpue_report` | HTML всех разделов; разделы с данными только GP (перекос, размеры, Informatica) пустые |
+| `pr_check_bd4ds` | развёрнут; без конфигурации в `tb_bd4ds` проверять нечего |
 
-Потоки-отчёты эмулятора — `testbed/ctl_worker/workflows_extra.json` (в снимке с боя их нет):
-`pc1080.mail_ctl_status` (каждые 2 ч), `pc1080.mail_ctl_alerts` (каждые 30 мин), расписание
-строит Airflow (`scheduled: false`, режим `mixed`), даги создаются на паузе.
+Потоки-отчёты эмулятора — `testbed/ctl_worker/workflows_extra.json` (в снимке с боя их нет),
+все `pc1080.mail_*`, расписание строит Airflow (`scheduled: false`, режим `mixed`), статистики
+пишутся на свою сущность 941010506 — на неё никто не подписан.
 
-## Чего нет и почему
+## Отличия от боя
 
-- `pr_mail_ctl_report` (блокировки через `pg_stat_activity`/`pg_locks` GP),
-  `pr_mail_ctl_work_load_report` (skew, resgroup — только в GP), `informatica`, `sdpue`,
-  `ztest` — следующим заходом.
+Общие правила сборки — выше. Точечные, по файлу (`_POINT` в `build.py`; не нашёлся шаблон —
+сборка падает, значит боевой SQL поменялся):
+
+| Файл | Greenplum | PostgreSQL |
+|---|---|---|
+| все | `pg_stat_activity.waiting_reason` | `wait_event` |
+| `pr_mail_ztest_report` | `count(distinct x) over (partition by y)` | два `dense_rank` (NULL — тоже значение) |
+| `pr_mail_ctl_work_load_report` | `interval / interval` | `extract(epoch …) / extract(epoch …)` |
+
+Порядок: `build.py` (движок и отчёты), вьюхи стенда обмена `gp_exchange/20_views.sql`, затем
+`build.py --post` (`vw_exchange_log_ids`, зависит от `vw_exchange_log`). `deploy.sh` падает на
+первой ошибке SQL и показывает её.
+
+## Найдено попутно
+
 - `COMMENT ON` вырезаются: в `GP/srv_wf/views/vw_log_ctl_entity.sql` (HR_Data E360-5966)
   неэкранированные кавычки внутри строки комментария (`obj = 'entity'`) — файл падает и в GP.
