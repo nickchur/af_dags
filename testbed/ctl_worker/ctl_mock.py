@@ -476,33 +476,36 @@ async def wf_loading_new(request: Request):
 
 
 async def loading_extended(request: Request):
-    p = request.query_params
-    alive = as_list(p.get('alive'))
-    statuses = as_list(p.get('status'))
-    engines = as_list(p.get('engines'))
-    profiles = as_list(p.get('profile_ids'))
-    limit = int(p.get('limit') or 1000)
+    """GET /loading/extended — список загрузок по alive, status, профилю, оркестратору, категории.
 
-    rows = q('select id from ctl_mock.loading order by id')
-    out = []
-    for r in rows:
-        ld = loading_obj(r['id'])
-        if alive and ld['alive'] not in alive:
-            continue
-        if statuses and ld['status'] not in statuses:
-            continue
-        # Профиль в загрузке приходит именем, а фильтр — идентификатором: сопоставляем
-        # через справочник профиля (в снимке он один, чужих профилей на стенде нет).
-        if profiles:
-            prof_id = str(PROFILE_OBJ.get('id')) if ld.get('profile') == PROFILE_OBJ.get('name') else ''
-            if prof_id not in profiles:
-                continue
-        if engines and (ld.get('workflow') or {}).get('engine') not in engines:
-            continue
-        out.append(loading_brief(ld))
-        if len(out) >= limit:
-            break
-    return JSONResponse(out)
+    Фильтры — в SQL, как в filtered-compact: перебор с объектом на каждую загрузку на
+    постоянно работающем стенде (1274 загрузки 26.09) не укладывался и в 60 с, а эмулятор
+    однопоточный — вставали сенсор, монитор и MCP. Оркестратор и категория — свойства
+    воркфлоу: переводим их в список wf_id по справочнику.
+    """
+    p = request.query_params
+    alive, statuses = as_list(p.get('alive')), as_list(p.get('status'))
+    engines, profiles, cats = as_list(p.get('engines')), as_list(p.get('profile_ids')), as_list(p.get('category_ids'))
+    limit = int(p.get('limit') or 1000)
+    where, args = ['true'], []
+    if engines or cats:
+        wids = [wid for wid, w in WORKFLOWS.items()
+                if (not engines or w['wf'].get('engine') in engines)
+                and (not cats or str(_cat_id(w['wf'])) in cats)]
+        where.append('wf_id = any(%s)')
+        args.append(wids)
+    # Профиль в загрузке приходит именем, а фильтр — идентификатором: сопоставляем
+    # через справочник профиля (в снимке он один, чужих профилей на стенде нет).
+    if profiles:
+        names = [PROFILE_OBJ.get('name')] if str(PROFILE_OBJ.get('id')) in profiles else []
+        where.append('profile = any(%s)')
+        args.append(names)
+    for col, val in (('alive', alive), ('status', statuses)):
+        if val:
+            where.append(f'{col} = any(%s)')
+            args.append(val)
+    rows = q(f"select id from ctl_mock.loading where {' and '.join(where)} order by id limit %s", (*args, limit))
+    return JSONResponse([loading_brief(loading_obj(r['id'])) for r in rows])
 
 
 async def loading_filtered_compact(request: Request):
@@ -516,21 +519,22 @@ async def loading_filtered_compact(request: Request):
     ids = [int(x) for x in as_list(p.get('loadingIds')) if str(x).isdigit()]
     names = as_list(p.get('wfNamesLike'))
     ctl_states, orch = as_list(p.get('ctlStates')), as_list(p.get('orchestratorStates'))
-    since, limit = p.get('startDateFrom') or '', int(p.get('limit') or 100)
+    since, limit = p.get('startDateFrom') or None, int(p.get('limit') or 100)
     order = 'asc' if p.get('ordering') == 'asc' else 'desc'
-    # ponytail: объект собирается на каждую строку; при десятках тысяч загрузок — фильтр в SQL
-    rows = (q(f'select id from ctl_mock.loading where id = any(%s) order by id {order}', (ids,)) if ids
-            else q(f'select id from ctl_mock.loading order by id {order}'))
-    items = []
-    for r in rows:
-        ld = loading_obj(r['id'])
-        name = (ld.get('workflow') or {}).get('name') or ''
-        if (names and not any(n in name for n in names)) or (ctl_states and ld['alive'] not in ctl_states) \
-                or (orch and ld['status'] not in orch) or (since and (ld.get('start_dttm') or '') < since):
-            continue
-        items.append(ld)
-        if len(items) >= limit:
-            break
+    # Фильтры — в SQL: объект загрузки собирается несколькими запросами, а загрузок на
+    # постоянно работающем стенде тысячи (26.09 перебор в Python не укладывался в 5 с MCP)
+    wids = [wid for wid, w in WORKFLOWS.items() if any(n in (w['wf'].get('name') or '') for n in names)]
+    if names and not wids:
+        return JSONResponse({'total': 0, 'items': []})
+    where, args = ['true'], []
+    for cond, val in (('id = any(%s)', ids), ('wf_id = any(%s)', wids), ('alive = any(%s)', ctl_states),
+                      ('status = any(%s)', orch), ('start_dttm >= %s::date', since)):
+        if val:
+            where.append(cond)
+            args.append(val)
+    rows = q(f"select id from ctl_mock.loading where {' and '.join(where)} order by id {order} limit %s",
+             (*args, limit))
+    items = [loading_obj(r['id']) for r in rows]
     return JSONResponse({'total': len(items), 'items': items})
 
 
