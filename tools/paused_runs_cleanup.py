@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-09-24 14:46 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 17:49 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Находит раны в `running` / `queued` у дагов на паузе и, если попросили, закрывает их —
 как кнопка **Mark failed** в UI.
@@ -201,7 +201,7 @@ def tools_paused_runs_cleanup():
     @task(task_id='find', trigger_rule=TriggerRule.NONE_FAILED)
     def find(**context) -> list:
         """🔎 Раны запаузенных дагов в выбранных состояниях, с возрастом и задачами."""
-        from sqlalchemy import func
+        from sqlalchemy import func, tuple_
 
         from airflow.models import DagModel, DagRun, Log, TaskInstance
         from airflow.utils import timezone as tz
@@ -226,13 +226,13 @@ def tools_paused_runs_cleanup():
             dag_ids = sorted({r['dag_id'] for r in runs})
             if runs:
                 keys = {(r['dag_id'], r['run_id']) for r in runs}
+                # По парам (dag_id, run_id) — индекс ti_dag_run; по одному dag_id читалась
+                # вся история запаузенных дагов, а лишнее отбрасывалось уже здесь
                 agg = (session.query(TaskInstance.dag_id, TaskInstance.run_id, TaskInstance.state,
                                      func.count(), func.max(TaskInstance.end_date))
-                       .filter(TaskInstance.dag_id.in_(dag_ids))
+                       .filter(tuple_(TaskInstance.dag_id, TaskInstance.run_id).in_(sorted(keys)))
                        .group_by(TaskInstance.dag_id, TaskInstance.run_id, TaskInstance.state))
                 for dag_id, run_id, state, n, last_end in agg:
-                    if (dag_id, run_id) not in keys:
-                        continue
                     info = tis.setdefault((dag_id, run_id), {'states': {}, 'last_end': None})
                     info['states'][state or 'none'] = n
                     if last_end and (info['last_end'] is None or last_end > info['last_end']):
