@@ -1,11 +1,11 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-24 13:00 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 16:05 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
 кто её открыл; здесь сетка DAG'а — лента здоровья контура: ❌ — был `error`.
 
-Одна задача `check`, семь проверок. Каждая изолирована: своё время, свой таймаут, свой
+Одна задача `check`, восемь проверок. Каждая изолирована: своё время, свой таймаут, свой
 `try/except` — упавшая даёт свою строку и не мешает остальным.
 
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
@@ -17,6 +17,7 @@
 | `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
 | `metabase` | время `SELECT 1`, соединений против `max_connections` | > 1 с или > 80 % | > 95 % |
 | `parsing` | свежесть разбора файлов, DAG'и без сериализации, ошибки импорта, итог ночного `parse_time` | новые ошибки импорта, файл выбился из круга разбора (старше и `min_file_process_interval + dag_file_processor_timeout`, и тройной медианы), разбор стоит целиком, DAG без сериализации, у `parse_time` находки | — |
+| `dag_size` | DAG'и по числу тасков — в определении и за ран (с раскрытыми mapped) за 7 дней, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300 | DAG больше 300 тасков | — |
 
 Итог — худший статус. **`error` роняет задачу** (после записи XCom и заметки): в сетке
 красный квадрат и уведомление через `on_callback`. `warn` — зелёный прогон с ⚠️ в заметке.
@@ -104,6 +105,16 @@ DB_STATEMENT_TIMEOUT_MS = 5000
 # Сколько имён показывать в строке проверки: XCom-бэкенд контура не берёт списков длиннее
 # 500, а заметка режется по 1000 символов — поимённо нужны только первые
 SHOW = 5
+# Размер DAG'ов (HRPDATALAB-16308): классы по числу тасков, каждый втрое больше прежнего.
+# Больше TASKS_ALERT — warn: такой DAG тяжёл шедулеру, сетке UI и пулам
+TASK_CLASSES = (1, 3, 10, 30, 100, 300)
+TASKS_ALERT = TASK_CLASSES[-1]
+# Сколько дней ранов смотреть на раскрытые mapped-таски
+TASKS_RUN_DAYS = 7
+# Запрос читает JSON всех сериализованных DAG'ов и таски ранов за неделю: на стенде
+# 27.09.2026 — 0,1 с на 73 DAG'ах и 102 тыс. task_instance. На контурах больше, общий
+# потолок в 5 с тесен
+DAG_SIZE_TIMEOUT_MS = 30000
 
 
 # ── Общее ─────────────────────────────────────────────────────────────
@@ -168,13 +179,13 @@ def _run(name: str, fn, *args) -> dict:
     return result
 
 
-def _pg_rows(sql: str, args: dict | None = None) -> list[dict]:
+def _pg_rows(sql: str, args: dict | None = None, timeout_ms: int = DB_STATEMENT_TIMEOUT_MS) -> list[dict]:
     """SELECT по метабазе с потолком на запрос."""
     from airflow.utils.session import create_session
     from sqlalchemy import text
 
     with create_session() as session:
-        session.execute(text(f"set local statement_timeout = {DB_STATEMENT_TIMEOUT_MS}"))
+        session.execute(text(f"set local statement_timeout = {int(timeout_ms)}"))
         return [dict(r) for r in session.execute(text(sql), args or {}).mappings()]
 
 
@@ -618,6 +629,77 @@ def check_parsing(dag_id: str, run_id: str) -> dict:
     return {**result, "status": status, "summary": "; ".join([summary, *notes])}
 
 
+# Два счёта, потому что они про разное. tasks — таски в определении DAG'а (сериализация).
+# max_ti — наибольшее число task_instance в одном ране за TASKS_RUN_DAYS дней: это уже с
+# раскрытыми mapped-тасками, и именно оно бьёт по шедулеру; DAG из 5 тасков с expand на
+# 1000 элементов по первому счёту безобиден. Класс — по большему из двух.
+# Раны отбираются по dag_run.start_date, а не сканом всего task_instance: на бою там
+# миллионы строк. tasks = null, если JSON сжат (compress_serialized_dags; на контурах
+# выключено, etl-core airflow-default.cfg) или DAG ещё не сериализован
+SQL_DAG_SIZE = """
+with m as (
+    select t.dag_id, max(t.cnt) as max_ti
+    from (select ti.dag_id, ti.run_id, count(*) as cnt
+          from task_instance ti
+          join dag_run r on r.dag_id = ti.dag_id and r.run_id = ti.run_id
+          where r.start_date > now() - cast(:days as interval)
+          group by ti.dag_id, ti.run_id) t
+    group by t.dag_id
+)
+select d.dag_id, d.is_paused,
+       json_array_length(s.data::json -> 'dag' -> 'tasks') as tasks,
+       coalesce(m.max_ti, 0)                               as max_ti
+from dag d
+left join serialized_dag s on s.dag_id = d.dag_id
+left join m on m.dag_id = d.dag_id
+where d.is_active
+"""
+
+
+def task_class(n: int) -> str:
+    """Класс по числу тасков: «1», «2–3», …, «101–300», «>300»."""
+    low = 1
+    for high in TASK_CLASSES:
+        if n <= high:
+            return str(high) if low == high else f"{low}–{high}"
+        low = high + 1
+    return f">{TASK_CLASSES[-1]}"
+
+
+def dag_size_verdict(rows: list[dict]) -> dict:
+    """Классы и алерт по строкам SQL_DAG_SIZE — отдельно от запроса, чтобы проверялось без базы."""
+    hist = dict.fromkeys([task_class(c) for c in TASK_CLASSES] + [task_class(TASKS_ALERT + 1)], 0)
+    big, unknown = [], 0
+    for r in rows:
+        size = max(int(r["tasks"] or 0), int(r["max_ti"] or 0))
+        # Нет ни сериализации, ни ранов за неделю — класса не назвать
+        if not size:
+            unknown += 1
+            continue
+        hist[task_class(size)] += 1
+        if size > TASKS_ALERT:
+            big.append((size, r))
+    big.sort(key=lambda x: -x[0])
+    top = {r["dag_id"]: {"tasks": r["tasks"], "max_ti": int(r["max_ti"] or 0), "paused": r["is_paused"]}
+           for _, r in big[:SHOW]}
+    head = (f"DAG'ов {len(rows)}; по числу тасков: " + ", ".join(f"{c} {n}" for c, n in hist.items() if n)
+            + (f", без данных {unknown}" if unknown else ""))
+    result = {"dags": len(rows), "classes": hist, "unknown": unknown, "over_alert": len(big), "top": top}
+    if not big:
+        return {**result, "status": "healthy", "summary": head}
+    names = ", ".join(f"{d} ({v['tasks'] if v['tasks'] is not None else '?'}/{v['max_ti']})" for d, v in top.items())
+    if len(big) > SHOW:
+        names += f" и ещё {len(big) - SHOW}"
+    return {**result, "status": "warn",
+            "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/за ран): {names}"}
+
+
+def check_dag_size() -> dict:
+    """DAG'и по числу тасков; больше TASKS_ALERT — warn."""
+    rows = _pg_rows(SQL_DAG_SIZE, {"days": f"{TASKS_RUN_DAYS} days"}, timeout_ms=DAG_SIZE_TIMEOUT_MS)
+    return dag_size_verdict(rows)
+
+
 # ── Сводка ────────────────────────────────────────────────────────────
 
 
@@ -682,7 +764,7 @@ def tools_system_health():
     # XCom — четыре лишние строки на прогон, 24 прогона в сутки
     @task(task_id="check", multiple_outputs=False)
     def check(**context) -> dict:
-        """Семь проверок подряд, итог — в лог, XCom и заметку; error роняет задачу."""
+        """Восемь проверок подряд, итог — в лог, XCom и заметку; error роняет задачу."""
         from airflow.exceptions import AirflowFailException
 
         state, msg = store_params(PARAMS_VAR, SAVED, context)
@@ -699,6 +781,7 @@ def tools_system_health():
             "pools": _run("pools", check_pools),
             "metabase": _run("metabase", check_metabase),
             "parsing": _run("parsing", check_parsing, dag_run.dag_id, dag_run.run_id),
+            "dag_size": _run("dag_size", check_dag_size),
         }
         took = round(time.time() - started, 1)
         status, reasons = verdict(checks)
