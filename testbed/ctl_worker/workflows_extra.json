@@ -1,0 +1,279 @@
+[
+ {
+  "wf": {
+   "id": 990001,
+   "name": "pc1080.mail_ctl_status",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "0 */2 * * *",
+    "wf_id": 990001
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_ctl_status()"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ },
+ {
+  "wf": {
+   "id": 990002,
+   "name": "pc1080.mail_ctl_alerts",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "*/30 * * * *",
+    "wf_id": 990002
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_ctl_alerts()"
+    },
+    {
+     "param": "wf_retry_cnt",
+     "prior_value": "0"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ },
+ {
+  "wf": {
+   "id": 990003,
+   "name": "pc1080.mail_ctl_report",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "15 */2 * * *",
+    "wf_id": 990003
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_ctl_report()"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ },
+ {
+  "wf": {
+   "id": 990004,
+   "name": "pc1080.mail_ctl_work_load_report",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "40 6 * * *",
+    "wf_id": 990004
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_ctl_work_load_report()"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ },
+ {
+  "wf": {
+   "id": 990005,
+   "name": "pc1080.mail_ztest_report",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "50 6 * * *",
+    "wf_id": 990005
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_ztest_report()"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ },
+ {
+  "wf": {
+   "id": 990006,
+   "name": "pc1080.mail_informatica_report",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "0 7 * * *",
+    "wf_id": 990006
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_informatica_report()"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ },
+ {
+  "wf": {
+   "id": 990007,
+   "name": "pc1080.mail_sdpue_report",
+   "profile": "HR_Data",
+   "engine": "dummy",
+   "category": "p1080",
+   "type": "principal",
+   "scheduled": false,
+   "deleted": false,
+   "singleLoading": true,
+   "maxActiveAutomaticLoadings": 1,
+   "eventAwaitStrategy": "or",
+   "wf_time_sched": {
+    "active": true,
+    "faultTolerance": true,
+    "sched": "10 7 * * *",
+    "wf_id": 990007
+   },
+   "statusNotifications": [],
+   "param": [
+    {
+     "param": "wf_sch",
+     "prior_value": "srv_wf"
+    },
+    {
+     "param": "wf_exe",
+     "prior_value": "pr_mail_sdpue_report()"
+    },
+    {
+     "param": "wf_timeout",
+     "prior_value": "10"
+    }
+   ]
+  },
+  "connectedEntities": [
+   941010506
+  ]
+ }
+]

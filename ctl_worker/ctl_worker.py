@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-22 14:41 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-26 21:26 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -14,7 +14,8 @@
 
 🧪 Тестовый режим (`test_mode` в `ctl_config`, только контуры DEV и IFT): вместо процедуры
 воркфлоу выполняется ожидание, а код результата берётся из профиля — `ok`, `ok-no` или
-`ok-no-error`. Параметр воркфлоу из CTL режим не включает.
+`ok-no-error`. Параметр воркфлоу из CTL режим не включает. Потоки с префиксами из
+`test_real` (по умолчанию отчёты `pc1080.mail_`, `pc1080.check_`) выполняются по-настоящему.
 """
 # Airflow 2.10.1
 
@@ -46,13 +47,15 @@ from functools import reduce
 from operator import and_, or_
 from pprint import PrettyPrinter
 
+from tenacity import stop_after_attempt
+
 
 from plugins.utils import add_note, env_stand, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
+from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_obj_save, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
                               ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed, ctl_loading_snapshot,
-                              ctl_exe_recover, gp_timeout, cfg_delta, EXE_MARGIN)
+                              ctl_exe_recover, gp_timeout, cfg_delta, EXE_MARGIN, AF_ENGINE)
 
 from logging import  getLogger
 logger = getLogger('airflow.task')
@@ -140,8 +143,17 @@ TEST_LEGACY = ('true', '1', 'yes', 'event', 'dataset', 'trigger')
 TEST_OFF = ('', 'off', 'false', 'none', '0')
 
 
-def test_profile(context=None):
+# Отчёты и проверки строятся поверх журнала движка — подделывать их незачем: на стенде они
+# показывают то, что накопили тестовые прогоны остальных потоков (решение 26.09.2026)
+TEST_REAL_DEFAULT = ('pc1080.mail_', 'pc1080.check_')
+
+
+def test_profile(context=None, wf_name=''):
     """Профиль тестового режима: имя из `TEST_PROFILES` или None, если режима нет.
+
+    Поток, чьё имя начинается с префикса из `test_real` (`ctl_config`), выполняется
+    по-настоящему и при включённом режиме — выключить режим для потока можно только там же,
+    где его включают; из CTL — нельзя.
 
     Источник один — `ctl_config`; параметр воркфлоу из CTL режим не включает. Контур не
     из `TEST_STANDS` гасит режим, и это не должно быть молчаливым: иначе «почему на бою
@@ -156,6 +168,13 @@ def test_profile(context=None):
         logger.warning(f"test_mode = {mode}: устаревшее значение, читаем как ok-no. "
                        f"Новые значения: {', '.join(TEST_PROFILES)}")
         mode = 'ok-no'
+
+    real = get_config().get('test_real', TEST_REAL_DEFAULT) or ()
+    if isinstance(real, str):   # форма конфига могла сохранить строкой через запятую
+        real = [p.strip() for p in real.split(',') if p.strip()]
+    if wf_name and str(wf_name).startswith(tuple(real)):
+        if context: add_note(f"🧪 test_real: {wf_name} выполняется по-настоящему", context, level='task')
+        return None
 
     if mode not in TEST_PROFILES:
         msg = f"⚠️ test_mode = {mode}: неизвестный профиль, тестовый режим выключен"
@@ -351,11 +370,49 @@ def _publish_stats(lid, eid, result):
     return logs
 
 
+def _html_list(html):
+    """HTML ответа шага → список разделов: JSON-массив строкой (так отдают pr_mail_*) либо один раздел."""
+    if isinstance(html, str):
+        try:
+            html = json.loads(html)
+        except ValueError:
+            return [html]
+    return html if isinstance(html, list) else [html]
+
+
+def _save_report(lid, result, context):
+    """Полная копия HTML-отчёта в бакет логов: `ctl/ctl_reports/{lid}.json`.
+
+    CTL режет статистику: `ctl_send_html` дробит раздел на фрагменты по `max_html`, а
+    раздел длиннее десяти фрагментов не отправляет вовсе — на объёмах прода это «CTL All
+    Active» и «CTL All WF» отчёта статуса (≈245 тыс. символов, стенд 26.09.2026). Копию
+    читает MCP `ctl_report`; повторная попытка загрузки её перезаписывает. Ошибка
+    сохранения исход загрузки не меняет.
+    """
+    html = _html_list(result.get('html'))
+    try:
+        ctl_obj_save(f"ctl_reports/{lid}", {
+            'loading_id': lid, 'dag_id': context['dag'].dag_id, 'run_id': context['run_id'],
+            'at': pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss'),
+            'res': result.get('res'), 'msg': result.get('msg'), 'html': html,
+        }, var=False)
+        return f"ctl/ctl_reports/{lid}.json"
+    except Exception as e:
+        logger.warning("Полная копия отчёта %s не сохранена: %s", lid, e, exc_info=True)
+        add_note(f"⚠️ Полная копия отчёта не сохранена: {type(e).__name__}: {e}", context, level='task')
+        return None
+
+
 def _emit_datasets(lid, eids, result, context):
     res = int(result['res']) if result.get('res') is not None else -99
-    if result.get('html') and eids:
-        ctl_send_html(result['html'], lid, int(eids[0].split('/')[0]))
-        result['html'] = ''
+    if result.get('html'):
+        copy = _save_report(lid, result, context)
+        if eids:
+            skipped = ctl_send_html(_html_list(result['html']), lid, int(eids[0].split('/')[0]))
+            if skipped:
+                add_note({'не отправлено в CTL (раздел: длина)': dict(skipped), 'полная копия': copy},
+                         context, level='task', title='⚠️ Отчёт длиннее предела CTL')
+            result['html'] = ''
     msg = {}
     for eid_str in eids:
         eid = int(eid_str.split('/')[0])
@@ -895,20 +952,28 @@ def build_worker_dag(w):
             # попадают из-за обрыва в самом конце: Greenplum отправлял результат, а воркера
             # уже убили по OOM или рестарту.
             if ti.try_number > 1:
-                gp_pid = ti.xcom_pull(key='gp_pid', task_ids='run_exe')
                 try:
-                    st, done = ctl_exe_recover(lid, gp_pid, deadline=int(wf_timeout.total_seconds()))
+                    st, done = ctl_exe_recover(lid, deadline=int(wf_timeout.total_seconds()))
                 except Exception as e:
                     # Неизвестность трактуем как «работа могла быть выполнена»: запустить
                     # ETL заново здесь дороже, чем отдать загрузку на разбор в CTL.
                     raise AirflowFailException(
                         f"⚠️ Повтор {ti.try_number}: Greenplum недоступен "
                         f"({type(e).__name__}: {e}) — ETL заново не запускаем") from e
-                if st != 'ok':
+                if st == 'lost':
+                    # Работы точно не было — отдаём ошибку в run_end, и он сразу применит
+                    # повторы воркфлоу (retry.on). Раньше таск падал, run_end уходил в
+                    # upstream_failed, и загрузка висела в RUNNING до монитора (6 ч).
+                    done = {'res': -9, 'msg': f"⚠️ Повтор {ti.try_number}: {done}",
+                            'ts': 'попытка оборвана'}
+                    title = 'Result (прошлая попытка оборвана)'
+                elif st != 'ok':
                     raise AirflowFailException(f"⚠️ Повтор {ti.try_number}: {done}")
-                done = {**done, 'ts': 'подобран из журнала GP'}
+                else:
+                    done = {**done, 'ts': 'подобран из журнала GP'}
+                    title = 'Result (ответ подобран из журнала GP)'
                 ti.xcom_push(key='result', value=done)
-                add_note(done, context, level='task,DAG', title='Result (ответ подобран из журнала GP)')
+                add_note(done, context, level='task,DAG', title=title)
                 return
 
             # Проверяем статус загрузки
@@ -917,7 +982,7 @@ def build_worker_dag(w):
             ti.xcom_push(key='current', value=json.dumps(ld_sts, default=str))
 
             # 🧪 Тестовый режим: только из ctl_config и только на разрешённых контурах
-            test_mode = test_profile(context)
+            test_mode = test_profile(context, wf.get('name', ''))
 
             if test_mode:
                 # Вместо процедуры воркфлоу — ожидание случайной длины. Куб смещает выборку
@@ -929,11 +994,13 @@ def build_worker_dag(w):
 
             retry = wf_prm.get('wfp_retry', {})
             
+            # lid — первым: по нему повторная попытка ищет запуск в pg_stat_activity
+            # (gp_backend_busy), а длинный exe отодвинул бы его за track_activity_query_size
             val = {
-                'wf': wf_name  # имя воркфлоу
+                'lid': lid     # id задачи
+                , 'wf': wf_name  # имя воркфлоу
                 , 'cat': cat   # категория воркфлоу
                 , 'exe': exe   # запуск
-                , 'lid': lid   # id задачи
                 , 'cwf': wid   # id воркфлоу
                 , 'sdt': sdt   # дата запуска
                 # , 'wfp': wfp   # параметры
@@ -958,7 +1025,11 @@ def build_worker_dag(w):
             
             # EXECUTE !!!
             ts = time.time()
-            res = gp_exe(sql=sql, ti=ti, timeout=int(wf_timeout.total_seconds())) 
+            # Одной попыткой: tenacity в gp_exe повторяет вызов при OperationalError, а это
+            # и обрыв соединения посреди запроса — Greenplum продолжает первый запуск, и
+            # повтор дал бы второй ETL параллельно. Потерянный ответ подбирает повтор таска.
+            once = gp_exe.retry_with(stop=stop_after_attempt(1))
+            res = once(sql=sql, ti=ti, timeout=int(wf_timeout.total_seconds()))
             # res['ts'] = pendulum.duration(seconds= int(time.time() - ts)).in_words()
             res['ts'] = str(timedelta(seconds=int(time.time() - ts)))
 
@@ -982,7 +1053,9 @@ def build_worker_dag(w):
                 pass
 
         outlets = [DatasetAlias(f"CTL/{profile}/{e}") for e in w_eids]
-        @task(outlets=outlets,)
+        # Вес 900 (на контурах weight_rule = absolute): итог должен уйти в CTL как можно
+        # быстрее — пока run_end стоит в очереди ctl_pool, загрузка висит в RUNNING
+        @task(outlets=outlets, priority_weight=900)
         def run_end(wf, **context):
             ti = context['task_instance']
             chk_any_conn('ctl')
@@ -1061,9 +1134,15 @@ def build_worker_dag(w):
 
 
 def _wf_eligible(wfs: dict) -> list:
-    """Воркфлоу, из которых вообще строятся даги: наш профиль и не удалённые."""
+    """Воркфлоу, из которых вообще строятся даги: наш профиль, оркестратор dummy, не удалённые.
+
+    Поток нашего профиля на другом оркестраторе Airflow не исполняет — прежде даг для него
+    строился и запускал ETL в обход того, кто поток действительно ведёт. Такой поток
+    загрузчик покажет как «вне присмотра» (ctl_loader.load_workflows).
+    """
     return [w for w in wfs.values()
-            if w.get('profile') == profile and not w.get('deleted', False)]
+            if w.get('profile') == profile and w.get('engine') == AF_ENGINE
+            and not w.get('deleted', False)]
 
 
 def _wf_check_shrink(eligible: list) -> None:

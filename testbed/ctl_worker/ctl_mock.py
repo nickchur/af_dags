@@ -23,7 +23,10 @@ postgres, схема `ctl_mock` (`schema.sql`). Ничего, кроме наш�
 from __future__ import annotations
 
 import json
+import logging
 import os
+import time
+from collections import deque
 from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +42,8 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 DSN = os.getenv('CTL_MOCK_DSN', 'postgresql://airflow:airflow@127.0.0.1:5432/gp_test')
+logger = logging.getLogger('ctl_mock')
+
 FIXTURES = Path(os.getenv('CTL_MOCK_FIXTURES', Path(__file__).with_name('fixtures')))
 PROFILE = os.getenv('CTL_MOCK_PROFILE', 'HR_Data')
 MOCK_TZ = os.getenv('CTL_MOCK_TZ', 'Europe/Moscow')   # в этой зоне CTL отдаёт все отметки
@@ -57,7 +62,11 @@ def _fixture(name, default):
 PROFILE_OBJ = _fixture('profile.json', {'id': 1557, 'name': PROFILE})
 CATEGORIES = _fixture('categories.json', [])
 ENTITIES = {int(k): v for k, v in _fixture('entities.json', {}).items()}
-WORKFLOWS = {int(w['wf']['id']): w for w in _fixture('workflows.json', [])}
+# Снимок с боя плюс стендовые потоки из репозитория (workflows_extra.json): потоки-отчёты
+# pc1080.mail_*, которых в снимке нет, а на стенде они строятся по-настоящему (test_real)
+_EXTRA = Path(__file__).with_name('workflows_extra.json')
+WORKFLOWS = {int(w['wf']['id']): w for w in _fixture('workflows.json', [])
+             + (json.loads(_EXTRA.read_text(encoding='utf-8')) if _EXTRA.exists() else [])}
 
 
 def _env_set(name: str) -> set[str]:
@@ -472,33 +481,67 @@ async def wf_loading_new(request: Request):
 
 
 async def loading_extended(request: Request):
-    p = request.query_params
-    alive = as_list(p.get('alive'))
-    statuses = as_list(p.get('status'))
-    engines = as_list(p.get('engines'))
-    profiles = as_list(p.get('profile_ids'))
-    limit = int(p.get('limit') or 1000)
+    """GET /loading/extended — список загрузок по alive, status, профилю, оркестратору, категории.
 
-    rows = q('select id from ctl_mock.loading order by id')
-    out = []
-    for r in rows:
-        ld = loading_obj(r['id'])
-        if alive and ld['alive'] not in alive:
-            continue
-        if statuses and ld['status'] not in statuses:
-            continue
-        # Профиль в загрузке приходит именем, а фильтр — идентификатором: сопоставляем
-        # через справочник профиля (в снимке он один, чужих профилей на стенде нет).
-        if profiles:
-            prof_id = str(PROFILE_OBJ.get('id')) if ld.get('profile') == PROFILE_OBJ.get('name') else ''
-            if prof_id not in profiles:
-                continue
-        if engines and (ld.get('workflow') or {}).get('engine') not in engines:
-            continue
-        out.append(loading_brief(ld))
-        if len(out) >= limit:
-            break
-    return JSONResponse(out)
+    Фильтры — в SQL, как в filtered-compact: перебор с объектом на каждую загрузку на
+    постоянно работающем стенде (1274 загрузки 26.09) не укладывался и в 60 с, а эмулятор
+    однопоточный — вставали сенсор, монитор и MCP. Оркестратор и категория — свойства
+    воркфлоу: переводим их в список wf_id по справочнику.
+    """
+    p = request.query_params
+    alive, statuses = as_list(p.get('alive')), as_list(p.get('status'))
+    engines, profiles, cats = as_list(p.get('engines')), as_list(p.get('profile_ids')), as_list(p.get('category_ids'))
+    limit = int(p.get('limit') or 1000)
+    where, args = ['true'], []
+    if engines or cats:
+        wids = [wid for wid, w in WORKFLOWS.items()
+                if (not engines or w['wf'].get('engine') in engines)
+                and (not cats or str(_cat_id(w['wf'])) in cats)]
+        where.append('wf_id = any(%s::bigint[])')
+        args.append(wids)
+    # Профиль в загрузке приходит именем, а фильтр — идентификатором: сопоставляем
+    # через справочник профиля (в снимке он один, чужих профилей на стенде нет).
+    if profiles:
+        names = [PROFILE_OBJ.get('name')] if str(PROFILE_OBJ.get('id')) in profiles else []
+        where.append('profile = any(%s::text[])')
+        args.append(names)
+    for col, val in (('alive', alive), ('status', statuses)):
+        if val:
+            where.append(f'{col} = any(%s::text[])')
+            args.append(val)
+    rows = q(f"select id from ctl_mock.loading where {' and '.join(where)} order by id limit %s", (*args, limit))
+    return JSONResponse([loading_brief(loading_obj(r['id'])) for r in rows])
+
+
+async def loading_filtered_compact(request: Request):
+    """GET /loading/filtered-compact (v1) — поиск загрузок, как в MCP ``ctl_workflow``/``ctl_search``.
+
+    Ответ ``{total, items}``, у загрузки — ``workflow`` и ``loading_status`` целиком (в
+    отличие от /loading/extended). Фильтры: ``loadingIds``, ``wfNamesLike`` (подстрока
+    имени), ``ctlStates`` (alive), ``orchestratorStates`` (status), ``startDateFrom``.
+    """
+    p = request.query_params
+    ids = [int(x) for x in as_list(p.get('loadingIds')) if str(x).isdigit()]
+    names = as_list(p.get('wfNamesLike'))
+    ctl_states, orch = as_list(p.get('ctlStates')), as_list(p.get('orchestratorStates'))
+    since, limit = p.get('startDateFrom') or None, int(p.get('limit') or 100)
+    order = 'asc' if p.get('ordering') == 'asc' else 'desc'
+    # Фильтры — в SQL: объект загрузки собирается несколькими запросами, а загрузок на
+    # постоянно работающем стенде тысячи (26.09 перебор в Python не укладывался в 5 с MCP)
+    wids = [wid for wid, w in WORKFLOWS.items() if any(n in (w['wf'].get('name') or '') for n in names)]
+    if names and not wids:
+        return JSONResponse({'total': 0, 'items': []})
+    where, args = ['true'], []
+    for cond, val in (('id = any(%s::bigint[])', ids), ('wf_id = any(%s::bigint[])', wids),
+                      ('alive = any(%s::text[])', ctl_states), ('status = any(%s::text[])', orch),
+                      ('start_dttm >= %s::date', since)):
+        if val:
+            where.append(cond)
+            args.append(val)
+    rows = q(f"select id from ctl_mock.loading where {' and '.join(where)} order by id {order} limit %s",
+             (*args, limit))
+    items = [loading_obj(r['id']) for r in rows]
+    return JSONResponse({'total': len(items), 'items': items})
 
 
 async def loading_one(request: Request):
@@ -559,8 +602,38 @@ async def _json(request: Request):
         return json.loads(raw) if raw else None
 
 
+# Лимит CTL на частоту запросов: сверх него — 429. Считаются все клиенты вместе, окно 1 с —
+# так видно, что тракт суммарно (задачи ctl_pool в своих процессах) превышает порог, который
+# rate_limit() держит только внутри процесса. Порог — тот же, что ctl_rps в ctl_config.
+RPS_LIMIT = int(os.getenv('CTL_MOCK_RPS', '10'))
+RPS_MODE = os.getenv('CTL_MOCK_RPS_MODE', 'reject')      # reject — 429; warn — только ругаться
+_hits: deque = deque()
+
+
+def _over_limit() -> int | None:
+    """Порог за последнюю секунду уже выбран — число принятых запросов; иначе None и запрос учтён.
+
+    Считаются только принятые: иначе при постоянной перегрузке окно не опустело бы никогда, и
+    эмулятор отказывал бы во всём, а не в избытке сверх порога.
+    """
+    now = time.monotonic()
+    while _hits and now - _hits[0] > 1.0:
+        _hits.popleft()
+    if RPS_LIMIT > 0 and len(_hits) >= RPS_LIMIT:
+        return len(_hits) + 1
+    _hits.append(now)
+    return None
+
+
 async def log_requests(request: Request, call_next):
-    response = await call_next(request)
+    rps = _over_limit()
+    if rps is not None:
+        logger.warning('ctl-mock: %s запросов за 1 с при лимите %s — %s %s', rps, RPS_LIMIT,
+                       request.method, request.url.path)
+    if rps is not None and RPS_MODE == 'reject':
+        response = JSONResponse({'error': f'Too Many Requests: {rps} req/s, limit {RPS_LIMIT}'}, status_code=429)
+    else:
+        response = await call_next(request)
     try:
         q("""insert into ctl_mock.api_log (method, path, query, status)
              values (%s,%s,%s,%s)""",
@@ -595,6 +668,7 @@ routes = [
     *route('/entity/{eid:int}', entity_one),
     *route('/entity', entities),
     *route('/loading/extended', loading_extended),
+    *route('/loading/filtered-compact', loading_filtered_compact),
     *route('/loading/{lid:int}/status', loading_status_put, ('PUT',)),
     *route('/loading/{lid:int}/entity/{eid:int}/stat/{sid:int}/statval', statval_post, ('POST',)),
     *route('/loading/{lid:int}/statvals', loading_statvals),
