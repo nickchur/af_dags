@@ -1,11 +1,11 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-24 13:00 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 17:06 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
 кто её открыл; здесь сетка DAG'а — лента здоровья контура: ❌ — был `error`.
 
-Одна задача `check`, семь проверок. Каждая изолирована: своё время, свой таймаут, свой
+Одна задача `check`, одиннадцать проверок. Каждая изолирована: своё время, свой таймаут, свой
 `try/except` — упавшая даёт свою строку и не мешает остальным.
 
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
@@ -17,9 +17,21 @@
 | `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
 | `metabase` | время `SELECT 1`, соединений против `max_connections` | > 1 с или > 80 % | > 95 % |
 | `parsing` | свежесть разбора файлов, DAG'и без сериализации, ошибки импорта, итог ночного `parse_time` | новые ошибки импорта, файл выбился из круга разбора (старше и `min_file_process_interval + dag_file_processor_timeout`, и тройной медианы), разбор стоит целиком, DAG без сериализации, у `parse_time` находки | — |
+| `runs` | раны в `queued` дольше 30 мин, раны `queued`/`running` у запаузенных дагов (поимённо, 10 самых старых) | есть раны у запаузенных дагов | — |
+| `scheduled` | даги с задачами в `scheduled` дольше 5 мин: сколько, как давно, упёрлись ли в свой `max_active_tasks` (`at_limit`) | застряли даги **не** на своём лимите | — |
+| `tables` | оценка строк больших таблиц метабазы (`reltuples`) | — | — |
+| `dag_size` | DAG'и по числу тасков — в определении и за ран (с раскрытыми mapped) за 7 дней, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300 | DAG больше 300 тасков | — |
 
 Итог — худший статус. **`error` роняет задачу** (после записи XCom и заметки): в сетке
 красный квадрат и уведомление через `on_callback`. `warn` — зелёный прогон с ⚠️ в заметке.
+
+**Плагин здоровья** (тег `health`): итог уходит ещё и отчётом в бакет логов,
+`system_health/checks/tools_system_health.json` (`report_health` из `plugins/utils.py`), откуда
+его читает `get_system_health` MCP — раздел `plugins`. Срок отчёта — 2 ч: пропустил два прогона,
+и core скажет «последний отчёт N назад». Раны запаузенных дагов, пулы, `scheduled`, отставание
+разбора и таблицы с etl-core 1.2.1 (HRPDATALAB-15978) проверяются только здесь, core их больше
+не считает. Все проверки — SQL к метабазе из таска: в AF3 так нельзя, их придётся перевести на
+REST.
 
 **Вывод:** строка на проверку в логе; XCom `return_value` — одна строка на прогон,
 `{status, reasons, checks, took_sec}`; заметка задачи и рана — нездоровые проверки по
@@ -57,12 +69,12 @@ from airflow.models import Param
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
-        saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, report_health, saved_params,
+        store_params, saved_schedule)
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
-        saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, report_health, saved_params,
+        store_params, saved_schedule)
 
 logger = logging.getLogger("airflow.task")
 
@@ -104,6 +116,32 @@ DB_STATEMENT_TIMEOUT_MS = 5000
 # Сколько имён показывать в строке проверки: XCom-бэкенд контура не берёт списков длиннее
 # 500, а заметка режется по 1000 символов — поимённо нужны только первые
 SHOW = 5
+# Размер DAG'ов (HRPDATALAB-16308): классы по числу тасков, каждый втрое больше прежнего.
+# Больше TASKS_ALERT — warn: такой DAG тяжёл шедулеру, сетке UI и пулам
+TASK_CLASSES = (1, 3, 10, 30, 100, 300)
+TASKS_ALERT = TASK_CLASSES[-1]
+# Сколько дней ранов смотреть на раскрытые mapped-таски
+TASKS_RUN_DAYS = 7
+# Запрос читает JSON всех сериализованных DAG'ов и таски ранов за неделю: на стенде
+# 27.09.2026 — 0,1 с на 73 DAG'ах и 102 тыс. task_instance. На контурах больше, общий
+# потолок в 5 с тесен
+DAG_SIZE_TIMEOUT_MS = 30000
+# Ран в queued дольше этого: меньше — обычное ожидание max_active_runs, дольше — чаще всего
+# даг на паузе
+QUEUED_RUN_STALE_SEC = 1800
+# Задача в scheduled дольше этого — повод назвать её даг; порог тот же, что у карточки
+# воркеров (STALE_AFTER_SEC): меньше — обычное ожидание цикла шедулера
+SCHEDULED_STALE_SEC = STALE_AFTER_SEC
+# Окно «даг только что был на лимите»: задачи дага, кончившиеся за это время, считаются к
+# занятым. Цикл шедулера сигмы — около 7 с, поэтому минуты хватает с запасом
+LIMIT_RECENT_SEC = 60
+# Сколько дагов и ранов называть поимённо в data
+TOP = 10
+# Таблицы метабазы, которые растут и чистятся tools_db_cleanup
+DB_TABLES = ("xcom", "log", "job", "dag_run", "task_instance", "task_fail",
+             "rendered_task_instance_fields", "celery_taskmeta")
+# Срок отчёта плагина: два часовых прогона с запасом
+REPORT_TTL_SEC = 2 * 3600 + 600
 
 
 # ── Общее ─────────────────────────────────────────────────────────────
@@ -168,13 +206,13 @@ def _run(name: str, fn, *args) -> dict:
     return result
 
 
-def _pg_rows(sql: str, args: dict | None = None) -> list[dict]:
+def _pg_rows(sql: str, args: dict | None = None, timeout_ms: int = DB_STATEMENT_TIMEOUT_MS) -> list[dict]:
     """SELECT по метабазе с потолком на запрос."""
     from airflow.utils.session import create_session
     from sqlalchemy import text
 
     with create_session() as session:
-        session.execute(text(f"set local statement_timeout = {DB_STATEMENT_TIMEOUT_MS}"))
+        session.execute(text(f"set local statement_timeout = {int(timeout_ms)}"))
         return [dict(r) for r in session.execute(text(sql), args or {}).mappings()]
 
 
@@ -618,6 +656,208 @@ def check_parsing(dag_id: str, run_id: str) -> dict:
     return {**result, "status": status, "summary": "; ".join([summary, *notes])}
 
 
+# Два счёта, потому что они про разное. tasks — таски в определении DAG'а (сериализация).
+# max_ti — наибольшее число task_instance в одном ране за TASKS_RUN_DAYS дней: это уже с
+# раскрытыми mapped-тасками, и именно оно бьёт по шедулеру; DAG из 5 тасков с expand на
+# 1000 элементов по первому счёту безобиден. Класс — по большему из двух.
+# Раны отбираются по dag_run.start_date, а не сканом всего task_instance: на бою там
+# миллионы строк. tasks = null, если JSON сжат (compress_serialized_dags; на контурах
+# выключено, etl-core airflow-default.cfg) или DAG ещё не сериализован
+SQL_DAG_SIZE = """
+with m as (
+    select t.dag_id, max(t.cnt) as max_ti
+    from (select ti.dag_id, ti.run_id, count(*) as cnt
+          from task_instance ti
+          join dag_run r on r.dag_id = ti.dag_id and r.run_id = ti.run_id
+          where r.start_date > now() - cast(:days as interval)
+          group by ti.dag_id, ti.run_id) t
+    group by t.dag_id
+)
+select d.dag_id, d.is_paused,
+       json_array_length(s.data::json -> 'dag' -> 'tasks') as tasks,
+       coalesce(m.max_ti, 0)                               as max_ti
+from dag d
+left join serialized_dag s on s.dag_id = d.dag_id
+left join m on m.dag_id = d.dag_id
+where d.is_active
+"""
+
+
+def task_class(n: int) -> str:
+    """Класс по числу тасков: «1», «2–3», …, «101–300», «>300»."""
+    low = 1
+    for high in TASK_CLASSES:
+        if n <= high:
+            return str(high) if low == high else f"{low}–{high}"
+        low = high + 1
+    return f">{TASK_CLASSES[-1]}"
+
+
+def dag_size_verdict(rows: list[dict]) -> dict:
+    """Классы и алерт по строкам SQL_DAG_SIZE — отдельно от запроса, чтобы проверялось без базы."""
+    hist = dict.fromkeys([task_class(c) for c in TASK_CLASSES] + [task_class(TASKS_ALERT + 1)], 0)
+    big, unknown = [], 0
+    for r in rows:
+        size = max(int(r["tasks"] or 0), int(r["max_ti"] or 0))
+        # Нет ни сериализации, ни ранов за неделю — класса не назвать
+        if not size:
+            unknown += 1
+            continue
+        hist[task_class(size)] += 1
+        if size > TASKS_ALERT:
+            big.append((size, r))
+    big.sort(key=lambda x: -x[0])
+    top = {r["dag_id"]: {"tasks": r["tasks"], "max_ti": int(r["max_ti"] or 0), "paused": r["is_paused"]}
+           for _, r in big[:SHOW]}
+    head = (f"DAG'ов {len(rows)}; по числу тасков: " + ", ".join(f"{c} {n}" for c, n in hist.items() if n)
+            + (f", без данных {unknown}" if unknown else ""))
+    result = {"dags": len(rows), "classes": hist, "unknown": unknown, "over_alert": len(big), "top": top}
+    if not big:
+        return {**result, "status": "healthy", "summary": head}
+    names = ", ".join(f"{d} ({v['tasks'] if v['tasks'] is not None else '?'}/{v['max_ti']})" for d, v in top.items())
+    if len(big) > SHOW:
+        names += f" и ещё {len(big) - SHOW}"
+    return {**result, "status": "warn",
+            "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/за ран): {names}"}
+
+
+def check_dag_size() -> dict:
+    """DAG'и по числу тасков; больше TASKS_ALERT — warn."""
+    rows = _pg_rows(SQL_DAG_SIZE, {"days": f"{TASKS_RUN_DAYS} days"}, timeout_ms=DAG_SIZE_TIMEOUT_MS)
+    return dag_size_verdict(rows)
+
+
+# ── Перенесено из etl-core (platform_health, до 1.2.1) ────────────────
+# AF3: метабаза из таска — в AF3 эти проверки переводятся на REST
+
+# AF2: у рана нет run_after — момент постановки в очередь, а у старых ранов без queued_at —
+# execution_date
+SQL_RUNS = """
+select
+    count(*) filter (where dr.state = 'queued'
+                       and coalesce(dr.queued_at, dr.execution_date)
+                           < now() - cast(:stale as interval))                                   as queued_stale,
+    -- trigger_dag паузу не смотрит: ран запаузенного дага висит в queued вечно
+    count(*) filter (where d.is_paused)                                                         as paused_active
+from dag_run dr
+join dag d on d.dag_id = dr.dag_id
+where dr.state in ('queued', 'running')
+"""
+
+# Сами раны запаузенных дагов, самые старые первыми. Одного счётчика мало: GigaCode 24.09.2026
+# на сигме искал пять таких ранов тридцатью вызовами. stuck.queued_runs показывает только
+# queued дольше получаса, tools_paused_runs_cleanup — только старше суток, а running не
+# показывает никто. Возраст: running — от старта, queued — от постановки в очередь
+SQL_PAUSED_RUNS = """
+select dr.dag_id, dr.run_id, dr.state,
+       cast(extract(epoch from now() - case when dr.state = 'running' and dr.start_date is not null
+                                            then dr.start_date
+                                            else coalesce(dr.queued_at, dr.execution_date) end)
+            as bigint)                                                                   as age_sec
+from dag_run dr
+join dag d on d.dag_id = dr.dag_id and d.is_paused
+where dr.state in ('queued', 'running')
+order by age_sec desc, dr.dag_id
+limit :top
+"""
+
+# Живые scheduled (даг не на паузе, ран в running) старше порога — по дагам. active — задачи
+# дага в queued и running: именно их шедулер сравнивает с dag.max_active_tasks, по всем ранам
+# сразу. Сигма 23.09.2026: 297 задач в scheduled были задачами raw_to_stable_* при
+# max_active_tasks = 4, а в лог шедулера это видно только как «>= max_active_tasks limit».
+# Карточка воркеров и публичный /health получают из этого только числа: имена дагов — сюда,
+# в MCP, куда без входа не попасть.
+#
+# active — снимок на один момент, и у дага с короткими задачами он врёт. Сигма 24.09.2026:
+# шедулер 3316 раз из 3567 писал «raw_to_stable_lrn_spsimadm has 4/4», задачи шли 7–14 с, а
+# между циклами (~7 с) кончившиеся освобождают места. Снимок попадал в эту щель, видел 0–3
+# из 4, и health называл даг «не на лимите» с советом смотреть parallelism. Поэтому к active
+# прибавляются задачи дага, кончившиеся за последние LIMIT_RECENT_SEC (recent): задача, которая
+# ждёт дольше 5 мин, а даг за минуту набирал свой лимит, ждёт именно лимита. recent берётся
+# только из ранов в running — по idx_dag_run_running_dags и ti_dag_run, без скана по end_date
+SQL_SCHEDULED = """
+with waiting as (
+    select ti.dag_id, count(*) as scheduled, min(ti.updated_at) as since
+    from task_instance ti
+    join dag d on d.dag_id = ti.dag_id and not d.is_paused
+    join dag_run dr on dr.dag_id = ti.dag_id and dr.run_id = ti.run_id and dr.state = 'running'
+    where ti.state = 'scheduled' and ti.updated_at < now() - cast(:stale as interval)
+    group by ti.dag_id
+)
+select w.dag_id, w.scheduled,
+       cast(extract(epoch from now() - w.since) as bigint)                   as oldest_sec,
+       (select count(*) from task_instance a
+         where a.dag_id = w.dag_id and a.state in ('queued', 'running'))      as active,
+       (select count(*) from dag_run r
+          join task_instance f on f.dag_id = r.dag_id and f.run_id = r.run_id
+         where r.dag_id = w.dag_id and r.state = 'running'
+           and f.end_date > now() - cast(:recent as interval))               as recent,
+       d.max_active_tasks
+from waiting w
+join dag d on d.dag_id = w.dag_id
+order by w.scheduled desc, w.dag_id
+"""
+
+# Оценка по статистике: count(*) по xcom и log на боевой метабазе — секунды. reltuples = -1 —
+# таблицу ещё не анализировали, числа нет. Таблица ищется по search_path (to_regclass), а не
+# в current_schema(): на стенде AF3 рядом с таблицами в public стояла пустая main
+SQL_TABLES = """
+select t.name as relname, c.reltuples::bigint as rows
+from unnest(cast(:tables as text[])) as t(name)
+join pg_class c on c.oid = to_regclass(t.name)
+"""
+
+
+
+
+def check_runs() -> dict:
+    """Раны, которые не начнутся или не кончатся: в queued дольше порога, у запаузенных дагов."""
+    counts = _pg_rows(SQL_RUNS, {"stale": f"{QUEUED_RUN_STALE_SEC} seconds"})[0]
+    result = {k: int(v or 0) for k, v in counts.items()}
+    if not result["paused_active"]:
+        return {**result, "status": "healthy",
+                "summary": f"в queued дольше {QUEUED_RUN_STALE_SEC // 60} мин: {result['queued_stale']}"}
+    runs = _pg_rows(SQL_PAUSED_RUNS, {"top": TOP})
+    names = _names(f"{r['dag_id']} ({r['state']}, {round((r['age_sec'] or 0) / 3600, 1)} ч)" for r in runs)
+    return {**result, "paused_runs": runs, "status": "warn",
+            "summary": f"ранов у запаузенных дагов в queued/running — {result['paused_active']}: {names}; "
+                       "пока даг на паузе, они не начнутся и не кончатся"}
+
+
+def check_scheduled() -> dict:
+    """Даги с задачами, давно ждущими в scheduled, и упёрлись ли они в свой max_active_tasks.
+
+    at_limit — running + queued дага вместе с кончившимися за LIMIT_RECENT_SEC (recent) не
+    меньше его max_active_tasks: шедулер задачи не отдаёт, потому что так велит даг. Это не
+    неисправность, в warn не идёт; warn — только если застряли даги не на лимите.
+    """
+    rows = _pg_rows(SQL_SCHEDULED, {"stale": f"{SCHEDULED_STALE_SEC} seconds",
+                                    "recent": f"{LIMIT_RECENT_SEC} seconds"})
+    for row in rows:
+        busy = row["active"] + (row.get("recent") or 0)
+        row["at_limit"] = row["max_active_tasks"] is not None and busy >= row["max_active_tasks"]
+    result = {"stale_after_sec": SCHEDULED_STALE_SEC, "total": sum(r["scheduled"] for r in rows),
+              "at_dag_limit": sum(r["scheduled"] for r in rows if r["at_limit"]),
+              "dags_total": len(rows), "dags": rows[:TOP]}
+    free = [r for r in rows if not r["at_limit"]]
+    head = (f"в scheduled дольше {SCHEDULED_STALE_SEC // 60} мин: {result['total']}, "
+            f"из них на лимите своего дага {result['at_dag_limit']}")
+    if not free:
+        return {**result, "status": "healthy", "summary": head}
+    return {**result, "status": "warn",
+            "summary": f"{head}; не на лимите max_active_tasks — "
+                       + _names(f"{r['dag_id']} ({r['scheduled']})" for r in free)
+                       + "; проверить пулы и слоты executor'а"}
+
+
+def check_tables() -> dict:
+    """Оценка строк больших таблиц метабазы — для «растёт ли метабаза»."""
+    rows = _pg_rows(SQL_TABLES, {"tables": list(DB_TABLES)})
+    tables = {r["relname"]: int(r["rows"]) for r in rows if r["rows"] is not None and r["rows"] >= 0}
+    return {"tables": tables, "status": "healthy",
+            "summary": ", ".join(f"{k} {v:,}".replace(",", " ") for k, v in tables.items())}
+
+
 # ── Сводка ────────────────────────────────────────────────────────────
 
 
@@ -660,8 +900,9 @@ def _param(key, default, **kwargs):
     start_date=datetime(2026, 9, 14, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools: служебный DAG — ролевка ограничивает запуск (HRPDATALAB-15421), а
-    # get_system_health показывает его в разделе служебных
-    tags=["DataLab", "tools", "check"],
+    # get_system_health показывает его в разделе служебных. Тег health: плагин здоровья —
+    # get_system_health читает его отчёт (раздел plugins)
+    tags=["DataLab", "tools", "check", "health"],
     catchup=False,
     # Смысл DAG'а — непрерывная лента, и он дёшев: включается сам
     is_paused_upon_creation=False,
@@ -682,7 +923,7 @@ def tools_system_health():
     # XCom — четыре лишние строки на прогон, 24 прогона в сутки
     @task(task_id="check", multiple_outputs=False)
     def check(**context) -> dict:
-        """Семь проверок подряд, итог — в лог, XCom и заметку; error роняет задачу."""
+        """Одиннадцать проверок подряд, итог — в лог, XCom, заметку и отчёт плагина; error роняет задачу."""
         from airflow.exceptions import AirflowFailException
 
         state, msg = store_params(PARAMS_VAR, SAVED, context)
@@ -699,6 +940,10 @@ def tools_system_health():
             "pools": _run("pools", check_pools),
             "metabase": _run("metabase", check_metabase),
             "parsing": _run("parsing", check_parsing, dag_run.dag_id, dag_run.run_id),
+            "dag_size": _run("dag_size", check_dag_size),
+            "runs": _run("runs", check_runs),
+            "scheduled": _run("scheduled", check_scheduled),
+            "tables": _run("tables", check_tables),
         }
         took = round(time.time() - started, 1)
         status, reasons = verdict(checks)
@@ -709,6 +954,8 @@ def tools_system_health():
         result = {"status": status, "reasons": reasons, "checks": checks, "took_sec": took}
         add_note(note_text(checks), context, level="task,DAG",
                  title=f"{ICON[status]} {took} sec system_health {stand}")
+        report_health({name: {**c, "skill": "tools"} for name, c in checks.items()}, context,
+                      ttl_sec=REPORT_TTL_SEC)
         if status == "error":
             # Падающая задача return-значения не оставляет — кладём его сами, иначе лента
             # в XCom теряла бы ровно те прогоны, ради которых она ведётся

@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-24 11:18 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-27 17:05 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -22,6 +22,7 @@
 | `query_to_dict()` | SQL → список словарей (Greenplum) |
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
+| `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
 from airflow.models import DagModel, TaskInstance, Pool
@@ -782,3 +783,65 @@ def get_af_conn():
     )
 
     return AF_ID
+
+
+#: Отчёт дага-плагина здоровья: контракт с etl-core (``mcp_health``, раздел ``plugins``
+#: сводки ``get_system_health``), меняются только вместе. Плагин — даг с тегом ``health``
+HEALTH_PREFIX = 'system_health/checks/'
+HEALTH_SCHEMA = 1
+#: Больше core не читает
+HEALTH_MAX_BYTES = 256 * 1024
+
+
+def report_health(checks, context=None, ttl_sec=7200):
+    """Пишет отчёт проверок дага в бакет логов, откуда его читает ``get_system_health``.
+
+    ``checks`` — ``{имя: {'status', 'summary', 'skill'?, ...}}``, статус из ``healthy``/``warn``/
+    ``error``/``unknown``; остальные поля проверки уходят в ``data``. ``ttl_sec`` — через сколько
+    отчёт считать просроченным: больше интервала расписания, иначе каждый поздний прогон —
+    тревога. Файл один на даг и перезаписывается целиком.
+
+    Сбой записи задачу не роняет: проверки уже в логе и заметке, а молчание плагина core
+    покажет сам — «последний отчёт N назад». Возвращает ключ или None.
+    """
+    import re
+    from airflow.configuration import conf
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+    context = context or get_current_context()
+    dag = context['dag']
+    key = f"{HEALTH_PREFIX}{dag.dag_id}.json"
+    version = re.search(r'· (v[\d.]+) ·', dag.doc_md or '')
+    report = {
+        'schema': HEALTH_SCHEMA,
+        'source': dag.dag_id,
+        'run_id': context['run_id'],
+        'version': version.group(1) if version else None,
+        'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'ttl_sec': int(ttl_sec),
+        'checks': {
+            name: {
+                'status': c.get('status', 'unknown'),
+                'summary': c.get('summary', ''),
+                **({'skill': c['skill']} if c.get('skill') else {}),
+                'data': {k: v for k, v in c.items() if k not in ('status', 'summary', 'skill')},
+            }
+            for name, c in checks.items()
+        },
+    }
+    text = json.dumps(report, ensure_ascii=False, default=str)
+    if len(text.encode()) > HEALTH_MAX_BYTES:
+        # Статусы и строки важнее подробностей: без data отчёт core ещё прочтёт
+        for c in report['checks'].values():
+            c['data'] = {'dropped': 'отчёт больше 256 КБ'}
+        text = json.dumps(report, ensure_ascii=False, default=str)
+    try:
+        bucket = conf.get('logging', 'remote_base_log_folder').split('://', 1)[1].split('/', 1)[0]
+        S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')).load_string(
+            text, key, bucket_name=bucket, replace=True,
+            encrypt=conf.getboolean('logging', 'encrypt_s3_logs', fallback=False))
+    except Exception:
+        logger.warning("report_health: отчёт %s не записан", key, exc_info=True)
+        return None
+    logger.info("report_health: %s", key)
+    return key

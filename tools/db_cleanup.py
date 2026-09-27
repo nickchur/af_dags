@@ -1,9 +1,12 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-24 13:00 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 17:49 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
-Большие таблицы (> 50 000 строк) удаляются порциями по диапазону дат.
+Большие таблицы (> 50 000 строк) удаляются порциями: по первичному ключу, если индекса по
+дате нет, а `id` есть (`task_reschedule`, `task_fail`, `job`, celery-таблицы), иначе по
+диапазону дат. До v1.14 условие «ран старше cutoff» у задач сравнивало `dag_id` само с собой
+и пропускало всё, а `dag_code` не чистился вовсе — та же ошибка с `fileloc_hash`.
 Порядок таблиц строится по внешним ключам — ребёнок раньше родителя, иначе каскад
 (`ON DELETE CASCADE`) утягивает детей в транзакцию родителя и батч перестаёт работать.
 
@@ -70,10 +73,12 @@ ensure_pool(TOOLS_POOL)
 
 BATCH_SIZE = 50_000
 
-# Дополнительные условия для использования существующих индексов без создания новых.
-# {p} — префикс алиаса таблицы ('' или 'base.').
-# Опираемся на idx_dag_run_execution_date: execution_date ≤ start_date всегда,
-# поэтому start_date < cutoff ⟹ execution_date < cutoff (безопасное добавление).
+# Дополнительные условия: не трогать строки ранов моложе cutoff.
+# {p} — префикс таблицы: её имя ('task_instance.') или алиас 'base.'; пустым не бывает, см. _do_cleanup.
+# execution_date ≤ start_date всегда, поэтому start_date < cutoff ⟹ execution_date < cutoff
+# (безопасное добавление). Индекса по execution_date в AF 2.11 нет — только вторым полем
+# в (dag_id, execution_date), — поэтому EXISTS находит ран по уникальному (dag_id, run_id)
+# (у xcom — по dag_run.id), а дату проверяет у одной найденной строки.
 _EXTRA_COND = {
     'dag_run': '{p}execution_date < :cutoff',
     'task_instance': (
@@ -96,7 +101,7 @@ _EXTRA_COND = {
         ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
         ' AND _dr.execution_date < :cutoff)'
     ),
-    # dag_run_id — FK на dag_run.id; подзапрос использует idx_dag_run_execution_date
+    # dag_run_id — FK на dag_run.id; подзапрос идёт по первичному ключу dag_run
     'xcom': (
         'EXISTS (SELECT 1 FROM main.dag_run _dr'
         ' WHERE _dr.id = {p}dag_run_id AND _dr.execution_date < :cutoff)'
@@ -167,11 +172,19 @@ _BATCH_DIV = {'dag_run': 10}
 
 # Таблицы без индекса на recency-колонке но с integer PK —
 # удаляем через ORDER BY pk LIMIT batch_size чтобы использовать PK-индекс.
+# Иначе каждый батч по диапазону дат — полный проход по таблице: у task_reschedule
+# (start_date), task_fail (start_date) и job (latest_heartbeat) индекса по дате нет
+# (у job — только вторым полем). id растёт вместе с датой, так что старые строки идут первыми.
+# ponytail: task_instance и xcom без целочисленного PK остаются на батчах по датам —
+# проход по таблице на батч; делить по dag_run.id, если ночная чистка начнёт не успевать.
 _PK_BATCH = {
     'celery_tasksetmeta': 'id',
     'celery_taskmeta':    'id',
     'callback_request':   'id',
     'import_error':       'id',
+    'task_reschedule':    'id',
+    'task_fail':          'id',
+    'job':                'id',
 }
 
 # Таблицы вне стандартного _cleanup_config с дополнительным safety-фильтром (opt-in через custom=True).
@@ -180,14 +193,14 @@ _CUSTOM_TABLES = {
     'dag_code': {
         'col': 'last_updated',
         'safe_where': (
-            'NOT EXISTS (SELECT 1 FROM main.serialized_dag sd WHERE sd.fileloc_hash = fileloc_hash)'
+            'NOT EXISTS (SELECT 1 FROM main.serialized_dag sd WHERE sd.fileloc_hash = dag_code.fileloc_hash)'
         ),
     },
     # Устаревший pickle-формат — нельзя трогать то, на что ссылается dag.pickle_id
     'dag_pickle': {
         'col': 'created_dttm',
         'safe_where': (
-            'NOT EXISTS (SELECT 1 FROM main.dag d WHERE d.pickle_id = id)'
+            'NOT EXISTS (SELECT 1 FROM main.dag d WHERE d.pickle_id = dag_pickle.id)'
         ),
     },
 }
@@ -431,21 +444,24 @@ def tools_db_cleanup():
             return str(d)[:10] if d else '—'
 
         def _idx_label(tbl, col, session):
-            """✅ прямой индекс / ↗ косвенный / 🔑 PK-батч / ❌ seq scan."""
+            """✅ прямой индекс / ↗ косвенный / 🔑 PK-батч / ❌ seq scan.
+
+            Прямой — колонка первая в индексе: вторым полем (job_type, latest_heartbeat) диапазон
+            по дате не ищется."""
             if col:
                 n = session.execute(text("""
                     SELECT COUNT(*) FROM pg_index i
-                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+                    JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
                     JOIN pg_class c ON c.oid = i.indrelid
                     JOIN pg_namespace ns ON ns.oid = c.relnamespace
                     WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
                 """), {'tbl': tbl, 'col': col}).scalar()
                 if n:
                     return '✅'
-            if tbl in _EXTRA_COND:
-                return '↗'
             if tbl in _PK_BATCH:
                 return '🔑'
+            if tbl in _EXTRA_COND:
+                return '↗'
             return '❌'
 
         def _do_cleanup(tbl, session, on_batch=None):
@@ -459,7 +475,7 @@ def tools_db_cleanup():
                 custom = _CUSTOM_TABLES[tbl]
                 col = custom['col']
                 idx = _idx_label(tbl, col, session)
-                p = ''
+                p = f'{tbl}.'
                 base_where = f"{col} < :cutoff AND {custom['safe_where']}"
                 count_sql = text(f"SELECT COUNT(*), MIN({col}), MAX({col}) FROM {t} WHERE {base_where}")
                 def make_delete(batch_extra=''):
@@ -481,7 +497,11 @@ def tools_db_cleanup():
                     base_where = f"base.{col} < :cutoff AND _l._max IS NULL"
                     from_clause = f"{t} base LEFT JOIN ({keep_sub}) _l ON {jc}"
                 else:
-                    p = ''
+                    # Имя таблицы, а не пустой префикс: неквалифицированный dag_id внутри
+                    # EXISTS по dag_run PostgreSQL берёт у самого dag_run, и условие
+                    # сравнивало поле с собой — пропускало всё (стенд, 27.09.2026:
+                    # task_reschedule 231 669 строк вместо 188 028)
+                    p = f'{tbl}.'
                     base_where = _BASE_WHERE.get(tbl, '{col} < :cutoff').format(col=col, p=p)
                     from_clause = t
 

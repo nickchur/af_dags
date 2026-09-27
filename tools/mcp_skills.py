@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-09-25 19:32 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 17:06 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -15,8 +15,12 @@ dag-processor'а и воркера; у вебсервера каталог да�
 | Оглавление: имя → sha256, путь, размер | Variable `mcp_skills` (JSON) |
 
 Имя навыка — имя файла без `.md`. Переменная переписывается, только если файл изменился;
-навык, чей файл исчез, снимается вместе со своей переменной. Два файла с одним именем —
-ошибка таска: какой из них отдавать, решать не нам.
+навык, чей файл исчез, снимается вместе со своей переменной.
+
+**Два файла с одним именем.** Навыки публикуют и чужие команды (каталог дагов общий), и чужая
+ошибка не должна останавливать публикацию остальных. Публикуется один файл: уже
+опубликованный (его путь в оглавлении), иначе ближайший к корню, при равной глубине — первый
+по алфавиту пути. Остальные — ⚠️ в заметке, таск не падает.
 
 **Документация дагов** — второй таск, `publish_docs`: все остальные `.md` (README каталогов,
 QUICKSTART, ТЗ) для пункта UI Docs → DAG Docs и ресурсов MCP `airflow://doc/{path}` (etl-core,
@@ -98,16 +102,21 @@ ONE_SHOT = ('purge_docs',)
 DEFAULT_SCHEDULE = '*/30 * * * *'
 
 
-def find_skills(root):
-    """``{имя: путь}`` по ``*/skill/*.md`` под ``root``. Дубли имён — ``ValueError``.
+def find_skills(root, index=None):
+    """``({имя: путь}, [дубли])`` по ``*/skill/*.md`` под ``root``.
 
     Скрытые каталоги и ``testbed`` пропускаются: их не разбирает и Airflow
     (``.airflowignore``), а навык из стенда на контур попадать не должен.
+
+    Из файлов с одним именем берётся уже опубликованный (путь из оглавления ``index``), иначе
+    ближайший к корню, при равной глубине — первый по алфавиту пути. Остальные — в дубли:
+    строка «имя: взят путь, пропущен путь».
     """
     import re
     from pathlib import Path
 
-    found, dups = {}, []
+    index = index or {}
+    by_name = {}
     for path in sorted(Path(root).glob('**/skill/*.md')):
         rel = path.relative_to(root)
         if any(p.startswith('.') or p == 'testbed' for p in rel.parts[:-1]):
@@ -116,13 +125,19 @@ def find_skills(root):
         if not re.match(SKILL_NAME_RE, name):
             logger.warning("Навык %s пропущен: имя не подходит под %s", rel, SKILL_NAME_RE)
             continue
-        if name in found:
-            dups.append(f"{name}: {found[name].relative_to(root)} и {rel}")
-            continue
-        found[name] = path
-    if dups:
-        raise ValueError("Навыки с одинаковым именем: " + "; ".join(dups))
-    return found
+        by_name.setdefault(name, []).append(path)
+
+    found, dups = {}, []
+    for name, paths in by_name.items():
+        published = (index.get(name) or {}).get('path')
+        paths.sort(key=lambda p: (str(p.relative_to(root)) != published, len(p.relative_to(root).parts),
+                                  str(p.relative_to(root))))
+        found[name] = paths[0]
+        for other in paths[1:]:
+            dups.append(f"{name}: взят {paths[0].relative_to(root)}, пропущен {other.relative_to(root)}")
+    for line in dups:
+        logger.warning("Навык с тем же именем: %s", line)
+    return found, dups
 
 
 def find_docs(root):
@@ -257,7 +272,8 @@ def tools_mcp_skills():
 
         root = conf.get('core', 'dags_folder')
         index = Variable.get(SKILL_INDEX, default_var={}, deserialize_json=True) or {}
-        new_index, to_write, to_delete, skipped = plan(find_skills(root), index, root)
+        found, dups = find_skills(root, index)
+        new_index, to_write, to_delete, skipped = plan(found, index, root)
 
         for name, text in to_write.items():
             Variable.set(
@@ -278,11 +294,12 @@ def tools_mcp_skills():
             rows.append(f"| `{name}` | `{meta['path']}` | {meta['bytes']} | {mark} |")
         rows += [f"| `{name}` | — | — | 🗑️ снят |" for name in to_delete]
         rows += [f"| ❌ {s} | | | пропущен |" for s in skipped]
+        rows += [f"| ⚠️ {d} | | | то же имя |" for d in dups]
         title = f"Навыки MCP: {len(new_index)}, записано {len(to_write)}, снято {len(to_delete)}"
         add_note("\n".join(rows), context, level='DAG,task', title=title)
         if skipped:
             raise ValueError("Навыки пропущены: " + "; ".join(skipped))
-        return {'skills': sorted(new_index), 'written': sorted(to_write), 'deleted': to_delete}
+        return {'skills': sorted(new_index), 'written': sorted(to_write), 'deleted': to_delete, 'duplicates': dups}
 
     @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish_docs(**context):

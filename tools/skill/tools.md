@@ -5,7 +5,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 # Служебные даги (`tools/`)
 
-*2026-09-25 12:38 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 17:12 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -21,7 +21,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 - Любой даг `tools_*` — сюда.
 - «Задачи висят в `scheduled`», «очередь стоит» — сначала `get_system_health` по навыку
-  **`airflow-health`** (`platform.scheduled`, `runs.paused_active`), подробный разбор — отчёт
+  **`airflow-health`** (`plugins.tools_system_health.checks.scheduled` и `.runs`), подробный разбор — отчёт
   `tools_queue_analyze` (раздел 3).
 - Загрузки CTL — навык **`ctl-worker`**; ЕР — **`er-export`**; ТФС — **`tfs-kafka`**.
 
@@ -58,7 +58,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 | `tools_queue_analyze` | вручную | Почему задачи ждут; брокер: живые и мусор | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны `running`/`queued` у запаузенных дагов | Mark failed — только при `close` |
 | `tools_pg_activity` | `*/10 * * * *` | Сессии метабазы: `idle in transaction`, долгие запросы, блокировки, чей таск | сессии — только при `terminate` и `dry_run=False` |
-| `tools_system_health` | `7 * * * *` | Снимок Health раз в час: компоненты, celery, бакет логов, пулы, метабаза, разбор файлов | ничего |
+| `tools_system_health` | `7 * * * *` | Снимок Health раз в час: компоненты, celery, бакет логов, пулы, метабаза, разбор файлов, размер DAG'ов, раны, `scheduled`, таблицы; отчёт — раздел `plugins` в `get_system_health` | ничего |
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log`: `stuck in queued`, `heartbeat timeout`, `state mismatch` | ничего |
 | `tools_db_cleanup` | `0 2 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
 | `tools_log_cleanup` | `17 5 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и выставляет правило жизненного цикла — по нему хранилище удаляет само, без отчёта |
@@ -125,13 +125,14 @@ description: Служебные даги Airflow (каталог tools/, на с
 |---|---|
 | Задачи висят в `scheduled` | последний ран `tools_queue_analyze`; нет свежего — посоветуй запуск (разбор ничего не меняет) |
 | Задачи висят в `queued` | `tools_log_events` (`stuck in queued`), вывод 📭 в `queue_analyze`, карточка Health |
-| `runs.paused_active` > 0 | `tools_paused_runs_cleanup` без `close` — список и кто поставил паузу |
+| `checks.runs` ⚠️ (раны у запаузенных дагов) | `tools_paused_runs_cleanup` без `close` — список и кто поставил паузу |
 | Таски умирают с обрывом метабазы, блокировки | заметки `tools_pg_activity`: `owner_alive=false` — брошенная сессия |
 | `tools_pg_activity` ❌ на `collect`: `canceling statement due to statement timeout` | его запрос не уложился в 30 с. Не объясняй это блокировкой или `idle in transaction`: SELECT в PostgreSQL блокировок строк не ждёт. До v1.8 модуля запрос сканировал весь `task_instance` (ift, 1,3 млн строк, падал с 01.09.2026); с v1.8 он идёт по индексам. Падает и после выкладки — метабаза перегружена или таблицы раздуты: человеку `EXPLAIN` запроса из заметки и `n_dead_tup`, `last_autoanalyze` в `pg_stat_user_tables` для `task_instance` и `job` |
 | `tools_test_dags` · `check_serialized.recheck_serialized_dag` в `running` часами | задача сама кончается за `min_file_process_interval` + `dag_file_processor_timeout` (у нас ~20 мин). Часами — это зомби, который шедулер не снял: `platform.zombies` и строка «Зомби не снимаются» навыка `airflow-health`. Закрыть — Mark failed в UI, это делает человек. Сигма-ифт 25.09.2026: три экземпляра висели 10 ч |
 | `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «сериализация переписана снова» | разбор файла недетерминирован: в коде дага порядок из `set`/словаря, время, случайность или внешний вызов. Разница `Было → Стало` в заметке называет поле. Правит автор дага |
 | `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «два файла на один dag_id» | это не ложное срабатывание: один `dag_id` объявлен в двух файлах, каждый разбор переписывает сериализацию другого, и в UI и у шедулера задачи и теги то есть, то нет. Разница из заметки и лога (`Было → Стало`) показывает, какая версия урезана: тег `QA`, меньше задач. Лечит владелец дага — удалить дубль или переименовать `dag_id`; путь в заметке называет чужой каталог (не `tools/`) — это не наш код, даг не перезапускать и `test_dags` не править. Сигма-ифт 24.09.2026: `reload_core_person_position_action` в `CI06884356/analytics/datalab/` и `CI06932748/analytics/datalab/` |
 | Файлы дагов не разбираются, ошибки импорта | `tools_system_health` (новые ошибки импорта по id), `tools_test_dags` (`parse_time`) |
+| «Даги с большим числом тасков», `tools_system_health` ⚠️ `dag_size` | заметка и XCom `checks.dag_size` последнего рана: `classes` — сколько DAG'ов в каждом классе, `top` — больше 300 тасков. В строке `имя (A/B)`: A — тасков в определении, B — наибольшее за один ран за 7 дней (с раскрытыми mapped); B ≫ A — это `expand`. Совет — владельцу дага: делить даг или ограничить раскрытие. Не падение, контур этим не сломан |
 | Подключение не работает | `tools_test_connections` (❌ по `conn_id`); список — `tools_show_connections` |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый или обновлённый навык появляется на сервере до получаса спустя после выкладки дагов, это не новая версия core; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |

@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-24 13:00 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-27 17:49 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -608,6 +608,7 @@ def tools_queue_analyze():
         """🗓️ Почему задачи ждут в scheduled: лимит дага, пул, приоритет; следы голодания."""
         from sqlalchemy import and_, exists, func
 
+        from airflow.jobs.job import Job
         from airflow.models import DagModel, DagRun, Pool, TaskInstance as TI
         from airflow.utils import timezone as tz
         from airflow.utils.session import create_session
@@ -631,8 +632,14 @@ def tools_queue_analyze():
                         .filter(TI.state.in_(("queued", "running"))).group_by(TI.pool))
             pools = {name: {"slots": slots, "used": int(used.get(name) or 0)}
                      for name, slots in session.query(Pool.pool, Pool.slots)}
+            # Через job, а не по start_date: индекса по start_date у task_instance нет, и отбор
+            # читал всю таблицу (стенд 27.09.2026: 74 мс на 102 тыс. строк). У задачи,
+            # стартовавшей за час, и хартбит её LocalTaskJob свежее часа — job_type_heart
+            hour_ago = now - timedelta(hours=1)
             dispatched = [w for (w,) in session.query(TI.priority_weight)
-                          .filter(TI.start_date >= now - timedelta(hours=1), TI.dag_id != me)]
+                          .join(Job, Job.id == TI.job_id)
+                          .filter(Job.job_type == "LocalTaskJob", Job.latest_heartbeat >= hour_ago,
+                                  TI.start_date >= hour_ago, TI.dag_id != me)]
 
             # След голодания: ран закрыт за сутки, ни одна задача не стартовала, есть skipped.
             # Так выглядит dagrun_timeout, сработавший, пока задачи ждали в scheduled
