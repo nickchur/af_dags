@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-25 19:31 MSK · v2.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 09:17 MSK · v2.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -97,11 +97,11 @@ from logging import getLogger
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -119,6 +119,8 @@ ensure_pool(TOOLS_POOL)
 PARAMS_VAR = "tools_test_dags_params"
 SAVED = saved_params(PARAMS_VAR)
 DEFAULT_SCHEDULE = "0 23 * * *"
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
 ONE_SHOT = ("cleanup_deleted",)
 
 # Соединение и бакет берём из настроек логирования, а не именем: на DEV бакет подменяет
@@ -370,7 +372,7 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     # растянулся бы на семь волн ожидания (до пары часов). Таски почти всё время спят
     # в ожидании парсинга, так что нагрузки это не добавляет — только занятые слоты
     max_active_tasks=12,
-    tags=["DataLab", "tools", "dag", "AutoQA"],
+    tags=["DataLab", "tools", "dag", "AutoQA", "health"],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
@@ -1329,6 +1331,15 @@ def tools_test_dags():
         add_note("\n\n".join(parts) or "Подозрительных DAG'ов не нашлось",
                  context, level="DAG", title=headline)
         logger.info("summary: %s", headline.replace("\n", " "))
+        # Статус: дрожащая сериализация — error, как и падение summary; немые сравнения — warn:
+        # сериализация цела, но изменение потеряется, если экземпляры не очистить
+        verdict_line = " / ".join(f"{st} {n}" for st, n in sorted(counts.items())) or "перепроверять было нечего"
+        report_health({"serialization": {
+            "status": "error" if bad else ("warn" if cmp_silent else "healthy"),
+            "summary": verdict_line + (f"; сравнений не отчиталось {cmp_silent}" if cmp_silent else ""),
+            "skill": "tools", "bad": bad, "counts": counts, "compare": cmp_counts,
+            "unstable": [r["dag_id"] for r in rechecks if r.get("status") in ("unstable", "duplicate_dag_id")][:20],
+        }}, context, ttl_sec=REPORT_TTL_SEC)
 
         if bad:
             raise AirflowFailException(f"Сериализация дрожит у {bad} DAG'ов: {headline}")

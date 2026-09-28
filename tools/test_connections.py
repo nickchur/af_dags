@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-24 11:19 MSK · v2.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 09:17 MSK · v2.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -42,11 +42,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -64,6 +64,8 @@ ensure_pool(TOOLS_POOL)
 PARAMS_VAR = "tools_test_connections_params"
 SAVED = saved_params(PARAMS_VAR)
 DEFAULT_SCHEDULE = "15 23 * * *"
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
 
 
 # Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
@@ -431,7 +433,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     # Ежедневно в 23:15 MSK, через 15 минут после tools_show_connections: тот обновляет
     # Variable local_connections, из которой этот DAG набирает список соединений на парсинге
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=["DataLab", "tools", "conn", "AutoQA"],
+    tags=["DataLab", "tools", "conn", "AutoQA", "health"],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
@@ -597,6 +599,11 @@ def tools_test_connections():  # noqa: PLR0915
         table = "| Соединение | Статус | Причина |\n|---|---|---|\n" + "\n".join(all_rows)
         add_note(table, context, level="DAG", title=headline)
         logger.info("summary: %s", headline)
+        report_health({"connections": {
+            "status": "error" if fail else "healthy", "summary": counts, "skill": "tools",
+            "ok": ok, "fail": fail, "skip": skip, "none": none_count,
+            "failed": [r.split("|")[1].strip(" `") for r in all_rows if "❌" in r][:20],
+        }}, context, ttl_sec=REPORT_TTL_SEC)
 
         if fail > 0:
             raise AirflowFailException(f"Connections check failed: {headline}")

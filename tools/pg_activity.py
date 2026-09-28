@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-24 21:19 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 09:17 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -57,11 +57,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -94,6 +94,9 @@ DEFAULTS = {
 }
 
 DEFAULT_SCHEDULE = '*/10 * * * *'
+# Плагин здоровья (тег health): отчёт живёт четыре интервала — один-два пропущенных прогона
+# под нагрузкой не тревога, а 40 минут тишины сторожа метабазы уже она
+REPORT_TTL_SEC = 40 * 60
 #: Разовая галочка: в переменную не сохраняется (см. выше)
 ONE_SHOT = ('terminate',)
 
@@ -277,7 +280,7 @@ def _fetch(sql: str) -> list:
     start_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, CFG_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'check'],
+    tags=['DataLab', 'tools', 'check', 'health'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
@@ -530,6 +533,8 @@ def tools_pg_activity():
 
         if not snapshot['findings']:
             add_note(f"✅ чисто: {head}", level='task,dag', context=context, title='🩺 pg_activity')
+            report_health({'pg_activity': {'status': 'healthy', 'summary': head, 'skill': 'tools',
+                                           **totals}}, context, ttl_sec=REPORT_TTL_SEC)
             return head
 
         # Заметка режется до 1000 символов, поэтому в неё идут счётчики и три самые
@@ -544,6 +549,8 @@ def tools_pg_activity():
         ]
         add_note({f"⚠️ {head} · {counts}": lines},
                  level='task,dag', context=context, title='🩺 pg_activity')
+        report_health({'pg_activity': {'status': 'warn', 'summary': f"{head} · {counts}", 'skill': 'tools',
+                                       'top': lines, **totals}}, context, ttl_sec=REPORT_TTL_SEC)
 
         if p['alert']:
             raise AirflowFailException(f"⚠️ {head} · {counts}\n" + "\n".join(lines))

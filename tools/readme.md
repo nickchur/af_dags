@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-28 08:41 MSK · v1.31 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 09:19 MSK · v1.32 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -10,6 +10,19 @@
 `tools_mcp_skills`): что делает каждый даг, как читать отчёты `queue_analyze` и
 `paused_runs_cleanup`, что советовать и что оставить человеку. При правке дага, его параметров
 или расписания по умолчанию навык правится в том же коммите.
+
+## Теги
+
+| Тег | Что значит | Даги |
+|---|---|---|
+| `health` | **плагин здоровья — контракт с core**: `get_system_health` ждёт от каждого активного дага с этим тегом отчёт `system_health/checks/<dag_id>.json` (`report_health`), иначе пишет «плагин X: нет отчёта», а просроченный по `ttl_sec` — «последний отчёт N назад». Без `report_health` тег не ставить | `system_health` (2 ч 10 мин), `pg_activity` (40 мин), `log_events`, `test_connections`, `test_dags` (26 ч) |
+| `clean` | удаляет или закрывает: строки метабазы, файлы, раны, сообщения брокера | `db_cleanup`, `log_cleanup`, `paused_runs_cleanup`, `queue_analyze` (`purge`) |
+| `check` | снимает состояние и ничего не меняет | `system_health`, `pg_activity`, `log_events` |
+| `AutoQA` | ночная регрессия | `show_connections`, `test_connections`, `test_dags`, `test_hrp_operators` |
+
+Отчёты плагинов: `pg_activity` — warn при находках; `log_events` — warn при сбоях доставки,
+error выше порога `alert_after`; `test_connections` — error, если упало хоть одно подключение;
+`test_dags` — error при дрожащей сериализации, warn при не отчитавшихся сравнениях.
 
 ## Состав
 

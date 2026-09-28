@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-24 13:00 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 09:17 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -61,10 +61,10 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, report_health, saved_params, store_params, saved_schedule)
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, report_health, saved_params, store_params, saved_schedule)
 
 logger = logging.getLogger("airflow.task")
 
@@ -103,6 +103,8 @@ PARAMS_VAR = 'tools_log_events_params'
 SAVED = saved_params(PARAMS_VAR)
 
 DEFAULT_SCHEDULE = '30 6 * * *'
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
 
 
 def names_drifted() -> str:
@@ -263,7 +265,7 @@ SELECT event, count(*) AS cnt
     start_date=datetime(2026, 9, 4, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'check'],
+    tags=['DataLab', 'tools', 'check', 'health'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
@@ -439,6 +441,8 @@ def tools_log_events():
             msg = f"✅ чисто: {head}"
             add_note({msg: ours} if ours else msg,
                      context=context, level='task,dag', title='📊 log_events ')
+            report_health({'log_events': {'status': 'healthy', 'summary': head, 'skill': 'tools',
+                                          'ours': snapshot['ours_total']}}, context, ttl_sec=REPORT_TTL_SEC)
             return msg
 
         lines = [f"{k}: {v['cnt']} (задач {v['tasks']})"
@@ -458,8 +462,13 @@ def tools_log_events():
 
         add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events ')
 
+        over = bool(limit and tasks > limit)
+        report_health({'log_events': {'status': 'error' if over else 'warn', 'summary': head, 'skill': 'tools',
+                                      'total': total, 'tasks': tasks, 'runs': runs, 'limit': limit,
+                                      'top': lines[:10]}}, context, ttl_sec=REPORT_TTL_SEC)
+
         # Порог — по задачам, а не по событиям (почему — в docstring модуля).
-        if limit and tasks > limit:
+        if over:
             raise AirflowFailException(f"⚠️ {head} — задач больше порога {limit}\n"
                                        + "\n".join(lines))
         return head
