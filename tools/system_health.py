@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 09:12 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:12 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -12,7 +12,7 @@
 |---|---|---|---|
 | `components` | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `control` | control-канал celery и брокер: `ping` к воркерам, бравшим задачи за 15 мин (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | часть работающих воркеров не ответила; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `control` | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -100,10 +100,11 @@ ICON = {"healthy": "✅", "unknown": "❔", "warn": "⚠️", "error": "❌"}
 STALE_AFTER_SEC = 5 * 60
 BROADCAST_TIMEOUT_SEC = 2
 # Control-канал: ping ждём дольше broadcast'а — на dev 27.09.2026 ответы опаздывали, и
-# двухсекундный опрос не отличал «опоздал» от «потерялся». Воркер считается работающим,
-# если брал задачи за последние WORKER_ACTIVE_SEC
+# двухсекундный опрос не отличал «опоздал» от «потерялся». Под обязан ответить, если на нём
+# прямо сейчас идёт задача: LocalTaskJob в running с хартбитом свежее BUSY_HEARTBEAT_SEC
+# (хартбит job — каждые 5 с)
 PING_TIMEOUT_SEC = 5
-WORKER_ACTIVE_SEC = 15 * 60
+BUSY_HEARTBEAT_SEC = 120
 # Звенья задержки control-канала: команда брокеру → доставка pub/sub → ответ воркера.
 # Пороги — порядок величины, а не замер: redis в одном ЦОД отвечает за единицы мс, и
 # сотни мс на команду или полсекунды на доставку уже объясняют опоздавшие ответы
@@ -372,17 +373,18 @@ def check_celery() -> dict:
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
 
 
-# Хосты, бравшие задачи недавно: по ним видно, кто обязан ответить на ping. Имя celery-узла
-# у платформы — celery@<hostname> (воркер стартует без -n). Берём из job, а не из
-# task_instance: у LocalTaskJob тот же hostname, хартбит идёт весь таск и остаётся на
-# его конце, и есть индекс job_type_heart (job_type, latest_heartbeat). task_instance
-# по end_date индекса не имеет — на dev 28.09.2026 (13 млн строк) запрос не уложился в 5 с
-SQL_WORKER_HOSTS = """
-select distinct hostname
+# Сколько подов сейчас исполняют задачи: столько узлов обязано ответить на ping. Сверяем
+# ЧИСЛА, а не имена: hostname в job у платформы — IP пода (etl-core hostname_callable: по
+# нему вебсервер читает живой лог), а узел celery зовётся celery@<имя пода>, и одно из другого
+# не получить. Сравнение имён на контурах давало «ни один не ответил» при живых воркерах
+# (альфа, 28.09.2026). Из job, а не из task_instance: индекс job_type_heart (job_type,
+# latest_heartbeat); task_instance на dev (13 млн строк) по времени не укладывался в 5 с
+SQL_BUSY_HOSTS = """
+select count(distinct hostname) as busy
   from job
  where job_type = 'LocalTaskJob'
+   and state = 'running'
    and latest_heartbeat > now() - cast(:age as interval)
-   and hostname <> ''
 """
 
 
@@ -464,21 +466,18 @@ def check_control() -> dict:
     """
     from airflow.providers.celery.executors.celery_executor import app
 
-    # Сравниваем по короткому имени: hostname в task_instance — getfqdn(), у celery-узла — gethostname()
-    hosts = {r["hostname"].split(".")[0]
-             for r in _pg_rows(SQL_WORKER_HOSTS, {"age": f"{WORKER_ACTIVE_SEC} seconds"})}
+    busy = int(_pg_rows(SQL_BUSY_HOSTS, {"age": f"{BUSY_HEARTBEAT_SEC} seconds"})[0]["busy"] or 0)
     started = time.time()
     try:
-        # limit: ответили все — не ждём таймаута, и время вызова становится задержкой
-        # самого медленного ответа
-        pong = app.control.ping(timeout=PING_TIMEOUT_SEC, limit=len(hosts) or None) or []
+        # limit: ответило столько, сколько подов занято, — не ждём таймаута, и время вызова
+        # становится задержкой самого медленного из нужных ответов
+        pong = app.control.ping(timeout=PING_TIMEOUT_SEC, limit=busy or None) or []
     except Exception as exc:
         return {"status": "error", "summary": f"брокер недоступен: {_short_reason(exc)}"}
     reply_sec = round(time.time() - started, 1)
-    answered = {name.split("@", 1)[-1].split(".")[0] for chunk in pong for name in chunk}
-    silent = sorted(hosts - answered)
-    result = {"hosts": len(hosts), "answered": len(answered & hosts), "silent": silent[:TOP],
-              "reply_sec": reply_sec}
+    nodes = sorted({name for chunk in pong for name in chunk})
+    missing = max(busy - len(nodes), 0)
+    result = {"busy_pods": busy, "answered": len(nodes), "nodes": nodes[:TOP], "reply_sec": reply_sec}
     notes, status = [], "healthy"
 
     try:
@@ -490,13 +489,13 @@ def check_control() -> dict:
     if result.get("loopback") is False:
         status = "error"
         notes.append("pub/sub брокера не доставляет даже самому себе")
-    if hosts and not (answered & hosts):
+    if busy and not nodes:
         status = "error"
-        notes.append("ни один работающий воркер не ответил на ping")
-    elif silent:
+        notes.append(f"ни один воркер не ответил на ping, а задачи идут на {busy} подах")
+    elif missing:
         status = _worst([status, "warn"])
-        notes.append(f"молчат: {_names(silent)}")
-    elif hosts and reply_sec > BROADCAST_TIMEOUT_SEC:
+        notes.append(f"не ответили {missing} из {busy} подов с задачами")
+    elif busy and reply_sec > BROADCAST_TIMEOUT_SEC:
         # Ответы доходят, но позже, чем их ждут карточка Health и отбивки воркеров (2 с) и
         # `celery list-workers` (1 с): там воркеры выглядят пропавшими. dev, 28.09.2026:
         # list-workers пуст, а ping с 5 с получил все 8 ответов
@@ -512,14 +511,14 @@ def check_control() -> dict:
     elif pubsub_ms is not None and pubsub_ms > PUBSUB_WARN_MS:
         status = _worst([status, "warn"])
         notes.append(f"pub/sub брокера доставляет за {pubsub_ms} мс при командах за {cmd_ms} мс")
-    elif hosts and answered & hosts and reply_sec > BROADCAST_TIMEOUT_SEC and pubsub_ms is not None:
+    elif nodes and not missing and reply_sec > BROADCAST_TIMEOUT_SEC and pubsub_ms is not None:
         notes.append(f"брокер быстрый (команда {cmd_ms} мс, pub/sub {pubsub_ms} мс) — медлят сами воркеры")
-    if hosts and result.get("pattern_subs") == 0 and not (answered & hosts):
+    if busy and result.get("pattern_subs") == 0 and not nodes:
         status = "error"
         notes.append("на узле брокера нет ни одной подписки-шаблона — воркеры не слушают control-канал")
 
-    head = (f"ответили {result['answered']} из {len(hosts)} работавших за {WORKER_ACTIVE_SEC // 60} мин"
-            + (f", за {reply_sec} с" if not silent else "")
+    head = (f"на ping ответили {len(nodes)}, задачи сейчас идут на {busy} подах"
+            + (f", за {reply_sec} с" if not missing else "")
             + (f"; брокер {result.get('node')}: команда {cmd_ms} мс, pub/sub {pubsub_ms} мс"
                if cmd_ms is not None else ""))
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
