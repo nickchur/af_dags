@@ -30,3 +30,11 @@
 
 - [x] 5.1 Стенд: сломать проверку (неверный SQL в `pg_activity` временно) → проверочный таск ❌, `health_errors` ❌ «не выполнился», ран красный, `on_callback` сработал; вернуть
 - [x] 5.2 Отчёты в `system_health/checks/` у шести плагинов, `skill` — навык своего дага; `ruff check tools plugins`; `sync_context.py`; коммит в PR #82 и описание PR
+
+## 6. Пульс и сторож плагинов (28.09.2026)
+
+- [x] 6.1 `tools_system_pulse` раз в 5 мин в `system_health.py`: `components`, `celery`, `control`, `metabase`, `delivery`; `collect` с заметкой → `health_*`, срок 15 мин; проверка: `airflow dags test` на стенде
+- [x] 6.2 `tools_system_health`: `s3_logs`, `pools`, `parsing`, `runs`, `scheduled` и новая `plugins` (свежесть отчётов остальных плагинов, пауза); проверка: на стенде `plugins` назвал запаузенные плагины
+- [x] 6.3 `dag_size` → таск в `tools_test_dags`, `tables` убран (размеры таблиц — `report` в `db_cleanup`); проверка: `airflow tasks test tools_test_dags dag_size`
+- [x] 6.4 `prune` убран у `queue_analyze` и `pg_activity`: папки чистит `log_cleanup` общим сроком бакета
+- [x] 6.5 Readme, навыки `tools`, `tools-system-health`, `tools-test-dags`; etl-core #85 — `airflow-health`, `docs/MCP.md`

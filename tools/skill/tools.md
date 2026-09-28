@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-28 12:18 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:38 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -20,7 +20,8 @@ description: Индекс служебных дагов Airflow (каталог 
 
 | Вопрос | Навык |
 |---|---|
-| Что показал `tools_system_health`, `control`, `workers: 0`, `dag_size`, ошибки импорта | **`tools-system-health`** |
+| Что показал `tools_system_pulse` / `tools_system_health`, `control`, `workers: 0`, ошибки импорта, плагин молчит | **`tools-system-health`** |
+| `dag_size`, даг больше 300 тасков | **`tools-test-dags`** |
 | Сессии и блокировки метабазы, `tools_pg_activity` | **`tools-pg-activity`** |
 | Задачи висят в `queued`, сбои доставки, `tools_log_events` | **`tools-log-events`** |
 | Подключение не работает, `tools_test_connections` | **`tools-test-connections`** |
@@ -46,7 +47,7 @@ description: Индекс служебных дагов Airflow (каталог 
   клетка называла объект, а ран краснеет только по вердикту сводки.
 - **Теги — роль:** `health` — плагин здоровья, `health_errors` пишет отчёт в
   `system_health/checks/<dag_id>.json`, его читает `get_system_health` → `plugins`; `clean` —
-  удаляет; `AutoQA` — регрессия и проверка «работает ли» (`dummy` раз в час). Плагины: `system_health`, `pg_activity`, `log_events`,
+  удаляет; `AutoQA` — регрессия и проверка «работает ли» (`dummy` раз в час). Плагины: `system_pulse`, `system_health`, `pg_activity`, `log_events`,
   `test_connections`, `test_dags`, `queue_analyze`.
 - **Пул `tools_pool`** (16 слотов). Короткие проверки идут с `priority_weight 900`,
   `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Тяжёлые `test_dags`,
@@ -73,7 +74,8 @@ description: Индекс служебных дагов Airflow (каталог 
 
 | Даг | Расписание | Что делает | Что меняет |
 |---|---|---|---|
-| `tools_system_health` | `7 * * * *` | Снимок Health раз в час | ничего |
+| `tools_system_pulse` | `2-59/5 * * * *` | Лежит ли контур: компоненты, celery, control, метабаза, доставка | ничего |
+| `tools_system_health` | `7 * * * *` | Почему задачи не идут: S3 логов, пулы, разбор, раны, `scheduled`; сторож отчётов плагинов | ничего |
 | `tools_pg_activity` | `*/10 * * * *` | Сессии и блокировки метабазы | сессии — только при `terminate` и `dry_run=False` |
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log` | ничего |
 | `tools_test_connections` | `15 23 * * *` | Доступность каждого подключения, важные — `critical` | ничего |
@@ -99,7 +101,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди. Расписание ни при чём. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable не трогать |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый навык появляется до получаса спустя после выкладки дагов; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма) |
 | `tools_dummy` ❌, `dummy_task` не зелёный | стоит шедулер: `get_system_health` → компоненты |
-| `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_health` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
+| `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_pulse` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
 | `tools_dummy` зелёный, в заметке `ping` шедулер или очередь — минуты | задержка планирования или доставки: `tools_queue_analyze`, `tools_log_events` |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |
 

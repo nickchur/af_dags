@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-28 10:49 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:38 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -40,7 +40,7 @@ tools/                   # Служебные DAG'и: проверка и обс
 ├── db_cleanup.py        # 🧹 Очистка метадаты Airflow старше N дней
 ├── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
 ├── log_events.py        # 📊 Сбои доставки задач: отчёт по журналу метабазы
-├── system_health.py     # 🩺 Снимок состояния контура раз в час
+├── system_health.py     # 🩺 Состояние контура: пульс раз в 5 мин и снимок раз в час
 ├── pg_activity.py       # 🐘 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
 ├── queue_analyze.py     # 🔬 Разбор очереди: почему задачи ждут; чистка брокера по галочке
 ├── paused_runs_cleanup.py # ⏸️ Зависшие раны запаузенных дагов: отчёт и Mark failed

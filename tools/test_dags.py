@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-28 10:38 MSK · v3.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 12:35 MSK · v3.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -18,8 +18,9 @@
 | **`compare.snapshot_dags`** | Пишет новые версии в S3 — всех изменившихся, сколько бы их ни было — и возвращает для `expand` пары «прошлая версия → новая», не больше `COMPARE_LIMIT` (100), свежие первыми. Статистика — в XCom `snapshot_stats`, пары сверх лимита — в `not_compared` |
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
 | **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
+| **`dag_size`** | Вне групп, с 28.09.2026 (до того — проверка часового `tools_system_health`): DAG'и по числу тасков — в определении и в последнем ране с раскрытыми mapped, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300. Больше 300 — ⚠️ в `health_warn`. Размер меняется только с выкладкой, поэтому раз в сутки |
 | **`report`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга; вердикт здоровья в XCom `health` |
-| **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения; ❌ дрожащая сериализация — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
+| **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения, DAG больше 300 тасков; ❌ дрожащая сериализация — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
 
 **Исключения:** DAG'и с id по префиксам из `SKIP_DAG_PREFIXES` (сейчас `deadlocker_*`)
 не проверяются вовсе — ни в статистике сериализации, ни в версиях, ни в покрытии.
@@ -98,11 +99,13 @@ from logging import getLogger
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule,
+        store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule,
+        store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -355,6 +358,98 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
         key=lambda d: (rank.get(d, 1), d in snap_ages, snap_ages.get(d), d),
     )
     return order if not limit else order[:limit]
+
+
+# ── Размер DAG'ов (до 28.09.2026 — проверка dag_size в tools_system_health) ──
+# Размер меняется только с выкладкой кода, поэтому раз в сутки рядом с parse_time, а не
+# каждый час: запрос — самый тяжёлый из часовых проверок
+# Размер DAG'ов (HRPDATALAB-16308): классы по числу тасков, каждый втрое больше прежнего.
+# Больше TASKS_ALERT — warn: такой DAG тяжёл шедулеру, сетке UI и пулам
+TASK_CLASSES = (1, 3, 10, 30, 100, 300)
+TASKS_ALERT = TASK_CLASSES[-1]
+# Запрос читает JSON всех сериализованных DAG'ов и по индексу — задачи последнего рана
+# каждого. Прежний счёт по всем ранам за 7 дней не уложился и в 30 с на dev 28.09.2026
+# (task_instance 13 млн строк, у dag_run.start_date нет индекса); потолок оставлен с запасом
+DAG_SIZE_TIMEOUT_MS = 30000
+# Сколько самых больших DAG'ов называть поимённо: заметка режется по 1000 символов
+SIZE_SHOW = 5
+
+
+# Два счёта, потому что они про разное. tasks — таски в определении DAG'а (сериализация).
+# max_ti — число task_instance в ПОСЛЕДНЕМ ране DAG'а: это уже с раскрытыми mapped-тасками,
+# и именно оно бьёт по шедулеру; DAG из 5 тасков с expand на 1000 элементов по первому
+# счёту безобиден. Класс — по большему из двух. До v1.13 здесь был максимум по ранам за
+# 7 дней — точнее для expand с плавающим размером, но на dev он не укладывался в 30 с:
+# теперь на DAG два поиска по индексу — последний ран (dag_run (dag_id, execution_date)) и
+# его задачи (task_instance ti_dag_run). Имя поля оставлено: его читает навык airflow-health.
+# tasks = null, если JSON сжат (compress_serialized_dags; на контурах выключено, etl-core
+# airflow-default.cfg) или DAG ещё не сериализован
+SQL_DAG_SIZE = """
+select d.dag_id, d.is_paused,
+       json_array_length(s.data::json -> 'dag' -> 'tasks') as tasks,
+       coalesce(m.max_ti, 0)                               as max_ti
+from dag d
+left join serialized_dag s on s.dag_id = d.dag_id
+left join lateral (
+    select count(*) as max_ti
+      from task_instance ti
+     where ti.dag_id = d.dag_id
+       and ti.run_id = (select r.run_id from dag_run r
+                         where r.dag_id = d.dag_id
+                         order by r.execution_date desc
+                         limit 1)
+) m on true
+where d.is_active
+"""
+
+
+def task_class(n: int) -> str:
+    """Класс по числу тасков: «1», «2–3», …, «101–300», «>300»."""
+    low = 1
+    for high in TASK_CLASSES:
+        if n <= high:
+            return str(high) if low == high else f"{low}–{high}"
+        low = high + 1
+    return f">{TASK_CLASSES[-1]}"
+
+
+def dag_size_verdict(rows: list[dict]) -> dict:
+    """Классы и алерт по строкам SQL_DAG_SIZE — отдельно от запроса, чтобы проверялось без базы."""
+    hist = dict.fromkeys([task_class(c) for c in TASK_CLASSES] + [task_class(TASKS_ALERT + 1)], 0)
+    big, unknown = [], 0
+    for r in rows:
+        size = max(int(r["tasks"] or 0), int(r["max_ti"] or 0))
+        # Нет ни сериализации, ни ранов — класса не назвать
+        if not size:
+            unknown += 1
+            continue
+        hist[task_class(size)] += 1
+        if size > TASKS_ALERT:
+            big.append((size, r))
+    big.sort(key=lambda x: -x[0])
+    top = {r["dag_id"]: {"tasks": r["tasks"], "max_ti": int(r["max_ti"] or 0), "paused": r["is_paused"]}
+           for _, r in big[:SIZE_SHOW]}
+    head = (f"DAG'ов {len(rows)}; по числу тасков: " + ", ".join(f"{c} {n}" for c, n in hist.items() if n)
+            + (f", без данных {unknown}" if unknown else ""))
+    result = {"dags": len(rows), "classes": hist, "unknown": unknown, "over_alert": len(big), "top": top}
+    if not big:
+        return {**result, "status": "healthy", "summary": head}
+    names = ", ".join(f"{d} ({v['tasks'] if v['tasks'] is not None else '?'}/{v['max_ti']})" for d, v in top.items())
+    if len(big) > SIZE_SHOW:
+        names += f" и ещё {len(big) - SIZE_SHOW}"
+    return {**result, "status": "warn",
+            "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/в последнем ране): {names}"}
+
+
+def check_dag_size() -> dict:
+    """DAG'и по числу тасков; больше TASKS_ALERT — warn."""
+    from airflow.utils.session import create_session
+    from sqlalchemy import text
+
+    with create_session() as session:
+        session.execute(text(f"set local statement_timeout = {DAG_SIZE_TIMEOUT_MS}"))
+        rows = [dict(r) for r in session.execute(text(SQL_DAG_SIZE)).mappings()]
+    return dag_size_verdict(rows)
 
 
 @dag(
@@ -1384,8 +1479,19 @@ def tools_test_dags():
 
     # parse_time вне групп и ни от кого не зависит: он про разбор файлов, а не про
     # содержимое serialized_dag
+    @task(task_id="dag_size")
+    def dag_size(**context) -> dict:
+        """📏 DAG'и по числу тасков: больше TASKS_ALERT — warn. Находкой не падает."""
+        result = check_dag_size()
+        add_note(result["summary"], context, level="task", title="📏 dag_size")
+        push_health({"dag_size": result}, context)
+        return result
+
     [tg_check, tg_compare, parse_time()] >> report_task
-    report_task >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
+    # dag_size — сам по себе, как parse_time: про код DAG'ов, а не про сериализацию
+    verdicts = health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
+    report_task >> verdicts
+    dag_size() >> verdicts
 
 
 tools_test_dags()
