@@ -1,20 +1,23 @@
 """
 ### 🫀 DAG: задачи выполняются
-*2026-09-28 10:38 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:45 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Раз в час ставит одну пустую задачу `ping` и ждёт, что воркер её выполнит. Зелёный ран —
-задачи доходят до воркера и отрабатывают; в заметке — под и сколько задача ждала в очереди.
-Красный ран по `dagrun_timeout` — за 50 минут задача так и не выполнилась: шедулер не
-поставил её в очередь или воркеры её не взяли. Разбор — `tools_system_health` и
-`tools_log_events` за это время.
+Раз в час два таска подряд:
+- `dummy_task` (`EmptyOperator`) — шедулер отмечает его успешным сам, до воркера он не
+  доходит: зелёный — шедулер жив и разбирает раны;
+- `ping` — настоящая задача на воркере. В заметке — под, сколько шедулер думал между
+  `dummy_task` и постановкой `ping` в очередь и сколько `ping` ждал воркера в очереди.
 
-`EmptyOperator` для этого не годится: шедулер отмечает его успешным сам, не отправляя на
-воркер. До 28.09.2026 — ручной даг для проверки Markdown в UI.
+Красный ран по `dagrun_timeout` — за 50 минут не выполнилось: не зелёный `dummy_task` —
+стоит шедулер, не зелёный `ping` — задачи не доходят до воркера. Разбор —
+`tools_system_health` и `tools_log_events` за это время. До 28.09.2026 — ручной даг для
+проверки Markdown в UI.
 """
 
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
+from airflow.operators.empty import EmptyOperator
 
 try:
     from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
@@ -23,6 +26,11 @@ except ImportError:
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
+
+
+def _sec(a, b):
+    """Секунды от a до b; '?' если одной из отметок нет."""
+    return f"{(b - a).total_seconds():.0f} с" if a and b else '?'
 
 
 @dag(
@@ -53,12 +61,16 @@ def tools_dummy():
 
     @task(task_id='ping')
     def ping(**context):
-        """Отмечает, где и через сколько после постановки в очередь выполнилась задача."""
+        """Отмечает, где выполнилась задача и сколько ждала шедулер и воркер."""
         ti = context['ti']
-        wait = f", в очереди {(ti.start_date - ti.queued_dttm).total_seconds():.0f} с" if ti.queued_dttm else ''
-        add_note(f"✅ выполнено на {ti.hostname}{wait}", context, level='task')
+        empty = context['dag_run'].get_task_instance('dummy_task')
+        add_note(
+            f"✅ выполнено на {ti.hostname}: шедулер {_sec(empty and empty.end_date, ti.queued_dttm)}, "
+            f"очередь {_sec(ti.queued_dttm, ti.start_date)}",
+            context, level='task',
+        )
 
-    ping()
+    EmptyOperator(task_id='dummy_task') >> ping()
 
 
 tools_dummy()

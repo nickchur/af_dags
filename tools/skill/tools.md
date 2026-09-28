@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-28 10:39 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:49 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -86,7 +86,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |
-| `tools_dummy` | `3 * * * *` | Задачи выполняются: одна задача `ping` на воркере; красный по `dagrun_timeout` (50 мин) — не выполнилась | ничего |
+| `tools_dummy` | `3 * * * *` | Шедулер и воркер живы: `dummy_task` (`EmptyOperator`, отмечает шедулер) → `ping` на воркере; в заметке `ping` — сколько думал шедулер и ждала очередь; красный по `dagrun_timeout` (50 мин) | ничего |
 
 ## 3. Разбор по симптому (общее)
 
@@ -98,7 +98,9 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_*` ❌ на таске `params`, есть `start_date`, в логе «не cron и не пресет» | негодное `schedule` в форме **ручного** запуска с `save_params`; переменная не тронута, остальные таски — `upstream_failed` |
 | `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди. Расписание ни при чём. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable не трогать |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый навык появляется до получаса спустя после выкладки дагов; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма) |
+| `tools_dummy` ❌, `dummy_task` не зелёный | стоит шедулер: `get_system_health` → компоненты |
 | `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_health` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
+| `tools_dummy` зелёный, в заметке `ping` шедулер или очередь — минуты | задержка планирования или доставки: `tools_queue_analyze`, `tools_log_events` |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |
 
 ## 4. Норма, а не тревога
