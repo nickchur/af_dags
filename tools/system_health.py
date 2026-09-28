@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 10:16 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -1076,7 +1076,7 @@ def _param(key, default, **kwargs):
     # Тег tools: служебный DAG — ролевка ограничивает запуск (HRPDATALAB-15421), а
     # get_system_health показывает его в разделе служебных. Тег health — роль: плагин
     # здоровья, get_system_health читает его отчёт (раздел plugins)
-    tags=["DataLab", "tools", "health"],
+    tags=["DataTools", "tools", "health"],
     catchup=False,
     # Смысл DAG'а — непрерывная лента, и он дёшев: включается сам
     is_paused_upon_creation=False,

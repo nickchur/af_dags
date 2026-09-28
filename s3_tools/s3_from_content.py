@@ -70,7 +70,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
         'retry_delay': pendulum.duration(seconds=30),
     },
     start_date=pendulum.datetime(2025, 8, 7, tz=pendulum.UTC),
-    tags=['DataLab', 'tools', 's3'],
+    tags=['DataTools', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

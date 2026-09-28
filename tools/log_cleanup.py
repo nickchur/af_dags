@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-09-28 10:25 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:38 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -175,15 +175,18 @@ params = {
         'pool': TOOLS_POOL,
         'retries': 2,
         'retry_delay': timedelta(seconds=30),
+        # Обход сам укладывается в max_minutes (30); потолок — от зависшего запроса к S3
+        'execution_timeout': timedelta(hours=2),
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataLab', 'tools', 'clean'],
+    tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
     max_active_tasks=1,
+    dagrun_timeout=timedelta(hours=4),
     on_failure_callback=on_callback,
     params=params,
 )

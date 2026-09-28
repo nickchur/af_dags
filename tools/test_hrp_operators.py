@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-09-28 10:23 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:38 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
@@ -325,13 +325,16 @@ def _ch_insert_sql(table: str) -> str:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
-    tags=["DataLab", "tools", "AutoQA"],
+    dagrun_timeout=dt.timedelta(hours=2),
+    tags=["DataTools", "tools", "AutoQA"],
     # retries — переживаем transient «Connection reset by peer» от общего ClickHouse/S3
     default_args={
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,
         "retries": 2,
         "retry_delay": dt.timedelta(seconds=30),
+        # Тестовые таблицы — десятки строк: потолок ловит зависание, а не объём
+        "execution_timeout": dt.timedelta(minutes=30),
         # Единый вывод исхода в заметку КАЖДОГО таска (успех/скип-причина/ошибка-причина).
         # on_callback пишет add_note со state (✅/❌/SKIPPED) и текстом context['exception'].
         # on_skipped_callback (Airflow ≥2.9) срабатывает на AirflowSkipException — так причина

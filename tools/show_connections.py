@@ -1,5 +1,5 @@
 """### 🔌 DAG: Список Airflow Connections
-*2026-09-28 10:23 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список всех подключений из secret backend, сгруппированных по их типу.
 Используется для аудита доступных соединений и верификации конфигурации backend'а.
@@ -71,7 +71,7 @@ DEFAULT_SCHEDULE = '0 23 * * *'
     # Ежедневно в 23:00 MSK: срез соединений обновляется перед ночным tools_test_connections
     # (23:15), который берёт список из Variable local_connections
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataLab', 'tools', 'AutoQA'],
+    tags=['DataTools', 'tools', 'AutoQA'],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,

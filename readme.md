@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-25 19:34 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:39 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -45,7 +45,7 @@ tools/                   # Служебные DAG'и: проверка и обс
 ├── queue_analyze.py     # 🔬 Разбор очереди: почему задачи ждут; чистка брокера по галочке
 ├── paused_runs_cleanup.py # ⏸️ Зависшие раны запаузенных дагов: отчёт и Mark failed
 ├── mcp_skills.py        # 🧭 Навыки агента и документация дагов → Variables для MCP
-├── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
+├── dummy.py             # 🫀 Раз в час: задачи доходят до воркера и выполняются
 └── skill/tools.md       # 🤖 Навык агента: служебные даги
 
 gp_exchange/                 # Приём универсального обмена из ПКАП: S3 → ClickHouse

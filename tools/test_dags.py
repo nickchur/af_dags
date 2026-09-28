@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-28 10:20 MSK · v3.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:38 MSK · v3.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -365,6 +365,8 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
         # без ретраев: перепроверка ждёт парсинг до 20 минут, повтор растянул бы прогон вдвое
         # и всё равно смотрел бы на тот же стенд
         "retries": 0,
+        # Перепроверка ждёт парсинг до 20 минут, parse_time на сигме — минуты
+        "execution_timeout": timedelta(hours=1),
         "on_failure_callback": on_callback,
     },
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
@@ -375,7 +377,9 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     # растянулся бы на семь волн ожидания (до пары часов). Таски почти всё время спят
     # в ожидании парсинга, так что нагрузки это не добавляет — только занятые слоты
     max_active_tasks=12,
-    tags=["DataLab", "tools", "AutoQA", "health"],
+    # Перепроверки идут волнами по max_active_tasks: 25 целей — три волны по 20 минут
+    dagrun_timeout=timedelta(hours=3),
+    tags=["DataTools", "tools", "AutoQA", "health"],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,

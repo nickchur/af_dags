@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-28 10:29 MSK · v1.33 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:39 MSK · v1.34 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -20,8 +20,8 @@
 Имена тасков одинаковы у всех дагов: `params` → `collect` → действие (`clean`, `close`,
 `purge`, `terminate`, `sweep`, `layout`, `publish`, `save`) → `report` → у плагинов здоровья
 `health_warn` / `health_errors`; `prune` — чистка своих снимков. `params` — через общий
-`store_params_task` у всех дагов с расписанием; без него — ручные `dummy`, `test_kafka_*` и
-`@once` `test_hrp_operators`: сохранять им нечего.
+`store_params_task` у всех дагов с расписанием; без него — `dummy` (одна задача), ручные
+`test_kafka_*` и `@once` `test_hrp_operators`: сохранять им нечего.
 
 **Даг-проверка находками не падает.** Сбор и сводка кладут вердикты в XCom `health`
 (`push_health`), итог подводят два последних таска из `health_tasks` (`plugins/utils.py`),
@@ -40,7 +40,7 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 |---|---|---|
 | `health` | **плагин здоровья — контракт с core**: `get_system_health` ждёт от каждого активного дага с этим тегом отчёт `system_health/checks/<dag_id>.json`, иначе пишет «плагин X: нет отчёта», а просроченный по `ttl_sec` — «последний отчёт N назад». Тег — только вместе с `health_tasks`; плагин создаётся включённым (`is_paused_upon_creation=False`) | `system_health` (2 ч 10 мин), `pg_activity` (40 мин), `log_events`, `test_connections`, `test_dags`, `queue_analyze` (26 ч) |
 | `clean` | удаляет или закрывает: строки метабазы, файлы, раны | `db_cleanup`, `log_cleanup`, `paused_runs_cleanup` |
-| `AutoQA` | ночная регрессия | `show_connections`, `test_connections`, `test_dags`, `test_hrp_operators`, `test_kafka_*` |
+| `AutoQA` | регрессия и проверка «работает ли» | `dummy` (раз в час), `show_connections`, `test_connections`, `test_dags`, `test_hrp_operators`, `test_kafka_*` |
 
 Тег-роль один на даг (плюс `AutoQA`); предметные теги (`conn`, `dag`, `mcp`, `operators`,
 `kafka`, `dummy`, `check`) сняты 28.09.2026 — отбирать по ним нечего.
@@ -288,6 +288,20 @@ DAG'а — лента здоровья: ❌ — был `error`.
 Тяжёлые прогоны — `test_dags`, `test_hrp_operators` — приоритета не получают намеренно:
 они длинные и несрочные.
 
+Потолки есть у всех дагов `tools` (с 28.09.2026 — и у долгих), и каждый заведомо больше
+штатной длительности — ловит зависание:
+
+| Даг | `execution_timeout` | `dagrun_timeout` |
+|---|---|---|
+| `db_cleanup` | 4 ч (VACUUM по таблице сам ограничен часом) | 6 ч |
+| `log_cleanup` | 2 ч (обход ограничен `max_minutes`) | 4 ч |
+| `test_dags` | 1 ч (перепроверка ждёт парсинг до 20 мин) | 3 ч |
+| `test_hrp_operators` | 30 мин | 2 ч |
+| `test_kafka_*` | 15 мин | 30 мин |
+| `queue_analyze`, `paused_runs_cleanup` | 10 мин | 30 мин |
+| `mcp_skills` | 5 мин | 15 мин |
+| `dummy` | 5 мин | 50 мин |
+
 ⚠️ Приоритет действует только на шаге «планировщик выбирает, что поставить в очередь». На
 очередь celery он не влияет — сообщение уезжает без приоритета
 (`celery_executor_utils.py`: `apply_async(args=args, queue=queue)`), — и не вытесняет уже
@@ -468,8 +482,13 @@ failed — как кнопка Mark failed: незавершённые зада�
     `purge_docs` удаляет все `af_doc__*`.
 
 ### [dummy.py](dummy.py)
-**Пустой даг `tools_dummy` для проверки Markdown в UI** (`doc_md`: таблицы, цитаты, код) и
-колбэков на ране, который ничего не делает. Только вручную. До 24.09.2026 — `dummy_dag` в
+**Задачи выполняются (`tools_dummy`, раз в час, `3 * * * *`).**
+
+Одна задача `ping` — настоящая, а не `EmptyOperator`: пустой оператор шедулер отмечает
+успешным сам, до воркера он не доходит. Зелёный ран — задачи доходят до воркера и
+отрабатывают; в заметке — под и ожидание в очереди. Красный по `dagrun_timeout` (50 мин,
+меньше интервала — раны не копятся) — задача не выполнилась. Создаётся включённым.
+До 28.09.2026 — ручной даг для проверки Markdown в UI, до 24.09.2026 — `dummy_dag` в
 S3-инструментах альфы.
 
 ## Сохраняемые параметры

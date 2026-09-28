@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-28 10:22 MSK · v3.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v3.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -477,7 +477,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         "on_failure_callback": on_callback,
     },
     start_date=datetime(2026, 9, 10, tzinfo=timezone.utc),
-    tags=["DataLab", "tools", "health"],
+    tags=["DataTools", "tools", "health"],
     catchup=False,
     # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
     is_paused_upon_creation=False,

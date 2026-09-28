@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-28 10:25 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:38 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -397,13 +397,17 @@ params = {
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
+        # Потолок от зависания на блокировке, а не от медленной чистки: VACUUM по таблице
+        # сам ограничен часом (db_vacuum), удаление идёт порциями
+        'execution_timeout': timedelta(hours=4),
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
-    tags=['DataLab', 'tools', 'clean'],
+    tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    dagrun_timeout=timedelta(hours=6),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     on_failure_callback=on_callback,
     params=params,

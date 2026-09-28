@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-09-24 13:00 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -766,7 +766,7 @@ def _group_row(hook, replica: str, dag_group) -> dict:
     schedule_interval=None,   # только ручной запуск
     max_active_runs=1,
     catchup=False,
-    tags=["DataLab", "CI02420667", "ER", "setup"],
+    tags=["DataTools", "CI02420667", "ER", "setup"],
     is_paused_upon_creation=False,
     doc_md=__doc__ + "\n\n### ⚙️ Конфигурация\n\n```\n"
            + json.dumps(_doc_cfg, indent=4, default=str) + "\n```",

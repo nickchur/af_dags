@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-09-28 10:23 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Находит раны в `running` / `queued` у дагов на паузе и, если попросили, закрывает их —
 как кнопка **Mark failed** в UI.
@@ -151,7 +151,7 @@ def classify(runs, tis, now, older_than_hours):
     },
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataLab', 'tools', 'clean'],
+    tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     # Закрывающий инструмент не включается сам после выкладки
     is_paused_upon_creation=True,

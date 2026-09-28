@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-28 10:19 MSK · v3.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v3.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -448,7 +448,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     # Ежедневно в 23:15 MSK, через 15 минут после tools_show_connections: тот обновляет
     # Variable local_connections, из которой этот DAG набирает список соединений на парсинге
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=["DataLab", "tools", "AutoQA", "health"],
+    tags=["DataTools", "tools", "AutoQA", "health"],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,

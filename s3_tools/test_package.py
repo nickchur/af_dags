@@ -1,5 +1,5 @@
 """### 📦 Тестовый пакет для единого репликатора / TFS
-*2026-08-19 14:20 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает тестовые ZIP-пакеты в S3 с актуальными таймштампами.
 По умолчанию используются встроенные тестовые данные (3 части, 36/37/38 строк).
@@ -52,7 +52,7 @@ else:
     default_args={"owner": "DataLab (CI02420667)", "retries": 0},
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
     start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
-    tags=["DataLab", "tools", "ER", "test"],
+    tags=["DataTools", "tools", "ER", "test"],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

@@ -26,7 +26,7 @@ with DAG(
     default_args=default_args,
     start_date=pendulum.datetime(2025, 12, 20),
     schedule_interval='*/30 * * * *',
-    tags=['DataLab', 'import', 'TFS', 'CI02420667', 'PKAP', 'exchange'],
+    tags=['DataTools', 'import', 'TFS', 'CI02420667', 'PKAP', 'exchange'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

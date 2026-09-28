@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-28 10:28 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:39 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -46,7 +46,7 @@ description: Индекс служебных дагов Airflow (каталог 
   клетка называла объект, а ран краснеет только по вердикту сводки.
 - **Теги — роль:** `health` — плагин здоровья, `health_errors` пишет отчёт в
   `system_health/checks/<dag_id>.json`, его читает `get_system_health` → `plugins`; `clean` —
-  удаляет; `AutoQA` — ночная регрессия. Плагины: `system_health`, `pg_activity`, `log_events`,
+  удаляет; `AutoQA` — регрессия и проверка «работает ли» (`dummy` раз в час). Плагины: `system_health`, `pg_activity`, `log_events`,
   `test_connections`, `test_dags`, `queue_analyze`.
 - **Пул `tools_pool`** (16 слотов). Короткие проверки идут с `priority_weight 900`,
   `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Тяжёлые `test_dags`,
@@ -64,7 +64,7 @@ description: Индекс служебных дагов Airflow (каталог 
   (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение —
   `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
 - **Создаются на паузе**: `db_cleanup`, `log_cleanup`, `paused_runs_cleanup`, ручные
-  `test_kafka_*` и `dummy`. Плагины здоровья, `mcp_skills`, `show_connections`,
+  `test_kafka_*`. Плагины здоровья, `dummy`, `mcp_skills`, `show_connections`,
   `test_hrp_operators` включаются сами. Плагин на паузе — в `get_system_health` «нет отчёта»;
   на паузе он обычно по решению человека.
 - **Итог — в заметках** рана и задач (`add_note`): ✅ / ❌ / ☮️. XCom тебе недоступен.
@@ -86,7 +86,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |
-| `tools_dummy` | вручную | Проверка Markdown в UI | ничего |
+| `tools_dummy` | `3 * * * *` | Задачи выполняются: одна задача `ping` на воркере; красный по `dagrun_timeout` (50 мин) — не выполнилась | ничего |
 
 ## 3. Разбор по симптому (общее)
 
@@ -98,6 +98,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_*` ❌ на таске `params`, есть `start_date`, в логе «не cron и не пресет» | негодное `schedule` в форме **ручного** запуска с `save_params`; переменная не тронута, остальные таски — `upstream_failed` |
 | `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди. Расписание ни при чём. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable не трогать |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый навык появляется до получаса спустя после выкладки дагов; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма) |
+| `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_health` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |
 
 ## 4. Норма, а не тревога

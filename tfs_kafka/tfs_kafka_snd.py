@@ -1,5 +1,5 @@
 """🚚 DAG отправки файлов в ТФС с соблюдением темпа маршрута.
-*2026-09-25 19:33 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v2.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Единственное место, откуда файлы ЕР уходят уведомлением в Kafka. Пакетные даги только
 ставят файлы в очередь, а разгребает её этот даг — в темпе, который декларирует ТФС.
@@ -151,7 +151,7 @@ PAUSE_KEY  = 'pause_noted'
     max_active_runs=1,
     catchup=False,
     dagrun_timeout=timedelta(minutes=70),
-    tags=["DataLab", "CI02420667", "TFS", "kafka"],
+    tags=["DataTools", "CI02420667", "TFS", "kafka"],
     is_paused_upon_creation=False,
     doc_md=__doc__,
     params={

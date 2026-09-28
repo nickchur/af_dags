@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-28 10:17 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -269,7 +269,7 @@ SELECT event, count(*) AS cnt
     start_date=datetime(2026, 9, 4, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'health'],
+    tags=['DataTools', 'tools', 'health'],
     catchup=False,
     # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
     is_paused_upon_creation=False,
