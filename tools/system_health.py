@@ -1,17 +1,18 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-27 17:06 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 08:41 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
 кто её открыл; здесь сетка DAG'а — лента здоровья контура: ❌ — был `error`.
 
-Одна задача `check`, одиннадцать проверок. Каждая изолирована: своё время, свой таймаут, свой
+Одна задача `check`, двенадцать проверок. Каждая изолирована: своё время, свой таймаут, свой
 `try/except` — упавшая даёт свою строку и не мешает остальным.
 
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
 |---|---|---|---|
 | `components` | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
+| `control` | control-канал celery: `ping` к воркерам, бравшим задачи за 15 мин; на узле брокера — права на каналы (`ACL GETUSER`), подписки-шаблоны (`PUBSUB NUMPAT`), петля pub/sub самому себе | часть работающих воркеров не ответила | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -98,6 +99,11 @@ ICON = {"healthy": "✅", "unknown": "❔", "warn": "⚠️", "error": "❌"}
 # STALE_AFTER_SEC, PROBE_TIMEOUT_SEC), чтобы DAG и карточка называли одно и то же одним словом
 STALE_AFTER_SEC = 5 * 60
 BROADCAST_TIMEOUT_SEC = 2
+# Control-канал: ping ждём дольше broadcast'а — на dev 27.09.2026 ответы опаздывали, и
+# двухсекундный опрос не отличал «опоздал» от «потерялся». Воркер считается работающим,
+# если брал задачи за последние WORKER_ACTIVE_SEC
+PING_TIMEOUT_SEC = 5
+WORKER_ACTIVE_SEC = 15 * 60
 # S3 — как у промежуточной выгрузки лога (etl-core PR #35, hrp_adapter/logging/handlers.py):
 # живой S3 отвечает за доли секунды, сломанный шлюз альфы 11.09.2026 отвечал 504 примерно
 # через минуту — одна попытка и короткие таймауты, чтобы проверка не висела вместе с ним
@@ -355,6 +361,100 @@ def check_celery() -> dict:
     queues = result.get("queues") or {}
     head = (f"воркеров {len(by_worker)}, слоты {busy} из {total}"
             + (", очередь " + ", ".join(f"{n} {v}" for n, v in queues.items()) if queues else ""))
+    return {**result, "status": status, "summary": "; ".join([head, *notes])}
+
+
+# Хосты, бравшие задачи недавно: по ним видно, кто обязан ответить на ping. Имя celery-узла
+# у платформы — celery@<hostname> (воркер стартует без -n), hostname в task_instance тот же
+SQL_WORKER_HOSTS = """
+select distinct hostname
+  from task_instance
+ where hostname <> ''
+   and (state = 'running' or end_date > now() - cast(:age as interval))
+"""
+
+
+def _plain(value):
+    """Ответы redis приходят байтами, в том числе ключи словарей."""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, dict):
+        return {_plain(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _broker_pubsub(app) -> dict:
+    """Pub/sub брокера на том узле, куда ходит сам celery: права, подписки, петля."""
+    out = {}
+    # Канал kombu, а не сырой клиент: он уже привязан к узлу кластера по global_keyprefix
+    with app.connection_for_read() as conn:
+        cli = conn.default_channel.client
+        try:
+            user = _plain(cli.execute_command("ACL", "WHOAMI"))
+            acl = _plain(cli.execute_command("ACL", "GETUSER", user))
+            out["acl_channels"] = dict(zip(acl[::2], acl[1::2])).get("channels")
+        except Exception as exc:
+            # ACL-команды пользователю могут быть закрыты — это не поломка pub/sub
+            out["acl_channels"] = f"не прочитаны: {_short_reason(exc)}"
+        # kombu подписывает воркеры шаблоном (fanout_patterns): PUBSUB CHANNELS их не видит
+        out["pattern_subs"] = cli.pubsub_numpat()
+        ps = cli.pubsub()
+        try:
+            topic = f"tools_system_health.loopback.{uuid.uuid4().hex[:8]}"
+            ps.subscribe(topic)
+            ps.get_message(timeout=2)  # подтверждение подписки
+            cli.publish(topic, "ping")
+            out["loopback"] = ps.get_message(timeout=PING_TIMEOUT_SEC) is not None
+        finally:
+            ps.close()
+    return out
+
+
+def check_control() -> dict:
+    """Control-канал celery: отвечают ли воркеры на ping через брокер.
+
+    Задачи идут через списки Redis, а ping/inspect — через pub/sub, и второе может молчать
+    при живом первом. Так было на dev с 27.09.2026 ~11:10 UTC: воркеры работали, а на
+    inspect отвечало 20–40 % опросов (отбивки health_beacon). От этого канала зависят
+    liveness-проба воркера (перезапускает под после 20 мин молчания) и число воркеров в
+    карточке Health; check_celery видит только итог — меньше воркеров, — а не причину.
+    """
+    from airflow.providers.celery.executors.celery_executor import app
+
+    # Сравниваем по короткому имени: hostname в task_instance — getfqdn(), у celery-узла — gethostname()
+    hosts = {r["hostname"].split(".")[0]
+             for r in _pg_rows(SQL_WORKER_HOSTS, {"age": f"{WORKER_ACTIVE_SEC} seconds"})}
+    try:
+        pong = app.control.ping(timeout=PING_TIMEOUT_SEC) or []
+    except Exception as exc:
+        return {"status": "error", "summary": f"брокер недоступен: {_short_reason(exc)}"}
+    answered = {name.split("@", 1)[-1].split(".")[0] for chunk in pong for name in chunk}
+    silent = sorted(hosts - answered)
+    result = {"hosts": len(hosts), "answered": len(answered & hosts), "silent": silent[:TOP]}
+    notes, status = [], "healthy"
+
+    try:
+        result.update(_broker_pubsub(app))
+    except Exception as exc:
+        logger.warning("control: pub/sub брокера не проверен", exc_info=True)
+        notes.append(f"pub/sub не проверен: {_short_reason(exc)}")
+
+    if result.get("loopback") is False:
+        status = "error"
+        notes.append("pub/sub брокера не доставляет даже самому себе")
+    if hosts and not (answered & hosts):
+        status = "error"
+        notes.append("ни один работающий воркер не ответил на ping")
+    elif silent:
+        status = _worst([status, "warn"])
+        notes.append(f"молчат: {_names(silent)}")
+    if hosts and result.get("pattern_subs") == 0:
+        status = "error"
+        notes.append("на узле брокера нет ни одной подписки-шаблона — воркеры не слушают control-канал")
+
+    head = f"ответили {result['answered']} из {len(hosts)} работавших за {WORKER_ACTIVE_SEC // 60} мин"
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
 
 
@@ -892,7 +992,8 @@ def _param(key, default, **kwargs):
         "priority_weight": 900,
         "weight_rule": "absolute",
         # Сетевые таймауты проверок в сумме около 90 с: S3 — три операции по 5 + 15 с,
-        # брокер — два broadcast по 2 с, метабаза — 5 с на запрос. Пять минут — про зависание
+        # брокер — два broadcast по 2 с и ping с петлёй pub/sub до 12 с, метабаза — 5 с на
+        # запрос. Пять минут — про зависание
         "execution_timeout": timedelta(minutes=5),
         "on_failure_callback": on_callback,
     },
@@ -923,7 +1024,7 @@ def tools_system_health():
     # XCom — четыре лишние строки на прогон, 24 прогона в сутки
     @task(task_id="check", multiple_outputs=False)
     def check(**context) -> dict:
-        """Одиннадцать проверок подряд, итог — в лог, XCom, заметку и отчёт плагина; error роняет задачу."""
+        """Двенадцать проверок подряд, итог — в лог, XCom, заметку и отчёт плагина; error роняет задачу."""
         from airflow.exceptions import AirflowFailException
 
         state, msg = store_params(PARAMS_VAR, SAVED, context)
@@ -935,6 +1036,7 @@ def tools_system_health():
         checks = {
             "components": _run("components", check_components),
             "celery": _run("celery", check_celery),
+            "control": _run("control", check_control),
             "s3_logs": _run("s3_logs", check_s3_logs, float(context["params"]["s3_slow_sec"]), dag_run.run_id),
             "delivery": _run("delivery", check_delivery, ti, dag_run),
             "pools": _run("pools", check_pools),

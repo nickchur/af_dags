@@ -5,7 +5,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 
 # Служебные даги (`tools/`)
 
-*2026-09-27 17:12 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 08:42 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -58,7 +58,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 | `tools_queue_analyze` | вручную | Почему задачи ждут; брокер: живые и мусор | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны `running`/`queued` у запаузенных дагов | Mark failed — только при `close` |
 | `tools_pg_activity` | `*/10 * * * *` | Сессии метабазы: `idle in transaction`, долгие запросы, блокировки, чей таск | сессии — только при `terminate` и `dry_run=False` |
-| `tools_system_health` | `7 * * * *` | Снимок Health раз в час: компоненты, celery, бакет логов, пулы, метабаза, разбор файлов, размер DAG'ов, раны, `scheduled`, таблицы; отчёт — раздел `plugins` в `get_system_health` | ничего |
+| `tools_system_health` | `7 * * * *` | Снимок Health раз в час: компоненты, celery, control-канал celery, бакет логов, пулы, метабаза, разбор файлов, размер DAG'ов, раны, `scheduled`, таблицы; отчёт — раздел `plugins` в `get_system_health` | ничего |
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log`: `stuck in queued`, `heartbeat timeout`, `state mismatch` | ничего |
 | `tools_db_cleanup` | `0 2 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
 | `tools_log_cleanup` | `17 5 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и выставляет правило жизненного цикла — по нему хранилище удаляет само, без отчёта |
@@ -133,6 +133,7 @@ description: Служебные даги Airflow (каталог tools/, на с
 | `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «два файла на один dag_id» | это не ложное срабатывание: один `dag_id` объявлен в двух файлах, каждый разбор переписывает сериализацию другого, и в UI и у шедулера задачи и теги то есть, то нет. Разница из заметки и лога (`Было → Стало`) показывает, какая версия урезана: тег `QA`, меньше задач. Лечит владелец дага — удалить дубль или переименовать `dag_id`; путь в заметке называет чужой каталог (не `tools/`) — это не наш код, даг не перезапускать и `test_dags` не править. Сигма-ифт 24.09.2026: `reload_core_person_position_action` в `CI06884356/analytics/datalab/` и `CI06932748/analytics/datalab/` |
 | Файлы дагов не разбираются, ошибки импорта | `tools_system_health` (новые ошибки импорта по id), `tools_test_dags` (`parse_time`) |
 | «Даги с большим числом тасков», `tools_system_health` ⚠️ `dag_size` | заметка и XCom `checks.dag_size` последнего рана: `classes` — сколько DAG'ов в каждом классе, `top` — больше 300 тасков. В строке `имя (A/B)`: A — тасков в определении, B — наибольшее за один ран за 7 дней (с раскрытыми mapped); B ≫ A — это `expand`. Совет — владельцу дага: делить даг или ограничить раскрытие. Не падение, контур этим не сломан |
+| `workers: 0` в карточке Health при идущих задачах, воркеры перезапускаются по liveness («celery молчит 1201 с»), `tools_system_health` ⚠️/❌ `control` | XCom `checks.control` последнего рана: `answered` из `hosts`, `silent` — кто молчит; `loopback: false` или `pattern_subs: 0` — pub/sub брокера сломан; `acl_channels` без `&*` — каналы закрыты правами пользователя. Задачи при этом идут: очереди — списки Redis, control-канал — pub/sub. Это вопрос к владельцам Redis, не к дагам |
 | Подключение не работает | `tools_test_connections` (❌ по `conn_id`); список — `tools_show_connections` |
 | На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый или обновлённый навык появляется на сервере до получаса спустя после выкладки дагов, это не новая версия core; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |

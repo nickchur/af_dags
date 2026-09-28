@@ -36,7 +36,7 @@
 | `plugins/` | `plugins/readme.md` | 2026-09-26 | `openspec/specs/plugins/spec.md` | 2026-09-17 ⚠️ | 2026-09-27 |
 | `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 | `openspec/specs/s3-tools/spec.md` | 2026-09-24 | 2026-09-24 |
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-24 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 ⚠️ | 2026-09-25 |
-| `tools/` | `tools/readme.md` | 2026-09-27 | `openspec/specs/tools/spec.md` | 2026-09-24 ⚠️ | 2026-09-27 |
+| `tools/` | `tools/readme.md` | 2026-09-28 | `openspec/specs/tools/spec.md` | 2026-09-24 ⚠️ | 2026-09-28 |
 | `xs_export/` | `xs_export/readme.md` | 2026-08-31 | `openspec/specs/xs-export/spec.md` | 2026-08-31 | 2026-09-02 |
 | `GP/` | `GP/readme.md` | 2026-09-26 | снимок `HR_Data` @ `1a3a317` | 2026-09-26 | 2026-09-26 |
 
