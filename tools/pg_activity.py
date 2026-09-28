@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-28 10:36 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:18 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -26,21 +26,19 @@
 | `zombie_after_sec` | Хартбит старше — владелец не жив, сек *(default: `300`, как у зомби-детектора Airflow)* |
 | `alert` | Находки — `error` (ран красный через `health_errors`), иначе `warn` *(default: `True`)* |
 | `save_s3` | Писать снимки в S3 *(default: `True`)* |
-| `keep_days` | Сколько дней держим снимки, старше — удаляем *(default: `30`)* |
 | `dry_run` | При `terminate=True` только показать кандидатов *(default: `True`)* |
 | `schedule` | Расписание: cron или пресет, пусто — только вручную *(default: `*/10 * * * *`)* |
 | `save_params` | Записать значения формы в Variable `tools_pg_activity_cfg` *(default: `False`)* |
 | `terminate` | Убивать найденные сессии. **В Variable не сохраняется** *(default: `False`)* |
 
 **Таски:** `params` (сохранение формы); `collect` → `save` / `terminate` → `report` →
-`health_warn` / `health_errors`; рядом `prune` — чистка снимков. Находки таски не роняют: при
+`health_warn` / `health_errors`. Находки таски не роняют: при
 `alert` они дают ❌ `health_errors` (ран красный, уведомление), без него — ⚠️ `health_warn`.
 Красный `collect` — сломалось само снятие; отчёт плагина здоровья пишет `health_errors`.
 
 Снимки лежат в бакете логов, в своей папке: `pg_activity/<YYYY-MM-DD>/<HHMMSS>.json`.
 Пустые снимки не пишутся — счётчики и так уходят в лог каждый запуск. Старые снимки
-даг убирает сам: наш S3-шлюз не принимает lifecycle-правило (`PutBucketLifecycleConfiguration`
-требует заголовок `Content-MD5`, которого boto3 больше не шлёт).
+убирает `tools_log_cleanup` общим сроком бакета.
 
 > Пороги и расписание берутся из Variable `tools_pg_activity_cfg`, форма запуска ими
 > предзаполняется. Поменять их для плановых запусков — запуск с галкой `save_params`
@@ -91,7 +89,6 @@ DEFAULTS = {
     "zombie_after_sec": 300,
     "alert": True,
     "save_s3": True,
-    "keep_days": 30,
     "dry_run": True,
 }
 
@@ -219,31 +216,6 @@ def _app_pid(application_name: str):
     return int(tail) if tail.isdigit() else None
 
 
-def _delete_keys(hook, keys: list) -> int:
-    """Удаляет ключи пачкой, а если шлюз пачку не принял — по одному.
-
-    Multi-object delete (POST ?delete) — из того же семейства запросов, что и
-    lifecycle: он требует Content-MD5, а boto3 вместо него давно шлёт контрольную
-    сумму, и шлюз может ответить отказом. У одиночного DELETE тела нет, спорить
-    не о чем — на нём и подстраховываемся.
-    """
-    try:
-        hook.delete_objects(bucket=BUCKET_NAME, keys=keys)
-        return len(keys)
-    except Exception as err:
-        logger.warning("удалить пачкой не вышло (%s), идём по одному", err)
-
-    conn = hook.get_conn()
-    deleted = 0
-    for key in keys:
-        try:
-            conn.delete_object(Bucket=BUCKET_NAME, Key=key)
-            deleted += 1
-        except Exception as err:
-            logger.warning("не удалён %s: %s", key, err)
-    return deleted
-
-
 def _fetch(sql: str) -> list:
     """Читает SQL в метабазе и отдаёт список словарей.
 
@@ -311,8 +283,6 @@ def _fetch(sql: str) -> list:
                        description='Краснеть при находках'),
         'save_s3': Param(_cfg['save_s3'], type='boolean',
                          description='Писать снимки в S3'),
-        'keep_days': Param(_cfg['keep_days'], type='integer', minimum=1,
-                           description='Сколько дней держим снимки в S3, старше — удаляем'),
         'dry_run': Param(_cfg['dry_run'], type='boolean',
                          description='При «Убивать сессии» — только показать кандидатов'),
         'schedule': Param(SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'],
@@ -480,51 +450,6 @@ def tools_pg_activity():
         add_note({'🔪 terminate': killed}, level='task', context=context)
         return killed
 
-    @task(task_id='prune', trigger_rule=TriggerRule.NONE_FAILED)
-    def prune(**context) -> str:
-        """🧹 Убирает снимки старше `keep_days`.
-
-        Сначала здесь стояло lifecycle-правило через `s3_set_ttl` — пусть чистит
-        хранилище. Не вышло: шлюз отвечает на PutBucketLifecycleConfiguration
-        "Missing required header for this request: Content-MD5", а boto3 этот
-        заголовок давно не шлёт, он заменён на контрольные суммы. Поэтому чистим
-        сами, благо ключ снимка начинается с даты и ходить за метаданными не нужно.
-        """
-        from airflow.exceptions import AirflowSkipException
-        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-
-        if not context['params']['save_s3']:
-            raise AirflowSkipException("save_s3=False — папку не трогаем")
-
-        days = context['params']['keep_days']
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-
-        hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
-        keys = hook.list_keys(bucket_name=BUCKET_NAME, prefix=PREFIX) or []
-
-        stale, unknown = [], 0
-        for key in keys:
-            day = key[len(PREFIX):].split('/')[0]
-            try:
-                if datetime.strptime(day, '%Y-%m-%d').date() < cutoff:
-                    stale.append(key)
-            except ValueError:
-                # Не наш формат — руками положили или писал кто-то ещё. Чужое не удаляем.
-                unknown += 1
-
-        if not stale:
-            msg = f"снимков старше {days}д нет, всего в папке {len(keys)}"
-            logger.info("🧹 %s", msg)
-            return msg
-
-        deleted = _delete_keys(hook, stale)
-        msg = f"удалено {deleted} из {len(stale)} снимков старше {days}д (всего было {len(keys)})"
-        if unknown:
-            msg += f", пропущено чужих ключей: {unknown}"
-        logger.info("🧹 %s", msg)
-        add_note({'🧹 prune': msg}, level='task', context=context)
-        return msg
-
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
         """🧾 Сводка в заметку и вердикт здоровья: находки — error при alert, иначе warn."""
@@ -567,10 +492,6 @@ def tools_pg_activity():
 
     save_params()
     snapshot = collect()
-
-    # prune не про находки: его дело — папка в S3. В цепочке до report он стоял зря,
-    # добавляя лишний прыжок через очередь к тому, ради чего даг и заводился.
-    snapshot >> prune()
     verdict = report(snapshot)
     [save(snapshot), terminate(snapshot)] >> verdict
     verdict >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)

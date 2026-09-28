@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-28 10:49 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:18 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -33,7 +33,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 - **Этапы и имена тасков одинаковы у всех дагов:** `params` → `collect` → действие (`clean`,
   `close`, `purge`, `terminate`, `sweep`, `publish`, `save`…) → `report` → у плагинов здоровья
-  `health_warn` / `health_errors`. `prune` — чистка своих снимков. 28.09.2026 переименованы:
+  `health_warn` / `health_errors`. 28.09.2026 переименованы:
   `system_health.check` → `collect` + `report`, `paused_runs_cleanup.find` и
   `show_connections.show_connections` → `collect`, `summary` → `report` (`test_connections`,
   `test_dags`, `test_hrp_operators`); в старых ранах — старые имена.

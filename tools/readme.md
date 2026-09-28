@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-28 12:14 MSK · v1.36 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:18 MSK · v1.37 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -19,7 +19,7 @@
 
 Имена тасков одинаковы у всех дагов: `params` → `collect` → действие (`clean`, `close`,
 `purge`, `terminate`, `sweep`, `layout`, `publish`, `save`) → `report` → у плагинов здоровья
-`health_warn` / `health_errors`; `prune` — чистка своих снимков. `params` — через общий
+`health_warn` / `health_errors`. `params` — через общий
 `store_params_task` у всех дагов с расписанием; без него — `dummy` (нечего сохранять), ручные
 `test_kafka_*` и `@once` `test_hrp_operators`: сохранять им нечего.
 
@@ -323,7 +323,7 @@ DAG'а — лента здоровья: ❌ — был `error`.
     у брошенной сессии — никогда. Число находок без живого владельца идёт в сводку счётчиком
     `orphan`.
 *   **Параметры**: пороги `idle_tx_sec` / `long_query_sec` / `lock_wait_sec` / `zombie_after_sec`,
-    `alert`, `save_s3`, `keep_days`, `dry_run` и расписание `schedule` (`*/10 * * * *`);
+    `alert`, `save_s3`, `dry_run` и расписание `schedule` (`*/10 * * * *`);
     хранятся в Variable `tools_pg_activity_cfg`, галка `save_params` (до 24.09.2026 —
     `save_to_var`) перезаписывает её значениями формы. Сохраняет отдельный таск `params`.
 *   **Убийство сессий**: параметр `terminate` (по умолчанию выключен и в Variable **не сохраняется**),
@@ -337,9 +337,7 @@ DAG'а — лента здоровья: ❌ — был `error`.
     `idle_in_transaction_session_timeout` на метабазе — вопрос к сопровождению PG; пока его
     нет, брошенная транзакция висит до перезапуска процесса и держит `xmin`, мешая autovacuum.
 *   **Снимки**: при находках пишутся в бакет логов, папка `pg_activity/<дата>/<время>.json`;
-    старше `keep_days` даг удаляет сам в таске `prune`. Lifecycle-правило не подошло:
-    шлюз отвечает на `PutBucketLifecycleConfiguration` требованием заголовка `Content-MD5`,
-    которого boto3 больше не шлёт.
+    старые убирает `tools_log_cleanup` общим сроком бакета.
 *   **Отчётность**: сводка в заметку; находки при `alert=True` — ❌ `health_errors` (ран
     красный, уведомление), без него — ⚠️ `health_warn`.
 

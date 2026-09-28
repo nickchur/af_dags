@@ -5,12 +5,12 @@ description: tools_pg_activity — сторож метабазы раз в 10 м
 
 # `tools_pg_activity` — сторож метабазы
 
-*2026-09-28 10:27 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:18 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и `health_warn` / `health_errors` — навык **`tools`**.
 
 **Таски:** `params`; `collect` → `save` / `terminate` → `report` → `health_warn` /
-`health_errors`; рядом `prune` (чистка снимков). Снимки при находках — в бакете логов,
+`health_errors`. Снимки при находках — в бакете логов,
 `pg_activity/<дата>/<время>.json`.
 
 **Итог.** Находки таски не роняют: при `alert` (по умолчанию) — ❌ `health_errors`, ран красный,
