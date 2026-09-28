@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 08:48 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 09:09 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -12,7 +12,7 @@
 |---|---|---|---|
 | `components` | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `control` | control-канал celery и брокер: `ping` к воркерам, бравшим задачи за 15 мин; на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | часть работающих воркеров не ответила; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `control` | control-канал celery и брокер: `ping` к воркерам, бравшим задачи за 15 мин (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | часть работающих воркеров не ответила; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -375,12 +375,16 @@ def check_celery() -> dict:
 
 
 # Хосты, бравшие задачи недавно: по ним видно, кто обязан ответить на ping. Имя celery-узла
-# у платформы — celery@<hostname> (воркер стартует без -n), hostname в task_instance тот же
+# у платформы — celery@<hostname> (воркер стартует без -n). Берём из job, а не из
+# task_instance: у LocalTaskJob тот же hostname, хартбит идёт весь таск и остаётся на
+# его конце, и есть индекс job_type_heart (job_type, latest_heartbeat). task_instance
+# по end_date индекса не имеет — на dev 28.09.2026 (13 млн строк) запрос не уложился в 5 с
 SQL_WORKER_HOSTS = """
 select distinct hostname
-  from task_instance
- where hostname <> ''
-   and (state = 'running' or end_date > now() - cast(:age as interval))
+  from job
+ where job_type = 'LocalTaskJob'
+   and latest_heartbeat > now() - cast(:age as interval)
+   and hostname <> ''
 """
 
 
