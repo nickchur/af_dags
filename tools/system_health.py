@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 08:43 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 08:48 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -12,7 +12,7 @@
 |---|---|---|---|
 | `components` | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `control` | control-канал celery: `ping` к воркерам, бравшим задачи за 15 мин; на узле брокера — права на каналы (`ACL GETUSER`), подписки-шаблоны (`PUBSUB NUMPAT`), петля pub/sub самому себе | часть работающих воркеров не ответила; все ответили, но дольше 2 с | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `control` | control-канал celery и брокер: `ping` к воркерам, бравшим задачи за 15 мин; на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | часть работающих воркеров не ответила; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -104,6 +104,16 @@ BROADCAST_TIMEOUT_SEC = 2
 # если брал задачи за последние WORKER_ACTIVE_SEC
 PING_TIMEOUT_SEC = 5
 WORKER_ACTIVE_SEC = 15 * 60
+# Звенья задержки control-канала: команда брокеру → доставка pub/sub → ответ воркера.
+# Пороги — порядок величины, а не замер: redis в одном ЦОД отвечает за единицы мс, и
+# сотни мс на команду или полсекунды на доставку уже объясняют опоздавшие ответы
+BROKER_CMD_WARN_MS = 100
+PUBSUB_WARN_MS = 500
+LATENCY_SAMPLES = 3
+# Поля INFO узла брокера: хватает, чтобы отличить перегруз и failover от сети
+INFO_FIELDS = ("redis_version", "role", "uptime_in_seconds", "connected_clients", "blocked_clients",
+               "pubsub_channels", "pubsub_patterns", "instantaneous_ops_per_sec", "used_memory_human",
+               "rejected_connections", "evicted_keys")
 # S3 — как у промежуточной выгрузки лога (etl-core PR #35, hrp_adapter/logging/handlers.py):
 # живой S3 отвечает за доли секунды, сломанный шлюз альфы 11.09.2026 отвечал 504 примерно
 # через минуту — одна попытка и короткие таймауты, чтобы проверка не висела вместе с ним
@@ -385,12 +395,31 @@ def _plain(value):
     return value
 
 
+def _median_ms(samples: list) -> float | None:
+    samples = sorted(x for x in samples if x is not None)
+    return round(samples[len(samples) // 2] * 1000, 1) if samples else None
+
+
 def _broker_pubsub(app) -> dict:
-    """Pub/sub брокера на том узле, куда ходит сам celery: права, подписки, петля."""
+    """Узел брокера, куда ходит сам celery: задержка команд и pub/sub, INFO, права, подписки."""
     out = {}
     # Канал kombu, а не сырой клиент: он уже привязан к узлу кластера по global_keyprefix
     with app.connection_for_read() as conn:
         cli = conn.default_channel.client
+        kw = cli.connection_pool.connection_kwargs
+        out["node"] = f"{kw.get('host')}:{kw.get('port')}"
+
+        samples = []
+        for _ in range(LATENCY_SAMPLES):
+            t = time.perf_counter()
+            cli.ping()
+            samples.append(time.perf_counter() - t)
+        out["cmd_ms"] = _median_ms(samples)
+        try:
+            info = cli.info()
+            out["info"] = {k: info[k] for k in INFO_FIELDS if k in info}
+        except Exception as exc:
+            out["info"] = f"не прочитан: {_short_reason(exc)}"
         # ACL и PUBSUB NUMPAT пользователю брокера бывают закрыты (dev, 28.09.2026:
         # NoPermissionError на оба) — это не поломка pub/sub, петлю проверяем всё равно
         try:
@@ -409,8 +438,14 @@ def _broker_pubsub(app) -> dict:
             topic = f"tools_system_health.loopback.{uuid.uuid4().hex[:8]}"
             ps.subscribe(topic)
             ps.get_message(timeout=2)  # подтверждение подписки
-            cli.publish(topic, "ping")
-            out["loopback"] = ps.get_message(timeout=PING_TIMEOUT_SEC) is not None
+            samples = []
+            for _ in range(LATENCY_SAMPLES):
+                t = time.perf_counter()
+                cli.publish(topic, "ping")
+                got = ps.get_message(timeout=PING_TIMEOUT_SEC)
+                samples.append(time.perf_counter() - t if got is not None else None)
+            out["loopback"] = any(x is not None for x in samples)
+            out["pubsub_ms"] = _median_ms(samples)
         finally:
             ps.close()
     return out
@@ -465,12 +500,26 @@ def check_control() -> dict:
         # list-workers пуст, а ping с 5 с получил все 8 ответов
         status = _worst([status, "warn"])
         notes.append(f"ответы идут {reply_sec} с — дольше {BROADCAST_TIMEOUT_SEC} с, которые ждут карточка и отбивки")
+
+    # Где набегает задержка: команда → доставка pub/sub → ответ воркера. Предупреждаем по
+    # первому медленному звену — следующие за ним медленны уже из-за него
+    cmd_ms, pubsub_ms = result.get("cmd_ms"), result.get("pubsub_ms")
+    if cmd_ms is not None and cmd_ms > BROKER_CMD_WARN_MS:
+        status = _worst([status, "warn"])
+        notes.append(f"брокер медленно отвечает на команды: {cmd_ms} мс — узел или сеть до него")
+    elif pubsub_ms is not None and pubsub_ms > PUBSUB_WARN_MS:
+        status = _worst([status, "warn"])
+        notes.append(f"pub/sub брокера доставляет за {pubsub_ms} мс при командах за {cmd_ms} мс")
+    elif hosts and answered & hosts and reply_sec > BROADCAST_TIMEOUT_SEC and pubsub_ms is not None:
+        notes.append(f"брокер быстрый (команда {cmd_ms} мс, pub/sub {pubsub_ms} мс) — медлят сами воркеры")
     if hosts and result.get("pattern_subs") == 0 and not (answered & hosts):
         status = "error"
         notes.append("на узле брокера нет ни одной подписки-шаблона — воркеры не слушают control-канал")
 
     head = (f"ответили {result['answered']} из {len(hosts)} работавших за {WORKER_ACTIVE_SEC // 60} мин"
-            + (f", за {reply_sec} с" if not silent else ""))
+            + (f", за {reply_sec} с" if not silent else "")
+            + (f"; брокер {result.get('node')}: команда {cmd_ms} мс, pub/sub {pubsub_ms} мс"
+               if cmd_ms is not None else ""))
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
 
 
