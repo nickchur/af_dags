@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 09:09 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 09:12 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
@@ -21,7 +21,7 @@
 | `runs` | раны в `queued` дольше 30 мин, раны `queued`/`running` у запаузенных дагов (поимённо, 10 самых старых) | есть раны у запаузенных дагов | — |
 | `scheduled` | даги с задачами в `scheduled` дольше 5 мин: сколько, как давно, упёрлись ли в свой `max_active_tasks` (`at_limit`) | застряли даги **не** на своём лимите | — |
 | `tables` | оценка строк больших таблиц метабазы (`reltuples`) | — | — |
-| `dag_size` | DAG'и по числу тасков — в определении и за ран (с раскрытыми mapped) за 7 дней, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300 | DAG больше 300 тасков | — |
+| `dag_size` | DAG'и по числу тасков — в определении и в последнем ране (с раскрытыми mapped), классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300 | DAG больше 300 тасков | — |
 
 Итог — худший статус. **`error` роняет задачу** (после записи XCom и заметки): в сетке
 красный квадрат и уведомление через `on_callback`. `warn` — зелёный прогон с ⚠️ в заметке.
@@ -136,11 +136,9 @@ SHOW = 5
 # Больше TASKS_ALERT — warn: такой DAG тяжёл шедулеру, сетке UI и пулам
 TASK_CLASSES = (1, 3, 10, 30, 100, 300)
 TASKS_ALERT = TASK_CLASSES[-1]
-# Сколько дней ранов смотреть на раскрытые mapped-таски
-TASKS_RUN_DAYS = 7
-# Запрос читает JSON всех сериализованных DAG'ов и таски ранов за неделю: на стенде
-# 27.09.2026 — 0,1 с на 73 DAG'ах и 102 тыс. task_instance. На контурах больше, общий
-# потолок в 5 с тесен
+# Запрос читает JSON всех сериализованных DAG'ов и по индексу — задачи последнего рана
+# каждого. Прежний счёт по всем ранам за 7 дней не уложился и в 30 с на dev 28.09.2026
+# (task_instance 13 млн строк, у dag_run.start_date нет индекса); потолок оставлен с запасом
 DAG_SIZE_TIMEOUT_MS = 30000
 # Ран в queued дольше этого: меньше — обычное ожидание max_active_runs, дольше — чаще всего
 # даг на паузе
@@ -826,28 +824,29 @@ def check_parsing(dag_id: str, run_id: str) -> dict:
 
 
 # Два счёта, потому что они про разное. tasks — таски в определении DAG'а (сериализация).
-# max_ti — наибольшее число task_instance в одном ране за TASKS_RUN_DAYS дней: это уже с
-# раскрытыми mapped-тасками, и именно оно бьёт по шедулеру; DAG из 5 тасков с expand на
-# 1000 элементов по первому счёту безобиден. Класс — по большему из двух.
-# Раны отбираются по dag_run.start_date, а не сканом всего task_instance: на бою там
-# миллионы строк. tasks = null, если JSON сжат (compress_serialized_dags; на контурах
-# выключено, etl-core airflow-default.cfg) или DAG ещё не сериализован
+# max_ti — число task_instance в ПОСЛЕДНЕМ ране DAG'а: это уже с раскрытыми mapped-тасками,
+# и именно оно бьёт по шедулеру; DAG из 5 тасков с expand на 1000 элементов по первому
+# счёту безобиден. Класс — по большему из двух. До v1.13 здесь был максимум по ранам за
+# 7 дней — точнее для expand с плавающим размером, но на dev он не укладывался в 30 с:
+# теперь на DAG два поиска по индексу — последний ран (dag_run (dag_id, execution_date)) и
+# его задачи (task_instance ti_dag_run). Имя поля оставлено: его читает навык airflow-health.
+# tasks = null, если JSON сжат (compress_serialized_dags; на контурах выключено, etl-core
+# airflow-default.cfg) или DAG ещё не сериализован
 SQL_DAG_SIZE = """
-with m as (
-    select t.dag_id, max(t.cnt) as max_ti
-    from (select ti.dag_id, ti.run_id, count(*) as cnt
-          from task_instance ti
-          join dag_run r on r.dag_id = ti.dag_id and r.run_id = ti.run_id
-          where r.start_date > now() - cast(:days as interval)
-          group by ti.dag_id, ti.run_id) t
-    group by t.dag_id
-)
 select d.dag_id, d.is_paused,
        json_array_length(s.data::json -> 'dag' -> 'tasks') as tasks,
        coalesce(m.max_ti, 0)                               as max_ti
 from dag d
 left join serialized_dag s on s.dag_id = d.dag_id
-left join m on m.dag_id = d.dag_id
+left join lateral (
+    select count(*) as max_ti
+      from task_instance ti
+     where ti.dag_id = d.dag_id
+       and ti.run_id = (select r.run_id from dag_run r
+                         where r.dag_id = d.dag_id
+                         order by r.execution_date desc
+                         limit 1)
+) m on true
 where d.is_active
 """
 
@@ -868,7 +867,7 @@ def dag_size_verdict(rows: list[dict]) -> dict:
     big, unknown = [], 0
     for r in rows:
         size = max(int(r["tasks"] or 0), int(r["max_ti"] or 0))
-        # Нет ни сериализации, ни ранов за неделю — класса не назвать
+        # Нет ни сериализации, ни ранов — класса не назвать
         if not size:
             unknown += 1
             continue
@@ -887,12 +886,12 @@ def dag_size_verdict(rows: list[dict]) -> dict:
     if len(big) > SHOW:
         names += f" и ещё {len(big) - SHOW}"
     return {**result, "status": "warn",
-            "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/за ран): {names}"}
+            "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/в последнем ране): {names}"}
 
 
 def check_dag_size() -> dict:
     """DAG'и по числу тасков; больше TASKS_ALERT — warn."""
-    rows = _pg_rows(SQL_DAG_SIZE, {"days": f"{TASKS_RUN_DAYS} days"}, timeout_ms=DAG_SIZE_TIMEOUT_MS)
+    rows = _pg_rows(SQL_DAG_SIZE, timeout_ms=DAG_SIZE_TIMEOUT_MS)
     return dag_size_verdict(rows)
 
 
