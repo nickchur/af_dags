@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-27 17:58 MSK · v1.30 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 08:27 MSK · v1.31 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -348,6 +348,18 @@ failed — как кнопка Mark failed: незавершённые зада�
 *   **Чего не заберёт**: сообщения, которые воркеры держат в работе, — их в очереди нет.
     При `task_acks_late = True` они вернутся через `visibility_timeout` (на контуре 6 ч), и
     повторный запуск их подберёт; быстрее — перезапустить поды воркеров.
+
+### [celery_control.py](celery_control.py)
+**Control-канал celery: доходят ли ping и inspect через брокер (`tools_celery_control`, вручную).**
+
+Задачи идут через списки Redis, а `ping`/`inspect`/`list-workers` — через pub/sub. Второе
+может молчать при живом первом, и тогда liveness-проба воркера перезапускает рабочие поды,
+а карточка Health показывает `workers: 0`. 28.09.2026 на dev так и было: `celery list-workers`
+из пода воркера — пусто при восьми работающих воркерах. Таск `check` исполняется на воркере
+(в поде нет ни python, ни `redis-cli`) и пишет в заметку: узел брокера, права пользователя
+(`ACL GETUSER`, нет `&*` — pub/sub закрыт), подписки-шаблоны (`PUBSUB NUMPAT`, kombu
+подписывается шаблоном, поэтому `PUBSUB CHANNELS` обычно пуст), публикацию самому себе и
+ответы на `app.control.ping`. Пустой ping роняет таск.
 
 ### [test_dags.py](test_dags.py)
 **Контроль сериализации DAG'ов (`tools_test_dags`).**
