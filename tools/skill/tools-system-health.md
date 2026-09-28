@@ -1,11 +1,11 @@
 ---
 name: tools-system-health
-description: tools_system_pulse (раз в 5 мин — компоненты, celery, control-канал celery и брокер, метабаза, доставка) и tools_system_health (раз в час — бакет логов, пулы, разбор файлов, раны, scheduled, сторож отчётов плагинов) и их отчёты в get_system_health → plugins. Используй, когда спрашивают «что показал tools_system_health / tools_system_pulse», «plugins.tools_system_health», «plugins.tools_system_pulse», «control warn/error», «workers: 0 при идущих задачах», «воркеры перезапускаются по liveness», «ошибки импорта», «плагин молчит», «tools_system_health красный».
+description: tools_system_pulse (раз в 5 мин — компоненты, celery, control-канал celery и брокер, метабаза, доставка) и tools_system_health (раз в час — бакет логов, пулы, разбор файлов, раны, scheduled, сторож отчётов плагинов) и их отчёты в get_system_health → plugins. Используй, когда спрашивают «что показал tools_system_health / tools_system_pulse», «plugins.tools_system_health», «plugins.tools_system_pulse», «control warn/error», «workers: 0 при идущих задачах», «воркеры перезапускаются по liveness», «ошибки импорта», «ран висит в running, last_scheduling_decision замер», «деактивированные даги», «плагин молчит», «tools_system_health красный».
 ---
 
 # `tools_system_pulse` и `tools_system_health` — состояние контура
 
-*2026-09-28 12:38 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 17:43 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и концепцию `health_warn` / `health_errors` — навык **`tools`**.
 
@@ -36,9 +36,18 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
 | `s3_logs` (час) | ❌ | бакет логов не принимает запись — задачи повиснут на записи лога (11.09.2026) |
 | `delivery` (пульс) | ⚠️ > 60 с | задача долго ждала воркера — очередь или слоты |
 | `parsing` (час) | ⚠️ | новые ошибки импорта (по id строки `import_error`), отставший файл, стоит разбор целиком |
-| `runs` (час) | ⚠️ | раны у запаузенных дагов — навык **`tools-paused-runs`** |
+| `runs` (час) | ⚠️ | раны у запаузенных дагов (`paused_runs`) — навык **`tools-paused-runs`**; раны у деактивированных (`inactive_runs`) — см. ниже |
 | `scheduled` (час) | ⚠️ | задачи застряли не на лимите своего дага — навык **`tools-queue-analyze`** |
 | `plugins` (час) | ⚠️ «молчат: tools_X (на паузе / нет отчёта / отчёт N ч назад)» | плагин перестал отчитываться: включить даг, посмотреть его последние раны и ошибки импорта. «сейчас tools_X warn/error» — справка: разбирать по навыку того дага (поле `skill` его отчёта), здесь не повторяется |
+
+**`runs.inactive_runs` — раны деактивированных дагов.** Шедулер разбирает раны только дагов
+с `is_paused = false` и `is_active = true`. `is_active` снимает dag-processor, когда файл дага
+разбирается, а сам даг из него не обновляется, — ошибка импорта или файл удалён. Ран стоит в
+`running`/`queued`, `last_scheduling_decision` замер (`frozen_sec`), задачи внутри могут уже
+кончиться. `error` — хвост ошибки импорта файла (`fileloc`), `null` — файла нет или даг из него убран. Это **не**
+«шедулер не закрыл ран»: не советуй Mark failed — почини импорт, и ран поедет сам с того
+места. `list_dags` таких дагов не показывает (только активные). Сигма-dev 28.09.2026: пять
+«5-дневных» ранов с `last_scheduling_decision` 23.09.
 
 **`control` — control-канал celery и брокер.** Задачи идут через списки Redis, а ping/inspect —
 через pub/sub, и второе может молчать при живом первом. Поля отчёта:

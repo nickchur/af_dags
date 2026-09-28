@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 12:35 MSK · v3.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 17:43 MSK · v3.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -27,7 +27,7 @@
 | `pools` (час) | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
 | `metabase` (пульс) | время `SELECT 1`, соединений против `max_connections` | > 1 с или > 80 % | > 95 % |
 | `parsing` (час) | свежесть разбора файлов, DAG'и без сериализации, ошибки импорта, итог ночного `parse_time` | новые ошибки импорта, файл выбился из круга разбора (старше и `min_file_process_interval + dag_file_processor_timeout`, и тройной медианы), разбор стоит целиком, DAG без сериализации, у `parse_time` находки | — |
-| `runs` (час) | раны в `queued` дольше 30 мин, раны `queued`/`running` у запаузенных дагов (поимённо, 10 самых старых) | есть раны у запаузенных дагов | — |
+| `runs` (час) | раны в `queued` дольше 30 мин, раны `queued`/`running` у запаузенных и у деактивированных дагов (поимённо, 10 самых старых; у деактивированных — сколько шедулер не смотрел на ран и ошибка импорта файла) | есть раны у запаузенных или деактивированных дагов | — |
 | `scheduled` (час) | даги с задачами в `scheduled` дольше 5 мин: сколько, как давно, упёрлись ли в свой `max_active_tasks` (`at_limit`) | застряли даги **не** на своём лимите | — |
 | `plugins` (час) | отчёты дагов-плагинов (тег `health`) в `system_health/checks/`: есть ли и не старше ли своего `ttl_sec`. Находки плагинов не повторяет — о них сообщает их `health_errors`; у кого сейчас warn/error, в строке справкой | плагин на паузе, без отчёта или с просроченным отчётом | — |
 
@@ -847,7 +847,9 @@ select
                        and coalesce(dr.queued_at, dr.execution_date)
                            < now() - cast(:stale as interval))                                   as queued_stale,
     -- trigger_dag паузу не смотрит: ран запаузенного дага висит в queued вечно
-    count(*) filter (where d.is_paused)                                                         as paused_active
+    count(*) filter (where d.is_paused)                                                         as paused_active,
+    -- шедулер разбирает раны только активных дагов: у выпавшего из разбора ран замирает
+    count(*) filter (where not d.is_active)                                                     as inactive_active
 from dag_run dr
 join dag d on d.dag_id = dr.dag_id
 where dr.state in ('queued', 'running')
@@ -907,18 +909,50 @@ join dag d on d.dag_id = w.dag_id
 order by w.scheduled desc, w.dag_id
 """
 
+# Раны деактивированных дагов (is_active = false). Шедулер берёт на рассмотрение раны только
+# активных дагов, а dag-processor снимает is_active, когда файл разбирается, но даг из него не
+# обновился дольше stale_dag_threshold — то есть при ошибке импорта или удалённом файле. Ран
+# стоит в running с замершим last_scheduling_decision и поедет сам, когда файл починят.
+# Сигма-dev 28.09.2026: GigaCode назвал пять таких ранов «не закрытыми шедулером» и советовал
+# Mark failed. frozen_sec — сколько шедулер не смотрел на ран; error — хвост ошибки импорта
+# файла, null — ошибки нет (файл удалён или даг из него убран)
+SQL_INACTIVE_RUNS = """
+select dr.dag_id, dr.run_id, dr.state, d.fileloc,
+       cast(extract(epoch from now() - coalesce(dr.last_scheduling_decision, dr.start_date,
+                                                dr.queued_at, dr.execution_date)) as bigint) as frozen_sec,
+       (select right(trim(ie.stacktrace), 300) from import_error ie
+         where ie.filename = d.fileloc order by ie.id desc limit 1)                        as error
+from dag_run dr
+join dag d on d.dag_id = dr.dag_id and not d.is_active
+where dr.state in ('queued', 'running')
+order by frozen_sec desc, dr.dag_id
+limit :top
+"""
+
+
 def check_runs() -> dict:
-    """Раны, которые не начнутся или не кончатся: в queued дольше порога, у запаузенных дагов."""
+    """Раны, которые не начнутся или не кончатся: в queued дольше порога, у запаузенных и
+    деактивированных дагов."""
     counts = _pg_rows(SQL_RUNS, {"stale": f"{QUEUED_RUN_STALE_SEC} seconds"})[0]
     result = {k: int(v or 0) for k, v in counts.items()}
-    if not result["paused_active"]:
+    notes = []
+    if result["paused_active"]:
+        result["paused_runs"] = _pg_rows(SQL_PAUSED_RUNS, {"top": TOP})
+        names = _names(f"{r['dag_id']} ({r['state']}, {round((r['age_sec'] or 0) / 3600, 1)} ч)"
+                       for r in result["paused_runs"])
+        notes.append(f"ранов у запаузенных дагов в queued/running — {result['paused_active']}: {names}; "
+                     "пока даг на паузе, они не начнутся и не кончатся")
+    if result["inactive_active"]:
+        result["inactive_runs"] = _pg_rows(SQL_INACTIVE_RUNS, {"top": TOP})
+        names = _names(f"{r['dag_id']} ({r['state']}, стоит {round((r['frozen_sec'] or 0) / 3600, 1)} ч"
+                       f"{', ошибка импорта' if r['error'] else ', ошибки импорта нет'})"
+                       for r in result["inactive_runs"])
+        notes.append(f"ранов у деактивированных дагов в queued/running — {result['inactive_active']}: {names}; "
+                     "шедулер их не разбирает, поедут сами, когда файл дага снова разберётся")
+    if not notes:
         return {**result, "status": "healthy",
                 "summary": f"в queued дольше {QUEUED_RUN_STALE_SEC // 60} мин: {result['queued_stale']}"}
-    runs = _pg_rows(SQL_PAUSED_RUNS, {"top": TOP})
-    names = _names(f"{r['dag_id']} ({r['state']}, {round((r['age_sec'] or 0) / 3600, 1)} ч)" for r in runs)
-    return {**result, "paused_runs": runs, "status": "warn",
-            "summary": f"ранов у запаузенных дагов в queued/running — {result['paused_active']}: {names}; "
-                       "пока даг на паузе, они не начнутся и не кончатся"}
+    return {**result, "status": "warn", "summary": "; ".join(notes)}
 
 
 def check_scheduled() -> dict:

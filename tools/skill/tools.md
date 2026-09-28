@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-28 12:38 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 17:43 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -28,6 +28,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | Сериализация дрожит, дубль `dag_id`, время разбора, `tools_test_dags` | **`tools-test-dags`** |
 | Задачи висят в `scheduled`, очередь стоит, мусор в брокере | **`tools-queue-analyze`** (сначала `get_system_health` по навыку **`airflow-health`**) |
 | Раны запаузенных дагов, `runs.paused_active` | **`tools-paused-runs`** |
+| Ран висит в `running`, `last_scheduling_decision` замер; раны деактивированных дагов, `runs.inactive_active` | **`tools-system-health`** |
 | Загрузки CTL / ЕР / ТФС | **`ctl-worker`** / **`er-export`** / **`tfs-kafka`** |
 
 ## 1. Общее устройство
