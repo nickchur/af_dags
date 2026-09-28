@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-28 10:49 MSK · v1.35 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:14 MSK · v1.36 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -369,7 +369,7 @@ failed — как кнопка Mark failed: незавершённые зада�
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`), только брокер. Теперь даг прежде
 всего разбирает очередь, а чистка брокера — один таск по разовой галочке `purge`. Таски:
 после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` ждёт `broker`, `report` —
-всех; `prune` сам по себе.
+всех. Дампы убирает `tools_log_cleanup` общим сроком бакета.
 
 *   **`scheduler`** — каждая живая задача в `scheduled` (даг не на паузе, ран `running`),
     ждущая дольше `stale_min` (5 мин), получает одну причину по порядку: **лимит дага**
@@ -386,7 +386,7 @@ failed — как кнопка Mark failed: незавершённые зада�
     `scheduled` были лимитом `max_active_tasks` дагов `raw_to_stable_*`, а не утечкой слотов;
     `tfs_kafka_snd` с весом 1 проигрывал весам 22–1921 и закрывался по `dagrun_timeout` без
     старта. Разбор целиком — `queue_cleanup/<дата>/<время>_analyze.json` в бакете логов.
-*   **Параметры**: `stale_min`, `queues`, `min_junk_share`, `max_delete`, `keep_days`,
+*   **Параметры**: `stale_min`, `queues`, `min_junk_share`, `max_delete`,
     `schedule` (по умолчанию `10 6 * * *` = 09:10 MSK; плановый прогон брокер не чистит) сохраняются в `tools_queue_analyze_params`;
     пока её нет, умолчания берутся из прежней `tools_queue_cleanup_cfg`. `purge` не сохраняется.
 

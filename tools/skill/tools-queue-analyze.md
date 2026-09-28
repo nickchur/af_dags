@@ -5,14 +5,14 @@ description: Отчёт tools_queue_analyze — почему задачи жду
 
 # `tools_queue_analyze` — разбор очереди
 
-*2026-09-28 10:27 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:14 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги (параметры, расписание, пул, `health_warn` / `health_errors`) —
 навык **`tools`**. Здесь — как читать этот отчёт.
 
 **Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` ждёт только
-`broker`; `report` — всех (идёт при любом их исходе) → `health_warn` / `health_errors`;
-`prune` (чистка дампов) сам по себе. Заметка `🔬 Разбор очереди` на ране: сначала **выводы**,
+`broker`; `report` — всех (идёт при любом их исходе) → `health_warn` / `health_errors`.
+Дампы убирает `tools_log_cleanup` общим сроком бакета. Заметка `🔬 Разбор очереди` на ране: сначала **выводы**,
 потом таблица по разделам.
 
 **Расписание:** раз в сутки, `10 6 * * *` = 09:10 MSK (начало рабочего дня — очередь занята).
