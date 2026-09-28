@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-08-07 12:10 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:23 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
@@ -325,7 +325,7 @@ def _ch_insert_sql(table: str) -> str:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
-    tags=["DataLab", "tools", "operators", "AutoQA"],
+    tags=["DataLab", "tools", "AutoQA"],
     # retries — переживаем transient «Connection reset by peer» от общего ClickHouse/S3
     default_args={
         "owner": "DataLab (CI02420667)",
@@ -546,7 +546,7 @@ def test_hrp_operators_dag():
         logger.info("OK: %s активная инкарнация %s = %d строк", table, active, cnt)
 
     # TaskGroup'ы используем с prefix_group_id=False: task_id остаются прежними (их
-    # используют XCom-pull'ы, ветки-гейты и summary), меняется лишь группировка в UI.
+    # используют XCom-pull'ы, ветки-гейты и report), меняется лишь группировка в UI.
 
     # ─────────────────────────────── setup ────────────────────────────────────
     with TaskGroup(group_id="setup", prefix_group_id=False):
@@ -559,7 +559,7 @@ def test_hrp_operators_dag():
     # Гейты групп: на каждую группу — branch по условию над системными флагами params.
     # Условие = все задействованные оператором системы включены (AND); битые проверки
     # дополнительно требуют run_known_broken. При False вся группа (ops + каскадом их
-    # валидаторы) скипается. Собираем гейты для summary/all_tasks.
+    # валидаторы) скипается. Собираем гейты для report/all_tasks.
     gates = []
 
     def gate_cond(*flags):
@@ -569,7 +569,7 @@ def test_hrp_operators_dag():
     def make_gate(cond, ops, gate_id, upstream=None):
         ids = [o.task_id for o in ops]
 
-        @task.branch(task_id=gate_id)  # gate_id всегда с префиксом "gate_" (summary их исключает)
+        @task.branch(task_id=gate_id)  # gate_id всегда с префиксом "gate_" (report их исключает)
         def _gate(params=None):
             return ids if cond(params) else []
 
@@ -852,9 +852,9 @@ def test_hrp_operators_dag():
         make_gate(gate_cond("run_known_broken", "test_ch"), [cluster_op],
                   "gate_cluster", upstream=setup_ch_t)
 
-    # ──────────────────────────── summary ─────────────────────────────────────
-    @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
-    def summary(**context):
+    # ──────────────────────────── report ──────────────────────────────────────
+    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
+    def report(**context):
         """Собирает статусы всех тасков прогона в markdown-таблицу (как в test_connections).
 
         Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
@@ -871,9 +871,9 @@ def test_hrp_operators_dag():
             states = {ti.task_id: (ti.state or "no_status") for ti in tis}
             rows, ok, fail, skip = [], 0, 0, 0
             for ti in tis:
-                # служебные таски не относятся к покрытию операторов: summary/cleanup
+                # служебные таски не относятся к покрытию операторов: report/cleanup
                 # и гейты-ветки (все с префиксом gate_) — их скип это норма
-                if ti.task_id in ("summary", "cleanup") or ti.task_id.startswith("gate_"):
+                if ti.task_id in ("report", "cleanup") or ti.task_id.startswith("gate_"):
                     continue
                 state = ti.state or "no_status"
                 if state == "success":
@@ -952,9 +952,9 @@ def test_hrp_operators_dag():
         _s3_purge_prefix(s3, params["s3_bucket"])
         logger.info("Cleanup complete")
 
-    # Все рабочие таски → summary → cleanup (оба ALL_DONE). Включаем КАЖДЫЙ таск как прямой
-    # upstream summary, чтобы ALL_DONE дождался всех валидаций (Airflow дедуплицирует рёбра).
-    summary_t = summary()
+    # Все рабочие таски → report → cleanup (оба ALL_DONE). Включаем КАЖДЫЙ таск как прямой
+    # upstream report, чтобы ALL_DONE дождался всех валидаций (Airflow дедуплицирует рёбра).
+    report_t = report()
     cleanup_t = cleanup()
     all_tasks = [
         setup_pg_t, setup_ch_t, setup_s3_t,
@@ -966,10 +966,10 @@ def test_hrp_operators_dag():
         list_keys, v_list_keys, file_read, bucket_viewer,
         cluster_op,
     ]
-    # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream summary — branch
+    # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream report — branch
     # принудительно скипает все прямые downstream вне своего списка, перебивая
-    # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому summary всё дожидается.
-    all_tasks >> summary_t >> cleanup_t
+    # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому report всё дожидается.
+    all_tasks >> report_t >> cleanup_t
 
 
 test_hrp_operators_dag()

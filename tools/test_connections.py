@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-28 09:17 MSK · v2.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:19 MSK · v3.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
@@ -23,17 +23,24 @@
 **Особенности:**
 - **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
-- **Отчетность**: Финальный таск `summary` формирует Markdown-таблицу со всеми статусами в заметках DAG'а.
+- **Отчетность**: таск `report` формирует Markdown-таблицу со всеми статусами (⭐ — важное) в заметке рана.
+- **Важные и вспомогательные**: параметр `critical` — шаблоны `conn_id` (fnmatch), по умолчанию
+  `airflowdb`, `ctl`, `s3` и подключение бакета логов; сохраняется с `save_params`. Упавшее
+  подключение роняет свой таск, но ран краснеет (❌ `health_errors`, уведомление) только из-за
+  важного; вспомогательное — ⚠️ `health_warn`, ран зелёный. Отчёт плагина здоровья пишет
+  `health_errors`.
 - **Проверка сериализации DAG'ов** вынесена в отдельный DAG `tools_test_dags`
   (`tools/test_dags.py`) — она ждёт парсинга файлов и живёт по своим часам.
 """
 
 import re
 from collections import defaultdict
+from fnmatch import fnmatch
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
 from typing import Optional
 
+from airflow.configuration import conf
 from airflow.decorators import dag, task
 from airflow.models import Connection, Variable
 from airflow.models.param import Param
@@ -42,11 +49,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -66,6 +73,14 @@ SAVED = saved_params(PARAMS_VAR)
 DEFAULT_SCHEDULE = "15 23 * * *"
 # Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
 REPORT_TTL_SEC = 26 * 3600
+# Навык агента, на который отчёт плагина отсылает толкование упавших подключений
+SKILL = "tools-test-connections"
+# Жизненно важные подключения — шаблоны conn_id (fnmatch). Упало важное — error, ран красный;
+# упало вспомогательное — warn, ран зелёный. Метабаза, CTL, основной S3 и бакет логов (от него
+# зависит сам Airflow); шаблоны, которых на контуре нет, ни с чем не совпадают (на сигме CTL нет)
+DEFAULT_CRITICAL = sorted({"airflowdb", "ctl", "s3", conf.get("logging", "remote_log_conn_id", fallback="") or "s3"})
+# task_id проверки → conn_id: _safe_id не обратим, а важность решается по conn_id
+_TASK_CONN: dict[str, str] = {}
 
 
 # Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
@@ -433,7 +448,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     # Ежедневно в 23:15 MSK, через 15 минут после tools_show_connections: тот обновляет
     # Variable local_connections, из которой этот DAG набирает список соединений на парсинге
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=["DataLab", "tools", "conn", "AutoQA", "health"],
+    tags=["DataLab", "tools", "AutoQA", "health"],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
@@ -446,6 +461,11 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             SAVED.get("schedule", DEFAULT_SCHEDULE), type=["string", "null"], title="Расписание",
             description="cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора",
         ),
+        "critical": Param(
+            SAVED.get("critical", DEFAULT_CRITICAL), type="array", items={"type": "string"},
+            title="Важные подключения",
+            description="Шаблоны conn_id (fnmatch): упало важное — ран красный, остальные — предупреждение",
+        ),
         "save_params": Param(
             False, type="boolean", title="Сохранить параметры",
             description=f"Записать параметры этого запуска в {PARAMS_VAR} как значения по умолчанию",
@@ -454,7 +474,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 )
 def tools_test_connections():  # noqa: PLR0915
 
-    # Без потомков: пропуск (save_params=False) ни на что не влияет; summary его не считает
+    # Без потомков: пропуск (save_params=False) ни на что не влияет; report его не считает
     @task(task_id="params")
     def save_params(**context):
         """💾 Сохраняет параметры запуска (в т. ч. расписание) как значения по умолчанию."""
@@ -469,10 +489,10 @@ def tools_test_connections():  # noqa: PLR0915
         with TaskGroup(group_id="tfs", tooltip=_GROUP_TOOLTIP["tfs"]) as tg_tfs:
             seen: set[str] = set()
             for conn_id, conn in sorted(_tfs_group.items()):
-                @task(
-                    task_id=_safe_id(conn_id, seen),
-                    doc_md=f"Проверка `{conn_id}` (S3)",
-                )
+                tid = _safe_id(conn_id, seen)
+                _TASK_CONN[f"tfs.{tid}"] = conn_id
+
+                @task(task_id=tid, doc_md=f"Проверка `{conn_id}` (S3)")
                 def tfs_task(cid=conn_id, **kwargs):
                     return _run_test(cid, conn_type="aws", **kwargs)
 
@@ -488,10 +508,10 @@ def tools_test_connections():  # noqa: PLR0915
         with TaskGroup(group_id=group_name, tooltip=tooltip) as tg:
             seen = set()
             for conn_id, conn in sorted(conns.items()):
-                @task(
-                    task_id=_safe_id(conn_id, seen),
-                    doc_md=f"Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)",
-                )
+                tid = _safe_id(conn_id, seen)
+                _TASK_CONN[f"{group_name}.{tid}"] = conn_id
+
+                @task(task_id=tid, doc_md=f"Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)")
                 def check_task(cid=conn_id, ctype=conn.conn_type, **kwargs):
                     return _run_test(cid, ctype, **kwargs)
 
@@ -500,9 +520,8 @@ def tools_test_connections():  # noqa: PLR0915
 
 
     # --- Summary ---
-    @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
-    def summary(**context):  # noqa: PLR0915
-        from airflow.exceptions import AirflowFailException
+    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
+    def report(**context):  # noqa: PLR0915
         from airflow.models import TaskInstance
         from airflow.utils.session import create_session
 
@@ -542,14 +561,16 @@ def tools_test_connections():  # noqa: PLR0915
             except Exception as e:
                 logger.warning("Could not load task notes: %s", e)
 
+        critical = list(context["params"].get("critical") or [])
+        failed_vital, failed_aux = [], []
         ok = fail = skip = none_count = 0
         all_rows = []
         durations = []
         icons = []
 
         for ti in tis:
-            # params — служебный таск формы, а не проверка соединения
-            if ti.task_id in ("summary", "params"):
+            # Служебные таски — не проверки соединений
+            if ti.task_id in ("report", "params", "health_warn", "health_errors"):
                 continue
 
             state = ti.state
@@ -586,8 +607,12 @@ def tools_test_connections():  # noqa: PLR0915
             name = ti.task_id
             if ti.map_index >= 0:
                 name += f"[{ti.rendered_map_index or ti.map_index}]"
+            conn_id = _TASK_CONN.get(ti.task_id, ti.task_id)
+            vital = any(fnmatch(conn_id, pat) for pat in critical)
+            if icon == "❌":
+                (failed_vital if vital else failed_aux).append(conn_id)
             if state != "success":
-                all_rows.append(f"| `{name}` | {icon} {state or 'not_started'} | {reason} |")
+                all_rows.append(f"| `{name}` | {'⭐' if vital else ''} | {icon} {state or 'not_started'} | {reason} |")
 
         avg_time = sum(durations) / len(durations) if durations else 0
         graph = "".join(icons)
@@ -596,24 +621,32 @@ def tools_test_connections():  # noqa: PLR0915
             counts += f" / 🔘 {none_count}"
         headline = f"{graph}\n\n{counts} | 🕒 Avg: {avg_time:.2f}s"
 
-        table = "| Соединение | Статус | Причина |\n|---|---|---|\n" + "\n".join(all_rows)
+        table = "| Соединение | Важное | Статус | Причина |\n|---|---|---|---|\n" + "\n".join(all_rows)
         add_note(table, context, level="DAG", title=headline)
-        logger.info("summary: %s", headline)
-        report_health({"connections": {
-            "status": "error" if fail else "healthy", "summary": counts, "skill": "tools",
-            "ok": ok, "fail": fail, "skip": skip, "none": none_count,
-            "failed": [r.split("|")[1].strip(" `") for r in all_rows if "❌" in r][:20],
-        }}, context, ttl_sec=REPORT_TTL_SEC)
+        logger.info("report: %s", headline)
+        # Упавшие подключения таск не роняют: важное — error (ран красный через health_errors),
+        # вспомогательное — warn (ран зелёный, ⚠️ в health_warn)
+        push_health({
+            "connections_critical": {
+                "status": "error" if failed_vital else "healthy",
+                "summary": (f"упали важные: {', '.join(failed_vital[:10])}" if failed_vital
+                            else f"важные в порядке ({', '.join(critical)})"),
+                "failed": failed_vital[:20], "critical": critical,
+            },
+            "connections": {
+                "status": "warn" if failed_aux else "healthy",
+                "summary": (f"упали вспомогательные: {', '.join(failed_aux[:10])}" if failed_aux else counts),
+                "ok": ok, "fail": fail, "skip": skip, "none": none_count, "failed": failed_aux[:20],
+            },
+        }, context)
+        return {"ok": ok, "fail": fail, "skip": skip, "none": none_count, "avg_time": avg_time,
+                "failed_critical": failed_vital, "failed_aux": failed_aux}
 
-        if fail > 0:
-            raise AirflowFailException(f"Connections check failed: {headline}")
-
-        return {"ok": ok, "fail": fail, "skip": skip, "none": none_count, "avg_time": avg_time}
-
-    summary_task = summary()
+    report_task = report()
 
     if groups:
-        groups >> summary_task
+        groups >> report_task
+    report_task >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_test_connections()

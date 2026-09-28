@@ -1,6 +1,6 @@
 """
 ### 🧪 DAG: Проверка отображения Markdown
-*2026-09-24 11:17 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:26 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Пустой даг: одна задача `EmptyOperator`. Нужен, чтобы посмотреть, как Airflow UI рисует
 `doc_md` — таблицы, цитаты, списки, ссылки, блоки кода — и проверить колбэки
@@ -66,7 +66,7 @@ ensure_pool(TOOLS_POOL)
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
     schedule=None,
-    tags=['DataLab', 'tools', 'dummy'],
+    tags=['DataLab', 'tools'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,

@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-28 09:17 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:17 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -24,7 +24,7 @@
 | `long_query_sec` | Порог для активного запроса, сек *(default: `300`)* |
 | `lock_wait_sec` | Порог ожидания блокировки, сек *(default: `60`)* |
 | `zombie_after_sec` | Хартбит старше — владелец не жив, сек *(default: `300`, как у зомби-детектора Airflow)* |
-| `alert` | Краснеть при находках *(default: `True`)* |
+| `alert` | Находки — `error` (ран красный через `health_errors`), иначе `warn` *(default: `True`)* |
 | `save_s3` | Писать снимки в S3 *(default: `True`)* |
 | `keep_days` | Сколько дней держим снимки, старше — удаляем *(default: `30`)* |
 | `dry_run` | При `terminate=True` только показать кандидатов *(default: `True`)* |
@@ -32,8 +32,10 @@
 | `save_params` | Записать значения формы в Variable `tools_pg_activity_cfg` *(default: `False`)* |
 | `terminate` | Убивать найденные сессии. **В Variable не сохраняется** *(default: `False`)* |
 
-**Таски:** `collect` → `save` / `terminate` → `report`, рядом `prune` — чистка снимков и
-`params` — сохранение формы.
+**Таски:** `params` (сохранение формы); `collect` → `save` / `terminate` → `report` →
+`health_warn` / `health_errors`; рядом `prune` — чистка снимков. Находки таски не роняют: при
+`alert` они дают ❌ `health_errors` (ран красный, уведомление), без него — ⚠️ `health_warn`.
+Красный `collect` — сломалось само снятие; отчёт плагина здоровья пишет `health_errors`.
 
 Снимки лежат в бакете логов, в своей папке: `pg_activity/<YYYY-MM-DD>/<HHMMSS>.json`.
 Пустые снимки не пишутся — счётчики и так уходят в лог каждый запуск. Старые снимки
@@ -57,11 +59,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -75,7 +77,7 @@ AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
 PREFIX = "pg_activity/"
 
-CFG_VAR = "tools_pg_activity_cfg"
+PARAMS_VAR = "tools_pg_activity_cfg"
 
 # Значения по умолчанию. Всё, кроме terminate: убийство сессий не должно становиться
 # настройкой, живущей между запусками, — галку ставят руками на конкретный ран.
@@ -97,11 +99,13 @@ DEFAULT_SCHEDULE = '*/10 * * * *'
 # Плагин здоровья (тег health): отчёт живёт четыре интервала — один-два пропущенных прогона
 # под нагрузкой не тревога, а 40 минут тишины сторожа метабазы уже она
 REPORT_TTL_SEC = 40 * 60
+# Навык агента, на который отчёт плагина отсылает толкование находок
+SKILL = 'tools-pg-activity'
 #: Разовая галочка: в переменную не сохраняется (см. выше)
 ONE_SHOT = ('terminate',)
 
 # Битая или недоступная переменная разбор не роняет: saved_params вернёт пусто
-SAVED = saved_params(CFG_VAR)
+SAVED = saved_params(PARAMS_VAR)
 _cfg = {**DEFAULTS, **SAVED}
 
 
@@ -278,11 +282,12 @@ def _fetch(sql: str) -> list:
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
-    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, CFG_VAR),
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'check', 'health'],
+    tags=['DataLab', 'tools', 'health'],
     catchup=False,
-    is_paused_upon_creation=True,
+    # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
+    is_paused_upon_creation=False,
     max_active_runs=1,
     # Тридцать минут, а не девять. Наложиться на следующий прогон не даёт
     # max_active_runs=1, а dagrun_timeout нужен только чтобы расклинить зависший
@@ -314,7 +319,7 @@ def _fetch(sql: str) -> list:
                           description='cron или пресет (@daily); пусто — только вручную. '
                                       'Применяется со следующего разбора'),
         'save_params': Param(False, type='boolean',
-                             description=f'Сохранить настройки формы в Variable {CFG_VAR}'),
+                             description=f'Сохранить настройки формы в Variable {PARAMS_VAR}'),
         'terminate': Param(False, type='boolean',
                            description='Убивать найденные сессии (в Variable не сохраняется)'),
     },
@@ -522,9 +527,7 @@ def tools_pg_activity():
 
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
-        """🧾 Сводка в заметку и, если просили, красный таск с уведомлением."""
-        from airflow.exceptions import AirflowFailException
-
+        """🧾 Сводка в заметку и вердикт здоровья: находки — error при alert, иначе warn."""
         p = context['params']
         counts = snapshot['counts']
         totals = snapshot['totals']
@@ -533,8 +536,7 @@ def tools_pg_activity():
 
         if not snapshot['findings']:
             add_note(f"✅ чисто: {head}", level='task,dag', context=context, title='🩺 pg_activity')
-            report_health({'pg_activity': {'status': 'healthy', 'summary': head, 'skill': 'tools',
-                                           **totals}}, context, ttl_sec=REPORT_TTL_SEC)
+            push_health({'pg_activity': {'status': 'healthy', 'summary': head, **totals}}, context)
             return head
 
         # Заметка режется до 1000 символов, поэтому в неё идут счётчики и три самые
@@ -549,11 +551,9 @@ def tools_pg_activity():
         ]
         add_note({f"⚠️ {head} · {counts}": lines},
                  level='task,dag', context=context, title='🩺 pg_activity')
-        report_health({'pg_activity': {'status': 'warn', 'summary': f"{head} · {counts}", 'skill': 'tools',
-                                       'top': lines, **totals}}, context, ttl_sec=REPORT_TTL_SEC)
-
-        if p['alert']:
-            raise AirflowFailException(f"⚠️ {head} · {counts}\n" + "\n".join(lines))
+        # Находки — не падение снятия: alert задаёт уровень, итог подводит health_errors
+        push_health({'pg_activity': {'status': 'error' if p['alert'] else 'warn',
+                                     'summary': f"{head} · {counts}", 'top': lines, **totals}}, context)
         return head
 
     @task(task_id='params')
@@ -563,7 +563,7 @@ def tools_pg_activity():
         Сам по себе, без потомков: сорванное сохранение (битое расписание) краснит ран, но
         снимок и отчёт от него не зависят.
         """
-        return store_params_task(CFG_VAR, SAVED, context, one_shot=ONE_SHOT)
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     save_params()
     snapshot = collect()
@@ -571,7 +571,9 @@ def tools_pg_activity():
     # prune не про находки: его дело — папка в S3. В цепочке до report он стоял зря,
     # добавляя лишний прыжок через очередь к тому, ради чего даг и заводился.
     snapshot >> prune()
-    [save(snapshot), terminate(snapshot)] >> report(snapshot)
+    verdict = report(snapshot)
+    [save(snapshot), terminate(snapshot)] >> verdict
+    verdict >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_pg_activity()

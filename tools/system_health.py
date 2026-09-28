@@ -1,11 +1,12 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 10:12 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:16 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
 признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
 кто её открыл; здесь сетка DAG'а — лента здоровья контура: ❌ — был `error`.
 
-Одна задача `check`, двенадцать проверок. Каждая изолирована: своё время, свой таймаут, свой
+**Таски:** `params` → `collect` (двенадцать проверок) → `report` (заметка) и `health_warn` /
+`health_errors` (итог). Проверки в `collect`. Каждая изолирована: своё время, свой таймаут, свой
 `try/except` — упавшая даёт свою строку и не мешает остальным.
 
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
@@ -23,20 +24,22 @@
 | `tables` | оценка строк больших таблиц метабазы (`reltuples`) | — | — |
 | `dag_size` | DAG'и по числу тасков — в определении и в последнем ране (с раскрытыми mapped), классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300 | DAG больше 300 тасков | — |
 
-Итог — худший статус. **`error` роняет задачу** (после записи XCom и заметки): в сетке
-красный квадрат и уведомление через `on_callback`. `warn` — зелёный прогон с ⚠️ в заметке.
+`collect` находками **не падает**: вердикты уходят в XCom `health`, итог подводят
+`health_warn` (есть `warn` — ✅ с ⚠️ в заметке, нет — skip) и `health_errors` (есть `error` —
+❌, ран красный, уведомление через `on_callback`; нет — skip). Красный `collect` значит, что
+сломалась сама проверка, — `health_errors` назовёт его «не выполнился».
 
-**Плагин здоровья** (тег `health`): итог уходит ещё и отчётом в бакет логов,
-`system_health/checks/tools_system_health.json` (`report_health` из `plugins/utils.py`), откуда
+**Плагин здоровья** (тег `health`): `health_errors` пишет отчёт в бакет логов,
+`system_health/checks/tools_system_health.json` (`health_tasks` из `plugins/utils.py`), откуда
 его читает `get_system_health` MCP — раздел `plugins`. Срок отчёта — 2 ч: пропустил два прогона,
 и core скажет «последний отчёт N назад». Раны запаузенных дагов, пулы, `scheduled`, отставание
 разбора и таблицы с etl-core 1.2.1 (HRPDATALAB-15978) проверяются только здесь, core их больше
 не считает. Все проверки — SQL к метабазе из таска: в AF3 так нельзя, их придётся перевести на
 REST.
 
-**Вывод:** строка на проверку в логе; XCom `return_value` — одна строка на прогон,
-`{status, reasons, checks, took_sec}`; заметка задачи и рана — нездоровые проверки по
-строке, здоровые одной строкой с временами.
+**Вывод:** строка на проверку в логе; XCom `return_value` таска `collect` — одна строка на
+прогон, `{status, reasons, checks, took_sec}` (до v2.0 таск звался `check`); заметка
+`report` — нездоровые проверки по строке, здоровые одной строкой с временами.
 
 | Параметр | Описание |
 |---|---|
@@ -67,15 +70,16 @@ from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
 from airflow.models import Param
+from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, report_health, saved_params,
-        store_params, saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, env_stand, health_tasks, on_callback, push_health, saved_params,
+        saved_schedule, store_params_task)
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, report_health, saved_params,
-        store_params, saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, env_stand, health_tasks, on_callback, push_health, saved_params,
+        saved_schedule, store_params_task)
 
 logger = logging.getLogger("airflow.task")
 
@@ -90,6 +94,10 @@ SAVED = saved_params(PARAMS_VAR)
 # На 7-й минуте, а не в :00: в начале часа стартует основная масса расписаний, и проверка
 # мерила бы собственную очередь за ними, а не состояние контура
 DEFAULT_SCHEDULE = "7 * * * *"
+# Срок отчёта плагина: два часовых прогона с запасом
+REPORT_TTL_SEC = 2 * 3600 + 600
+# Навык агента, на который отчёт плагина отсылает толкование своих проверок
+SKILL = "tools-system-health"
 
 RANK = {"healthy": 0, "unknown": 1, "warn": 2, "error": 3}
 ICON = {"healthy": "✅", "unknown": "❔", "warn": "⚠️", "error": "❌"}
@@ -155,8 +163,6 @@ TOP = 10
 # Таблицы метабазы, которые растут и чистятся tools_db_cleanup
 DB_TABLES = ("xcom", "log", "job", "dag_run", "task_instance", "task_fail",
              "rendered_task_instance_fields", "celery_taskmeta")
-# Срок отчёта плагина: два часовых прогона с запасом
-REPORT_TTL_SEC = 2 * 3600 + 600
 
 
 # ── Общее ─────────────────────────────────────────────────────────────
@@ -745,7 +751,7 @@ def _prev_import_error_id(dag_id: str, run_id: str) -> int | None:
 
     with create_session() as session:
         row = (session.query(XCom)
-               .filter(XCom.dag_id == dag_id, XCom.task_id == "check",
+               .filter(XCom.dag_id == dag_id, XCom.task_id.in_(("collect", "check")),
                        XCom.key == "return_value", XCom.run_id != run_id)
                .order_by(XCom.timestamp.desc()).first())
         if row is None:
@@ -1068,9 +1074,9 @@ def _param(key, default, **kwargs):
     start_date=datetime(2026, 9, 14, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools: служебный DAG — ролевка ограничивает запуск (HRPDATALAB-15421), а
-    # get_system_health показывает его в разделе служебных. Тег health: плагин здоровья —
-    # get_system_health читает его отчёт (раздел plugins)
-    tags=["DataLab", "tools", "check", "health"],
+    # get_system_health показывает его в разделе служебных. Тег health — роль: плагин
+    # здоровья, get_system_health читает его отчёт (раздел plugins)
+    tags=["DataLab", "tools", "health"],
     catchup=False,
     # Смысл DAG'а — непрерывная лента, и он дёшев: включается сам
     is_paused_upon_creation=False,
@@ -1087,17 +1093,17 @@ def _param(key, default, **kwargs):
 )
 def tools_system_health():
 
+    @task(task_id="params")
+    def save_params(**context):
+        """💾 Сохраняет параметры запуска (в т. ч. расписание) как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context)
+
     # multiple_outputs=False: по аннотации dict Airflow разложил бы ответ на отдельные ключи
-    # XCom — четыре лишние строки на прогон, 24 прогона в сутки
-    @task(task_id="check", multiple_outputs=False)
-    def check(**context) -> dict:
-        """Двенадцать проверок подряд, итог — в лог, XCom, заметку и отчёт плагина; error роняет задачу."""
-        from airflow.exceptions import AirflowFailException
-
-        state, msg = store_params(PARAMS_VAR, SAVED, context)
-        if state == "fail":
-            raise AirflowFailException(msg)
-
+    # XCom — четыре лишние строки на прогон, 24 прогона в сутки. NONE_FAILED: params штатно
+    # пропускает себя при save_params=False
+    @task(task_id="collect", multiple_outputs=False, trigger_rule=TriggerRule.NONE_FAILED)
+    def collect(**context) -> dict:
+        """Двенадцать проверок подряд; вердикты — в XCom health, находками таск не падает."""
         ti, dag_run = context["ti"], context["dag_run"]
         started = time.time()
         checks = {
@@ -1116,23 +1122,22 @@ def tools_system_health():
         }
         took = round(time.time() - started, 1)
         status, reasons = verdict(checks)
-        stand = env_stand() or "?"
-        logger.info("%s system_health %s за %.1f с%s", ICON[status], stand, took,
+        logger.info("%s system_health %s за %.1f с%s", ICON[status], env_stand() or "?", took,
                     "".join(f"\n  {r}" for r in reasons))
+        push_health(checks, context)
+        return {"status": status, "reasons": reasons, "checks": checks, "took_sec": took}
 
-        result = {"status": status, "reasons": reasons, "checks": checks, "took_sec": took}
-        add_note(note_text(checks), context, level="task,DAG",
-                 title=f"{ICON[status]} {took} sec system_health {stand}")
-        report_health({name: {**c, "skill": "tools"} for name, c in checks.items()}, context,
-                      ttl_sec=REPORT_TTL_SEC)
-        if status == "error":
-            # Падающая задача return-значения не оставляет — кладём его сами, иначе лента
-            # в XCom теряла бы ровно те прогоны, ради которых она ведётся
-            ti.xcom_push(key="return_value", value=result)
-            raise AirflowFailException("; ".join(reasons))
-        return result
+    @task(task_id="report")
+    def report(result: dict, **context) -> str:
+        """🧾 Заметка: нездоровые проверки по строке, здоровые одной строкой с временами."""
+        title = f"{ICON[result['status']]} {result['took_sec']} sec system_health {env_stand() or '?'}"
+        add_note(note_text(result["checks"]), context, level="task,DAG", title=title)
+        return title
 
-    check()
+    result = collect()
+    save_params() >> result
+    report(result)
+    result >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_system_health()

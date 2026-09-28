@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-28 09:17 MSK · v2.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-28 10:20 MSK · v3.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -8,7 +8,7 @@
 
 Две независимые группы: **`check_serialized`** ловит дрожание сериализации на парсинге
 (может ждать часами), **`compare`** ведёт версии в S3 и показывает, что изменилось
-(минуты). Итог обеих собирает `summary`.
+(минуты). Итог обеих собирает `report`, вердикт здоровья — `health_warn` / `health_errors`.
 
 | Таск | Что делает |
 |---|---|
@@ -18,7 +18,8 @@
 | **`compare.snapshot_dags`** | Пишет новые версии в S3 — всех изменившихся, сколько бы их ни было — и возвращает для `expand` пары «прошлая версия → новая», не больше `COMPARE_LIMIT` (100), свежие первыми. Статистика — в XCom `snapshot_stats`, пары сверх лимита — в `not_compared` |
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
 | **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
-| **`summary`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга |
+| **`report`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга; вердикт здоровья в XCom `health` |
+| **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения; ❌ дрожащая сериализация — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
 
 **Исключения:** DAG'и с id по префиксам из `SKIP_DAG_PREFIXES` (сейчас `deadlocker_*`)
 не проверяются вовсе — ни в статистике сериализации, ни в версиях, ни в покрытии.
@@ -67,7 +68,7 @@ dag_snapshots/<dag_id>/00002.<dag_hash>.json.gz
 | `duplicate_dag_id` | 👯 | Сменился `fileloc` — два файла на один `dag_id` |
 | `snapshot_broken` | ⚠️ | Версия не читается или не разбирается |
 
-Если экземпляр сравнения упал и не оставил XCom, `summary` считает его «немым» и пишет
+Если экземпляр сравнения упал и не оставил XCom, `report` считает его «немым» и пишет
 об этом отдельной строкой: версия уже записана, поэтому следующий прогон этот DAG не
 переоткроет — хэши совпадут. Чинится очисткой упавшего экземпляра: обе версии лежат
 в S3, он перечитает те же объекты и выдаст тот же вердикт.
@@ -97,11 +98,11 @@ from logging import getLogger
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, report_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -121,6 +122,8 @@ SAVED = saved_params(PARAMS_VAR)
 DEFAULT_SCHEDULE = "0 23 * * *"
 # Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
 REPORT_TTL_SEC = 26 * 3600
+# Навык агента, на который отчёт плагина отсылает толкование вердиктов сериализации
+SKILL = "tools-test-dags"
 ONE_SHOT = ("cleanup_deleted",)
 
 # Соединение и бакет берём из настроек логирования, а не именем: на DEV бакет подменяет
@@ -372,7 +375,7 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
     # растянулся бы на семь волн ожидания (до пары часов). Таски почти всё время спят
     # в ожидании парсинга, так что нагрузки это не добавляет — только занятые слоты
     max_active_tasks=12,
-    tags=["DataLab", "tools", "dag", "AutoQA", "health"],
+    tags=["DataLab", "tools", "AutoQA", "health"],
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
@@ -399,7 +402,7 @@ def _snapshot_targets(all_dags: list[str], snap_ages: dict, changed: list[str], 
 def tools_test_dags():
 
     # Имена групп нужны и в коде: внутри группы task_id получает префикс, а xcom_pull
-    # и запрос состояний в summary ищут по полному имени
+    # и запрос состояний в report ищут по полному имени
     CHECK_GROUP = "check_serialized"
     COMPARE_GROUP = "compare"
 
@@ -559,7 +562,7 @@ def tools_test_dags():
         за окно ожидания парсинга могло не случиться из-за очереди в dag-processor'е.
 
         Итог всегда уходит в XCom `recheck` (до возможного падения — иначе при падении
-        return-значения бы не осталось), оттуда его собирает summary.
+        return-значения бы не осталось), оттуда его собирает report.
         """
         import time
 
@@ -762,7 +765,7 @@ def tools_test_dags():
         Пары идут именно return-значением: expand умеет раскрываться только по
         `return_value` и на кастомном XCom-ключе падает ещё при разборе файла
         (`mappedoperator.py:132`, «cannot map over XCom with custom key»). Поэтому
-        статистика для summary уезжает в ключ `snapshot_stats`, а не наоборот.
+        статистика для report уезжает в ключ `snapshot_stats`, а не наоборот.
 
         Изменившиеся отбираются здесь же, а не приезжают от find_changed: тот же листинг и
         те же хэши, но без списка в XCom. Версии пишутся всем изменившимся, на сравнение
@@ -1198,12 +1201,11 @@ def tools_test_dags():
                 "serialized_gap": sum(r["missing"] for r in gap_rows)}
 
     # --- Summary ---
-    @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
-    def summary(**context) -> dict:
+    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
+    def report(**context) -> dict:
         """Сводка по всем экземплярам перепроверки: вердикт, ожидание, число расхождений."""
         import json
 
-        from airflow.exceptions import AirflowFailException
         from airflow.models import TaskInstance
         from airflow.utils.session import create_session
 
@@ -1258,7 +1260,7 @@ def tools_test_dags():
             f"{icon_by_status.get(st, '❔')} {st} {n}" for st, n in sorted(counts.items())
         ) or "перепроверять было нечего"
 
-        # Ветка версий: у неё свои вердикты, на падение summary они не влияют —
+        # Ветка версий: у неё свои вердикты, на вердикт report они не влияют —
         # изменение сериализации после деплоя это норма
         found = ti.xcom_pull(task_ids=f"{COMPARE_GROUP}.find_changed", key="find_stats") or {}
         found = json.loads(found) if isinstance(found, str) else found
@@ -1330,27 +1332,25 @@ def tools_test_dags():
 
         add_note("\n\n".join(parts) or "Подозрительных DAG'ов не нашлось",
                  context, level="DAG", title=headline)
-        logger.info("summary: %s", headline.replace("\n", " "))
-        # Статус: дрожащая сериализация — error, как и падение summary; немые сравнения — warn:
-        # сериализация цела, но изменение потеряется, если экземпляры не очистить
+        logger.info("report: %s", headline.replace("\n", " "))
+        # Вердикт, а не падение: дрожащая сериализация — error (ран красный через
+        # health_errors), немые сравнения — warn: сериализация цела, но изменение потеряется,
+        # если экземпляры не очистить
         verdict_line = " / ".join(f"{st} {n}" for st, n in sorted(counts.items())) or "перепроверять было нечего"
-        report_health({"serialization": {
+        push_health({"serialization": {
             "status": "error" if bad else ("warn" if cmp_silent else "healthy"),
             "summary": verdict_line + (f"; сравнений не отчиталось {cmp_silent}" if cmp_silent else ""),
-            "skill": "tools", "bad": bad, "counts": counts, "compare": cmp_counts,
+            "bad": bad, "counts": counts, "compare": cmp_counts,
             "unstable": [r["dag_id"] for r in rechecks if r.get("status") in ("unstable", "duplicate_dag_id")][:20],
-        }}, context, ttl_sec=REPORT_TTL_SEC)
-
-        if bad:
-            raise AirflowFailException(f"Сериализация дрожит у {bad} DAG'ов: {headline}")
+        }}, context)
 
         return {"stats": stats, "recheck": rechecks, "counts": counts, "found": found,
                 "compare": cmp_counts, "compare_silent": cmp_silent, "snapshot": snapshot,
                 "parse_time": parsed}
 
-    summary_task = summary()
+    report_task = report()
 
-    # Без потомков: пропуск (save_params=False) ни на что не влияет; summary смотрит
+    # Без потомков: пропуск (save_params=False) ни на что не влияет; report смотрит
     # только свои ветки по task_id
     @task(task_id="params")
     def save_params(**context):
@@ -1380,7 +1380,8 @@ def tools_test_dags():
 
     # parse_time вне групп и ни от кого не зависит: он про разбор файлов, а не про
     # содержимое serialized_dag
-    [tg_check, tg_compare, parse_time()] >> summary_task
+    [tg_check, tg_compare, parse_time()] >> report_task
+    report_task >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_test_dags()

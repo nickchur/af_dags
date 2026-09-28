@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-09-25 19:30 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:25 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -59,12 +59,12 @@ from airflow.utils.trigger_rule import TriggerRule
 try:
     from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, saved_schedule,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, saved_schedule,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params_task, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -192,14 +192,7 @@ def tools_log_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        return msg
+        return store_params_task(PARAMS_VAR, SAVED, context)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

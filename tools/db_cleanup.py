@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-27 17:49 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:25 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -57,12 +57,12 @@ import logging
 try:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
-        saved_params, store_params, saved_schedule,
+        saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
-        saved_params, store_params, saved_schedule,
+        saved_params, store_params_task, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -413,14 +413,7 @@ def tools_db_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        return msg
+        return store_params_task(PARAMS_VAR, SAVED, context)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

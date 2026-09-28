@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-27 17:49 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:22 MSK · v3.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -7,7 +7,14 @@
 по галочке `purge`.
 
 **Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` (только при
-`purge`) ждёт `broker`; `report` — всех, при любом их исходе; `prune` — чистка дампов, сам по себе.
+`purge`) ждёт `broker`; `report` — всех, при любом их исходе, → `health_warn` / `health_errors`;
+`prune` — чистка дампов, сам по себе.
+
+**Плагин здоровья** (тег `health`), раз в сутки в 09:10 MSK — в начале рабочего дня очередь
+занята, ночью разбирать нечего. Вердикт не выше ⚠️: очередь — не авария. Предупреждение —
+мусор в брокере не ниже `min_junk_share`, голодание по приоритету, раны, закрытые без старта,
+и не отработавший сборщик; остальные выводы — справка в заметке. Плановый прогон брокер не
+чистит: `purge` разовая и не сохраняется. Отчёт для `get_system_health` пишет `health_errors`.
 
 | Таск | Что смотрит |
 |---|---|
@@ -72,11 +79,13 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
+        store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
+        store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -114,10 +123,18 @@ DEFAULTS = {
     # Как STALE_AFTER_SEC карточки Health (etl-core celery_health_plugin): младше — обычное
     # ожидание цикла шедулера
     "stale_min": 5,
-    # Разбор ничего не меняет, но и регулярным быть не обязан: по умолчанию — вручную
-    "schedule": "",
+    # Раз в сутки в 06:10 UTC = 09:10 MSK (start_date в UTC — cron в его зоне): в начале
+    # рабочего дня очередь занята, ночью разбирать нечего
+    "schedule": "10 6 * * *",
 }
 ONE_SHOT = ("purge",)
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
+# Навык агента, на который отчёт плагина отсылает толкование выводов
+SKILL = "tools-queue-analyze"
+# Выводы, которые дают ⚠️ (по значку в начале строки conclusions): мусор в брокере, голодание
+# по приоритету, раны без старта. Лимиты дагов и пулы — ограничения в коде дагов, справка
+WARN_MARKS = ("🗑️", "⚖️", "⏱️")
 
 SAVED = saved_params(PARAMS_VAR)
 _cfg = {**DEFAULTS, **{k: v for k, v in saved_params(OLD_VAR).items() if k in DEFAULTS}, **SAVED}
@@ -460,13 +477,14 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         "on_failure_callback": on_callback,
     },
     start_date=datetime(2026, 9, 10, tzinfo=timezone.utc),
-    tags=["DataLab", "tools", "clean"],
+    tags=["DataLab", "tools", "health"],
     catchup=False,
-    is_paused_upon_creation=True,
+    # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
+    is_paused_upon_creation=False,
     max_active_runs=1,
     # Удаление из брокера по таймеру не случается: purge разовая и не сохраняется, так что
     # плановый запуск только разбирает
-    schedule=saved_schedule(SAVED, None, PARAMS_VAR),
+    schedule=saved_schedule(SAVED, DEFAULTS["schedule"], PARAMS_VAR),
     dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
     params={
@@ -883,6 +901,14 @@ def tools_queue_analyze():
         logger.info("📊 сводка:\n%s", summary)
         title = f"🔬 Разбор очереди: {len(found)} выводов" if found else "🔬 Разбор очереди: в норме"
         add_note(summary, context=context, level="DAG,Task", title=title)
+
+        # Вердикт не выше warn: очередь — не авария. Не отработавший сборщик — тоже warn
+        warns = [x for x in found if x.startswith(WARN_MARKS)]
+        warns += [f"{t} не отработал ({state(t)})" for t in ("broker", "scheduler", "capacity")
+                  if state(t) in ("failed", "upstream_failed")]
+        push_health({"queue": {"status": "warn" if warns else "healthy",
+                               "summary": "; ".join(warns) if warns else f"в норме, выводов {len(found)}",
+                               "conclusions": found}}, context)
         return summary
 
     @task(task_id="prune", trigger_rule=TriggerRule.ALL_DONE)
@@ -916,7 +942,7 @@ def tools_queue_analyze():
     snapshot, sched, cap = broker(), scheduler(), capacity()
     done >> [snapshot, sched, cap]
     purged = purge(snapshot)
-    report(snapshot, sched, cap, purged)
+    report(snapshot, sched, cap, purged) >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
     prune()
 
 
