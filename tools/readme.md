@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-29 09:06 MSK · v1.40 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 15:21 MSK · v1.41 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -40,7 +40,7 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 |---|---|---|
 | `health` | **плагин здоровья — контракт с core**: `get_system_health` ждёт от каждого активного дага с этим тегом отчёт `system_health/checks/<dag_id>.json`, иначе пишет «плагин X: нет отчёта», а просроченный по `ttl_sec` — «последний отчёт N назад». Тег — только вместе с `health_tasks`; плагин создаётся включённым (`is_paused_upon_creation=False`) | `system_health` (2 ч 10 мин), `pg_activity` (40 мин), `log_events`, `test_connections`, `test_dags`, `queue_analyze` (26 ч) |
 | `clean` | удаляет или закрывает: строки метабазы, файлы, раны | `db_cleanup`, `log_cleanup`, `paused_runs_cleanup` |
-| `AutoQA` | регрессия и проверка «работает ли» | `dummy` (раз в час), `show_connections`, `test_connections`, `test_dags`, `test_hrp_operators`, `test_kafka_*` |
+| `AutoQA` | регрессия и проверка «работает ли» | `dummy` (раз в час), `test_connections`, `test_dags`, `test_hrp_operators`, `test_kafka_*` |
 
 Тег-роль один на даг (плюс `AutoQA`); предметные теги (`conn`, `dag`, `mcp`, `operators`,
 `kafka`, `dummy`, `check`) сняты 28.09.2026 — отбирать по ним нечего.
@@ -53,18 +53,19 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 
 ## Состав
 
-### [show_connections.py](show_connections.py)
-**Аудит и группировка Airflow Connections.**
-
-Выводит список всех подключений, сгруппированных по типу. Используется для быстрой проверки конфигурации secret backend.
-*   **Кэширование**: Результаты сохраняются в Airflow Variable `local_connections`.
-*   **Интеграция**: Служит источником данных для DAG'а `test_connections`.
-
 ### [test_connections.py](test_connections.py)
 **Мониторинг и проверка всех Airflow Connections.**
 
 DAG автоматически обнаруживает все подключения и проверяет их доступность.
-*   **Оптимизация**: Использует Airflow Variable `local_connections` в качестве источника данных.
+*   **Список в том же ране**: первый таск `collect` снимает подключения из secret backend
+    (заметка — таблица по типам) и пишет Variable `local_connections` — из неё строят выпадающие
+    списки kafka-подключений `test_kafka` и `ctl_tfs`. Разбор файла Variable не читает. До
+    29.09.2026 список снимал отдельный даг `show_connections`.
+*   **Один mapped-таск `check`** по списку рана, экземпляр на подключение подписан «группа ·
+    `conn_id`» (`tfs`, `postgres`, `s3`, `ctl`, `clickhouse`, `kafka`, `trino`, `redis`,
+    `other`). Упал `collect` — ❌ `health_errors`.
+*   **`skip_<группа>`** (`skip_tfs`, `skip_kafka`, …; секция формы «Пропуск групп») —
+    подключения группы не проверяются (☮️, не ошибка); сохраняются с `save_params`.
 *   **Стандартизация**: Статус пропущенных проверок помечается символом `☮️`.
 *   **Отчетность**: таск `report` — сводная таблица ✅/❌/☮️ (⭐ — важное) в заметке рана.
 *   **Важные подключения** — параметр `critical` (шаблоны `conn_id`, fnmatch; по умолчанию
@@ -272,7 +273,7 @@ DAG автоматически обнаруживает все подключе�
 
 ### Приоритет и потолок времени у коротких проверок
 
-`pg_activity`, `log_events`, `system_health`, `system_pulse`, `test_connections` и `show_connections` работают секунды, а
+`pg_activity`, `log_events`, `system_health`, `system_pulse` и `test_connections` работают секунды, а
 нужны ровно тогда, когда контуру плохо. Поэтому у них:
 
 *   **`priority_weight: 900` с `weight_rule: 'absolute'`.** Все проверки живут в общем
@@ -507,7 +508,7 @@ S3-инструментах альфы.
 ## Сохраняемые параметры
 
 `db_cleanup`, `log_cleanup`, `log_events`, `system_health`, `pg_activity`, `mcp_skills`,
-`paused_runs_cleanup`, `queue_analyze`, `show_connections`, `test_connections` и `test_dags` берут значения по умолчанию из своей Airflow
+`paused_runs_cleanup`, `queue_analyze`, `test_connections` и `test_dags` берут значения по умолчанию из своей Airflow
 Variable (`tools_<имя>_params`; у `pg_activity` — `tools_pg_activity_cfg`), а при её отсутствии —
 из кода. Механизм общий — `saved_params`, `saved_schedule` и `store_params_task` в
 `plugins/utils.py`; сохраняет отдельный таск `params` галочкой `save_params`. Variable записывается только запуском с галочкой

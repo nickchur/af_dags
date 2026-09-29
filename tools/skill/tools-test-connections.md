@@ -5,14 +5,21 @@ description: tools_test_connections — ночная проверка каждо
 
 # `tools_test_connections` — доступность подключений
 
-*2026-09-28 10:27 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 15:22 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и `health_warn` / `health_errors` — навык **`tools`**. Список
-подключений — `tools_show_connections` (Variable `local_connections`, через MCP закрыта).
+подключений снимает первый таск `collect` этого же рана (заметка — таблица по типам; Variable
+`local_connections` для выпадающих списков, через MCP закрыта). До 29.09.2026 — отдельный даг
+`tools_show_connections`, в старых ранах — таски по подключениям без `collect`.
 
-**Таски:** `params`; по таску на подключение в группе по типу (`tfs`, `postgres`, `s3`, `ctl`,
-`clickhouse`, `kafka`, `trino`, `redis`, `other`) → `report` (таблица ✅/❌/☮️, ⭐ — важное) →
-`health_warn` / `health_errors`. Раз в сутки в 23:15 MSK, после `tools_show_connections`.
+**Таски:** `params`; `collect` → mapped-таск `check`, экземпляр на подключение, подписан
+«группа · `conn_id`» (группы `tfs`, `postgres`, `s3`, `ctl`, `clickhouse`, `kafka`, `trino`,
+`redis`, `other`) → `report` (таблица ✅/❌/☮️, ⭐ — важное) →
+`health_warn` / `health_errors`. Раз в сутки в 23:15 MSK. Упал `collect` — список не снят, проверок нет, ❌ `health_errors`
+(`connections_critical` называет `collect`).
+
+**Пропуск групп.** Флаги `skip_<группа>` (`skip_kafka`, …; сохраняются с `save_params`):
+подключения группы — ☮️, не ошибка и не предупреждение. ☮️ целой группы при зелёном ране — чаще всего она.
 
 **Важные и вспомогательные.** Параметр `critical` — шаблоны `conn_id` (fnmatch), по умолчанию
 `airflowdb`, `ctl`, `s3` и подключение бакета логов; сохраняется с `save_params` в

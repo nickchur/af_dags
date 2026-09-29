@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-28 12:38 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 15:21 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -32,8 +32,7 @@ s3_tools/                # S3-инструменты альфы (ручной з
 └── s3_viewer.py         # 🗂️ Список ключей и чтение файлов через HrpS3*Operator
 
 tools/                   # Служебные DAG'и: проверка и обслуживание → tools/readme.md
-├── show_connections.py  # 🔌 Подключения из secret backend, сгруппированные по типу
-├── test_connections.py  # 🔎 Проверка доступности всех подключений + serialized_dag
+├── test_connections.py  # 🔎 Список подключений secret backend и проверка доступности каждого
 ├── test_hrp_operators.py # 🧪 Функциональный стенд для hrp_operators (pg↔s3↔ch)
 ├── test_kafka.py        # 📨 Проверка Kafka: продюсер и консьюмер тестовых сообщений
 ├── test_dags.py         # 🧬 Проверка сериализации DAG'ов, снимки версий

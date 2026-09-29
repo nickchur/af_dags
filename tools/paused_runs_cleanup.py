@@ -142,7 +142,7 @@ def classify(runs, tis, now, older_than_hours):
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
-        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. show_connections.py)
+        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. test_connections.py)
         'priority_weight': 900,
         'weight_rule': 'absolute',
         # Сотня ранов — секунды; потолок про зависшую блокировку в метабазе

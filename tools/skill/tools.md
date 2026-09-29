@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-29 09:06 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 15:21 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -66,7 +66,7 @@ description: Индекс служебных дагов Airflow (каталог 
   (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение —
   `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
 - **Создаются на паузе**: `db_cleanup`, `log_cleanup`, `paused_runs_cleanup`, ручные
-  `test_kafka_*`. Плагины здоровья, `dummy`, `mcp_skills`, `show_connections`,
+  `test_kafka_*`. Плагины здоровья, `dummy`, `mcp_skills`,
   `test_hrp_operators` включаются сами. Плагин на паузе — в `get_system_health` «нет отчёта»;
   на паузе он обычно по решению человека.
 - **Итог — в заметках** рана и задач (`add_note`): ✅ / ❌ / ☮️. XCom тебе недоступен.
@@ -79,13 +79,12 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_system_health` | `7 * * * *` | Почему задачи не идут: S3 логов, пулы, разбор, раны, `scheduled`; сторож отчётов плагинов | ничего |
 | `tools_pg_activity` | `*/10 * * * *` | Сессии и блокировки метабазы | сессии — только при `terminate` и `dry_run=False` |
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log` | ничего |
-| `tools_test_connections` | `15 23 * * *` | Доступность каждого подключения, важные — `critical` | ничего |
+| `tools_test_connections` | `15 23 * * *` | Список подключений secret backend (`collect`) и доступность каждого, важные — `critical` | Variable `local_connections` |
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
 | `tools_queue_analyze` | `10 9 * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
 | `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
 | `tools_log_cleanup` | `17 8 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
-| `tools_show_connections` | `0 23 * * *` | Подключения secret backend → Variable `local_connections` | Variable |
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |
