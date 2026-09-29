@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-09-23 20:30 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 12:57 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -74,14 +74,14 @@ logger = logging.getLogger("airflow.task")
 # null возвращает значение из кода.
 #
 # Переопределяются ТОЛЬКО ключи из OVERRIDABLE. Остальное живёт в коде осознанно:
-# DEF_ARGS содержит функции; FORMAT_MAP, TYPE_MAP, EXTRA_PRE/SUF и HIVE_RESERVED — это
+# DEF_ARGS содержит функции; FORMAT_MAP, TYPE_MAP и EXTRA_PRE/SUF — это
 # контракт обмена с КАП, а не настройка стенда; TS_POOL_SLOTS обязан быть 1 по устройству
 # пула меток времени; POOL_SLOTS не берём, потому что ensure_pool существующий пул
 # не трогает — правка выглядела бы применённой, не будучи ею.
 CFG_VAR_NAME = "datalab_er_config"
 
 OVERRIDABLE = ('CH_ID', 'S3_CONN', 'BUCKET', 'TFS_MAP', 'LIMITS', 'DEFAULT_PARAMS',
-               'HIST_TABLE', 'HIST_CURRENT_VW')
+               'HIST_TABLE', 'HIST_CURRENT_VW', 'HIVE_RESERVED')
 
 
 def cfg_overrides() -> dict:
@@ -756,69 +756,13 @@ def check_table(row: dict, key: str, errors: list[str], params: dict) -> bool:
 # ради этого нельзя: это файл с DAG-ами, и его разбор поднял бы всю фабрику.
 
 
-# Hive keywords (all versions, reserved + non-reserved) — имена колонок из этого набора
-# получают суффикс '_' согласно требованиям KAP/TFS (раздел 11 документации ЕР).
-HIVE_RESERVED: frozenset = frozenset({
-    # 1.2 non-reserved
-    'add','admin','after','analyze','archive','asc','before','bucket','buckets','cascade',
-    'change','cluster','clustered','clusterstatus','collection','columns','comment','compact',
-    'compactions','compute','concatenate','continue','data','databases','datetime','day',
-    'dbproperties','deferred','defined','delimited','dependency','desc','directories',
-    'directory','disable','distribute','enable','escaped','exclusive','explain','export',
-    'fields','file','fileformat','first','format','formatted','functions','hold_ddltime',
-    'hour','idxproperties','ignore','index','indexes','inpath','inputdriver','inputformat',
-    'items','jar','keys','limit','lines','load','location','lock','locks','logical','long',
-    'mapjoin','materialized','metadata','minus','minute','month','msck','noscan','no_drop',
-    'offline','option','outputdriver','outputformat','overwrite','owner','partitioned',
-    'partitions','plus','pretty','principals','protection','purge','read','readonly',
-    'rebuild','recordreader','recordwriter','regexp','reload','rename','repair','replace',
-    'replication','restrict','rewrite','rlike','role','roles','schema','schemas','second',
-    'semi','serde','serdeproperties','server','sets','shared','show','show_database',
-    'skewed','sort','sorted','ssl','statistics','stored','streamtable','string','struct',
-    'tables','tblproperties','temporary','terminated','tinyint','touch','transactions',
-    'unarchive','undo','uniontype','unlock','unset','unsigned','uri','use','utc','view',
-    'while','year',
-    # 1.2 reserved
-    'all','alter','and','array','as','authorization','between','bigint','binary','boolean',
-    'both','by','case','cast','char','column','conf','create','cross','cube','current',
-    'current_date','current_timestamp','cursor','database','date','decimal','delete',
-    'describe','distinct','double','drop','else','end','exchange','exists','extended',
-    'external','false','fetch','float','following','for','from','full','function','grant',
-    'group','grouping','having','if','import','in','inner','insert','int','intersect',
-    'interval','into','is','join','lateral','left','less','like','local','macro','map',
-    'more','none','not','null','of','on','or','order','out','outer','over','partialscan',
-    'partition','percent','preceding','preserve','procedure','range','reads','reduce',
-    'revoke','right','rollup','row','rows','select','set','smallint','table','tablesample',
-    'then','timestamp','to','transform','trigger','true','truncate','unbounded','union',
-    'uniquejoin','update','user','using','utc_tmestamp','values','varchar','when','where',
-    'window','with',
-    # 2.0+
-    'autocommit','isolation','level','offset','snapshot','transaction','work','write',
-    'commit','only','rollback','start',
-    # 2.1+
-    'abort','key','last','norely','novalidate','nulls','rely','validate',
-    'cache','constraint','foreign','primary','references',
-    # 2.2+
-    'days','dayofweek','dump','hours','matched','merge','minutes','months','quarter',
-    'repl','seconds','status','views','week','weeks','years',
-    'except','extract','floor','integer','precision',
-    # 2.3+
-    'detail','expression','operator','summary','vectorization','wait',
-    # 3.0+
-    'activate','active','alloc_fraction','check','default','do','enforced','kill',
-    'management','mapping','move','path','plan','plans','pool','query',
-    'query_parallelism','reoptimization','resource','scheduling_policy','unmanaged',
-    'workload','zone',
-    'any','application','dec','numeric','sync','time','timestamplocaltz','unique',
-    # 4.0+
-    'ast','at','branch','cbo','cost','cron','dcproperties','debug','disabled',
-    'distributed','enabled','every','execute','executed','expire_snapshots','joincost',
-    'managed','managedlocation','optimize','remote','respect','retain','retention',
-    'scheduled','set_current_snapshot','snapshots','spec','system_time','system_version',
-    'tag','transactional','trim','type','unknown','url','within',
-    'compactionid','connector','connectors','convert','ddl','force','leading','older',
-    'pkfk_join','prepare','qualify','real','some','than','trailing',
-})
+# 🔤 Зарезервированные слова Hive: колонка с таким именем получает суффикс '_' и в .meta,
+# и в файле данных (safe_name, hive_field) — так требует КАП (раздел 11 документации ЕР).
+# По умолчанию список ПУСТ, слова добавляются осознанно, формой export_er_setup (ключ
+# HIVE_RESERVED в datalab_er_config). До 29.09.2026 здесь жил полный словарь Hive 1.2–4.0
+# (~400 слов) — суффикс получали и колонки, которые КАП принимает как есть, а файл данных
+# суффикса не знал, и КАП отвергал его кодами 625–627.
+HIVE_RESERVED: frozenset = frozenset(str(w).lower() for w in _ovr('HIVE_RESERVED', []))
 
 def build_sql(sql_meta: str | dict, indent: str = "    ") -> str:
     """Собирает SQL-запрос из словаря метаданных или возвращает строку как есть.
@@ -888,6 +832,21 @@ def with_condition(where: str | None, full: bool = False, elsewhere: str = '') -
 def safe_name(name: str) -> str:
     """Имя колонки для .meta: совпавшее с зарезервированным словом Hive получает суффикс '_'."""
     return name + '_' if name.lower() in HIVE_RESERVED else name
+
+
+def hive_field(expr: str) -> str:
+    """Выражение из fields для запроса ДАННЫХ: колонка, чьё имя .meta получит с суффиксом '_'
+    (safe_name), получает тот же алиас. Иначе заголовок TSV и ключи JSON несут 'status', а
+    .meta — 'status_', и КАП отвергает файл кодами 625–627 («Имена колонок не совпадают с
+    meta»; сигма 27.09.2026, evolution.lc_items_completed). Выражение без выводимого имени
+    не трогаем — его и .meta не назовёт, об этом говорит сверка в build_meta.
+    """
+    name = field_name(expr)
+    if name is None or safe_name(name) == name:
+        return expr
+    alias = re.search(r'\sas\s+[A-Za-z_]\w*\s*$', str(expr), re.I)
+    body = str(expr)[:alias.start()] if alias else str(expr)
+    return f"{body.rstrip()} AS {safe_name(name)}"
 
 
 def field_name(expr: str) -> str | None:
@@ -1274,7 +1233,8 @@ def export_sql(entry: dict, params: dict, table_key: str = '') -> dict:
         """Читает SQL-метадату по ключу, добавляет обязательные поля и окно дельты."""
         m = entry.get(key)
         if isinstance(m, dict) and "fields" not in m:
-            m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + fields + [c['sql'] for c in EXTRA_SUF]}
+            m = {**m, "fields": [c['sql'] for c in EXTRA_PRE] + [hive_field(f) for f in fields]
+                 + [c['sql'] for c in EXTRA_SUF]}
         if isinstance(m, dict):
             # Плейсхолдер ищем и в остальных частях запроса: окно, положенное внутрь CTE
             # или подзапроса FROM, снаружи дописывать не надо. settings и fields сюда не
@@ -1342,6 +1302,9 @@ def get_config() -> dict:
         'S3_CONN':         S3_CONN,
         'HIST_TABLE':      HIST_TABLE,
         'HIST_CURRENT_VW': HIST_CURRENT_VW,
+        # Списком, а не frozenset: снимок уходит в JSON (форма, XCom), и патч из формы
+        # сверяется по типу именно с ним.
+        'HIVE_RESERVED':   sorted(HIVE_RESERVED),
         'CH_HIST_COLS':    list(CH_HIST_COLS),
         'VAR_NAME':        VAR_NAME,
         'RAW_VAR_NAME':    RAW_VAR_NAME,

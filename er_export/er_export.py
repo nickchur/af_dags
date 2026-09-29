@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-09-28 10:36 MSK · v3.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 12:57 MSK · v3.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -370,7 +370,8 @@ def _er_init(cfg, **context):
     Delta-режим: читает export.extract_current_vw; при первом запуске создаёт bootstrap-состояние
     с time_from/time_to = lower_bound.
     Recent-режим: вычисляет окно [now() - recent_interval, now()] без обращения к CH.
-    Период: date_from/date_to из DAG Params перебивают состояние и помечают ран как ad_hoc.
+    Период: date_from/date_to из DAG Params перебивают состояние и помечают ран как ad_hoc;
+    с галкой shift_state период записывается в историю и дельта продолжает от date_to.
 
     Возвращаемый словарь (XCom "return_value") используется всеми downstream-тасками
     через _xcom(context, cfg['tg'], 'init') — внутри TaskGroup id составной.
@@ -537,6 +538,11 @@ def _er_init(cfg, **context):
     # 📅 Ручная выгрузка за период. Задаётся на весь пакет и перебивает состояние дельты.
     date_from = str(p.get('date_from') or '').strip()
     date_to   = str(p.get('date_to') or '').strip()
+    if p.get('shift_state') and not (date_from or date_to):
+        raise AirflowFailException(
+            "«Сдвинуть состояние дельты» работает только с периодом: задайте «Дата с» — "
+            "новую начальную точку — и «Дата по»"
+        )
     if date_from or date_to:
         if not (date_from and date_to):
             raise AirflowFailException(
@@ -546,19 +552,40 @@ def _er_init(cfg, **context):
         if date_to <= date_from:
             raise AirflowFailException(f"date_to ({date_to}) должна быть больше date_from ({date_from})")
 
+        # ⏩ Галка «Сдвинуть состояние дельты»: период уходит в историю как обычное окно,
+        # и следующая дельта продолжит от date_to. Так поставку, застрявшую в 1970-м или
+        # отставшую на месяцы, переводят в нужную точку одним раном — lower_bound для этого
+        # не годится, он читается только до первой записи в истории. Действует лишь на
+        # дельту: у recent и full_export состояния нет.
+        shift = bool(p.get('shift_state')) and result.get('mode') == "'delta'"
+        # Только вперёд. Строка сдвига получает ключом extract_time = прежнее reached;
+        # откати её date_to назад, следующая дельта записалась бы с extract_time = date_to,
+        # то есть МЛАДШЕ строки сдвига, argMax во вью выбирал бы сдвиг снова и снова, и
+        # поставка вечно выгружала бы одно и то же окно. Повторить прошлое — период без галки.
+        if shift and _parse_ts(date_to) <= _parse_ts(str(result['extract_time']).strip("'")):
+            raise AirflowFailException(
+                f"{cfg['schema_name']}.{cfg['tbl']}: сдвиг состояния только вперёд — date_to ({date_to}) "
+                f"не позже достигнутого {result['extract_time']}. Для повторной выгрузки прошлого "
+                "снимите галку «Сдвинуть состояние дельты»"
+            )
         result.update({
-            'extract_time': f"'{date_to}'",
             'time_from':    f"'{date_from}'",
             'time_to':      f"'{date_to}'",
             'condition':    f"'{date_from}' < {tf} and {tf} <= '{date_to}'",
-            # Состояние дельты не двигаем: save_status пропустит запись в историю,
-            # а is_current=True не даст schedule_next запустить следующий цикл. Иначе разовая
-            # доливка за прошлый месяц отбросила бы регулярный поток назад.
+            # Автозапуск не взводим ни в каком случае: после сдвига дальше поедет штатное
+            # расписание, а без сдвига is_current=True не даст schedule_next запустить
+            # следующий цикл, и разовая доливка за прошлый месяц не отбросит поток назад.
             'is_current':   'True',
-            'ad_hoc':       'True',
+            'ad_hoc':       'False' if shift else 'True',
             'mode':         "'ad_hoc'",
         })
-        logger.info("📅 Разовая выгрузка за период %s .. %s, состояние дельты не сохраняется", date_from, date_to)
+        if not shift:
+            # Без сдвига ключ строки — сам период; save_status её всё равно не запишет.
+            # Со сдвигом extract_time остаётся достигнутым состоянием, как у обычной дельты:
+            # строка с ним старше всех прежних и выигрывает argMax во вью.
+            result['extract_time'] = f"'{date_to}'"
+        logger.info("📅 Разовая выгрузка за период %s .. %s, состояние дельты %s", date_from, date_to,
+                    "сдвигается на date_to" if shift else "не сохраняется")
 
     # extract_time, condition и increment перечислены явно: из формы они больше не правятся
     # (у каждой таблицы своё состояние), но в заметке нужны — смотрят именно на них.
@@ -1199,13 +1226,22 @@ def _dag_params(gp: dict, tables: dict) -> dict:
                         '«ГГГГ-ММ-ДД ЧЧ:ММ:СС», например 2026-08-01 00:00:00. '
                         'Граница строгая: берётся то, что БОЛЬШЕ неё. '
                         'Задавать вместе с «Дата по», обе — в одном формате. '
-                        'Состояние дельты при этом НЕ сохраняется.',
+                        'Состояние дельты при этом НЕ сохраняется, если не отмечено '
+                        '«Сдвинуть состояние дельты».',
         ),
         'date_to': Param(
             None, type=['string', 'null'], title='Дата по',
             description='Верхняя граница периода, включительно: берётся то, что МЕНЬШЕ '
                         'ИЛИ РАВНО. Формат тот же, например 2026-08-31 23:59:59. '
                         'За сутки 1 августа: с 2026-08-01 по 2026-08-02.',
+        ),
+        'shift_state': Param(
+            False, type='boolean', title='Сдвинуть состояние дельты',
+            description='Только вместе с «Дата с» / «Дата по». Отметить — период записывается '
+                        'в историю как обычное окно, и следующая дельта продолжит от «Дата по». '
+                        'Так переводят вперёд поставку, застрявшую в 1970 году или отставшую на '
+                        'месяцы. Данные между прежним состоянием и «Дата с» не выгружаются. '
+                        'Назад не сдвигает: повторить прошлое — период без этой галки.',
         ),
         # Именно type='boolean', а не ['boolean','null']: чекбокс в форме Airflow рисуется
         # по сравнению schema.type == "boolean" строкой, и с типом-списком поле выпадает
