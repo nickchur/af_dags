@@ -570,6 +570,7 @@ def store_params_task(var_name, saved, context=None, one_shot=(), flag='save_par
         raise AirflowSkipException(msg)
     if status == 'fail':
         raise AirflowFailException(msg)
+    add_note(msg, context, level='task')
     return msg
 
 
@@ -845,3 +846,90 @@ def report_health(checks, context=None, ttl_sec=7200):
         return None
     logger.info("report_health: %s", key)
     return key
+
+
+HEALTH_XCOM_KEY = 'health'
+# Упавший проверочный таск — тоже ошибка: проверка, которая не выполнилась, не значит «здорово»
+HEALTH_FAILED_STATES = ('failed', 'upstream_failed')
+
+
+def push_health(checks, context=None):
+    """Кладёт вердикты проверочного таска в XCom ``health``.
+
+    ``checks`` — ``{имя: {'status', 'summary', ...}}``, формат ``report_health``. Итог подводят
+    ``health_warn`` / ``health_errors`` из ``health_tasks``: сам проверочный таск находками не падает.
+    """
+    context = context or get_current_context()
+    context['ti'].xcom_push(key=HEALTH_XCOM_KEY, value=checks)
+    return checks
+
+
+def _gather_health(context) -> dict:
+    """Вердикты прямых upstream-тасков плюс упавшие без вердикта — как ``error``."""
+    ti, task, dag_run = context['ti'], context['task'], context['dag_run']
+    upstream = sorted(task.upstream_task_ids)
+    if not upstream:
+        return {}
+    # Все предки — чтобы у upstream_failed назвать виновника, а не того, кто за ним не пошёл
+    ancestors = sorted(task.get_flat_relative_ids(upstream=True))
+    with create_session() as session:
+        states = (session.query(TaskInstance.task_id, TaskInstance.map_index, TaskInstance.state)
+                  .filter(TaskInstance.dag_id == dag_run.dag_id, TaskInstance.run_id == dag_run.run_id,
+                          TaskInstance.task_id.in_(ancestors))
+                  .order_by(TaskInstance.task_id, TaskInstance.map_index).all())
+    rows = [r for r in states if r[0] in upstream]
+    culprits = sorted({t for t, _, st in states if st == 'failed' and t not in upstream})
+    checks = {}
+    for task_id, map_index, state in rows:
+        label = task_id if map_index < 0 else f'{task_id}[{map_index}]'
+        got = ti.xcom_pull(task_ids=task_id, key=HEALTH_XCOM_KEY,
+                           map_indexes=map_index if map_index >= 0 else None)
+        if isinstance(got, dict) and got:
+            for name, check in got.items():
+                checks[name if name not in checks else f'{name}[{map_index}]'] = dict(check)
+        elif state in HEALTH_FAILED_STATES:
+            why = f": упал {', '.join(culprits[:5])}" if state == 'upstream_failed' and culprits else ''
+            checks[label] = {'status': 'error', 'summary': f'таск {label} не выполнился ({state}){why}'}
+    return checks
+
+
+def health_tasks(ttl_sec, skill='tools'):
+    """Два итоговых таска дага-проверки: ``health_warn`` и ``health_errors``.
+
+    Ставятся прямыми потомками проверочных тасков, запускаются при любом их исходе
+    (``ALL_DONE``). ``health_warn``: есть ``warn`` — заметка ⚠️ и успех, нет — skip.
+    ``health_errors``: пишет отчёт плагина (``report_health``, единственное место записи) и
+    при ``error`` падает с заметкой ❌ — ран красный, уведомление штатным колбэком; нет — skip.
+    ``skill`` — навык агента этого дага, уходит в отчёт каждой проверки.
+    """
+    from airflow.decorators import task
+    from airflow.utils.trigger_rule import TriggerRule
+
+    def lines(checks, icon):
+        return "\n\n".join(f"{icon} **{name}** — {c.get('summary', '')}" for name, c in checks.items())
+
+    @task(task_id='health_warn', trigger_rule=TriggerRule.ALL_DONE)
+    def health_warn(**context):
+        """⚠️ Предупреждения проверок; нет их — skip."""
+        from airflow.exceptions import AirflowSkipException
+
+        warns = {n: c for n, c in _gather_health(context).items() if c.get('status') == 'warn'}
+        if not warns:
+            raise AirflowSkipException('предупреждений нет')
+        add_note(lines(warns, '⚠️'), context, level='task,DAG', title=f'⚠️ предупреждений {len(warns)}')
+        return {n: c.get('summary', '') for n, c in warns.items()}
+
+    @task(task_id='health_errors', trigger_rule=TriggerRule.ALL_DONE)
+    def health_errors(**context):
+        """❌ Ошибки проверок и отчёт плагина здоровья; ошибок нет — skip."""
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+        checks = _gather_health(context)
+        report_health({n: {**c, 'skill': skill} for n, c in checks.items()}, context, ttl_sec=ttl_sec)
+        errors = {n: c for n, c in checks.items() if c.get('status') == 'error'}
+        if not errors:
+            raise AirflowSkipException('ошибок нет')
+        add_note(lines(errors, '❌'), context, level='task,DAG', title=f'❌ ошибок {len(errors)}')
+        raise AirflowFailException('; '.join(f"{n}: {c.get('summary', '')}" for n, c in errors.items()))
+
+    return [health_warn(), health_errors()]

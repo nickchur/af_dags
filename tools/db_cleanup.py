@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-27 17:49 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:09 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -16,7 +16,7 @@
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
-| ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
+| ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 5 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
 🔁 **Переиндексации нет (v1.11).** `REINDEX` убран целиком — тяжёлая операция под админским
@@ -57,12 +57,12 @@ import logging
 try:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
-        saved_params, store_params, saved_schedule,
+        saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
-        saved_params, store_params, saved_schedule,
+        saved_params, store_params_task, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -268,7 +268,7 @@ def _log_sql(sql, bind, msg="SQL"):
             q = q.replace(f":{k}", v)
         logger.info(f"{msg}:\n{q}")
     except Exception as e:
-        logger.warning(f"⚠️ Не удалось развернуть SQL: {sql} | Параметры: {bind}")
+        logger.warning(f"⚠️ Не удалось развернуть SQL ({e}): {sql} | Параметры: {bind}")
 
 
 def db_stats(tables):
@@ -340,7 +340,10 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
-DEFAULT_SCHEDULE = '0 2 * * *'
+# 05:00 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '0 2 * * *')
+DEFAULT_SCHEDULE = '0 5 * * *'
+MSK = timezone(timedelta(hours=3))
+
 
 
 params = {
@@ -397,13 +400,17 @@ params = {
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
+        # Потолок от зависания на блокировке, а не от медленной чистки: VACUUM по таблице
+        # сам ограничен часом (db_vacuum), удаление идёт порциями
+        'execution_timeout': timedelta(hours=4),
         'on_failure_callback': on_callback,
     },
-    start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
-    tags=['DataLab', 'tools', 'clean'],
+    start_date=datetime(2025, 8, 7, tzinfo=MSK),
+    tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    dagrun_timeout=timedelta(hours=6),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     on_failure_callback=on_callback,
     params=params,
@@ -413,14 +420,7 @@ def tools_db_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        return msg
+        return store_params_task(PARAMS_VAR, SAVED, context)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

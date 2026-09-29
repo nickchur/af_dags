@@ -31,13 +31,13 @@
 | Каталог | Как устроено | Обновлён | Что обязано работать | Обновлена | Код |
 |---|---|---|---|---|---|
 | `ctl_worker/` | `ctl_worker/readme.md` | 2026-09-26 | `openspec/specs/ctl-worker/spec.md` | 2026-09-17 ⚠️ | 2026-09-26 |
-| `er_export/` | `er_export/README.md` | 2026-09-23 | `openspec/specs/er-export/spec.md` | 2026-09-01 ⚠️ | 2026-09-24 |
-| `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 ⚠️ | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 ⚠️ | 2026-09-24 |
-| `plugins/` | `plugins/readme.md` | 2026-09-26 | `openspec/specs/plugins/spec.md` | 2026-09-17 ⚠️ | 2026-09-26 |
-| `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 | `openspec/specs/s3-tools/spec.md` | 2026-09-24 | 2026-09-24 |
-| `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-24 | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 ⚠️ | 2026-09-25 |
-| `tools/` | `tools/readme.md` | 2026-09-25 | `openspec/specs/tools/spec.md` | 2026-09-24 | 2026-09-25 |
-| `xs_export/` | `xs_export/readme.md` | 2026-08-31 | `openspec/specs/xs-export/spec.md` | 2026-08-31 | 2026-09-02 |
+| `er_export/` | `er_export/README.md` | 2026-09-23 ⚠️ | `openspec/specs/er-export/spec.md` | 2026-09-01 ⚠️ | 2026-09-28 |
+| `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 ⚠️ | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
+| `plugins/` | `plugins/readme.md` | 2026-09-26 | `openspec/specs/plugins/spec.md` | 2026-09-17 ⚠️ | 2026-09-28 |
+| `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 ⚠️ | `openspec/specs/s3-tools/spec.md` | 2026-09-24 ⚠️ | 2026-09-28 |
+| `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-24 ⚠️ | `openspec/specs/tfs-kafka/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
+| `tools/` | `tools/readme.md` | 2026-09-29 | `openspec/specs/tools/spec.md` | 2026-09-24 ⚠️ | 2026-09-29 |
+| `xs_export/` | `xs_export/readme.md` | 2026-09-28 | `openspec/specs/xs-export/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
 | `GP/` | `GP/readme.md` | 2026-09-26 | снимок `HR_Data` @ `1a3a317` | 2026-09-26 | 2026-09-26 |
 
-*Собрано 2026-09-26 скриптом `sync_context.py`*
+*Собрано 2026-09-29 скриптом `sync_context.py`*

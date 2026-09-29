@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-25 19:34 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 12:38 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -40,12 +40,12 @@ tools/                   # Служебные DAG'и: проверка и обс
 ├── db_cleanup.py        # 🧹 Очистка метадаты Airflow старше N дней
 ├── log_cleanup.py       # 🪣 Обслуживание бакета логов задач: удаление старых объектов
 ├── log_events.py        # 📊 Сбои доставки задач: отчёт по журналу метабазы
-├── system_health.py     # 🩺 Снимок состояния контура раз в час
+├── system_health.py     # 🩺 Состояние контура: пульс раз в 5 мин и снимок раз в час
 ├── pg_activity.py       # 🐘 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
 ├── queue_analyze.py     # 🔬 Разбор очереди: почему задачи ждут; чистка брокера по галочке
 ├── paused_runs_cleanup.py # ⏸️ Зависшие раны запаузенных дагов: отчёт и Mark failed
 ├── mcp_skills.py        # 🧭 Навыки агента и документация дагов → Variables для MCP
-├── dummy.py             # 🎭 Шаблон DAG для проверки Markdown в Airflow UI
+├── dummy.py             # 🫀 Раз в час: шедулер и воркер живы, задержки планирования и очереди
 └── skill/tools.md       # 🤖 Навык агента: служебные даги
 
 gp_exchange/                 # Приём универсального обмена из ПКАП: S3 → ClickHouse

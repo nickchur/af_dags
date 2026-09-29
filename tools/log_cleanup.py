@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-09-25 19:30 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:07 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -30,7 +30,7 @@ remote_base_log_folder`.
 | ♻️ `lifecycle`   | `True` — выставлять правило жизненного цикла *(default)* |
 | 🧪 `dry_run`     | `True` — ничего не удалять и правил не менять, только посчитать |
 | ⏱ `max_minutes` | Потолок обхода бакета (минуты, default: `30`) |
-| ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 5 * * *`)* |
+| ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 8 * * *`)* |
 | 💾 `save_params` | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
 Значения по умолчанию берутся из переменной `tools_log_cleanup_params`, если она задана,
@@ -59,12 +59,12 @@ from airflow.utils.trigger_rule import TriggerRule
 try:
     from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, saved_schedule,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params, saved_schedule,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params_task, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -121,7 +121,10 @@ def _walk_order(roots: list) -> list:
 # Механика повторяет db_cleanup.py; общее на два DAG-а — чтение переменной
 # (utils.saved_params) и проверка расписания (utils.valid_schedule).
 PARAMS_VAR = 'tools_log_cleanup_params'
-DEFAULT_SCHEDULE = '17 5 * * *'
+# 08:17 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '17 5 * * *')
+DEFAULT_SCHEDULE = '17 8 * * *'
+MSK = timezone(timedelta(hours=3))
+
 SAVED = saved_params(PARAMS_VAR)
 
 
@@ -175,15 +178,18 @@ params = {
         'pool': TOOLS_POOL,
         'retries': 2,
         'retry_delay': timedelta(seconds=30),
+        # Обход сам укладывается в max_minutes (30); потолок — от зависшего запроса к S3
+        'execution_timeout': timedelta(hours=2),
         'on_failure_callback': on_callback,
     },
-    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
+    start_date=datetime(2026, 1, 22, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataLab', 'tools', 'clean'],
+    tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
     max_active_tasks=1,
+    dagrun_timeout=timedelta(hours=4),
     on_failure_callback=on_callback,
     params=params,
 )
@@ -192,14 +198,7 @@ def tools_log_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        return msg
+        return store_params_task(PARAMS_VAR, SAVED, context)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку

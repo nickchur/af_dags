@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-09-27 17:49 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Находит раны в `running` / `queued` у дагов на паузе и, если попросили, закрывает их —
 как кнопка **Mark failed** в UI.
@@ -51,7 +51,7 @@
 `close` сохраняемый: чтобы закрывали и плановые запуски, один раз запустить с `close` и
 `save_params`. До этого плановые запуски только считают.
 
-**Таски:** `params` → `find` → `close`. Отчёт `find` — заметкой на ран: даги, раны, возраст,
+**Таски:** `params` → `collect` → `close`. Отчёт `collect` — заметкой на ран: даги, раны, возраст,
 задачи по состояниям и **кто поставил паузу** — последнее событие паузы в `log` (UI, API,
 CLI). Паузу из кода (`update_dag_pause` CTL, `is_paused_upon_creation`) журнал не пишет —
 тогда «нет записи».
@@ -151,7 +151,7 @@ def classify(runs, tis, now, older_than_hours):
     },
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataLab', 'tools', 'clean'],
+    tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     # Закрывающий инструмент не включается сам после выкладки
     is_paused_upon_creation=True,
@@ -198,8 +198,8 @@ def tools_paused_runs_cleanup():
 
     # NONE_FAILED: params штатно пропускает себя без save_params. Если же он упал (битое
     # расписание), дальше не идём: форма негодная — закрывать по ней нельзя
-    @task(task_id='find', trigger_rule=TriggerRule.NONE_FAILED)
-    def find(**context) -> list:
+    @task(task_id='collect', trigger_rule=TriggerRule.NONE_FAILED)
+    def collect(**context) -> list:
         """🔎 Раны запаузенных дагов в выбранных состояниях, с возрастом и задачами."""
         from sqlalchemy import func, tuple_
 
@@ -314,7 +314,7 @@ def tools_paused_runs_cleanup():
             raise AirflowFailException(f"{title}: " + "; ".join(f"{r['dag_id']} {r['run_id']}" for r in failed))
         return {'closed': len(done)}
 
-    found = find()
+    found = collect()
     save_params() >> found
     close(found)
 
@@ -344,7 +344,7 @@ def _close_run(r, me):
 
         ti = TaskInstance
         mine = (ti.dag_id == r['dag_id'], ti.run_id == r['run_id'])
-        # Задача в running: find такие раны не отдаёт, но она могла стартовать между find и
+        # Задача в running: collect такие раны не отдаёт, но она могла стартовать между collect и
         # close. Не трогаем — доработает, и ран закроется в следующий проход
         if session.query(ti.task_id).filter(*mine, ti.state == TaskInstanceState.RUNNING).first():
             return "оставлен: задача в running"

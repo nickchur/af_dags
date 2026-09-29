@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-21 12:41 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:38 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -219,10 +219,12 @@ _DEF_ARGS = {
     "owner":               "DataLab (CI02420667)",
     "retries":             0,
     "pool":                TOOLS_POOL,
+    # Чтение ждёт сообщение параметром timeout (180 с по умолчанию)
+    "execution_timeout":   timedelta(minutes=15),
     "on_failure_callback": on_callback,
     "on_success_callback": on_callback,
 }
-_TAGS = ["DataLab", "tools", "kafka", "AutoQA"]
+_TAGS = ["DataTools", "tools", "AutoQA"]
 
 
 # ── DAG: tools_test_kafka_snd ───────────────────────────────────────────────
@@ -234,6 +236,7 @@ _TAGS = ["DataLab", "tools", "kafka", "AutoQA"]
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    dagrun_timeout=timedelta(minutes=30),
     render_template_as_native_obj=True,
     tags=_TAGS,
     default_args=_DEF_ARGS,
@@ -271,6 +274,7 @@ tools_test_kafka_snd()
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    dagrun_timeout=timedelta(minutes=30),
     render_template_as_native_obj=True,
     tags=_TAGS,
     default_args=_DEF_ARGS,

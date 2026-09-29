@@ -1,41 +1,52 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-27 17:06 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 17:43 MSK · v3.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Снимает то, что показывает вкладка Health на Cluster Activity, и ещё несколько дешёвых
-признаков, пишет итог в лог, XCom и заметку. У карточки нет истории и её видит только тот,
-кто её открыл; здесь сетка DAG'а — лента здоровья контура: ❌ — был `error`.
+Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
+отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
+контура: ❌ — был `error`.
 
-Одна задача `check`, одиннадцать проверок. Каждая изолирована: своё время, свой таймаут, свой
+**С 28.09.2026 (v3.0) — два DAG'а в одном файле.** Дешёвое «лежит ли контур» (`components`,
+`celery`, `control`, `metabase`, `delivery`) раз в 5 минут проверяет **`tools_system_pulse`**,
+здесь — остальное раз в час. `dag_size` переехал в ночной `tools_test_dags` (размер меняется
+только с выкладкой), `tables` убран: размеры таблиц метабазы с разницей к прошлому прогону
+показывает `report` в `tools_db_cleanup`.
+
+**Таски:** `params` → `collect` (шесть проверок) → `report` (заметка) и `health_warn` /
+`health_errors` (итог). Каждая проверка изолирована: своё время, свой таймаут, свой
 `try/except` — упавшая даёт свою строку и не мешает остальным.
+
+Проверки обоих DAG'ов, в скобках — чья: пульс или час.
 
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
 |---|---|---|---|
-| `components` | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
-| `celery` | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `s3_logs` | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
-| `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
-| `pools` | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
-| `metabase` | время `SELECT 1`, соединений против `max_connections` | > 1 с или > 80 % | > 95 % |
-| `parsing` | свежесть разбора файлов, DAG'и без сериализации, ошибки импорта, итог ночного `parse_time` | новые ошибки импорта, файл выбился из круга разбора (старше и `min_file_process_interval + dag_file_processor_timeout`, и тройной медианы), разбор стоит целиком, DAG без сериализации, у `parse_time` находки | — |
-| `runs` | раны в `queued` дольше 30 мин, раны `queued`/`running` у запаузенных дагов (поимённо, 10 самых старых) | есть раны у запаузенных дагов | — |
-| `scheduled` | даги с задачами в `scheduled` дольше 5 мин: сколько, как давно, упёрлись ли в свой `max_active_tasks` (`at_limit`) | застряли даги **не** на своём лимите | — |
-| `tables` | оценка строк больших таблиц метабазы (`reltuples`) | — | — |
-| `dag_size` | DAG'и по числу тасков — в определении и за ран (с раскрытыми mapped) за 7 дней, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300 | DAG больше 300 тасков | — |
+| `components` (пульс) | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
+| `celery` (пульс) | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
+| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `s3_logs` (час) | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
+| `delivery` (пульс) | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
+| `pools` (час) | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
+| `metabase` (пульс) | время `SELECT 1`, соединений против `max_connections` | > 1 с или > 80 % | > 95 % |
+| `parsing` (час) | свежесть разбора файлов, DAG'и без сериализации, ошибки импорта, итог ночного `parse_time` | новые ошибки импорта, файл выбился из круга разбора (старше и `min_file_process_interval + dag_file_processor_timeout`, и тройной медианы), разбор стоит целиком, DAG без сериализации, у `parse_time` находки | — |
+| `runs` (час) | раны в `queued` дольше 30 мин, раны `queued`/`running` у запаузенных и у деактивированных дагов (поимённо, 10 самых старых; у деактивированных — сколько шедулер не смотрел на ран и ошибка импорта файла) | есть раны у запаузенных или деактивированных дагов | — |
+| `scheduled` (час) | даги с задачами в `scheduled` дольше 5 мин: сколько, как давно, упёрлись ли в свой `max_active_tasks` (`at_limit`) | застряли даги **не** на своём лимите | — |
+| `plugins` (час) | отчёты дагов-плагинов (тег `health`) в `system_health/checks/`: есть ли и не старше ли своего `ttl_sec`. Находки плагинов не повторяет — о них сообщает их `health_errors`; у кого сейчас warn/error, в строке справкой | плагин на паузе, без отчёта или с просроченным отчётом | — |
 
-Итог — худший статус. **`error` роняет задачу** (после записи XCom и заметки): в сетке
-красный квадрат и уведомление через `on_callback`. `warn` — зелёный прогон с ⚠️ в заметке.
+`collect` находками **не падает**: вердикты уходят в XCom `health`, итог подводят
+`health_warn` (есть `warn` — ✅ с ⚠️ в заметке, нет — skip) и `health_errors` (есть `error` —
+❌, ран красный, уведомление через `on_callback`; нет — skip). Красный `collect` значит, что
+сломалась сама проверка, — `health_errors` назовёт его «не выполнился».
 
-**Плагин здоровья** (тег `health`): итог уходит ещё и отчётом в бакет логов,
-`system_health/checks/tools_system_health.json` (`report_health` из `plugins/utils.py`), откуда
+**Плагин здоровья** (тег `health`): `health_errors` пишет отчёт в бакет логов,
+`system_health/checks/tools_system_health.json` (`health_tasks` из `plugins/utils.py`), откуда
 его читает `get_system_health` MCP — раздел `plugins`. Срок отчёта — 2 ч: пропустил два прогона,
 и core скажет «последний отчёт N назад». Раны запаузенных дагов, пулы, `scheduled`, отставание
-разбора и таблицы с etl-core 1.2.1 (HRPDATALAB-15978) проверяются только здесь, core их больше
+разбора с etl-core 1.2.1 (HRPDATALAB-15978) проверяются только здесь, core их больше
 не считает. Все проверки — SQL к метабазе из таска: в AF3 так нельзя, их придётся перевести на
 REST.
 
-**Вывод:** строка на проверку в логе; XCom `return_value` — одна строка на прогон,
-`{status, reasons, checks, took_sec}`; заметка задачи и рана — нездоровые проверки по
-строке, здоровые одной строкой с временами.
+**Вывод:** строка на проверку в логе; XCom `return_value` таска `collect` — одна строка на
+прогон, `{status, reasons, checks, took_sec}` (до v2.0 таск звался `check`); заметка
+`report` — нездоровые проверки по строке, здоровые одной строкой с временами.
 
 | Параметр | Описание |
 |---|---|
@@ -45,8 +56,8 @@ REST.
 
 **Чего этот DAG не увидит:**
 
-- Когда воркеры не берут задачи, он и сам не запустится. Сигнал тогда — пропуски в сетке и
-  растущая `delivery` на прогонах вокруг.
+- Когда воркеры не берут задачи, он и сам не запустится. Сигнал тогда — пропуски в сетке
+  обоих DAG'ов и растущая `delivery` у пульса.
 - Пока на контуре нет etl-core PR #35, висящий S3 может подвесить и лог этой задачи
   (выгрузка из `emit` синхронная). Её снимет `execution_timeout`, и падение по таймауту
   само будет сигналом.
@@ -66,15 +77,16 @@ from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
 from airflow.models import Param
+from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, report_health, saved_params,
-        store_params, saved_schedule)
+        HEALTH_PREFIX, TOOLS_POOL, add_note, ensure_pool, env_stand, health_tasks, on_callback, push_health,
+        saved_params, saved_schedule, store_params_task)
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, report_health, saved_params,
-        store_params, saved_schedule)
+        HEALTH_PREFIX, TOOLS_POOL, add_note, ensure_pool, env_stand, health_tasks, on_callback, push_health,
+        saved_params, saved_schedule, store_params_task)
 
 logger = logging.getLogger("airflow.task")
 
@@ -89,6 +101,10 @@ SAVED = saved_params(PARAMS_VAR)
 # На 7-й минуте, а не в :00: в начале часа стартует основная масса расписаний, и проверка
 # мерила бы собственную очередь за ними, а не состояние контура
 DEFAULT_SCHEDULE = "7 * * * *"
+# Срок отчёта плагина: два часовых прогона с запасом
+REPORT_TTL_SEC = 2 * 3600 + 600
+# Навык агента, на который отчёт плагина отсылает толкование своих проверок
+SKILL = "tools-system-health"
 
 RANK = {"healthy": 0, "unknown": 1, "warn": 2, "error": 3}
 ICON = {"healthy": "✅", "unknown": "❔", "warn": "⚠️", "error": "❌"}
@@ -98,6 +114,22 @@ ICON = {"healthy": "✅", "unknown": "❔", "warn": "⚠️", "error": "❌"}
 # STALE_AFTER_SEC, PROBE_TIMEOUT_SEC), чтобы DAG и карточка называли одно и то же одним словом
 STALE_AFTER_SEC = 5 * 60
 BROADCAST_TIMEOUT_SEC = 2
+# Control-канал: ping ждём дольше broadcast'а — на dev 27.09.2026 ответы опаздывали, и
+# двухсекундный опрос не отличал «опоздал» от «потерялся». Под обязан ответить, если на нём
+# прямо сейчас идёт задача: LocalTaskJob в running с хартбитом свежее BUSY_HEARTBEAT_SEC
+# (хартбит job — каждые 5 с)
+PING_TIMEOUT_SEC = 5
+BUSY_HEARTBEAT_SEC = 120
+# Звенья задержки control-канала: команда брокеру → доставка pub/sub → ответ воркера.
+# Пороги — порядок величины, а не замер: redis в одном ЦОД отвечает за единицы мс, и
+# сотни мс на команду или полсекунды на доставку уже объясняют опоздавшие ответы
+BROKER_CMD_WARN_MS = 100
+PUBSUB_WARN_MS = 500
+LATENCY_SAMPLES = 3
+# Поля INFO узла брокера: хватает, чтобы отличить перегруз и failover от сети
+INFO_FIELDS = ("redis_version", "role", "uptime_in_seconds", "connected_clients", "blocked_clients",
+               "pubsub_channels", "pubsub_patterns", "instantaneous_ops_per_sec", "used_memory_human",
+               "rejected_connections", "evicted_keys")
 # S3 — как у промежуточной выгрузки лога (etl-core PR #35, hrp_adapter/logging/handlers.py):
 # живой S3 отвечает за доли секунды, сломанный шлюз альфы 11.09.2026 отвечал 504 примерно
 # через минуту — одна попытка и короткие таймауты, чтобы проверка не висела вместе с ним
@@ -116,16 +148,6 @@ DB_STATEMENT_TIMEOUT_MS = 5000
 # Сколько имён показывать в строке проверки: XCom-бэкенд контура не берёт списков длиннее
 # 500, а заметка режется по 1000 символов — поимённо нужны только первые
 SHOW = 5
-# Размер DAG'ов (HRPDATALAB-16308): классы по числу тасков, каждый втрое больше прежнего.
-# Больше TASKS_ALERT — warn: такой DAG тяжёл шедулеру, сетке UI и пулам
-TASK_CLASSES = (1, 3, 10, 30, 100, 300)
-TASKS_ALERT = TASK_CLASSES[-1]
-# Сколько дней ранов смотреть на раскрытые mapped-таски
-TASKS_RUN_DAYS = 7
-# Запрос читает JSON всех сериализованных DAG'ов и таски ранов за неделю: на стенде
-# 27.09.2026 — 0,1 с на 73 DAG'ах и 102 тыс. task_instance. На контурах больше, общий
-# потолок в 5 с тесен
-DAG_SIZE_TIMEOUT_MS = 30000
 # Ран в queued дольше этого: меньше — обычное ожидание max_active_runs, дольше — чаще всего
 # даг на паузе
 QUEUED_RUN_STALE_SEC = 1800
@@ -137,11 +159,6 @@ SCHEDULED_STALE_SEC = STALE_AFTER_SEC
 LIMIT_RECENT_SEC = 60
 # Сколько дагов и ранов называть поимённо в data
 TOP = 10
-# Таблицы метабазы, которые растут и чистятся tools_db_cleanup
-DB_TABLES = ("xcom", "log", "job", "dag_run", "task_instance", "task_fail",
-             "rendered_task_instance_fields", "celery_taskmeta")
-# Срок отчёта плагина: два часовых прогона с запасом
-REPORT_TTL_SEC = 2 * 3600 + 600
 
 
 # ── Общее ─────────────────────────────────────────────────────────────
@@ -358,6 +375,176 @@ def check_celery() -> dict:
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
 
 
+# Сколько подов сейчас исполняют задачи: столько узлов обязано ответить на ping. Сверяем
+# ЧИСЛА, а не имена: hostname в job у платформы — IP пода (etl-core hostname_callable: по
+# нему вебсервер читает живой лог), а узел celery зовётся celery@<имя пода>, и одно из другого
+# не получить. Сравнение имён на контурах давало «ни один не ответил» при живых воркерах
+# (альфа, 28.09.2026). Из job, а не из task_instance: индекс job_type_heart (job_type,
+# latest_heartbeat); task_instance на dev (13 млн строк) по времени не укладывался в 5 с
+SQL_BUSY_HOSTS = """
+select count(distinct hostname) as busy
+  from job
+ where job_type = 'LocalTaskJob'
+   and state = 'running'
+   and latest_heartbeat > now() - cast(:age as interval)
+"""
+
+
+def _plain(value):
+    """Ответы redis приходят байтами, в том числе ключи словарей."""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    if isinstance(value, dict):
+        return {_plain(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    return value
+
+
+def _median_ms(samples: list) -> float | None:
+    samples = sorted(x for x in samples if x is not None)
+    return round(samples[len(samples) // 2] * 1000, 1) if samples else None
+
+
+def _broker_pubsub(app) -> dict:
+    """Узел брокера, куда ходит сам celery: задержка команд и pub/sub, INFO, права, подписки."""
+    out = {}
+    # Канал kombu, а не сырой клиент: он уже привязан к узлу кластера по global_keyprefix
+    with app.connection_for_read() as conn:
+        cli = conn.default_channel.client
+        kw = cli.connection_pool.connection_kwargs
+        out["node"] = f"{kw.get('host')}:{kw.get('port')}"
+
+        samples = []
+        for _ in range(LATENCY_SAMPLES):
+            t = time.perf_counter()
+            cli.ping()
+            samples.append(time.perf_counter() - t)
+        out["cmd_ms"] = _median_ms(samples)
+        try:
+            info = cli.info()
+            out["info"] = {k: info[k] for k in INFO_FIELDS if k in info}
+        except Exception as exc:
+            out["info"] = f"не прочитан: {_short_reason(exc)}"
+        # ACL и PUBSUB NUMPAT пользователю брокера бывают закрыты (dev, 28.09.2026:
+        # NoPermissionError на оба) — это не поломка pub/sub, петлю проверяем всё равно
+        try:
+            user = _plain(cli.execute_command("ACL", "WHOAMI"))
+            acl = _plain(cli.execute_command("ACL", "GETUSER", user))
+            out["acl_channels"] = dict(zip(acl[::2], acl[1::2])).get("channels")
+        except Exception as exc:
+            out["acl_channels"] = f"не прочитаны: {_short_reason(exc)}"
+        try:
+            # kombu подписывает воркеры шаблоном (fanout_patterns): PUBSUB CHANNELS их не видит
+            out["pattern_subs"] = cli.pubsub_numpat()
+        except Exception as exc:
+            out["pattern_subs"] = f"не прочитаны: {_short_reason(exc)}"
+        ps = cli.pubsub()
+        try:
+            topic = f"tools_system_health.loopback.{uuid.uuid4().hex[:8]}"
+            ps.subscribe(topic)
+            ps.get_message(timeout=2)  # подтверждение подписки
+            samples = []
+            for _ in range(LATENCY_SAMPLES):
+                t = time.perf_counter()
+                cli.publish(topic, "ping")
+                got = ps.get_message(timeout=PING_TIMEOUT_SEC)
+                samples.append(time.perf_counter() - t if got is not None else None)
+            out["loopback"] = any(x is not None for x in samples)
+            out["pubsub_ms"] = _median_ms(samples)
+        finally:
+            ps.close()
+    return out
+
+
+def check_control() -> dict:
+    """Control-канал celery: отвечают ли воркеры на ping через брокер.
+
+    Задачи идут через списки Redis, а ping/inspect — через pub/sub, и второе может молчать
+    при живом первом. Так было на dev с 27.09.2026 ~11:10 UTC: воркеры работали, а на
+    inspect отвечало 20–40 % опросов (отбивки health_beacon). От этого канала зависят
+    liveness-проба воркера (перезапускает под после 20 мин молчания) и число воркеров в
+    карточке Health; check_celery видит только итог — меньше воркеров, — а не причину.
+    """
+    from airflow.providers.celery.executors.celery_executor import app
+
+    busy = int(_pg_rows(SQL_BUSY_HOSTS, {"age": f"{BUSY_HEARTBEAT_SEC} seconds"})[0]["busy"] or 0)
+    started = time.time()
+    try:
+        # limit: ответило столько, сколько подов занято, — не ждём таймаута, и время вызова
+        # становится задержкой самого медленного из нужных ответов
+        pong = app.control.ping(timeout=PING_TIMEOUT_SEC, limit=busy or None) or []
+    except Exception as exc:
+        return {"status": "error", "summary": f"брокер недоступен: {_short_reason(exc)}"}
+    reply_sec = round(time.time() - started, 1)
+    nodes = sorted({name for chunk in pong for name in chunk})
+    missing = max(busy - len(nodes), 0)
+    result = {"busy_pods": busy, "answered": len(nodes), "nodes": nodes[:TOP], "reply_sec": reply_sec}
+    notes, status = [], "healthy"
+
+    try:
+        result.update(_broker_pubsub(app))
+    except Exception as exc:
+        logger.warning("control: pub/sub брокера не проверен", exc_info=True)
+        notes.append(f"pub/sub не проверен: {_short_reason(exc)}")
+
+    if result.get("loopback") is False:
+        status = "error"
+        notes.append("pub/sub брокера не доставляет даже самому себе")
+    if busy and not nodes:
+        status = "error"
+        notes.append(f"ни один воркер не ответил на ping, а задачи идут на {busy} подах")
+    elif missing:
+        status = _worst([status, "warn"])
+        notes.append(f"не ответили {missing} из {busy} подов с задачами")
+    elif busy and reply_sec > BROADCAST_TIMEOUT_SEC:
+        # Ответы доходят, но позже, чем их ждут карточка Health и отбивки воркеров (2 с) и
+        # `celery list-workers` (1 с): там воркеры выглядят пропавшими. dev, 28.09.2026:
+        # list-workers пуст, а ping с 5 с получил все 8 ответов
+        status = _worst([status, "warn"])
+        notes.append(f"ответы идут {reply_sec} с — дольше {BROADCAST_TIMEOUT_SEC} с, которые ждут карточка и отбивки")
+
+    # Где набегает задержка: команда → доставка pub/sub → ответ воркера. Предупреждаем по
+    # первому медленному звену — следующие за ним медленны уже из-за него
+    cmd_ms, pubsub_ms = result.get("cmd_ms"), result.get("pubsub_ms")
+    if cmd_ms is not None and cmd_ms > BROKER_CMD_WARN_MS:
+        status = _worst([status, "warn"])
+        notes.append(f"брокер медленно отвечает на команды: {cmd_ms} мс — узел или сеть до него")
+    elif pubsub_ms is not None and pubsub_ms > PUBSUB_WARN_MS:
+        status = _worst([status, "warn"])
+        notes.append(f"pub/sub брокера доставляет за {pubsub_ms} мс при командах за {cmd_ms} мс")
+    elif nodes and not missing and reply_sec > BROADCAST_TIMEOUT_SEC and pubsub_ms is not None:
+        notes.append(f"брокер быстрый (команда {cmd_ms} мс, pub/sub {pubsub_ms} мс) — медлят сами воркеры")
+    if busy and result.get("pattern_subs") == 0 and not nodes:
+        status = "error"
+        notes.append("на узле брокера нет ни одной подписки-шаблона — воркеры не слушают control-канал")
+
+    head = (f"на ping ответили {len(nodes)}, задачи сейчас идут на {busy} подах"
+            + (f", за {reply_sec} с" if not missing else "")
+            + (f"; брокер {result.get('node')}: команда {cmd_ms} мс, pub/sub {pubsub_ms} мс"
+               if cmd_ms is not None else ""))
+    return {**result, "status": status, "summary": "; ".join([head, *notes])}
+
+
+def _log_bucket():
+    """Клиент бакета логов с короткими таймаутами и одной попыткой, и имя бакета.
+
+    Подключение и бакет — из [logging] remote_log_conn_id / remote_base_log_folder, а не
+    именем: на DEV бакет подменяет airflow_entrypoint. config сливается с botocore-настройками
+    подключения, а не заменяет их (см. check_s3_logs).
+    """
+    from airflow.configuration import conf
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    from botocore.config import Config
+
+    conn_id = conf.get("logging", "REMOTE_LOG_CONN_ID")
+    bucket = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")[0]
+    limits = Config(connect_timeout=S3_CONNECT_TIMEOUT_SEC, read_timeout=S3_READ_TIMEOUT_SEC,
+                    retries={"total_max_attempts": 1})
+    base = S3Hook(aws_conn_id=conn_id).conn_config.botocore_config
+    return S3Hook(aws_conn_id=conn_id, config=base.merge(limits) if base else limits).get_conn(), bucket
+
+
 def check_s3_logs(slow_sec: float, run_id: str) -> dict:
     """Запись, чтение и удаление в бакете логов задач — тем же подключением, что у лога.
 
@@ -376,23 +563,16 @@ def check_s3_logs(slow_sec: float, run_id: str) -> dict:
     удалении, подберёт log_cleanup — у этой папки свой срок хранения.
     """
     from airflow.configuration import conf
-    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-    from botocore.config import Config
 
     # Лог в S3 не пишется (локальный компоуз) — проверять нечего, и это не поломка
     if not conf.getboolean("logging", "REMOTE_LOGGING", fallback=False):
         return {"status": "unknown", "summary": "remote_logging выключен — лог в S3 не пишется"}
-    conn_id = conf.get("logging", "REMOTE_LOG_CONN_ID")
-    bucket = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")[0]
     key = "system_health/probe.txt"
-    limits = Config(connect_timeout=S3_CONNECT_TIMEOUT_SEC, read_timeout=S3_READ_TIMEOUT_SEC,
-                    retries={"total_max_attempts": 1})
     # Подключение и клиент — отдельной цифрой: на стенде это 6 с из 6.4 (секрет-бэкенд и
     # сессия boto), сами операции — десятые доли. Медленный секрет-бэкенд не должен
     # выглядеть медленным S3, поэтому в порог s3_slow_sec setup не входит
     ts = time.time()
-    base = S3Hook(aws_conn_id=conn_id).conn_config.botocore_config
-    client = S3Hook(aws_conn_id=conn_id, config=base.merge(limits) if base else limits).get_conn()
+    client, bucket = _log_bucket()
     setup = round(time.time() - ts, 2)
     extra = {"ServerSideEncryption": "AES256"} if conf.getboolean("logging", "ENCRYPT_S3_LOGS", fallback=False) else {}
 
@@ -579,7 +759,7 @@ def _prev_import_error_id(dag_id: str, run_id: str) -> int | None:
 
     with create_session() as session:
         row = (session.query(XCom)
-               .filter(XCom.dag_id == dag_id, XCom.task_id == "check",
+               .filter(XCom.dag_id == dag_id, XCom.task_id.in_(("collect", "check")),
                        XCom.key == "return_value", XCom.run_id != run_id)
                .order_by(XCom.timestamp.desc()).first())
         if row is None:
@@ -656,77 +836,6 @@ def check_parsing(dag_id: str, run_id: str) -> dict:
     return {**result, "status": status, "summary": "; ".join([summary, *notes])}
 
 
-# Два счёта, потому что они про разное. tasks — таски в определении DAG'а (сериализация).
-# max_ti — наибольшее число task_instance в одном ране за TASKS_RUN_DAYS дней: это уже с
-# раскрытыми mapped-тасками, и именно оно бьёт по шедулеру; DAG из 5 тасков с expand на
-# 1000 элементов по первому счёту безобиден. Класс — по большему из двух.
-# Раны отбираются по dag_run.start_date, а не сканом всего task_instance: на бою там
-# миллионы строк. tasks = null, если JSON сжат (compress_serialized_dags; на контурах
-# выключено, etl-core airflow-default.cfg) или DAG ещё не сериализован
-SQL_DAG_SIZE = """
-with m as (
-    select t.dag_id, max(t.cnt) as max_ti
-    from (select ti.dag_id, ti.run_id, count(*) as cnt
-          from task_instance ti
-          join dag_run r on r.dag_id = ti.dag_id and r.run_id = ti.run_id
-          where r.start_date > now() - cast(:days as interval)
-          group by ti.dag_id, ti.run_id) t
-    group by t.dag_id
-)
-select d.dag_id, d.is_paused,
-       json_array_length(s.data::json -> 'dag' -> 'tasks') as tasks,
-       coalesce(m.max_ti, 0)                               as max_ti
-from dag d
-left join serialized_dag s on s.dag_id = d.dag_id
-left join m on m.dag_id = d.dag_id
-where d.is_active
-"""
-
-
-def task_class(n: int) -> str:
-    """Класс по числу тасков: «1», «2–3», …, «101–300», «>300»."""
-    low = 1
-    for high in TASK_CLASSES:
-        if n <= high:
-            return str(high) if low == high else f"{low}–{high}"
-        low = high + 1
-    return f">{TASK_CLASSES[-1]}"
-
-
-def dag_size_verdict(rows: list[dict]) -> dict:
-    """Классы и алерт по строкам SQL_DAG_SIZE — отдельно от запроса, чтобы проверялось без базы."""
-    hist = dict.fromkeys([task_class(c) for c in TASK_CLASSES] + [task_class(TASKS_ALERT + 1)], 0)
-    big, unknown = [], 0
-    for r in rows:
-        size = max(int(r["tasks"] or 0), int(r["max_ti"] or 0))
-        # Нет ни сериализации, ни ранов за неделю — класса не назвать
-        if not size:
-            unknown += 1
-            continue
-        hist[task_class(size)] += 1
-        if size > TASKS_ALERT:
-            big.append((size, r))
-    big.sort(key=lambda x: -x[0])
-    top = {r["dag_id"]: {"tasks": r["tasks"], "max_ti": int(r["max_ti"] or 0), "paused": r["is_paused"]}
-           for _, r in big[:SHOW]}
-    head = (f"DAG'ов {len(rows)}; по числу тасков: " + ", ".join(f"{c} {n}" for c, n in hist.items() if n)
-            + (f", без данных {unknown}" if unknown else ""))
-    result = {"dags": len(rows), "classes": hist, "unknown": unknown, "over_alert": len(big), "top": top}
-    if not big:
-        return {**result, "status": "healthy", "summary": head}
-    names = ", ".join(f"{d} ({v['tasks'] if v['tasks'] is not None else '?'}/{v['max_ti']})" for d, v in top.items())
-    if len(big) > SHOW:
-        names += f" и ещё {len(big) - SHOW}"
-    return {**result, "status": "warn",
-            "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/за ран): {names}"}
-
-
-def check_dag_size() -> dict:
-    """DAG'и по числу тасков; больше TASKS_ALERT — warn."""
-    rows = _pg_rows(SQL_DAG_SIZE, {"days": f"{TASKS_RUN_DAYS} days"}, timeout_ms=DAG_SIZE_TIMEOUT_MS)
-    return dag_size_verdict(rows)
-
-
 # ── Перенесено из etl-core (platform_health, до 1.2.1) ────────────────
 # AF3: метабаза из таска — в AF3 эти проверки переводятся на REST
 
@@ -738,7 +847,9 @@ select
                        and coalesce(dr.queued_at, dr.execution_date)
                            < now() - cast(:stale as interval))                                   as queued_stale,
     -- trigger_dag паузу не смотрит: ран запаузенного дага висит в queued вечно
-    count(*) filter (where d.is_paused)                                                         as paused_active
+    count(*) filter (where d.is_paused)                                                         as paused_active,
+    -- шедулер разбирает раны только активных дагов: у выпавшего из разбора ран замирает
+    count(*) filter (where not d.is_active)                                                     as inactive_active
 from dag_run dr
 join dag d on d.dag_id = dr.dag_id
 where dr.state in ('queued', 'running')
@@ -798,30 +909,50 @@ join dag d on d.dag_id = w.dag_id
 order by w.scheduled desc, w.dag_id
 """
 
-# Оценка по статистике: count(*) по xcom и log на боевой метабазе — секунды. reltuples = -1 —
-# таблицу ещё не анализировали, числа нет. Таблица ищется по search_path (to_regclass), а не
-# в current_schema(): на стенде AF3 рядом с таблицами в public стояла пустая main
-SQL_TABLES = """
-select t.name as relname, c.reltuples::bigint as rows
-from unnest(cast(:tables as text[])) as t(name)
-join pg_class c on c.oid = to_regclass(t.name)
+# Раны деактивированных дагов (is_active = false). Шедулер берёт на рассмотрение раны только
+# активных дагов, а dag-processor снимает is_active, когда файл разбирается, но даг из него не
+# обновился дольше stale_dag_threshold — то есть при ошибке импорта или удалённом файле. Ран
+# стоит в running с замершим last_scheduling_decision и поедет сам, когда файл починят.
+# Сигма-dev 28.09.2026: GigaCode назвал пять таких ранов «не закрытыми шедулером» и советовал
+# Mark failed. frozen_sec — сколько шедулер не смотрел на ран; error — хвост ошибки импорта
+# файла, null — ошибки нет (файл удалён или даг из него убран)
+SQL_INACTIVE_RUNS = """
+select dr.dag_id, dr.run_id, dr.state, d.fileloc,
+       cast(extract(epoch from now() - coalesce(dr.last_scheduling_decision, dr.start_date,
+                                                dr.queued_at, dr.execution_date)) as bigint) as frozen_sec,
+       (select right(trim(ie.stacktrace), 300) from import_error ie
+         where ie.filename = d.fileloc order by ie.id desc limit 1)                        as error
+from dag_run dr
+join dag d on d.dag_id = dr.dag_id and not d.is_active
+where dr.state in ('queued', 'running')
+order by frozen_sec desc, dr.dag_id
+limit :top
 """
 
 
-
-
 def check_runs() -> dict:
-    """Раны, которые не начнутся или не кончатся: в queued дольше порога, у запаузенных дагов."""
+    """Раны, которые не начнутся или не кончатся: в queued дольше порога, у запаузенных и
+    деактивированных дагов."""
     counts = _pg_rows(SQL_RUNS, {"stale": f"{QUEUED_RUN_STALE_SEC} seconds"})[0]
     result = {k: int(v or 0) for k, v in counts.items()}
-    if not result["paused_active"]:
+    notes = []
+    if result["paused_active"]:
+        result["paused_runs"] = _pg_rows(SQL_PAUSED_RUNS, {"top": TOP})
+        names = _names(f"{r['dag_id']} ({r['state']}, {round((r['age_sec'] or 0) / 3600, 1)} ч)"
+                       for r in result["paused_runs"])
+        notes.append(f"ранов у запаузенных дагов в queued/running — {result['paused_active']}: {names}; "
+                     "пока даг на паузе, они не начнутся и не кончатся")
+    if result["inactive_active"]:
+        result["inactive_runs"] = _pg_rows(SQL_INACTIVE_RUNS, {"top": TOP})
+        names = _names(f"{r['dag_id']} ({r['state']}, стоит {round((r['frozen_sec'] or 0) / 3600, 1)} ч"
+                       f"{', ошибка импорта' if r['error'] else ', ошибки импорта нет'})"
+                       for r in result["inactive_runs"])
+        notes.append(f"ранов у деактивированных дагов в queued/running — {result['inactive_active']}: {names}; "
+                     "шедулер их не разбирает, поедут сами, когда файл дага снова разберётся")
+    if not notes:
         return {**result, "status": "healthy",
                 "summary": f"в queued дольше {QUEUED_RUN_STALE_SEC // 60} мин: {result['queued_stale']}"}
-    runs = _pg_rows(SQL_PAUSED_RUNS, {"top": TOP})
-    names = _names(f"{r['dag_id']} ({r['state']}, {round((r['age_sec'] or 0) / 3600, 1)} ч)" for r in runs)
-    return {**result, "paused_runs": runs, "status": "warn",
-            "summary": f"ранов у запаузенных дагов в queued/running — {result['paused_active']}: {names}; "
-                       "пока даг на паузе, они не начнутся и не кончатся"}
+    return {**result, "status": "warn", "summary": "; ".join(notes)}
 
 
 def check_scheduled() -> dict:
@@ -850,12 +981,59 @@ def check_scheduled() -> dict:
                        + "; проверить пулы и слоты executor'а"}
 
 
-def check_tables() -> dict:
-    """Оценка строк больших таблиц метабазы — для «растёт ли метабаза»."""
-    rows = _pg_rows(SQL_TABLES, {"tables": list(DB_TABLES)})
-    tables = {r["relname"]: int(r["rows"]) for r in rows if r["rows"] is not None and r["rows"] >= 0}
-    return {"tables": tables, "status": "healthy",
-            "summary": ", ".join(f"{k} {v:,}".replace(",", " ") for k, v in tables.items())}
+# Даги-плагины здоровья: тег health, даг жив (разбирается). Отчёт каждого — в бакете логов
+SQL_PLUGINS = """
+select d.dag_id, d.is_paused
+from dag d
+join dag_tag t on t.dag_id = d.dag_id and t.name = 'health'
+where d.is_active
+order by d.dag_id
+"""
+
+
+def check_plugins(own_dag_id: str) -> dict:
+    """Отчёты дагов-плагинов на месте и свежие; сами находки плагинов не повторяются.
+
+    О своих ошибках плагин сообщает сам — красным health_errors. Сторож ловит другое: плагин
+    замолчал (на паузе, не разбирается, не доходит до health_errors), и его отчёт тихо
+    протух. core покажет это только на запрос get_system_health, здесь — в ленте раз в час.
+    Свой отчёт не проверяем: его пишет этот же ран, позже этой проверки.
+    """
+    from airflow.configuration import conf
+    from botocore.exceptions import ClientError
+
+    if not conf.getboolean("logging", "REMOTE_LOGGING", fallback=False):
+        return {"status": "unknown", "summary": "remote_logging выключен — отчётов плагинов нет"}
+    rows = [r for r in _pg_rows(SQL_PLUGINS) if r["dag_id"] != own_dag_id]
+    client, bucket = _log_bucket()
+    silent, statuses = {}, {}
+    for row in rows:
+        dag_id = row["dag_id"]
+        if row["is_paused"]:
+            silent[dag_id] = "на паузе"
+            continue
+        try:
+            body = client.get_object(Bucket=bucket, Key=f"{HEALTH_PREFIX}{dag_id}.json")["Body"].read()
+            report = json.loads(body)
+        except ClientError as exc:
+            missing = exc.response.get("Error", {}).get("Code") in ("NoSuchKey", "404")
+            silent[dag_id] = "нет отчёта" if missing else f"отчёт не прочитан: {_short_reason(exc)}"
+            continue
+        except ValueError as exc:
+            silent[dag_id] = f"отчёт не разобран: {_short_reason(exc)}"
+            continue
+        age = _age_sec(report.get("at"))
+        if age is None or age > int(report.get("ttl_sec") or 0):
+            silent[dag_id] = f"отчёт {round(age / 3600, 1) if age is not None else '?'} ч назад"
+        statuses[dag_id] = _worst(c.get("status") for c in (report.get("checks") or {}).values())
+    now_bad = {d: st for d, st in statuses.items() if st in ("warn", "error")}
+    head = f"плагинов {len(rows)}" + (f"; сейчас {_names(f'{d} {st}' for d, st in now_bad.items())}"
+                                      if now_bad else "")
+    result = {"plugins": len(rows), "silent": silent, "statuses": statuses}
+    if not silent:
+        return {**result, "status": "healthy", "summary": f"{head}; отчёты свежие"}
+    return {**result, "status": "warn",
+            "summary": f"{head}; молчат: " + _names(f"{d} ({why})" for d, why in silent.items())}
 
 
 # ── Сводка ────────────────────────────────────────────────────────────
@@ -880,29 +1058,44 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
+# Общее у обоих DAG-ов файла
+DEFAULT_ARGS = {
+    "owner": "DataLab (CI02420667)",
+    "pool": TOOLS_POOL,
+    "retries": 0,
+    # Как у остальных коротких проверок (tools/readme.md): выше регрессионных прогонов
+    # того же пула, ниже агента CTL; absolute — чтобы вес не складывался по цепочке
+    "priority_weight": 900,
+    "weight_rule": "absolute",
+    # Сетевые таймауты проверок в сумме около 90 с: S3 — три операции по 5 + 15 с и чтение
+    # отчётов плагинов, метабаза — 5 с на запрос. Пять минут — про зависание
+    "execution_timeout": timedelta(minutes=5),
+    "on_failure_callback": on_callback,
+}
+OWNER_LINKS = {"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"}
+
+
+def _finish(name: str, checks: dict, started: float, context) -> dict:
+    """Итог проверок: строка в лог, вердикты в XCom health; находками не падает."""
+    took = round(time.time() - started, 1)
+    status, reasons = verdict(checks)
+    logger.info("%s %s %s за %.1f с%s", ICON[status], name, env_stand() or "?", took,
+                "".join(f"\n  {r}" for r in reasons))
+    push_health(checks, context)
+    return {"status": status, "reasons": reasons, "checks": checks, "took_sec": took}
+
+
 @dag(
     doc_md=__doc__,
-    owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
-    default_args={
-        "owner": "DataLab (CI02420667)",
-        "pool": TOOLS_POOL,
-        "retries": 0,
-        # Как у остальных коротких проверок (tools/readme.md): выше регрессионных прогонов
-        # того же пула, ниже агента CTL; absolute — чтобы вес не складывался по цепочке
-        "priority_weight": 900,
-        "weight_rule": "absolute",
-        # Сетевые таймауты проверок в сумме около 90 с: S3 — три операции по 5 + 15 с,
-        # брокер — два broadcast по 2 с, метабаза — 5 с на запрос. Пять минут — про зависание
-        "execution_timeout": timedelta(minutes=5),
-        "on_failure_callback": on_callback,
-    },
+    owner_links=OWNER_LINKS,
+    default_args=DEFAULT_ARGS,
     # Часовой пояс DAG-а берётся из start_date.tzinfo — расписание московское
     start_date=datetime(2026, 9, 14, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools: служебный DAG — ролевка ограничивает запуск (HRPDATALAB-15421), а
-    # get_system_health показывает его в разделе служебных. Тег health: плагин здоровья —
-    # get_system_health читает его отчёт (раздел plugins)
-    tags=["DataLab", "tools", "check", "health"],
+    # get_system_health показывает его в разделе служебных. Тег health — роль: плагин
+    # здоровья, get_system_health читает его отчёт (раздел plugins)
+    tags=["DataTools", "tools", "health"],
     catchup=False,
     # Смысл DAG'а — непрерывная лента, и он дёшев: включается сам
     is_paused_upon_creation=False,
@@ -919,51 +1112,115 @@ def _param(key, default, **kwargs):
 )
 def tools_system_health():
 
+    @task(task_id="params")
+    def save_params(**context):
+        """💾 Сохраняет параметры запуска (в т. ч. расписание) как значения по умолчанию."""
+        return store_params_task(PARAMS_VAR, SAVED, context)
+
     # multiple_outputs=False: по аннотации dict Airflow разложил бы ответ на отдельные ключи
-    # XCom — четыре лишние строки на прогон, 24 прогона в сутки
-    @task(task_id="check", multiple_outputs=False)
-    def check(**context) -> dict:
-        """Одиннадцать проверок подряд, итог — в лог, XCom, заметку и отчёт плагина; error роняет задачу."""
-        from airflow.exceptions import AirflowFailException
+    # XCom — четыре лишние строки на прогон, 24 прогона в сутки. NONE_FAILED: params штатно
+    # пропускает себя при save_params=False
+    @task(task_id="collect", multiple_outputs=False, trigger_rule=TriggerRule.NONE_FAILED)
+    def collect(**context) -> dict:
+        """Шесть проверок подряд; вердикты — в XCom health, находками таск не падает."""
+        dag_run = context["dag_run"]
+        started = time.time()
+        checks = {
+            "s3_logs": _run("s3_logs", check_s3_logs, float(context["params"]["s3_slow_sec"]), dag_run.run_id),
+            "pools": _run("pools", check_pools),
+            "parsing": _run("parsing", check_parsing, dag_run.dag_id, dag_run.run_id),
+            "runs": _run("runs", check_runs),
+            "scheduled": _run("scheduled", check_scheduled),
+            "plugins": _run("plugins", check_plugins, dag_run.dag_id),
+        }
+        return _finish("system_health", checks, started, context)
 
-        state, msg = store_params(PARAMS_VAR, SAVED, context)
-        if state == "fail":
-            raise AirflowFailException(msg)
+    @task(task_id="report")
+    def report(result: dict, **context) -> str:
+        """🧾 Заметка: нездоровые проверки по строке, здоровые одной строкой с временами."""
+        title = f"{ICON[result['status']]} {result['took_sec']} sec system_health {env_stand() or '?'}"
+        add_note(note_text(result["checks"]), context, level="task,DAG", title=title)
+        return title
 
+    result = collect()
+    save_params() >> result
+    report(result)
+    result >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
+
+
+tools_system_health()
+
+
+# ── Пульс ─────────────────────────────────────────────────────────────
+
+PULSE_DOC = """### 💓 DAG: Пульс контура раз в 5 минут
+*2026-09-28 12:35 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+
+Лежит ли контур прямо сейчас: пять дешёвых проверок, секунды на прогон. Вынесены
+28.09.2026 из часового `tools_system_health`, чтобы авария была видна через минуты, а не
+через час. Проверки и пороги те же, код общий — `tools/system_health.py`.
+
+**Таски:** `collect` (проверки и заметка) → `health_warn` / `health_errors`. Отдельного
+`report` нет: 288 прогонов в сутки, лишний таск на каждом — лишний поход через воркер.
+Таска `params` тоже нет — сохранять нечего, расписание в коде.
+
+| Проверка | Что смотрит |
+|---|---|
+| `components` | `get_airflow_health()`: метабаза, шедулер, dag-processor, triggerer |
+| `celery` | воркеры через брокер, длина очередей, счётчики `task_instance` |
+| `control` | control-канал celery и узел брокера: `ping`, задержки `cmd_ms` / `pubsub_ms` |
+| `metabase` | время `SELECT 1`, соединений против `max_connections` |
+| `delivery` | сколько эта задача ждала воркера и насколько шедулер опоздал с раном |
+
+Пороги и толкование — в описании `tools_system_health` и навыке `tools-system-health`.
+
+**Плагин здоровья** (тег `health`): отчёт `system_health/checks/tools_system_pulse.json`, срок
+15 минут — три пропущенных прогона, и core скажет «последний отчёт N назад».
+
+**Чего этот DAG не увидит:** когда воркеры не берут задачи, он и сам не запустится. Сигнал
+тогда — пропуски в сетке и растущая `delivery` на прогонах вокруг.
+"""
+# Со 2-й минуты, а не с :00: в начале часа и пятиминуток стартует основная масса расписаний
+PULSE_SCHEDULE = "2-59/5 * * * *"
+# Три пропущенных прогона
+PULSE_TTL_SEC = 15 * 60
+
+
+@dag(
+    doc_md=PULSE_DOC,
+    owner_links=OWNER_LINKS,
+    # Проверки пульса укладываются в секунды: брокер — два broadcast по 2 с и ping с петлёй
+    # pub/sub до 12 с, метабаза — 5 с на запрос
+    default_args={**DEFAULT_ARGS, "execution_timeout": timedelta(minutes=2)},
+    start_date=datetime(2026, 9, 28, tzinfo=MSK),
+    schedule=PULSE_SCHEDULE,
+    tags=["DataTools", "tools", "health"],
+    catchup=False,
+    is_paused_upon_creation=False,
+    max_active_runs=1,
+    # Меньше интервала: зависший прогон краснеет до следующего, а не копит очередь за собой
+    dagrun_timeout=timedelta(minutes=4),
+)
+def tools_system_pulse():
+
+    @task(task_id="collect", multiple_outputs=False)
+    def collect(**context) -> dict:
+        """Пять дешёвых проверок и заметка; вердикты — в XCom health, находками таск не падает."""
         ti, dag_run = context["ti"], context["dag_run"]
         started = time.time()
         checks = {
             "components": _run("components", check_components),
             "celery": _run("celery", check_celery),
-            "s3_logs": _run("s3_logs", check_s3_logs, float(context["params"]["s3_slow_sec"]), dag_run.run_id),
-            "delivery": _run("delivery", check_delivery, ti, dag_run),
-            "pools": _run("pools", check_pools),
+            "control": _run("control", check_control),
             "metabase": _run("metabase", check_metabase),
-            "parsing": _run("parsing", check_parsing, dag_run.dag_id, dag_run.run_id),
-            "dag_size": _run("dag_size", check_dag_size),
-            "runs": _run("runs", check_runs),
-            "scheduled": _run("scheduled", check_scheduled),
-            "tables": _run("tables", check_tables),
+            "delivery": _run("delivery", check_delivery, ti, dag_run),
         }
-        took = round(time.time() - started, 1)
-        status, reasons = verdict(checks)
-        stand = env_stand() or "?"
-        logger.info("%s system_health %s за %.1f с%s", ICON[status], stand, took,
-                    "".join(f"\n  {r}" for r in reasons))
-
-        result = {"status": status, "reasons": reasons, "checks": checks, "took_sec": took}
-        add_note(note_text(checks), context, level="task,DAG",
-                 title=f"{ICON[status]} {took} sec system_health {stand}")
-        report_health({name: {**c, "skill": "tools"} for name, c in checks.items()}, context,
-                      ttl_sec=REPORT_TTL_SEC)
-        if status == "error":
-            # Падающая задача return-значения не оставляет — кладём его сами, иначе лента
-            # в XCom теряла бы ровно те прогоны, ради которых она ведётся
-            ti.xcom_push(key="return_value", value=result)
-            raise AirflowFailException("; ".join(reasons))
+        result = _finish("system_pulse", checks, started, context)
+        title = f"{ICON[result['status']]} {result['took_sec']} sec system_pulse {env_stand() or '?'}"
+        add_note(note_text(checks), context, level="task,DAG", title=title)
         return result
 
-    check()
+    collect() >> health_tasks(ttl_sec=PULSE_TTL_SEC, skill=SKILL)
 
 
-tools_system_health()
+tools_system_pulse()

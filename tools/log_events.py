@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-24 13:00 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -42,14 +42,16 @@
 | 🕐 `hours` | Окно отчёта, часов *(default: `24`, максимум `168` — см. замеры в коде)* |
 | 📈 `days` | Глубина разбивки по дням *(default: `7`, максимум `30`)* |
 | 🔝 `top` | Сколько строк «даг · задача» показать *(default: `10`)* |
-| 🚨 `alert_after` | Порог: **задач** больше — таск краснеет; `0` — только показывать *(default: `0`)* |
+| 🚨 `alert_after` | Порог: **задач** больше — ❌ `health_errors`, ран красный; `0` — только показывать (⚠️) *(default: `0`)* |
 | ⏰ `schedule` | Расписание (МСК): cron или пресет, пусто — только вручную *(default: `30 6 * * *`)* |
 | 💾 `save_params` | Сохранить параметры запуска как значения по умолчанию *(default: `False`)* |
 
 Отчёт только читает журнал: ничего не удаляет и не правит. Чистит `log` отдельный даг —
 `db_cleanup`, и от его `retention_days` зависит, насколько глубоко видно разбивку по дням.
 
-**Таски:** `params` → `collect` → `report`.
+**Таски:** `params` → `collect` → `report` → `health_warn` / `health_errors`. Сбои таски не
+роняют: выше порога `alert_after` — ❌ `health_errors` (ран красный, уведомление), ниже или при
+нулевом пороге — ⚠️ `health_warn`. Отчёт плагина здоровья пишет `health_errors`.
 """
 
 from datetime import datetime, timedelta, timezone
@@ -61,10 +63,10 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task)
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, saved_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task)
 
 logger = logging.getLogger("airflow.task")
 
@@ -103,6 +105,10 @@ PARAMS_VAR = 'tools_log_events_params'
 SAVED = saved_params(PARAMS_VAR)
 
 DEFAULT_SCHEDULE = '30 6 * * *'
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
+# Навык агента, на который отчёт плагина отсылает толкование сбоев
+SKILL = 'tools-log-events'
 
 
 def names_drifted() -> str:
@@ -263,9 +269,10 @@ SELECT event, count(*) AS cnt
     start_date=datetime(2026, 9, 4, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'check'],
+    tags=['DataTools', 'tools', 'health'],
     catchup=False,
-    is_paused_upon_creation=True,
+    # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
+    is_paused_upon_creation=False,
     max_active_runs=1,
     # Потолок на прогон, а не только на таск: при max_active_runs=1 зависший прогон
     # закрывает дорогу всем следующим — так же, как у сторожа метабазы.
@@ -298,21 +305,12 @@ SELECT event, count(*) AS cnt
 )
 def tools_log_events():
 
+    # Негодное расписание переменную не переписывает, и таск падает: битое значение уронило
+    # бы разбор файла и убрало из UI саму форму, через которую его можно починить
     @task(task_id='params')
     def save_params(**context) -> str:
         """💾 Сохраняет параметры запуска как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        # Негодное расписание переменную не переписывает, и таск обязан упасть: битое
-        # значение уронило бы разбор файла и убрало из UI саму форму, через которую его
-        # можно починить (см. спеку check, сценарий «Негодное расписание в форме»).
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        add_note(msg, context=context, level='task')
-        return msg
+        return store_params_task(PARAMS_VAR, SAVED, context)
 
     @task(task_id='collect', trigger_rule=TriggerRule.NONE_FAILED)
     def collect(**context) -> dict:
@@ -407,9 +405,7 @@ def tools_log_events():
 
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
-        """🧾 Сводка в заметку; при превышении порога — красный таск и уведомление."""
-        from airflow.exceptions import AirflowFailException
-
+        """🧾 Сводка в заметку и вердикт здоровья: выше порога — error, есть сбои — warn."""
         p = context['params']
         limit = int(p['alert_after'])
         total, tasks, runs = snapshot['total'], snapshot['tasks'], snapshot['runs']
@@ -439,6 +435,8 @@ def tools_log_events():
             msg = f"✅ чисто: {head}"
             add_note({msg: ours} if ours else msg,
                      context=context, level='task,dag', title='📊 log_events ')
+            push_health({'log_events': {'status': 'healthy', 'summary': head,
+                                        'ours': snapshot['ours_total']}}, context)
             return msg
 
         lines = [f"{k}: {v['cnt']} (задач {v['tasks']})"
@@ -458,14 +456,19 @@ def tools_log_events():
 
         add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events ')
 
-        # Порог — по задачам, а не по событиям (почему — в docstring модуля).
-        if limit and tasks > limit:
-            raise AirflowFailException(f"⚠️ {head} — задач больше порога {limit}\n"
-                                       + "\n".join(lines))
+        # Порог — по задачам, а не по событиям (почему — в docstring модуля). Выше порога —
+        # error: таск не падает, ран краснеет через health_errors
+        over = bool(limit and tasks > limit)
+        push_health({'log_events': {'status': 'error' if over else 'warn',
+                                    'summary': head + (f" — задач больше порога {limit}" if over else ""),
+                                    'total': total, 'tasks': tasks, 'runs': runs, 'limit': limit,
+                                    'top': lines[:10]}}, context)
         return head
 
     snapshot = collect()
-    save_params() >> snapshot >> report(snapshot)
+    verdict = report(snapshot)
+    save_params() >> snapshot >> verdict
+    verdict >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_log_events()

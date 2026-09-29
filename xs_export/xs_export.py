@@ -1,5 +1,5 @@
 """🏭 Фабрика DAG-ов выгрузок xStream: метаданные из JSON → DAG на поставку.
-*2026-08-31 20:58 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Читает export_xs_optimized.json и на каждую запись собирает DAG, вся начинка которого —
 группа задач из xs_common. Сборщику передаётся name_file целиком: по нему он выбирает
@@ -139,7 +139,7 @@ def create_dynamic_dags():
     with open(META_FILE, 'r') as f:
         dag_configs = json.load(f)
 
-    common_tags = ["DataLab", "CI02420667", "ClickHouse", "xStream"]
+    common_tags = ["DataTools", "CI02420667", "ClickHouse", "xStream"]
 
     for dag_id, config in dag_configs.items():
         # Запись, из которой SQL не собирается, дальше упрётся в RuntimeError сборщика —

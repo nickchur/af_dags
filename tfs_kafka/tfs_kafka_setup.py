@@ -1,5 +1,5 @@
 """⏸️ DAG-пульт паузы отправки в ТФС.
-*2026-08-28 17:15 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ставит и снимает паузу отправки, не трогая ни выгрузку, ни постановку в очередь: файлы
 продолжают складываться в очередь по расписанию, а `tfs_kafka_snd` их не берёт. Сняли
@@ -100,7 +100,7 @@ NOTE_LIMIT = 15
     schedule=None,               # только ручной запуск
     max_active_runs=1,
     catchup=False,
-    tags=["DataLab", "CI02420667", "TFS", "kafka", "setup"],
+    tags=["DataTools", "CI02420667", "TFS", "kafka", "setup"],
     is_paused_upon_creation=False,
     doc_md=__doc__,
     params={

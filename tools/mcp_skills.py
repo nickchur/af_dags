@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-09-27 17:06 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -230,7 +230,7 @@ def _docs_s3():
     },
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataLab', 'tools', 'mcp'],
+    tags=['DataTools', 'tools'],
     catchup=False,
     is_paused_upon_creation=False,
     params={

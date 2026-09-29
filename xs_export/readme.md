@@ -1,5 +1,5 @@
 # Динамическая генерация DAG-ов xStream Export
-*2026-08-31 20:44 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:39 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Данная директория содержит инструменты для миграции и работы с динамическими DAG-ами выгрузки данных через xStream (Airflow).
 
@@ -30,4 +30,4 @@
 
 ## Теги
 Все создаваемые DAG-и автоматически помечаются тегами:
-`DataLab`, `CI02420667`, `ClickHouse`, `xStream`.
+`DataTools`, `CI02420667`, `ClickHouse`, `xStream`.

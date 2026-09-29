@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-09-24 13:00 MSK · v3.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v3.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -1360,7 +1360,7 @@ def create_export_dag(dag_id: str, group: dict) -> tuple[str, DAG]:
         # что-то своё здесь нельзя — пакет поехал бы не в своё окно.
         schedule_interval=group['schedule'],
         max_active_tasks=int(gp['max_active_tasks']), max_active_runs=1, catchup=False,
-        tags=['DataLab', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
+        tags=['DataTools', 'CI02420667', 'ClickHouse', 'ER', replica, *schemas],
         render_template_as_native_obj=True,
         # На паузе создаётся любой новый пакет, а при is_paused в настройке паузу ещё
         # и дожимает синк — на уже созданный даг этот флаг сам по себе не действует.
@@ -1505,7 +1505,7 @@ def create_broken_dag(dag_id: str, errors: list, schedule=None) -> tuple[str, DA
         },
         start_date=datetime(2024, 12, 18, tzinfo=timezone.utc),
         schedule_interval=schedule, max_active_runs=1, catchup=False,
-        tags=['DataLab', 'CI02420667', 'ER', replica, 'BROKEN'],
+        tags=['DataTools', 'CI02420667', 'ER', replica, 'BROKEN'],
         is_paused_upon_creation=True,
     )
     with dag:

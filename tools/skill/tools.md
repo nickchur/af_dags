@@ -1,167 +1,133 @@
 ---
 name: tools
-description: Служебные даги Airflow (каталог tools/, на сигме CI06932748/tools) — tools_queue_analyze (почему задачи ждут в scheduled, мусор в брокере), tools_paused_runs_cleanup (зависшие раны запаузенных дагов), tools_pg_activity (сессии и блокировки метабазы), tools_system_health, tools_log_events, tools_db_cleanup, tools_log_cleanup, tools_test_dags, tools_show_connections / tools_test_connections, tools_mcp_skills. Используй, когда спрашивают «почему задачи висят в scheduled / queued», «очередь стоит», «даг ждёт, а слоты свободны», «ран запаузенного дага висит», «runs.paused_active», «что показал tools_*», «tools_* красный», «как поменять расписание служебного дага», «где сохраняются параметры», «нет навыка на MCP / нет текста в DAG Docs».
+description: Индекс служебных дагов Airflow (каталог tools/, на сигме CI06932748/tools) — какой даг отвечает на какой вопрос, общее устройство (пул, сохраняемые параметры, расписание), итог дагов-проверок в тасках health_warn / health_errors, теги-роли. Подробности по дагам — навыки tools-system-health, tools-pg-activity, tools-log-events, tools-test-connections, tools-test-dags, tools-queue-analyze, tools-paused-runs. Используй, когда спрашивают про любой tools_*, «tools_* красный», «health_errors / health_warn», «plugins: нет отчёта», «как поменять расписание служебного дага», «где сохраняются параметры», «нет навыка на MCP / нет текста в DAG Docs», «метабаза растёт».
 ---
 
-# Служебные даги (`tools/`)
+# Служебные даги (`tools/`) — индекс
 
-*2026-09-27 17:12 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:06 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
 прав код. На сигме каталог лежит как `CI06932748/tools/…`, общие функции — модуль
-`CI06932748.tools.utils` (в репозитории — `plugins/utils.py`). До 24.09.2026 каталог в
-репозитории назывался `check/`; нынешний `s3_tools/` (S3-инструменты альфы) в навык не входит.
+`CI06932748.tools.utils` (в репозитории — `plugins/utils.py`). `s3_tools/` в навык не входит.
 
 У тебя только чтение через MCP: раны, состояния задач, заметки. Даги ты не запускаешь, паузу
 не снимаешь, галочки не ставишь — советуешь человеку, **что запустить и с какими
-параметрами** (раздел 7).
+параметрами** (раздел 5).
 
-## 0. Когда этот навык
+## 0. Куда идти
 
-- Любой даг `tools_*` — сюда.
-- «Задачи висят в `scheduled`», «очередь стоит» — сначала `get_system_health` по навыку
-  **`airflow-health`** (`plugins.tools_system_health.checks.scheduled` и `.runs`), подробный разбор — отчёт
-  `tools_queue_analyze` (раздел 3).
-- Загрузки CTL — навык **`ctl-worker`**; ЕР — **`er-export`**; ТФС — **`tfs-kafka`**.
+| Вопрос | Навык |
+|---|---|
+| Что показал `tools_system_pulse` / `tools_system_health`, `control`, `workers: 0`, ошибки импорта, плагин молчит | **`tools-system-health`** |
+| `dag_size`, даг больше 300 тасков | **`tools-test-dags`** |
+| Сессии и блокировки метабазы, `tools_pg_activity` | **`tools-pg-activity`** |
+| Задачи висят в `queued`, сбои доставки, `tools_log_events` | **`tools-log-events`** |
+| Подключение не работает, `tools_test_connections` | **`tools-test-connections`** |
+| Сериализация дрожит, дубль `dag_id`, время разбора, `tools_test_dags` | **`tools-test-dags`** |
+| Задачи висят в `scheduled`, очередь стоит, мусор в брокере | **`tools-queue-analyze`** (сначала `get_system_health` по навыку **`airflow-health`**) |
+| Раны запаузенных дагов, `runs.paused_active` | **`tools-paused-runs`** |
+| Ран висит в `running`, `last_scheduling_decision` замер; раны деактивированных дагов, `runs.inactive_active` | **`tools-system-health`** |
+| Загрузки CTL / ЕР / ТФС | **`ctl-worker`** / **`er-export`** / **`tfs-kafka`** |
 
 ## 1. Общее устройство
 
-- **Пул `tools_pool`** (16 слотов) на все служебные даги. Короткие проверки идут с
-  `priority_weight 900`, `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000).
-  Тяжёлые `test_dags` и `test_hrp_operators` приоритета не получают намеренно.
-- **Сохраняемые параметры.** Форма запуска предзаполняется из Variable
-  `tools_<имя>_params` (у `pg_activity` — `tools_pg_activity_cfg`), при её отсутствии — из кода.
-  Записывает переменную только запуск с галочкой **`save_params`** — отдельный таск `params`
-  (☮️, если галочки нет или значения не изменились). Разовый эксперимент в UI поэтому ничего не
-  меняет.
-  Что сохранено на самом деле, смотри MCP-инструментом `get_variable_value("tools_<имя>_params")`
-  (у `pg_activity` — `tools_pg_activity_cfg`): значение — форма и `schedule`, `description` — когда и каким раном записано. Без аргумента
-  инструмент перечисляет доступные ключи; `local_connections` через MCP закрыта намеренно.
-- **Расписание — тоже параметр** `schedule` (cron или пресет; пусто или `None` — только вручную).
-  Новое применяется **со следующего разбора файла**, сам запуск идёт по старому. Негодное
-  значение таск `params` не записывает и падает ❌; уже записанное битым игнорируется в пользу кода.
+- **Этапы и имена тасков одинаковы у всех дагов:** `params` → `collect` → действие (`clean`,
+  `close`, `purge`, `terminate`, `sweep`, `publish`, `save`…) → `report` → у плагинов здоровья
+  `health_warn` / `health_errors`. 28.09.2026 переименованы:
+  `system_health.check` → `collect` + `report`, `paused_runs_cleanup.find` и
+  `show_connections.show_connections` → `collect`, `summary` → `report` (`test_connections`,
+  `test_dags`, `test_hrp_operators`); в старых ранах — старые имена.
+- **Итог дага-проверки — в двух последних тасках.** Сбор и сводка находками не падают:
+  - ⚠️ `health_warn` зелёный с заметкой — есть предупреждения; ☮️ — нет;
+  - ❌ `health_errors` красный, ран красный, уведомление — есть ошибки; ☮️ — нет;
+  - красный **сбор** (`collect`, `report`) — сломалась сама проверка, `health_errors` назовёт
+    его «не выполнился».
+  Исключение — таск на один объект (подключение, перепроверка одного DAG'а): он красный, чтобы
+  клетка называла объект, а ран краснеет только по вердикту сводки.
+- **Теги — роль:** `health` — плагин здоровья, `health_errors` пишет отчёт в
+  `system_health/checks/<dag_id>.json`, его читает `get_system_health` → `plugins`; `clean` —
+  удаляет; `AutoQA` — регрессия и проверка «работает ли» (`dummy` раз в час). Плагины: `system_pulse`, `system_health`, `pg_activity`, `log_events`,
+  `test_connections`, `test_dags`, `queue_analyze`.
+- **Пул `tools_pool`** (16 слотов). Короткие проверки идут с `priority_weight 900`,
+  `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Тяжёлые `test_dags`,
+  `test_hrp_operators` и чистильщики приоритета не получают намеренно.
+- **Сохраняемые параметры.** Форма запуска предзаполняется из Variable `tools_<имя>_params`
+  (у `pg_activity` — `tools_pg_activity_cfg`), при её отсутствии — из кода. Записывает её
+  только запуск с галочкой **`save_params`** — таск `params` (☮️, если галочки нет или значения
+  не изменились). Что сохранено, смотри MCP `get_variable_value("tools_<имя>_params")`:
+  значение — форма и `schedule`, `description` — когда и каким раном записано. Без аргумента
+  инструмент перечисляет ключи; `local_connections` через MCP закрыта намеренно.
+- **Расписание — тоже параметр** `schedule` (cron или пресет; пусто или `None` — только
+  вручную). Новое применяется **со следующего разбора файла**. Негодное значение таск `params`
+  не записывает и падает ❌; уже записанное битым игнорируется в пользу кода.
 - **Разовые галочки не сохраняются никогда**: `purge` (`queue_analyze`), `terminate`
-  (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение
-  — `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
-- **Создаются на паузе** (`is_paused_upon_creation=True`): `db_cleanup`, `log_cleanup`,
-  `log_events`, `pg_activity`, `queue_analyze`, `paused_runs_cleanup`, а также ручные
-  `test_kafka_*` и `dummy`. Включены сразу: `system_health`, `mcp_skills`, `show_connections`,
-  `test_connections`, `test_dags`, `test_hrp_operators`. Даг на паузе на контуре — обычно
-  решение человека, а не авария.
+  (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение —
+  `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
+- **Создаются на паузе**: `db_cleanup`, `log_cleanup`, `paused_runs_cleanup`, ручные
+  `test_kafka_*`. Плагины здоровья, `dummy`, `mcp_skills`, `show_connections`,
+  `test_hrp_operators` включаются сами. Плагин на паузе — в `get_system_health` «нет отчёта»;
+  на паузе он обычно по решению человека.
 - **Итог — в заметках** рана и задач (`add_note`): ✅ / ❌ / ☮️. XCom тебе недоступен.
 
 ## 2. Даги
 
-| Даг | Расписание по умолчанию | Что делает | Что меняет |
+| Даг | Расписание | Что делает | Что меняет |
 |---|---|---|---|
-| `tools_queue_analyze` | вручную | Почему задачи ждут; брокер: живые и мусор | брокер — только при `purge` |
-| `tools_paused_runs_cleanup` | `0 * * * *` | Раны `running`/`queued` у запаузенных дагов | Mark failed — только при `close` |
-| `tools_pg_activity` | `*/10 * * * *` | Сессии метабазы: `idle in transaction`, долгие запросы, блокировки, чей таск | сессии — только при `terminate` и `dry_run=False` |
-| `tools_system_health` | `7 * * * *` | Снимок Health раз в час: компоненты, celery, бакет логов, пулы, метабаза, разбор файлов, размер DAG'ов, раны, `scheduled`, таблицы; отчёт — раздел `plugins` в `get_system_health` | ничего |
-| `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log`: `stuck in queued`, `heartbeat timeout`, `state mismatch` | ничего |
-| `tools_db_cleanup` | `0 2 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
-| `tools_log_cleanup` | `17 5 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и выставляет правило жизненного цикла — по нему хранилище удаляет само, без отчёта |
-| `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора файлов | ничего; никогда не падает |
-| `tools_show_connections` | `0 23 * * *` | Подключения secret backend по типам → Variable `local_connections` | Variable |
-| `tools_test_connections` | `15 23 * * *` | Доступность каждого подключения, ✅/❌/☮️ | ничего |
-| `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации `af_docs`, тексты `af_doc__*` при `store_docs` | Variables |
+| `tools_system_pulse` | `2-59/5 * * * *` | Лежит ли контур: компоненты, celery, control, метабаза, доставка | ничего |
+| `tools_system_health` | `7 * * * *` | Почему задачи не идут: S3 логов, пулы, разбор, раны, `scheduled`; сторож отчётов плагинов | ничего |
+| `tools_pg_activity` | `*/10 * * * *` | Сессии и блокировки метабазы | сессии — только при `terminate` и `dry_run=False` |
+| `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log` | ничего |
+| `tools_test_connections` | `15 23 * * *` | Доступность каждого подключения, важные — `critical` | ничего |
+| `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
+| `tools_queue_analyze` | `10 9 * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
+| `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
+| `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
+| `tools_log_cleanup` | `17 8 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
+| `tools_show_connections` | `0 23 * * *` | Подключения secret backend → Variable `local_connections` | Variable |
+| `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |
-| `tools_dummy` | вручную | Проверка Markdown в UI | ничего |
+| `tools_dummy` | `3 * * * *` | Шедулер и воркер живы: `dummy_task` (`EmptyOperator`, отмечает шедулер) → `ping` на воркере; в заметке `ping` — сколько думал шедулер и ждала очередь; красный по `dagrun_timeout` (50 мин) | ничего |
 
-## 3. `tools_queue_analyze` — как читать отчёт
+Cron у всех — по Москве (зона `start_date` дага). До 29.09.2026 по UTC шли `tools_queue_analyze`
+(`10 6`), `tools_db_cleanup` (`0 2`) и `tools_log_cleanup` (`17 5`); время прогонов то же.
 
-Таски: после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` ждёт только
-`broker`; `report` — всех (идёт при любом их исходе); `prune` (чистка дампов) сам по себе.
-Заметка `🔬 Разбор очереди` на ране: сначала **выводы**, потом таблица по разделам.
-
-У каждой живой задачи в `scheduled` (даг не на паузе, ран `running`), которая ждёт дольше
-`stale_min` (5 мин), одна причина по порядку:
-
-| Вывод | Что значит | Что советовать |
-|---|---|---|
-| 🚧 `<даг>` упёрся в `max_active_tasks` | `queued`+`running` дага ≥ его лимита | поднять `max_active_tasks` **в коде дага**; `parallelism` не поможет |
-| 🏊 Пул исчерпан | слоты пула заняты целиком | размер пула или разнести даги по пулам |
-| ⚖️ Приоритет | месту в даге и пуле есть, а вес ниже медианы ушедших в работу за час | `priority_weight` + `weight_rule='absolute'` у голодающего дага |
-| ❓ Без видимой причины | ни лимит, ни пул, ни вес | лог шедулера — человеку |
-| ⏱️ Ран закрыт без единого старта | failed за сутки, ни одна задача не стартовала, есть `skipped` | след голодания: `dagrun_timeout` сработал, пока задачи ждали |
-| ⏸️ Раны запаузенных дагов | ран в `queued`/`running` у дага на паузе | не поедут никогда — `tools_paused_runs_cleanup` |
-| 🅿️ На парковке | `scheduled` у дага на паузе или в ране не `running` | шедулер их не берёт, в ёмкость не входят |
-| 🔒 Слоты executor'а заняты | `queued`+`running` ≥ `parallelism` × живые шедулеры | лог шедулера, строки `slot_reconciler` |
-| 📭 `queued` без сообщения в брокере | задач в `queued` больше, чем живых сообщений и занятых слотов | кандидаты в `stuck in queued`; `tools_log_events` |
-| 🗑️ Мусор в брокере | доля ≥ `min_junk_share` (0.5) | запуск с `purge` — человеку |
-
-`parallelism` в отчёте — **воркера**; у шедулера он может быть другим (vault перекрывает
-`airflow.cfg`) — сверяй через MCP `get_config_value`, поле `components`.
-
-Пример из жизни (сигма, 23.09.2026): 297 задач в `scheduled` — не утечка слотов
-(`slot_reconciler gap=0`), а лимит 4 у `raw_to_stable_*`; `tfs_kafka_snd` с весом 1 проигрывал
-весам 22–1921 и закрывался по `dagrun_timeout` без старта.
-
-## 4. `tools_paused_runs_cleanup`
-
-Шедулер запаузенный даг не разбирает вовсе — ни задачи, ни `dagrun_timeout`. А `trigger_dag`
-(кнопка, API, сенсор CTL) паузу не смотрит и создаёт ран сразу в `queued`. Такой ран висит,
-пока паузу не снимут.
-
-- Возраст: `queued` — от `queued_at`; `running` — от последнего движения задач. Ран, где задача
-  ещё в `running`, не трогается.
-- Без `close` — только отчёт `⏸️ Зависших ранов…`: даги, раны, возраст и **кто поставил паузу**
-  (последнее событие в журнале: `paused` — UI, `patch_dag` — API, `cli_dag_pause` — CLI;
-  «нет записи» — пауза из кода, например `update_dag_pause` CTL или создание на паузе).
-- `close` — как Mark failed: незавершённые задачи → `skipped`, ран → `failed`, на ран заметка
-  «Закрыт tools_paused_runs_cleanup…». Больше `max_runs` (200) — не закрывает ничего, таск ❌.
-- Паузу не снимает. Ран `failed` «без причины» у запаузенного дага — смотри его заметку.
-- В `get_system_health` закрытые раны — `counts.closed_runs` и `details.closed_runs`, не
-  падения (etl-core 1.1.31, навык `airflow-health` v1.23). На контуре со старым пакетом они
-  идут в «упавших запусков»: сотни ранов с одним временем окончания и старыми `run_id` —
-  прогон с `close`, а не авария. Так было на сигме-ифт 24.09.2026 в 12:01: «упавших 388».
-- У CTL-дагов на альфе такие раны `queued` закрывает ещё и санитар `ctl_monitor`.
-
-## 5. Разбор по симптому
+## 3. Разбор по симптому (общее)
 
 | Симптом | Куда смотреть |
 |---|---|
-| Задачи висят в `scheduled` | последний ран `tools_queue_analyze`; нет свежего — посоветуй запуск (разбор ничего не меняет) |
-| Задачи висят в `queued` | `tools_log_events` (`stuck in queued`), вывод 📭 в `queue_analyze`, карточка Health |
-| `checks.runs` ⚠️ (раны у запаузенных дагов) | `tools_paused_runs_cleanup` без `close` — список и кто поставил паузу |
-| Таски умирают с обрывом метабазы, блокировки | заметки `tools_pg_activity`: `owner_alive=false` — брошенная сессия |
-| `tools_pg_activity` ❌ на `collect`: `canceling statement due to statement timeout` | его запрос не уложился в 30 с. Не объясняй это блокировкой или `idle in transaction`: SELECT в PostgreSQL блокировок строк не ждёт. До v1.8 модуля запрос сканировал весь `task_instance` (ift, 1,3 млн строк, падал с 01.09.2026); с v1.8 он идёт по индексам. Падает и после выкладки — метабаза перегружена или таблицы раздуты: человеку `EXPLAIN` запроса из заметки и `n_dead_tup`, `last_autoanalyze` в `pg_stat_user_tables` для `task_instance` и `job` |
-| `tools_test_dags` · `check_serialized.recheck_serialized_dag` в `running` часами | задача сама кончается за `min_file_process_interval` + `dag_file_processor_timeout` (у нас ~20 мин). Часами — это зомби, который шедулер не снял: `platform.zombies` и строка «Зомби не снимаются» навыка `airflow-health`. Закрыть — Mark failed в UI, это делает человек. Сигма-ифт 25.09.2026: три экземпляра висели 10 ч |
-| `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «сериализация переписана снова» | разбор файла недетерминирован: в коде дага порядок из `set`/словаря, время, случайность или внешний вызов. Разница `Было → Стало` в заметке называет поле. Правит автор дага |
-| `tools_test_dags` · `check_serialized.recheck_serialized_dag` ❌ «два файла на один dag_id» | это не ложное срабатывание: один `dag_id` объявлен в двух файлах, каждый разбор переписывает сериализацию другого, и в UI и у шедулера задачи и теги то есть, то нет. Разница из заметки и лога (`Было → Стало`) показывает, какая версия урезана: тег `QA`, меньше задач. Лечит владелец дага — удалить дубль или переименовать `dag_id`; путь в заметке называет чужой каталог (не `tools/`) — это не наш код, даг не перезапускать и `test_dags` не править. Сигма-ифт 24.09.2026: `reload_core_person_position_action` в `CI06884356/analytics/datalab/` и `CI06932748/analytics/datalab/` |
-| Файлы дагов не разбираются, ошибки импорта | `tools_system_health` (новые ошибки импорта по id), `tools_test_dags` (`parse_time`) |
-| «Даги с большим числом тасков», `tools_system_health` ⚠️ `dag_size` | заметка и XCom `checks.dag_size` последнего рана: `classes` — сколько DAG'ов в каждом классе, `top` — больше 300 тасков. В строке `имя (A/B)`: A — тасков в определении, B — наибольшее за один ран за 7 дней (с раскрытыми mapped); B ≫ A — это `expand`. Совет — владельцу дага: делить даг или ограничить раскрытие. Не падение, контур этим не сломан |
-| Подключение не работает | `tools_test_connections` (❌ по `conn_id`); список — `tools_show_connections` |
-| На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый или обновлённый навык появляется на сервере до получаса спустя после выкладки дагов, это не новая версия core; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма), альфа читает тексты из бакета |
+| `get_system_health` → `plugins`: «плагин tools_X: нет отчёта» | даг на паузе, не запускался после выкладки или расписание снято (`schedule` пуст в Variable `*_params`) |
+| «последний отчёт N назад» | прогоны не идут: раны дага, пул `tools_pool`, очередь |
+| статус проверки в отчёте плагина | итог дага; поле `skill` проверки называет навык с толкованием |
+| `tools_*` ❌ на таске `params`, есть `start_date`, в логе «не cron и не пресет» | негодное `schedule` в форме **ручного** запуска с `save_params`; переменная не тронута, остальные таски — `upstream_failed` |
+| `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди. Расписание ни при чём. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable не трогать |
+| На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый навык появляется до получаса спустя после выкладки дагов; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма) |
+| `tools_dummy` ❌, `dummy_task` не зелёный | стоит шедулер: `get_system_health` → компоненты |
+| `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_pulse` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
+| `tools_dummy` зелёный, в заметке `ping` шедулер или очередь — минуты | задержка планирования или доставки: `tools_queue_analyze`, `tools_log_events` |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |
-| `tools_*` ❌ на таске `params`, есть `start_date` и лог с «не cron и не пресет» | негодное `schedule` в форме **ручного** запуска с `save_params`; переменная не тронута, остальные таски — `upstream_failed` |
-| `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди (`stuck in queued`, упавший воркер, затор). Расписание ни при чём: у плановых ранов (`scheduled__…`) `save_params` не стоит, а битое сохранённое значение `params` не проверяет. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable `*_params` не трогать |
 
-## 6. Норма, а не тревога
+## 4. Норма, а не тревога
 
 - ☮️ `params` — запуск без `save_params` или без изменений.
-- ☮️ `purge` / `close` — галочка не стояла: отчёт без изменений.
-- `tools_test_dags`: подозрение на дрожание само по себе не авария. Красный
-  `recheck_serialized_dag` означает, что перепроверка его подтвердила (§5), и тогда
-  красная и сводка.
-- ☮️ у проверок `tools_test_connections` — проверка пропущена (нет библиотеки, выключенное подключение).
-- Даг `tools_*`, которого нет в списке, но есть в старых ранах: `tools_queue_cleanup` с
-  24.09.2026 — это `tools_queue_analyze`; `dummy_dag` — `tools_dummy`.
+- ☮️ `health_warn` и `health_errors` — всё здорово.
+- ☮️ `purge` / `close` / `terminate` — галочка не стояла.
+- ❌ таск подключения при зелёном ране `tools_test_connections` — упало вспомогательное.
+- Даг `tools_*` из старых ранов: `tools_queue_cleanup` с 24.09.2026 — `tools_queue_analyze`;
+  `dummy_dag` — `tools_dummy`.
 
-## 7. Чего не советовать и что — человеку
+## 5. Чего не советовать и что — человеку
 
-- **Не советуй `parallelism`**, пока отчёт показывает 🚧 лимит дага: лечится лимитом в коде дага.
-- **Не советуй снимать паузу** ради зависшего рана: вместе с ним поедут все накопленные раны и
-  расписание дага. Сначала — чьё это решение (журнал паузы в отчёте).
 - `purge`, `close`, `terminate`, `purge_docs`, `db_cleanup` с `dry_run=False` — запускает
   **человек**. Ты говоришь, с какими параметрами, и что увидит в заметке.
-- Сменить расписание: запуск дага с новым `schedule` и `save_params` — без выкладки.
+- Сменить расписание или список важных подключений: запуск с новыми параметрами и
+  `save_params` — без выкладки.
 - `test_kafka` не для регулярной отправки: мимо очереди и лимитов тракта ТФС.
 
-## 8. Как отвечать
+## 6. Как отвечать
 
 Коротко: **что видно** (даг, ран, заметка — цитатой ключевой строки), **что это значит** по
-разделам 3–6, **что сделать** и кто это делает. Если нужного рана нет или он старый — так и
+навыку дага, **что сделать** и кто это делает. Если нужного рана нет или он старый — так и
 скажи и предложи запуск с конкретными параметрами.

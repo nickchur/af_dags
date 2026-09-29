@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-27 17:49 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:06 MSK · v3.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -7,7 +7,14 @@
 по галочке `purge`.
 
 **Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` (только при
-`purge`) ждёт `broker`; `report` — всех, при любом их исходе; `prune` — чистка дампов, сам по себе.
+`purge`) ждёт `broker`; `report` — всех, при любом их исходе, → `health_warn` / `health_errors`.
+Дампы убирает `tools_log_cleanup` общим сроком бакета.
+
+**Плагин здоровья** (тег `health`), раз в сутки в 09:10 MSK — в начале рабочего дня очередь
+занята, ночью разбирать нечего. Вердикт не выше ⚠️: очередь — не авария. Предупреждение —
+мусор в брокере не ниже `min_junk_share`, голодание по приоритету, раны, закрытые без старта,
+и не отработавший сборщик; остальные выводы — справка в заметке. Плановый прогон брокер не
+чистит: `purge` разовая и не сохраняется. Отчёт для `get_system_health` пишет `health_errors`.
 
 | Таск | Что смотрит |
 |---|---|
@@ -39,7 +46,6 @@
 | `queues` | Очереди через запятую; пусто — собрать из конфигурации и метабазы *(default: пусто)* |
 | `min_junk_share` | Не удалять, если мусора меньше этой доли очереди *(default: `0.5`)* |
 | `max_delete` | Не удалять, если мусора больше этого числа *(default: `5000`)* |
-| `keep_days` | Сколько дней держим дампы, старше — убираем *(default: `30`)* |
 | `schedule` | Расписание; пусто — только вручную *(default: пусто)* |
 | `save_params` | Записать форму в Variable `tools_queue_analyze_params` *(default: `False`)* |
 | `purge` | Удалять размеченный мусор. **В Variable не сохраняется** *(default: `False`)* |
@@ -63,7 +69,6 @@ from datetime import datetime, timedelta, timezone
 import base64
 import json
 import logging
-import re
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
@@ -72,11 +77,13 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
+        store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
+        store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -84,8 +91,8 @@ logger = logging.getLogger("airflow.task")
 # Пул заводим при разборе файла: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
 
-# Бакет и коннект — те же, что у логов задач, но папка своя: дампы не должны попасть под
-# чистку логов (см. tools/log_cleanup.py) и мешаться с ними в выдаче.
+# Бакет и коннект — те же, что у логов задач, папка своя: с логами в выдаче не мешается,
+# старое убирает tools_log_cleanup общим сроком бакета.
 # verify=False у S3Hook ниже — как во всех дагах этого репозитория: наш S3-шлюз ходит
 # по внутреннему сертификату, которого нет в бандле CA у образа. Правильное решение —
 # CA в подключении; пока его нет, оставляем как есть, но помним, что это не «на всякий
@@ -110,14 +117,22 @@ DEFAULTS = {
     "min_junk_share": 0.5,
     # Верхний предел на одно удаление: страховка от ошибки в разметке, а не от объёма.
     "max_delete": 5000,
-    "keep_days": 30,
     # Как STALE_AFTER_SEC карточки Health (etl-core celery_health_plugin): младше — обычное
     # ожидание цикла шедулера
     "stale_min": 5,
-    # Разбор ничего не меняет, но и регулярным быть не обязан: по умолчанию — вручную
-    "schedule": "",
+    # Раз в сутки в 09:10 MSK (cron в зоне start_date, как у соседних дагов; до 29.09.2026 —
+    # UTC, «10 6 * * *»): в начале рабочего дня очередь занята, ночью разбирать нечего
+    "schedule": "10 9 * * *",
 }
 ONE_SHOT = ("purge",)
+MSK = timezone(timedelta(hours=3))
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
+# Навык агента, на который отчёт плагина отсылает толкование выводов
+SKILL = "tools-queue-analyze"
+# Выводы, которые дают ⚠️ (по значку в начале строки conclusions): мусор в брокере, голодание
+# по приоритету, раны без старта. Лимиты дагов и пулы — ограничения в коде дагов, справка
+WARN_MARKS = ("🗑️", "⚖️", "⏱️")
 
 SAVED = saved_params(PARAMS_VAR)
 _cfg = {**DEFAULTS, **{k: v for k, v in saved_params(OLD_VAR).items() if k in DEFAULTS}, **SAVED}
@@ -132,11 +147,6 @@ TERMINAL_STATES = frozenset({"success", "failed", "skipped", "upstream_failed", 
 
 # Партия для IN по кортежам: планировщик разбирает список из тысяч элементов заметно дольше.
 STATE_BATCH = 500
-# Длина даты в имени папки дампа (`YYYY-MM-DD`) — по ней же отбираются старые дампы.
-DATE_LEN = 10
-# Имя папки дампа. Отбор старого идёт строковым сравнением, поэтому объект, имя которого
-# на дату не похоже, под чистку попадать не должен — он «меньше» любой даты.
-DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/")
 # Предел на чтение: тела читаются в память целиком, иначе разметить их нечем.
 # Гигабайтная очередь — уже не случай этого инструмента, и упасть на входе честнее, чем
 # по OOM в середине разбора. Проверяется по LLEN, до LRANGE, то есть даром, — и по
@@ -459,14 +469,15 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         "execution_timeout": timedelta(minutes=10),
         "on_failure_callback": on_callback,
     },
-    start_date=datetime(2026, 9, 10, tzinfo=timezone.utc),
-    tags=["DataLab", "tools", "clean"],
+    start_date=datetime(2026, 9, 10, tzinfo=MSK),
+    tags=["DataTools", "tools", "health"],
     catchup=False,
-    is_paused_upon_creation=True,
+    # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
+    is_paused_upon_creation=False,
     max_active_runs=1,
     # Удаление из брокера по таймеру не случается: purge разовая и не сохраняется, так что
     # плановый запуск только разбирает
-    schedule=saved_schedule(SAVED, None, PARAMS_VAR),
+    schedule=saved_schedule(SAVED, DEFAULTS["schedule"], PARAMS_VAR),
     dagrun_timeout=timedelta(minutes=30),
     on_failure_callback=on_callback,
     params={
@@ -485,10 +496,6 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         "max_delete": Param(
             _cfg["max_delete"], type="integer", minimum=1,
             description="Не удалять, если мусора больше этого числа",
-        ),
-        "keep_days": Param(
-            _cfg["keep_days"], type="integer", minimum=1,
-            description="Сколько дней держим дампы",
         ),
         "schedule": Param(
             _cfg["schedule"], type=["string", "null"],
@@ -883,41 +890,21 @@ def tools_queue_analyze():
         logger.info("📊 сводка:\n%s", summary)
         title = f"🔬 Разбор очереди: {len(found)} выводов" if found else "🔬 Разбор очереди: в норме"
         add_note(summary, context=context, level="DAG,Task", title=title)
+
+        # Вердикт не выше warn: очередь — не авария. Не отработавший сборщик — тоже warn
+        warns = [x for x in found if x.startswith(WARN_MARKS)]
+        warns += [f"{t} не отработал ({state(t)})" for t in ("broker", "scheduler", "capacity")
+                  if state(t) in ("failed", "upstream_failed")]
+        push_health({"queue": {"status": "warn" if warns else "healthy",
+                               "summary": "; ".join(warns) if warns else f"в норме, выводов {len(found)}",
+                               "conclusions": found}}, context)
         return summary
-
-    @task(task_id="prune", trigger_rule=TriggerRule.ALL_DONE)
-    def prune(**context) -> str:
-        """🧹 Убирает дампы старше `keep_days`.
-
-        Своими руками, а не lifecycle-правилом бакета: наш S3-шлюз не принимает
-        PutBucketLifecycleConfiguration (требует Content-MD5, которого boto3 больше не шлёт).
-        """
-        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-
-        keep = int(context["params"]["keep_days"])
-        edge = (datetime.now(timezone.utc) - timedelta(days=keep)).strftime("%Y-%m-%d")
-        hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
-        keys = hook.list_keys(bucket_name=BUCKET_NAME, prefix=PREFIX) or []
-        # Дата лежит в имени папки, поэтому отбираем строковым сравнением, а не запросом
-        # метаданных на каждый объект: формат `YYYY-MM-DD` сравнивается как строка верно.
-        # Имя, на дату не похожее, пропускаем: чужой объект под нашим префиксом иначе
-        # сравнился бы «меньше края» и был бы удалён заодно.
-        old = [
-            k for k in keys
-            if DATE_DIR_RE.match(k[len(PREFIX):]) and k[len(PREFIX):len(PREFIX) + DATE_LEN] < edge
-        ]
-        if old:
-            hook.delete_objects(bucket=BUCKET_NAME, keys=old)
-        msg = f"дампов: {len(keys)}, убрано старше {edge}: {len(old)}"
-        logger.info("🧹 %s", msg)
-        return msg
 
     done = save_params()
     snapshot, sched, cap = broker(), scheduler(), capacity()
     done >> [snapshot, sched, cap]
     purged = purge(snapshot)
-    report(snapshot, sched, cap, purged)
-    prune()
+    report(snapshot, sched, cap, purged) >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_queue_analyze()

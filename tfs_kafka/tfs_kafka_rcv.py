@@ -1,5 +1,5 @@
 """📨 DAG приёма обратных квитанций ТФС из Kafka в хранилище тракта.
-*2026-09-25 19:33 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-28 10:36 MSK · v2.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Обратная квитанция `TransferFileCephRs` приходит по ВСЕМ маршрутам ТФС (xStream и ЕР)
 и сопоставляется с отправкой по `RqUID`. Результат передачи — в `File/Status/StatusCode`,
@@ -109,7 +109,7 @@ NOTE_FAILED_MAX = 5
     max_active_runs=1,
     catchup=False,
     dagrun_timeout=timedelta(minutes=70),
-    tags=["DataLab", "CI02420667", "TFS", "kafka"],
+    tags=["DataTools", "CI02420667", "TFS", "kafka"],
     is_paused_upon_creation=False,
     doc_md=__doc__,
 )

@@ -919,7 +919,7 @@ DAG: import_gp_ue_exchange
     - Отказоустойчивость: `catchup=False`, `max_active_runs=1`.
 
 Автор: Чуркин Николай
-Теги: ['DataLab', 'import', 'tfs', 'CI02420667', 'pkap', 'exchange']
+Теги: ['DataTools', 'import', 'tfs', 'CI02420667', 'pkap', 'exchange']
 """
 
 with DAG(
@@ -929,7 +929,7 @@ with DAG(
     default_args=default_args,
     start_date=pendulum.datetime(2025, 12, 20),
     schedule=[TFS_IN_DATASET],
-    tags=['DataLab', 'import', 'TFS', 'CI02420667', 'PKAP', 'exchange'],
+    tags=['DataTools', 'import', 'TFS', 'CI02420667', 'PKAP', 'exchange'],
     catchup=False,
     is_paused_upon_creation=True,
     render_template_as_native_obj=True,
