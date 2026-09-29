@@ -5,7 +5,7 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
 
 # `tools_system_pulse` и `tools_system_health` — состояние контура
 
-*2026-09-28 17:43 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 16:56 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и концепцию `health_warn` / `health_errors` — навык **`tools`**.
 
@@ -32,6 +32,7 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
 |---|---|---|
 | `components` (пульс) | ❌ | метабаза, шедулер или dag-processor `unhealthy` — навык `airflow-health` |
 | `celery` (пульс) | ⚠️ ждут при занятых воркерах | не хватает слотов: ёмкость, не авария |
+| `celery` (пульс) | `слоты ? из N` | воркеры и слоты — по отбивкам; `?` — занятость не измерена (control-канал не успел), не авария. `source: broadcast` и «ни один воркер не ответил» при живых подах в старых ранах (до 29.09.2026) — медленный control-канал, смотри `control` |
 | `control` (пульс) | ⚠️/❌, `workers: 0` в карточке Health при идущих задачах, воркеры перезапускаются по liveness («celery молчит 1201 с») | см. ниже |
 | `s3_logs` (час) | ❌ | бакет логов не принимает запись — задачи повиснут на записи лога (11.09.2026) |
 | `delivery` (пульс) | ⚠️ > 60 с | задача долго ждала воркера — очередь или слоты |

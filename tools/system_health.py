@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-28 17:43 MSK · v3.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 16:56 MSK · v3.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -20,7 +20,7 @@
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
 |---|---|---|---|
 | `components` (пульс) | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
-| `celery` (пульс) | воркеры через брокер (`broadcast`), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
+| `celery` (пульс) | воркеры из отбивок `health_beacon` (нет отбивок — `broadcast` брокеру), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
 | `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` (час) | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` (пульс) | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
@@ -306,12 +306,32 @@ def _queue_lengths(app, names) -> dict:
     return out
 
 
+def _beacon_workers() -> dict | None:
+    """Воркеры из отбивок (etl-core health_beacon); None — отбивок нет или живых в них нет."""
+    try:
+        from airflow.configuration import conf
+        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+        from sber_app_dataplatform_etl_core.hrp_adapter import health_beacon as hb
+
+        hook = S3Hook(aws_conn_id=conf.get("logging", "REMOTE_LOG_CONN_ID"), verify=False)
+        pods = hb.summarize_pods(hb.read_snapshot(hook, conf.get("logging", "REMOTE_BASE_LOG_FOLDER")))
+    except Exception:
+        logger.info("celery: отбивок нет, опрашиваем брокер", exc_info=True)
+        return None
+    return pods if pods.get("alive") else None
+
+
 def check_celery() -> dict:
     """Воркеры, очереди и задачи — с воркера, где брокер виден всегда.
 
     Карточка Health опрашивает брокер из вебсервера, и на контуре, где вебсерверу redis
     закрыт (сигма, 12.09.2026), она серая. Отсюда брокер виден: этот процесс сам получил
     задачу через него.
+
+    Воркеров считаем по отбивкам, как карточка; broadcast — запасной путь. Прямой опрос ждёт
+    BROADCAST_TIMEOUT_SEC, и при медленном control-канале (sigma-dev 29.09.2026: ответы за
+    4.8 с) давал «воркеров 0, ни один не ответил» при живых подах — о самом канале и так
+    говорит проверка control.
     """
     from airflow.configuration import conf
     from airflow.providers.celery.executors.celery_executor import app
@@ -321,22 +341,30 @@ def check_celery() -> dict:
     result = {**counters}
     notes, status = [], "healthy"
 
-    try:
-        stats = app.control.broadcast("stats", reply=True, timeout=BROADCAST_TIMEOUT_SEC) or []
-        active = app.control.broadcast("active", reply=True, timeout=BROADCAST_TIMEOUT_SEC) or []
-    except Exception as exc:
-        logger.warning("celery: брокер недоступен", exc_info=True)
-        return {**result, "status": "error", "summary": f"брокер недоступен: {_short_reason(exc)}"}
+    pods = _beacon_workers()
+    if pods:
+        # занятость или слоты хоть одного пода неизвестны — None, а не заниженная сумма
+        workers, total, busy = pods["alive"], pods.get("slots_total"), pods.get("slots_busy")
+        result["source"] = "beacons"
+    else:
+        try:
+            stats = app.control.broadcast("stats", reply=True, timeout=BROADCAST_TIMEOUT_SEC) or []
+            active = app.control.broadcast("active", reply=True, timeout=BROADCAST_TIMEOUT_SEC) or []
+        except Exception as exc:
+            logger.warning("celery: брокер недоступен", exc_info=True)
+            return {**result, "status": "error", "summary": f"брокер недоступен: {_short_reason(exc)}"}
 
-    by_worker = {}
-    for chunk in stats:
-        by_worker.update(chunk)
-    busy_by = {}
-    for chunk in active:
-        busy_by.update(chunk)
-    total = sum(((info or {}).get("pool") or {}).get("max-concurrency") or 0 for info in by_worker.values())
-    busy = sum(len(busy_by.get(name) or []) for name in by_worker)
-    result.update(workers=len(by_worker), slots_total=total, slots_busy=busy)
+        by_worker = {}
+        for chunk in stats:
+            by_worker.update(chunk)
+        busy_by = {}
+        for chunk in active:
+            busy_by.update(chunk)
+        workers = len(by_worker)
+        total = sum(((info or {}).get("pool") or {}).get("max-concurrency") or 0 for info in by_worker.values())
+        busy = sum(len(busy_by.get(name) or []) for name in by_worker)
+        result["source"] = "broadcast"
+    result.update(workers=workers, slots_total=total, slots_busy=busy)
 
     try:
         names = {conf.get("operators", "default_queue", fallback="default")}
@@ -346,20 +374,23 @@ def check_celery() -> dict:
         logger.warning("celery: очереди не прочитаны", exc_info=True)
         notes.append(f"очереди не прочитаны: {_short_reason(exc)}")
 
-    if not by_worker:
+    if not workers:
         status = "error"
         notes.insert(0, "ни один воркер не ответил")
     if counters["queued_stale"]:
         waiting = f"ждут дольше {STALE_AFTER_SEC // 60} мин: {counters['queued_stale']}"
-        if by_worker and not busy:
+        if workers and busy == 0:
             status = "error"
             notes.append(f"{waiting}, воркеры пусты")
+        elif busy is None:
+            status = _worst([status, "warn"])
+            notes.append(f"{waiting}, занятость воркеров не измерена")
         else:
             # Карточка при занятых воркерах молчит; раз в час — стоит сказать: это нехватка
             # ёмкости, и по ленте видно, как часто она случается
             status = _worst([status, "warn"])
             notes.append(f"{waiting}, воркеры заняты — не хватает слотов")
-    if total and busy > total:
+    if total and busy is not None and busy > total:
         status = _worst([status, "warn"])
         notes.append(f"занято слотов больше, чем есть: {busy} из {total}")
     if counters["scheduled_stale"]:
@@ -370,7 +401,7 @@ def check_celery() -> dict:
         notes.append(f"running без pid: {counters['running_no_pid']}")
 
     queues = result.get("queues") or {}
-    head = (f"воркеров {len(by_worker)}, слоты {busy} из {total}"
+    head = (f"воркеров {workers}, слоты {'?' if busy is None else busy} из {'?' if total is None else total}"
             + (", очередь " + ", ".join(f"{n} {v}" for n, v in queues.items()) if queues else ""))
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
 
