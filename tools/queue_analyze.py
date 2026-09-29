@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-29 17:13 MSK · v3.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 17:46 MSK · v3.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -194,13 +194,15 @@ def _decode(raw) -> dict:
     # Протокол celery v2: тело — [args, kwargs, embed]. Команда Airflow лежит первым
     # позиционным аргументом execute_command. Разбираем тело, а не headers.argsrepr:
     # repr придётся парсить как питон, а тело — обычный JSON.
-    # Чужое тело (не список, пустой список, args не список) — команды нет, id и task остаются
+    # Чужое тело (не список, пустой список, args не список) — команды нет, id и task остаются.
+    # Первый элемент — через next(iter()), без индекса: пустой список даёт None, а не IndexError
     payload = json.loads(body) if body else None
-    args = payload[0] if isinstance(payload, list) and payload and isinstance(payload[0], list) else []
+    args = next(iter(payload), None) if isinstance(payload, list) else None
+    command = next(iter(args), None) if isinstance(args, list) else None
     return {
         "id": headers.get("id"),
         "task": headers.get("task"),
-        "command": args[0] if args and isinstance(args[0], list) else None,
+        "command": command if isinstance(command, list) else None,
     }
 
 
