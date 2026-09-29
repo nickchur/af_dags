@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-09-29 12:57 MSK · v3.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 13:18 MSK · v3.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -141,6 +141,12 @@ def next_window(reached: datetime, increment: int, overlap: int,
         time_to    = min(reached + increment, now)   (increment — МИНУТЫ)
         is_current = reached + increment >= now
 
+    increment = 0 (умолчание с 29.09.2026) — окно без потолка: всё, что накопилось, уходит
+    одним раном до now. Прежде шаг был 60 мин, а следующий цикл взводился через
+    selfrun_timeout (тоже 60 мин по умолчанию): за час выгружался час, и отставшая поставка
+    не догоняла текущее время никогда. Положительный increment теперь — потолок окна для
+    поставок, где пакет за долгий простой вышел бы слишком большим.
+
     Единицы разные и такими остаются: ровно так они заданы в er_wf_meta и в форме
     запуска, и ровно так их считала вью (toIntervalSecond / toIntervalMinute).
 
@@ -154,7 +160,7 @@ def next_window(reached: datetime, increment: int, overlap: int,
     now = (now or datetime.now(timezone.utc)).replace(tzinfo=None)
     if reached.tzinfo is not None:
         reached = reached.astimezone(timezone.utc).replace(tzinfo=None)
-    edge = reached + timedelta(minutes=int(increment))
+    edge = reached + timedelta(minutes=int(increment)) if int(increment) > 0 else now
     return reached - timedelta(seconds=int(overlap)), min(edge, now), edge >= now
 
 
@@ -272,7 +278,7 @@ def _state_to_params(cur: dict, cfg: dict) -> dict:
     extract_time), и по нему же argMax находит последнюю строку.
     """
     tf   = str(cur.get('time_field') or cfg.get('time_field') or '').strip("'")
-    inc  = int(cfg.get('increment', 60) or 60)
+    inc  = int(cfg.get('increment') or 0)
     ovl  = int(cfg.get('overlap', 0) or 0)
     ec   = cur['extract_count']
     reached = cur['reached']
@@ -363,6 +369,31 @@ class _ZipReader:
         return chunk
 
 
+def _source_start(hook, cfg) -> datetime:
+    """🌱 Начальная точка новой поставки без lower_bound: min(time_field) по её запросу.
+
+    Пустой источник ClickHouse отдаёт как NULL (Nullable) или как 1970-01-01 (DateTime):
+    начала у данных ещё нет — таблица пропускается, состояние не пишется, и следующий ран
+    спросит снова.
+    """
+    if not cfg.get('sql_min'):
+        raise AirflowFailException(
+            f"{cfg['schema_name']}.{cfg['tbl']}: пустой lower_bound, а запрос задан строкой — "
+            "начало данных не вычислить. Проставьте lower_bound в params поставки"
+        )
+    sql = cfg['sql_min'].replace('{condition}', '1=1').replace('{export_time}', 'now64(6)')
+    row = get_dict_from_ch(hook, sql)
+    start = row[0]['start'] if row else None
+    if start is None or start.year < 2000:
+        raise AirflowSkipException(
+            f"🌱 {cfg['schema_name']}.{cfg['tbl']}: источник пуст — начальная точка не определена, "
+            "ждём первых данных"
+        )
+    if start.tzinfo is not None:
+        start = start.astimezone(timezone.utc).replace(tzinfo=None)
+    return start.replace(microsecond=0) - timedelta(seconds=1)
+
+
 @task(task_id='init')
 def _er_init(cfg, **context):
     """⚙️ Инициализирует состояние выгрузки и возвращает словарь SQL-литералов для шаблонов.
@@ -450,7 +481,7 @@ def _er_init(cfg, **context):
         'xstream_sanitize':   cfg.get('xstream_sanitize', 'False'),
         'sanitize_array':     cfg.get('sanitize_array', 'False'),
         'sanitize_list':      cfg.get('sanitize_list', ''),
-        'increment':          str(cfg.get('increment', 60)),
+        'increment':          str(cfg.get('increment') or 0),
         'overlap':            str(cfg.get('overlap', 0)),
         'time_field':         f"'{tf}'",
     }
@@ -486,9 +517,16 @@ def _er_init(cfg, **context):
             # считается общей формулой. Первое окно поэтому не пустое, как было раньше:
             # прежний bootstrap записывал time_from = time_to = lower_bound, то есть
             # первый ран новой поставки уходил впустую, только чтобы завести строку.
-            logger.warning("First execution for %s. Bootstrapping from lower_bound=%s.", cfg['tbl'], lb)
+            #
+            # lower_bound пуст — начало данных самого источника, min(time_field) по запросу
+            # поставки. Прежде пустой lower_bound означал 1970-01-01, и поставка годами
+            # выгружала пустые окна (сигма 24.09.2026, learning.lc_items_opened). Секунда
+            # назад — потому что нижняя граница окна строгая, а формат режет миллисекунды.
+            start = _parse_ts(lb) if cfg.get('lower_bound') else _source_start(hook, cfg)
+            logger.warning("First execution for %s. Bootstrapping from %s (lower_bound=%s).",
+                           cfg['tbl'], start, cfg.get('lower_bound') or '—')
             state = {
-                'num_state': 0, 'reached': _parse_ts(lb),
+                'num_state': 0, 'reached': start,
                 'extract_count': None, 'loaded': None, 'sent': None, 'confirmed': None,
                 'time_field': tf,
             }
@@ -1173,6 +1211,8 @@ def _table_cfg(table_key: str, entry: dict, gcfg: dict) -> dict:
         'sql_get_current': (sql_cur_state(gcfg['replica'], schema, tbl)
                             if (is_delta and not p['full_export']) else None),
         'sql_meta':        q['sql_meta'],
+        # Начало данных источника для первого рана без lower_bound (_source_start)
+        'sql_min':         q['sql_min'],
         # Части запроса как есть — из них build_meta достаёт таблицы-источники, чтобы
         # взять описания колонок. Имя выгрузки для этого не годится: таблицы с таким
         # именем может не быть вовсе.

@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-09-29 12:57 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 13:18 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -507,30 +507,19 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
 
 
 def check_start(row: dict, info: dict, reached: dict, errors: list[str], warnings: list[str]) -> bool:
-    """🌱 У поставки по дельте должна быть начальная точка.
+    """🌱 Поставка по дельте, застрявшая в прошлом.
 
-    lower_bound читается только при первом запуске, пока у поставки нет строк в истории;
-    пустой он превращается в 1970-01-01, и поставка годами выгружает пустые часы, не
-    догоняя текущее время никогда (сигма 24.09.2026, learning.lc_items_opened). Поэтому:
-    - истории нет и lower_bound пуст — ошибка настройки, поставка не заводится;
-    - история есть, но стоит раньше 2000 года — предупреждение: lower_bound уже не
-      поможет, лечится разовым раном с галкой «Сдвинуть состояние дельты».
-    Поставку с историей и пустым lower_bound не ломаем: она идёт от своего состояния.
+    До 29.09.2026 пустой lower_bound превращался в 1970-01-01, и поставка годами выгружала
+    пустые окна (сигма 24.09.2026, learning.lc_items_opened). Новая поставка теперь
+    стартует с min(time_field) источника, а уже застрявшей lower_bound не поможет: он
+    читается только до первой строки в истории. О такой предупреждаем и называем лечение.
+    errors не используется: застрявшая поставка работает, ломать ей пакет незачем.
     """
     p = info['params']
     if p.get('full_export') or p.get('is_recent'):
         return True
     at = reached.get((row['replica'], row['schema_name'], row['extract_name']))
-    if at is None:
-        if str(p.get('lower_bound') or '').strip():
-            return True
-        errors.append(
-            f"{info['key']}: пустой lower_bound у новой поставки по дельте — первое окно "
-            "начнётся с 1970-01-01, и пакет не догонит текущее время никогда. Проставьте "
-            'в params дату начала: {"lower_bound": "2026-01-01"}'
-        )
-        return False
-    if at.year < 2000:
+    if at is not None and at.year < 2000:
         warnings.append(
             f"{info['key']}: состояние дельты стоит на {at:%Y-%m-%d %H:%M} — поставка выгружает "
             "пустые окна. lower_bound уже не читается (история есть); переведите её вперёд "

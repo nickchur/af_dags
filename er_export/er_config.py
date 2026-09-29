@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-09-29 12:57 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 13:18 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -307,9 +307,9 @@ TABLE_PARAMS: dict = {
     # либо нет — наследование работает так же, как у остальных параметров.
     'is_recent':         0,
     'full_export':       0,            # 1 = выгружать таблицу целиком: окно дельты не подставляется, состояние не ведётся
-    'increment':         60,           # шаг дельты, мин: time_to = time_from + increment (не чаще 1 пакета/час по стандарту ТФС)
+    'increment':         0,            # потолок окна дельты, мин; 0 — без потолка: отставшая поставка догоняет now одним раном
     'overlap':           0,            # перекрытие окна дельты назад, сек (для компенсации задержек CDC)
-    'lower_bound':       '',           # нижняя граница первой дельты (bootstrap); '' → 1970-01-01
+    'lower_bound':       '',           # нижняя граница первой дельты (bootstrap); '' → min(time_field) источника
     # Поле времени в источнике. insert_time — метка CDC, общая для источников контура
     # (её же используют выгрузки xs_export). Пустое допустимо только при full_export=1.
     # В поставках с JOIN или агрегацией задавайте его с префиксом таблицы ('s.insert_time'):
@@ -1244,6 +1244,14 @@ def export_sql(entry: dict, params: dict, table_key: str = '') -> dict:
                                               elsewhere=rest)}
         return build_sql(m)
 
+    def _prep_min(key):
+        """Начало данных источника: min(time_field) по тому же FROM/JOIN/WHERE, без окна."""
+        m = entry.get(key)
+        tf = str(params.get('time_field') or '').strip()
+        if not (isinstance(m, dict) and "fields" not in m and tf) or params['full_export']:
+            return ""
+        return build_sql({**m, "fields": [f"min({tf}) AS start"]})
+
     def _prep_data(key):
         """Тот же запрос, но только с data-колонками — build_meta делает по нему DESCRIBE."""
         m = entry.get(key)
@@ -1261,6 +1269,7 @@ def export_sql(entry: dict, params: dict, table_key: str = '') -> dict:
         'sql_key':    'sql_stmt_export_delta' if sql_delta else 'sql_stmt_export_recent',
         'sql_export': sql_exp,
         'sql_meta':   _prep_data('sql_stmt_export_delta') or _prep_data('sql_stmt_export_recent'),
+        'sql_min':    _prep_min('sql_stmt_export_delta'),
     }
 
 
