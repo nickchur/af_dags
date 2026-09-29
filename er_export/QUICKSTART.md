@@ -1,6 +1,6 @@
 # 🚀 Быстрый старт: заводим выгрузку в ЕР
 
-*2026-09-01 08:48 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 13:18 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Пошагово, с готовыми текстами для копирования. Подробности — в [README.md](README.md);
 сюда вынесено то, что нужно, чтобы довести первую выгрузку до зелёного рана.
@@ -244,7 +244,7 @@ DAG `export_er__hrplatform_datalab__7` создаётся **на паузе** �
 | `max_active_tasks` | `4` | сколько таблиц пакета грузятся разом |
 | `full_export` | `0` | `1` = выгружать таблицу целиком |
 | `time_field` | `insert_time` | поле времени для окна дельты |
-| `increment` | `60` | шаг дельты в минутах |
+| `increment` | `0` | потолок окна дельты в минутах; `0` — до текущего времени одним раном |
 | `format` | `TSVWithNames` | `TSVWithNames` или `JSONEachRow` |
 | `send_empty` | `0` | `1` = слать пустой пакет при нулевой дельте |
 | `strategy` | `FULL_UK` | стратегия слияния на стороне ЕР |

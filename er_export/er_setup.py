@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-09-28 10:36 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 13:18 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один ран делает всё, что раньше делали два дага (`export_er_wf_edit` и `export_er_sync`):
 показывает запись, проверяет её на живом ClickHouse, пишет новую версию и раскладывает
@@ -147,6 +147,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
@@ -372,6 +373,12 @@ def _check_config_patch(patch: dict) -> list[str]:
             if bad:
                 errors.append(f"TFS_MAP: у реплик {bad} значение должно быть парой "
                               '["ScenarioId", "префикс в S3"]')
+        elif key == 'HIVE_RESERVED':
+            # Слово уходит в сравнение с именами колонок и в алиас запроса данных:
+            # не-идентификатор дал бы синтаксическую ошибку во всех выгрузках разом.
+            bad = [w for w in val if not isinstance(w, str) or not re.fullmatch(r'[A-Za-z_]\w*', w)]
+            if bad:
+                errors.append(f"HIVE_RESERVED: {bad} — нужны слова-идентификаторы [A-Za-z_][A-Za-z0-9_]*")
         elif key == 'LIMITS':
             bad = [k for k, v in val.items() if not isinstance(v, int) or isinstance(v, bool)]
             if bad:
@@ -499,12 +506,37 @@ def wf_entry(row: dict, grp_row: dict, comment: str = '') -> dict:
     }
 
 
-def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[dict, list[str], list[str]]:
+def check_start(row: dict, info: dict, reached: dict, errors: list[str], warnings: list[str]) -> bool:
+    """🌱 Поставка по дельте, застрявшая в прошлом.
+
+    До 29.09.2026 пустой lower_bound превращался в 1970-01-01, и поставка годами выгружала
+    пустые окна (сигма 24.09.2026, learning.lc_items_opened). Новая поставка теперь
+    стартует с min(time_field) источника, а уже застрявшей lower_bound не поможет: он
+    читается только до первой строки в истории. О такой предупреждаем и называем лечение.
+    errors не используется: застрявшая поставка работает, ломать ей пакет незачем.
+    """
+    p = info['params']
+    if p.get('full_export') or p.get('is_recent'):
+        return True
+    at = reached.get((row['replica'], row['schema_name'], row['extract_name']))
+    if at is not None and at.year < 2000:
+        warnings.append(
+            f"{info['key']}: состояние дельты стоит на {at:%Y-%m-%d %H:%M} — поставка выгружает "
+            "пустые окна. lower_bound уже не читается (история есть); переведите её вперёд "
+            "ручным раном пакета с «Дата с» / «Дата по» и галкой «Сдвинуть состояние дельты»"
+        )
+    return True
+
+
+def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict,
+              reached: dict | None = None) -> tuple[dict, list[str], list[str]]:
     """🧬 Раскладывает строки er_wf_meta по группам, разрешая наследование от строк-дефолтов.
 
     tables      — строки-поставки (extract_name непустой)
     defaults    — {(replica, dag_group): строка-дефолт группы}
     ch_comments — {ключ записи (raw_key): комментарий таблицы-источника}
+    reached     — {(replica, schema_name, extract_name): достигнутое состояние дельты}
+                  из er_extract_current_vw; нет ключа — поставка ещё не выгружалась
 
     Возвращает (структура для Variable, ошибки, предупреждения). Ключ верхнего уровня —
     dag_id пакета: он же имя дага; в историю выгрузок он попадает отдельной колонкой.
@@ -607,6 +639,8 @@ def build_wfs(tables: list[dict], defaults: dict, ch_comments: dict) -> tuple[di
 
         if not check_table(info['row'], info['key'],
                            errors.setdefault(gkey, []), info['params']):
+            continue
+        if not check_start(row, info, reached or {}, errors.setdefault(gkey, []), warnings):
             continue
 
         group = wfs.setdefault(dag_id_for(*gkey), {
@@ -1032,7 +1066,16 @@ def er_setup_dag():
             info = wf_entry(merged, _group_row(hook, merged['replica'], merged.get('dag_group')))
             result['kind'] = 'поставка'
             check_group_names(merged['replica'], merged.get('dag_group'), errors)
-            check_table(info['row'], info['key'], errors, info['params'])
+            if check_table(info['row'], info['key'], errors, info['params']):
+                # Начальную точку дельты проверяем до записи: иначе новая поставка без
+                # lower_bound всплыла бы только ошибкой синхронизации всего пакета.
+                triple = (merged['replica'], merged['schema_name'], merged['extract_name'])
+                cur = get_dict_from_ch(hook, f"""
+                    SELECT reached FROM {_cfg['HIST_CURRENT_VW']}
+                    WHERE replica = '{_q(triple[0])}' AND schema_name = '{_q(triple[1])}'
+                      AND extract_name = '{_q(triple[2])}'
+                """)
+                check_start(merged, info, {triple: cur[0]['reached']} if cur else {}, errors, warnings)
 
             # Расписание и групповые параметры у поставки игнорируются — предупреждаем
             # здесь же, чтобы это было видно до записи, а не только в логе синхронизации.
@@ -1226,7 +1269,15 @@ def er_setup_dag():
         }
         ch_comments = ch_table_comments(hook, sources_by_key) if sources_by_key else {}
 
-        wfs, errors, warnings = build_wfs(tables, defaults, ch_comments)
+        # Достигнутые состояния — чтобы отличить новую поставку без начальной точки от
+        # работающей (check_start). Один запрос на весь синк, вью маленькая.
+        reached = {
+            (r['replica'], r['schema_name'], r['extract_name']): r['reached']
+            for r in get_dict_from_ch(
+                hook, f"SELECT replica, schema_name, extract_name, reached FROM {_cfg['HIST_CURRENT_VW']}")
+        }
+
+        wfs, errors, warnings = build_wfs(tables, defaults, ch_comments, reached)
 
         if not wfs:
             raise ValueError(
