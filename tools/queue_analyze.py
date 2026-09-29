@@ -462,7 +462,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,
         "retries": 0,
-        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. show_connections.py).
+        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. test_connections.py).
         # Разбор очереди нужен ровно тогда, когда она стоит: ждать в ней самому незачем
         "priority_weight": 900,
         "weight_rule": "absolute",

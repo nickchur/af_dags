@@ -265,7 +265,7 @@ SELECT event, count(*) AS cnt
         'on_failure_callback': on_callback,
     },
     # Часовой пояс DAG-а берётся из start_date.tzinfo, поэтому расписание московское —
-    # как у соседей по каталогу (show_connections, test_connections).
+    # как у соседей по каталогу (test_connections).
     start_date=datetime(2026, 9, 4, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
