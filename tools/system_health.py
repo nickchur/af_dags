@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-29 16:56 MSK · v3.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 18:27 MSK · v3.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -310,11 +310,12 @@ def _beacon_workers() -> dict | None:
     """Воркеры из отбивок (etl-core health_beacon); None — отбивок нет или живых в них нет."""
     try:
         from airflow.configuration import conf
-        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         from sber_app_dataplatform_etl_core.hrp_adapter import health_beacon as hb
 
-        hook = S3Hook(aws_conn_id=conf.get("logging", "REMOTE_LOG_CONN_ID"), verify=False)
-        pods = hb.summarize_pods(hb.read_snapshot(hook, conf.get("logging", "REMOTE_BASE_LOG_FOLDER")))
+        # Хук с короткими таймаутами, как у s3_logs: висящий S3 не должен съесть бюджет пульса.
+        # Протухший снимок отдельно не ловим: summarize_pods сам не считает живым под, чья
+        # отбивка старше трёх интервалов, — такой снимок даёт alive 0 и уходит в broadcast
+        pods = hb.summarize_pods(hb.read_snapshot(_log_hook(), conf.get("logging", "REMOTE_BASE_LOG_FOLDER")))
     except Exception:
         logger.info("celery: отбивок нет, опрашиваем брокер", exc_info=True)
         return None
@@ -385,11 +386,14 @@ def check_celery() -> dict:
         elif busy is None:
             status = _worst([status, "warn"])
             notes.append(f"{waiting}, занятость воркеров не измерена")
-        else:
+        elif workers:
             # Карточка при занятых воркерах молчит; раз в час — стоит сказать: это нехватка
-            # ёмкости, и по ленте видно, как часто она случается
+            # ёмкости, и по ленте видно, как часто она случается. Без воркеров «заняты»
+            # было бы неправдой: там уже error «ни один воркер не ответил»
             status = _worst([status, "warn"])
             notes.append(f"{waiting}, воркеры заняты — не хватает слотов")
+        else:
+            notes.append(waiting)
     if total and busy is not None and busy > total:
         status = _worst([status, "warn"])
         notes.append(f"занято слотов больше, чем есть: {busy} из {total}")
@@ -557,23 +561,30 @@ def check_control() -> dict:
     return {**result, "status": status, "summary": "; ".join([head, *notes])}
 
 
-def _log_bucket():
-    """Клиент бакета логов с короткими таймаутами и одной попыткой, и имя бакета.
+def _log_hook():
+    """S3Hook бакета логов с короткими таймаутами и одной попыткой.
 
-    Подключение и бакет — из [logging] remote_log_conn_id / remote_base_log_folder, а не
-    именем: на DEV бакет подменяет airflow_entrypoint. config сливается с botocore-настройками
-    подключения, а не заменяет их (см. check_s3_logs).
+    Подключение — из [logging] remote_log_conn_id, а не именем: на DEV бакет подменяет
+    airflow_entrypoint. config сливается с botocore-настройками подключения, а не заменяет
+    их (см. check_s3_logs).
     """
     from airflow.configuration import conf
     from airflow.providers.amazon.aws.hooks.s3 import S3Hook
     from botocore.config import Config
 
     conn_id = conf.get("logging", "REMOTE_LOG_CONN_ID")
-    bucket = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")[0]
     limits = Config(connect_timeout=S3_CONNECT_TIMEOUT_SEC, read_timeout=S3_READ_TIMEOUT_SEC,
                     retries={"total_max_attempts": 1})
     base = S3Hook(aws_conn_id=conn_id).conn_config.botocore_config
-    return S3Hook(aws_conn_id=conn_id, config=base.merge(limits) if base else limits).get_conn(), bucket
+    return S3Hook(aws_conn_id=conn_id, config=base.merge(limits) if base else limits)
+
+
+def _log_bucket():
+    """Клиент бакета логов (_log_hook) и имя бакета из [logging] remote_base_log_folder."""
+    from airflow.configuration import conf
+
+    bucket = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].partition("/")[0]
+    return _log_hook().get_conn(), bucket
 
 
 def check_s3_logs(slow_sec: float, run_id: str) -> dict:
