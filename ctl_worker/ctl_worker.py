@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-26 21:26 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 10:21 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -911,6 +911,10 @@ def build_worker_dag(w):
         # execution_timeout — по потолку из метаданных воркфлоу на момент разбора дага; запрос
         # получает statement_timeout по параметрам загрузки. Расходятся они, только если
         # wf_timeout поменяли в CTL между разбором и запуском — разбор идёт каждые минуты.
+        # Сам запрос execution_timeout не прерывает: сигнал таймаута срабатывает только когда
+        # psycopg2 вернёт управление (стенд 29.09.2026: лимит 20 с, pg_sleep(90) — таск упал
+        # на 90-й секунде, запрос дожил до конца). Обрывает запрос statement_timeout, поэтому
+        # он обязан быть ниже execution_timeout — лестница timeout_ladder это держит.
         @task(pool='gp_pool', retries=1, execution_timeout=exe_timeout + EXE_MARGIN)
         def run_exe(wf, **context):
             """### Выполнение бизнес-логики в Greenplum

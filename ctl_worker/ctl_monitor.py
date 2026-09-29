@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-26 21:10 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 09:52 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -369,7 +369,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     action = 'notFound'
                     
                 if action in ['Skipped']:
-                    wf_interval = gp_exe(None, f"SELECT '{sla}'::interval") if sla else timedelta(days=1)
+                    # Интервал разбирает Greenplum: формат wf_interval — интервал PostgreSQL. До
+                    # 29.09.2026 SQL уходил вторым аргументом, а первым — None: «can't execute an
+                    # empty query», и сенсор с soft_fail молча пропускал весь прогон монитора
+                    wf_interval = gp_exe("SELECT %s::interval", (sla,)) if sla else timedelta(days=1)
                     # wf_interval = timedelta(hours=6)
                     tst = pendulum.parse(sdt, tz=get_config()['tz']) + wf_interval 
                     if tst <= now:
