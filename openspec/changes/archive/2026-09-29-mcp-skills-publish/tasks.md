@@ -4,4 +4,5 @@
 - [x] Стенд 23.09.2026, временный sqlite: запись, повтор без записи, правка, дубль имени,
       новый навык, `testbed/` пропущен, снятие удалённого; чтение через FastMCP
 - [x] `tools/readme.md`
-- [ ] После выкладки: `airflow://skills` на af-alpha-dev показывает `ctl-worker`
+- [x] После выкладки: `airflow://skills` на af-alpha-dev показывает `ctl-worker` —
+      28.09.2026 GigaCode: `get_skill()` на альфе отдаёт `ctl-worker` v1.10

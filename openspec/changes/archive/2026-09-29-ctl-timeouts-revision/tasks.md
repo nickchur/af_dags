@@ -9,8 +9,11 @@
 - [x] 1.2 `ctl_worker.py`: три копии разбора (`run_tfs`, `run_exe` дважды) → `gp_timeout`;
       предупреждение в лог и заметку `Run_prm`. Проверка: заметка показывает потолок и
       предупреждение при 600.
-- [ ] 1.3 `run_exe`: `execution_timeout` = потолок + 10 мин; остальным — `task_timeout`.
+- [x] 1.3 `run_exe`: `execution_timeout` = потолок + 10 мин; остальным — `task_timeout`.
       Проверка на стенде: прерывает ли `execution_timeout` задачу, висящую в `pg_sleep`.
+      **Не прерывает** (стенд 29.09.2026): лимит 20 с, `pg_sleep(90)` через `gp_exe` — таск упал
+      по таймауту на 90-й секунде, запрос в базе дожил до конца. Обрывает запрос только
+      `statement_timeout`; поэтому он ниже `execution_timeout` (лестница), комментарий в `run_exe`.
 - [x] 1.4 Снять `sla=sla_time`, ключ `sla_time`; `exe_timeout` из описания дага.
 
 ## 2. Монитор
@@ -36,7 +39,11 @@
 ## 4. Проверка
 
 - [x] 4.1 `ruff check --select F`, `openspec validate --strict`.
-- [ ] 4.2 Стенд AF2 с эмулятором CTL — сценарии из спеки.
+- [x] 4.2 Стенд AF2 с эмулятором CTL — сценарии из спеки (29.09.2026): LOCK 3 ч — не тронута,
+      LOCK 6 ч — reStarted, RUNNING/RUN 8 ч при `wf_timeout` 600 — не тронута, 11 ч — reRunned,
+      TIME-WAIT идущей загрузки — не тронута; `timeout_ladder` ловит все три нарушения. Попутно
+      найден и исправлен вызов `gp_exe(None, sql)` в SLA-ветке монитора: при `wf_interval` у
+      загрузки весь прогон монитора молча уходил в skipped (soft_fail).
 - [x] 4.3 agy-ревью диффа. Оба «дефекта» опровергнуты: импорт `AirflowFailException` есть
       в обоих файлах; таймаут reschedule-сенсора считается от первой попытки рана
       (`sensors/base.py:260`, `first_try_number = max_tries - retries + 1`), а не от текущей.
