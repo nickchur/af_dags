@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-28 10:38 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:07 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -16,7 +16,7 @@
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
-| ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 2 * * *`)* |
+| ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 5 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
 🔁 **Переиндексации нет (v1.11).** `REINDEX` убран целиком — тяжёлая операция под админским
@@ -340,7 +340,10 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
-DEFAULT_SCHEDULE = '0 2 * * *'
+# 05:00 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '0 2 * * *')
+DEFAULT_SCHEDULE = '0 5 * * *'
+MSK = timezone(timedelta(hours=3))
+
 
 
 params = {
@@ -402,7 +405,7 @@ params = {
         'execution_timeout': timedelta(hours=4),
         'on_failure_callback': on_callback,
     },
-    start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
+    start_date=datetime(2025, 8, 7, tzinfo=MSK),
     tags=['DataTools', 'tools', 'clean'],
     catchup=False,
     is_paused_upon_creation=True,

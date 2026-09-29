@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-09-28 10:38 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:07 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -30,7 +30,7 @@ remote_base_log_folder`.
 | ♻️ `lifecycle`   | `True` — выставлять правило жизненного цикла *(default)* |
 | 🧪 `dry_run`     | `True` — ничего не удалять и правил не менять, только посчитать |
 | ⏱ `max_minutes` | Потолок обхода бакета (минуты, default: `30`) |
-| ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 5 * * *`)* |
+| ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 8 * * *`)* |
 | 💾 `save_params` | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
 Значения по умолчанию берутся из переменной `tools_log_cleanup_params`, если она задана,
@@ -121,7 +121,10 @@ def _walk_order(roots: list) -> list:
 # Механика повторяет db_cleanup.py; общее на два DAG-а — чтение переменной
 # (utils.saved_params) и проверка расписания (utils.valid_schedule).
 PARAMS_VAR = 'tools_log_cleanup_params'
-DEFAULT_SCHEDULE = '17 5 * * *'
+# 08:17 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '17 5 * * *')
+DEFAULT_SCHEDULE = '17 8 * * *'
+MSK = timezone(timedelta(hours=3))
+
 SAVED = saved_params(PARAMS_VAR)
 
 
@@ -179,7 +182,7 @@ params = {
         'execution_timeout': timedelta(hours=2),
         'on_failure_callback': on_callback,
     },
-    start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
+    start_date=datetime(2026, 1, 22, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=['DataTools', 'tools', 'clean'],
     catchup=False,

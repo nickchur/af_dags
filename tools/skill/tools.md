@@ -83,16 +83,16 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
 | `tools_queue_analyze` | `10 9 * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
-| `tools_db_cleanup` | `0 2 * * *` (UTC, 05:00 MSK) | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
-| `tools_log_cleanup` | `17 5 * * *` (UTC, 08:17 MSK) | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
+| `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
+| `tools_log_cleanup` | `17 8 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
 | `tools_show_connections` | `0 23 * * *` | Подключения secret backend → Variable `local_connections` | Variable |
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |
 | `tools_dummy` | `3 * * * *` | Шедулер и воркер живы: `dummy_task` (`EmptyOperator`, отмечает шедулер) → `ping` на воркере; в заметке `ping` — сколько думал шедулер и ждала очередь; красный по `dagrun_timeout` (50 мин) | ничего |
 
-Cron — по Москве (зона `start_date` дага), кроме помеченных UTC. `tools_queue_analyze` до
-29.09.2026 шёл по UTC (`10 6`), время прогона то же.
+Cron у всех — по Москве (зона `start_date` дага). До 29.09.2026 по UTC шли `tools_queue_analyze`
+(`10 6`), `tools_db_cleanup` (`0 2`) и `tools_log_cleanup` (`17 5`); время прогонов то же.
 
 ## 3. Разбор по симптому (общее)
 
