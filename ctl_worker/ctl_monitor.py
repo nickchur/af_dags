@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-29 09:52 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 21:28 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -237,6 +237,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         ue_active = set()      # воркфлоу UE, у которых есть активная загрузка
         ue_complete = True     # ответ CTL по UE не обрезан лимитом — можно искать пропавших
 
+        # wf на пробу: у многих активных загрузок один поток, а проба на стенде шла 12–14 мин
+        # при интервале 15 — около 2000 обращений к CTL. В GP wf не пишем: изменения несёт лоадер
+        wf_cache = {}
+
         for c, cat in ctl_obj_load('ctl_categories').items():
             is_ue = cat.get('name') in ue_names
             data = {'alive': '["ACTIVE"]', 'category_ids': f'[{c}]'}
@@ -255,8 +259,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 prm = ld.get('params', {})
                 wfn = ld.get('wf_name','unknown')
                 # wf = wfs[wid]
-                wf = ctl_api(f'/v4/api/wf/{wid}')
-                wf = ctl_wf_norm(wf, None)
+                if wid not in wf_cache:
+                    wf_cache[wid] = ctl_wf_norm(ctl_api(f'/v4/api/wf/{wid}', gp_log=False), None)
+                wf = wf_cache[wid]
                 # double (свой профиль + dummy внутри ue_category) исполняет Airflow — ему своя логика
                 ue_ld = is_ue and ctl_wf_owner(wf, ue_names, prf) == 'ue'
                 if is_ue:
