@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-29 09:07 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:09 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -268,7 +268,7 @@ def _log_sql(sql, bind, msg="SQL"):
             q = q.replace(f":{k}", v)
         logger.info(f"{msg}:\n{q}")
     except Exception as e:
-        logger.warning(f"⚠️ Не удалось развернуть SQL: {sql} | Параметры: {bind}")
+        logger.warning(f"⚠️ Не удалось развернуть SQL ({e}): {sql} | Параметры: {bind}")
 
 
 def db_stats(tables):
