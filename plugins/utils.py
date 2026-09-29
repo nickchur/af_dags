@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-29 18:02 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 18:36 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -365,8 +365,6 @@ def _on_callback(context, level=None):
         logger.info(message)
     elif state == TaskInstanceState.FAILED:
         logger.error(message)
-        if level != 'DAG':
-            add_note(message, context, level='DAG', add=True)
         if level != 'DAG':
             add_note(message, context, level='DAG', add=True)
     else:
@@ -779,7 +777,7 @@ def get_af_conn():
     pwd = conn_json['password']
     logger.info(
         f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
-        f"/{conn_json['schema']} | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
+        f"/{conn_json['schema']} | пароль: {len(pwd)} симв."
         f" | {', '.join(f'{k}={v}' for k, v in sorted(conn_json['extra'].items()))}"
     )
 

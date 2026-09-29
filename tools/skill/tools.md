@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-29 15:21 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 18:36 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -102,7 +102,7 @@ Cron у всех — по Москве (зона `start_date` дага). До 29
 | статус проверки в отчёте плагина | итог дага; поле `skill` проверки называет навык с толкованием |
 | `tools_*` ❌ на таске `params`, есть `start_date`, в логе «не cron и не пресет» | негодное `schedule` в форме **ручного** запуска с `save_params`; переменная не тронута, остальные таски — `upstream_failed` |
 | `tools_*` ❌ на таске `params`, `start_date` пуст, в логе `http://:8080/…: No host supplied` | таск **не стартовал ни на одном воркере**: его сняли в очереди. Расписание ни при чём. Смотри `tools_log_events` за это время и `platform.scheduled`/`queued` в Health; совет — перезапуск рана, Variable не трогать |
-| На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый навык появляется до получаса спустя после выкладки дагов; навык — Variable `mcp_skill__<имя>`; текст документа хранится, только если `store_docs` (сигма) |
+| На MCP нет навыка / в DAG Docs нет текста | `tools_mcp_skills` (каждые 30 мин): новый навык появляется до получаса спустя после выкладки дагов; навык — Variable `mcp_skill__<имя>`; текст документа — `docs/<путь>` в бакете логов, оглавление — Variable `af_docs` |
 | `tools_dummy` ❌, `dummy_task` не зелёный | стоит шедулер: `get_system_health` → компоненты |
 | `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_pulse` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
 | `tools_dummy` зелёный, в заметке `ping` шедулер или очередь — минуты | задержка планирования или доставки: `tools_queue_analyze`, `tools_log_events` |
