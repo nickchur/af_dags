@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-29 15:45 MSK · v3.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 15:46 MSK · v3.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
@@ -470,7 +470,13 @@ def tools_test_connections():  # noqa: PLR0915
         context = get_current_context()
         context["conn_label"] = f"{item['group']} · {item['conn_id']}"
         if context["params"].get(f"skip_{item['group']}"):
-            raise AirflowSkipException(f"☮️ группа {item['group']} пропущена параметром skip_{item['group']}")
+            try:
+                from plugins.utils import add_note  # type: ignore
+            except ImportError:
+                from CI06932748.tools.utils import add_note  # type: ignore
+            msg = f"Группа {item['group']} пропущена параметром skip_{item['group']}"
+            add_note(msg, context, level="task", title=f"☮️ {item['conn_id']}")
+            raise AirflowSkipException(msg)
         return _run_test(item["conn_id"], item["conn_type"], **context)
 
     checks = check.expand(item=collect())
