@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-09-22 13:26 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 15:22 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -90,7 +90,7 @@ KAFKA_SND_CONN = 'tfs-kafka-in'
 def _kafka_conn_ids() -> list[str]:
     """conn_id kafka-соединений из Variable `local_connections` — для выпадающего списка.
 
-    Variable наполняет DAG `tools_show_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: [{conn_id, host, ...}]}.
     Читается на парсинге, иначе examples не попадут в форму запуска. Дефолтные коннекты
     держим в списке всегда: без них выпадашка откроется без своего же значения, а при
     недоступной Variable осталась бы пустой.

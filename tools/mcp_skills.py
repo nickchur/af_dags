@@ -221,7 +221,7 @@ def _docs_s3():
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 2,
-        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. show_connections.py)
+        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. test_connections.py)
         'priority_weight': 900,
         'weight_rule': 'absolute',
         # Чтение пары файлов и запись переменных — секунды; потолок про зависание

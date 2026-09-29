@@ -1,12 +1,12 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-28 10:36 MSK · v3.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 15:45 MSK · v3.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
-Для каждого соединения создается индивидуальный таск, что позволяет локализовать проблемы со связностью.
-
-Запускается ежедневно в 23:15 MSK — через 15 минут после `tools_show_connections`,
-который обновляет Variable `local_connections`: список соединений читается из неё на
-парсинге файла, поэтому свежесть Variable определяет состав тасков.
+Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
+(и обновляет Variable `local_connections` для выпадающих списков kafka-подключений), дальше в
+mapped-таск `check` проверяет подключения этого списка — экземпляр на подключение, в сетке
+подписан «группа · `conn_id`». Состав проверок всегда свежий: парсинг файла
+Variable не читает. До 29.09.2026 список снимал отдельный даг `tools_show_connections`.
 
 | Группа | Условие (conn_id / type) | Описание проверки |
 |---|---|---|
@@ -21,7 +21,10 @@
 | **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
 **Особенности:**
-- **Оптимизация**: Использует Airflow Variable `local_connections` (создаваемую в `show_connections`) для ускорения получения списка соединений.
+- **Группы**: набор задан в коде (таблица выше). Флаги `skip_<группа>` (`skip_kafka`, …,
+  секция «Пропуск групп»): подключения группы не проверяются (☮️, не ошибка); сохраняются с
+  `save_params`.
+  Не снялся список (`collect` упал) — ❌ `health_errors`, проверять было нечего.
 - **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
 - **Отчетность**: таск `report` формирует Markdown-таблицу со всеми статусами (⭐ — важное) в заметке рана.
 - **Важные и вспомогательные**: параметр `critical` — шаблоны `conn_id` (fnmatch), по умолчанию
@@ -33,8 +36,6 @@
   (`tools/test_dags.py`) — она ждёт парсинга файлов и живёт по своим часам.
 """
 
-import re
-from collections import defaultdict
 from fnmatch import fnmatch
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
@@ -42,9 +43,7 @@ from typing import Optional
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
-from airflow.models import Connection, Variable
 from airflow.models.param import Param
-from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
@@ -66,8 +65,7 @@ MSK = timezone(timedelta(hours=3))
 ensure_pool(TOOLS_POOL)
 
 # Расписание — параметр формы: меняется запуском с save_params, без выкладки (как у
-# db_cleanup). Пусто — только ручной запуск. По умолчанию — через 15 минут после
-# tools_show_connections: тот обновляет local_connections, отсюда список соединений
+# db_cleanup). Пусто — только ручной запуск
 PARAMS_VAR = "tools_test_connections_params"
 SAVED = saved_params(PARAMS_VAR)
 DEFAULT_SCHEDULE = "15 23 * * *"
@@ -79,8 +77,6 @@ SKILL = "tools-test-connections"
 # упало вспомогательное — warn, ран зелёный. Метабаза, CTL, основной S3 и бакет логов (от него
 # зависит сам Airflow); шаблоны, которых на контуре нет, ни с чем не совпадают (на сигме CTL нет)
 DEFAULT_CRITICAL = sorted({"airflowdb", "ctl", "s3", conf.get("logging", "remote_log_conn_id", fallback="") or "s3"})
-# task_id проверки → conn_id: _safe_id не обратим, а важность решается по conn_id
-_TASK_CONN: dict[str, str] = {}
 
 
 # Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
@@ -94,20 +90,6 @@ _CONN_CONFIG: dict[str, str] = {
     "trino":       "Trino",
     "redis":       "Redis",
 }
-
-# Заголовки групп для tooltip в UI
-_GROUP_TOOLTIP: dict[str, str] = {
-    "tfs":        "TFS-соединения",
-    "postgres":   "PostgreSQL",
-    "s3":         "S3 / Object Storage",
-    "ctl":        "CTL / HTTP (KerberosHttp)",
-    "clickhouse": "ClickHouse",
-    "kafka":      "Kafka",
-    "trino":      "Trino",
-    "redis":      "Redis",
-    "other":      "Прочие соединения",
-}
-
 
 def _map_type(conn_type: str) -> Optional[str]:
     """conn_type Airflow → тип проверки; None, если проверять нечем.
@@ -130,82 +112,31 @@ def _map_type(conn_type: str) -> Optional[str]:
 
 
 # ---------------------------------------------------------------------------
-# Parse-time: читаем и группируем соединения из secret backend
+# Группы проверок: набор постоянный, состав — из collect того же рана
 # ---------------------------------------------------------------------------
 
-def _load_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
-    """Читает соединения из Variable и возвращает (tfs_group, type_groups)."""
-    local_connections: dict[str, Connection] = {}
-
-    try:
-        var_data = Variable.get("local_connections", deserialize_json=True, default_var=None)
-        if var_data:
-            for ctype, conns in var_data.items():
-                for c in conns:
-                    local_connections[c["conn_id"]] = Connection(
-                        conn_id=c["conn_id"],
-                        conn_type=c.get("conn_type") or (ctype if ctype != "clickhouse" else "sqlite"),
-                        host=c["host"],
-                        port=c["port"],
-                        schema=c["schema"],
-                        description=c["description"],
-                    )
-    except Exception as exc:
-        logger.warning("_load_groups: failed to load local_connections: %s", exc)
-
-    logger.info("Found %d local connections total", len(local_connections))
-
-    tfs_group = {
-        cid: conn
-        for cid, conn in local_connections.items()
-        if "tfs" in cid.lower() and conn.conn_type == "aws"
-    }
-
-    type_groups: dict[str, dict[str, Connection]] = defaultdict(dict)
-    for cid, conn in local_connections.items():
-        if cid in tfs_group:
-            continue
-        group = conn.conn_type
-        chk = _map_type(group)
-        if group == "sqlite":
-            group = "clickhouse"
-        elif group == "aws":
-            group = "s3"
-        elif chk == "KerberosHttp":
-            group = "ctl"
-        elif chk is None:
-            group = "other"
-        type_groups[group][cid] = conn
-
-    for gname, gconns in type_groups.items():
-        logger.info("Group '%s' has %d connections", gname, len(gconns))
-
-    return tfs_group, type_groups
+# Порядок групп в сетке: TFS первым, прочие — последними
+GROUPS = ("tfs", "postgres", "s3", "ctl", "clickhouse", "kafka", "trino", "redis", "other")
+# Подписи флагов skip_<группа> в форме запуска
+_GROUP_TITLE = {
+    "tfs": "TFS-соединения", "postgres": "PostgreSQL", "s3": "S3 / Object Storage",
+    "ctl": "CTL / HTTP (KerberosHttp)", "clickhouse": "ClickHouse", "kafka": "Kafka",
+    "trino": "Trino", "redis": "Redis", "other": "Прочие соединения",
+}
 
 
-_groups_cache = None
-
-
-def _get_groups() -> tuple[dict[str, Connection], dict[str, dict[str, Connection]]]:
-    global _groups_cache
-    if _groups_cache is None:
-        _groups_cache = _load_groups()
-    return _groups_cache
-
-
-_tfs_group, _type_groups = _get_groups()
-
-
-def _safe_id(conn_id: str, seen: set[str]) -> str:
-    """Приводит conn_id к безопасному идентификатору таска; при коллизии добавляет суффикс _2, _3, ..."""
-    base = re.sub(r"[^a-zA-Z0-9_.\-]", "_", conn_id)
-    safe = base
-    i = 2
-    while safe in seen:
-        safe = f"{base}_{i}"
-        i += 1
-    seen.add(safe)
-    return safe
+def _group(conn_id: str, conn_type: str) -> str:
+    """Группа проверки для подключения: tfs, тип хранилища, ctl или other."""
+    if "tfs" in conn_id.lower() and conn_type == "aws":
+        return "tfs"
+    if conn_type == "sqlite":
+        return "clickhouse"
+    if conn_type == "aws":
+        return "s3"
+    chk = _map_type(conn_type)
+    if chk == "KerberosHttp":
+        return "ctl"
+    return conn_type if chk is not None and conn_type in GROUPS else "other"
 
 
 # ---------------------------------------------------------------------------
@@ -445,8 +376,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     # Часовой пояс DAG'а берётся из start_date.tzinfo (models/dag.py:614-628), поэтому
     # [core] default_timezone = utc не мешает: 23:15 — московские
     start_date=datetime(2026, 1, 1, tzinfo=MSK),
-    # Ежедневно в 23:15 MSK, через 15 минут после tools_show_connections: тот обновляет
-    # Variable local_connections, из которой этот DAG набирает список соединений на парсинге
+    # Ежедневно в 23:15 MSK
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     tags=["DataTools", "tools", "AutoQA", "health"],
     catchup=False,
@@ -466,6 +396,11 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             title="Важные подключения",
             description="Шаблоны conn_id (fnmatch): упало важное — ран красный, остальные — предупреждение",
         ),
+        # По флагу на группу: подключения группы не проверяются — ☮️, не ошибка
+        **{f"skip_{g}": Param(
+            SAVED.get(f"skip_{g}", False), type="boolean", title=f"Пропустить {g}",
+            description=_GROUP_TITLE[g], section="Пропуск групп",
+        ) for g in GROUPS},
         "save_params": Param(
             False, type="boolean", title="Сохранить параметры",
             description=f"Записать параметры этого запуска в {PARAMS_VAR} как значения по умолчанию",
@@ -482,41 +417,63 @@ def tools_test_connections():  # noqa: PLR0915
 
     save_params()
 
-    groups = []
+    # Список снимается в том же ране: состав проверок всегда свежий, парсинг файла
+    # Variable не читает. Один expand на весь список: по XCom-ключу группы Airflow 2
+    # раскрывать не умеет, группа — в подписи экземпляра
+    @task(task_id="collect", retries=2)
+    def collect(**context):
+        """🔌 Подключения secret backend: список проверок по группам и Variable local_connections."""
+        from collections import defaultdict
 
-    # --- TFS group (priority) ---
-    if _tfs_group:
-        with TaskGroup(group_id="tfs", tooltip=_GROUP_TOOLTIP["tfs"]) as tg_tfs:
-            seen: set[str] = set()
-            for conn_id, conn in sorted(_tfs_group.items()):
-                tid = _safe_id(conn_id, seen)
-                _TASK_CONN[f"tfs.{tid}"] = conn_id
+        from airflow.configuration import get_custom_secret_backend
+        from airflow.exceptions import AirflowFailException
+        from airflow.models import Variable
 
-                @task(task_id=tid, doc_md=f"Проверка `{conn_id}` (S3)")
-                def tfs_task(cid=conn_id, **kwargs):
-                    return _run_test(cid, conn_type="aws", **kwargs)
+        try:
+            from plugins.utils import add_note  # type: ignore
+        except ImportError:
+            from CI06932748.tools.utils import add_note  # type: ignore
 
-                tfs_task()
-        groups.append(tg_tfs)
+        backend = get_custom_secret_backend()
+        if not hasattr(backend, "_local_connections"):
+            raise AirflowFailException(f"{backend} has no attr `_local_connections`")
+        conns = backend._local_connections
+        logger.info("Loaded %d connections from backend", len(conns))
 
-    # --- Type groups ---
-    for group_name in ("postgres", "s3", "ctl", "clickhouse", "kafka", "trino", "redis", "other"):
-        conns = _type_groups.get(group_name, {})
-        if not conns:
-            continue
-        tooltip = _GROUP_TOOLTIP.get(group_name, group_name)
-        with TaskGroup(group_id=group_name, tooltip=tooltip) as tg:
-            seen = set()
-            for conn_id, conn in sorted(conns.items()):
-                tid = _safe_id(conn_id, seen)
-                _TASK_CONN[f"{group_name}.{tid}"] = conn_id
+        # Variable — для выпадающих списков kafka-подключений (test_kafka, ctl_tfs):
+        # {conn_type: [{conn_id, host, ...}]}, sqlite показываем как clickhouse
+        by_type = defaultdict(list)
+        items = []
+        for cid, conn in sorted(conns.items()):
+            by_type["clickhouse" if conn.conn_type == "sqlite" else conn.conn_type].append({
+                "conn_id": cid, "host": conn.host, "port": conn.port, "schema": conn.schema,
+                "description": conn.description or "No description",
+            })
+            items.append({"group": _group(cid, conn.conn_type), "conn_id": cid, "conn_type": conn.conn_type})
+        Variable.set("local_connections", dict(by_type), serialize_json=True)
 
-                @task(task_id=tid, doc_md=f"Проверка `{conn_id}` (conn_type=`{conn.conn_type}`)")
-                def check_task(cid=conn_id, ctype=conn.conn_type, **kwargs):
-                    return _run_test(cid, ctype, **kwargs)
+        headers = ["conn_type", "conn_id", "host", "port", "schema", "description"]
+        table = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
+        for ctype, rows in sorted(by_type.items()):
+            table += ["| " + " | ".join(str({"conn_type": ctype, **c}[h]) for h in headers) + " |" for c in rows]
+        add_note("\n".join(table), context, level="task", title=f"Connections: {len(conns)} в {len(by_type)} типах")
+        return sorted(items, key=lambda i: (GROUPS.index(i["group"]), i["conn_id"]))
 
-                check_task()
-        groups.append(tg)
+    @task(task_id="check", map_index_template="{{ conn_label }}")
+    def check(item: dict):
+        """Проверка одного подключения; в сетке экземпляр подписан «группа · conn_id»."""
+        # item, а не conn: conn — ключ контекста Airflow
+        from airflow.operators.python import get_current_context
+
+        from airflow.exceptions import AirflowSkipException
+
+        context = get_current_context()
+        context["conn_label"] = f"{item['group']} · {item['conn_id']}"
+        if context["params"].get(f"skip_{item['group']}"):
+            raise AirflowSkipException(f"☮️ группа {item['group']} пропущена параметром skip_{item['group']}")
+        return _run_test(item["conn_id"], item["conn_type"], **context)
+
+    checks = check.expand(item=collect())
 
 
     # --- Summary ---
@@ -562,6 +519,9 @@ def tools_test_connections():  # noqa: PLR0915
                 logger.warning("Could not load task notes: %s", e)
 
         critical = list(context["params"].get("critical") or [])
+        # Номер экземпляра check → подключение: тот же список, по которому шёл expand
+        listed = context["ti"].xcom_pull(task_ids="collect") or []
+        collect_ok = any(ti.task_id == "collect" and ti.state == "success" for ti in tis)
         failed_vital, failed_aux = [], []
         ok = fail = skip = none_count = 0
         all_rows = []
@@ -570,7 +530,10 @@ def tools_test_connections():  # noqa: PLR0915
 
         for ti in tis:
             # Служебные таски — не проверки соединений
-            if ti.task_id in ("report", "params", "health_warn", "health_errors"):
+            if ti.task_id in ("report", "params", "collect", "health_warn", "health_errors"):
+                continue
+            # -1 — не раскрытый check: collect не выполнился или список пуст
+            if ti.map_index < 0:
                 continue
 
             state = ti.state
@@ -601,13 +564,10 @@ def tools_test_connections():  # noqa: PLR0915
             if ti.duration:
                 durations.append(ti.duration)
 
-            # Выводим только ошибки и скипы. У mapped-таска к имени добавляем индекс —
-            # иначе несколько строк выглядят одинаково; rendered_map_index у recheck
-            # содержит dag_id, у остальных его нет, поэтому фолбэк на номер
-            name = ti.task_id
-            if ti.map_index >= 0:
-                name += f"[{ti.rendered_map_index or ti.map_index}]"
-            conn_id = _TASK_CONN.get(ti.task_id, ti.task_id)
+            # Выводим только ошибки и скипы; строка — группа и conn_id экземпляра
+            item = listed[ti.map_index] if ti.map_index < len(listed) else {}
+            conn_id = item.get("conn_id", f"check[{ti.map_index}]")
+            name = f"{item.get('group', '?')} · {conn_id}"
             vital = any(fnmatch(conn_id, pat) for pat in critical)
             if icon == "❌":
                 (failed_vital if vital else failed_aux).append(conn_id)
@@ -626,6 +586,9 @@ def tools_test_connections():  # noqa: PLR0915
         logger.info("report: %s", headline)
         # Упавшие подключения таск не роняют: важное — error (ран красный через health_errors),
         # вспомогательное — warn (ран зелёный, ⚠️ в health_warn)
+        if not collect_ok:
+            # Список не снят — проверять было нечего, это ошибка, а не «всё зелёное»
+            failed_vital.insert(0, "collect")
         push_health({
             "connections_critical": {
                 "status": "error" if failed_vital else "healthy",
@@ -643,9 +606,7 @@ def tools_test_connections():  # noqa: PLR0915
                 "failed_critical": failed_vital, "failed_aux": failed_aux}
 
     report_task = report()
-
-    if groups:
-        groups >> report_task
+    checks >> report_task
     report_task >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 

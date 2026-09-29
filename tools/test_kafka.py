@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-09-28 10:38 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 15:22 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -32,7 +32,7 @@
 
 | Параметр   | Описание |
 |---|---|
-| `conn_id`  | Airflow Kafka conn_id (kafka_config_id); выпадающий список — kafka-коннекты из Variable `local_connections`, её наполняет `tools_show_connections` |
+| `conn_id`  | Airflow Kafka conn_id (kafka_config_id); выпадающий список — kafka-коннекты из Variable `local_connections`, её наполняет `tools_test_connections` (таск `collect`) |
 | `topic`    | Имя топика |
 | `message`  | Только write: текст сообщения, уходит как есть. Маркеры `{RqUID}` и `{RqTm}` заменяются при отправке; по умолчанию — `TransferFileCephRq` |
 | `mode`     | Только read: `read_last` / `wait` |
@@ -134,9 +134,9 @@ DEFAULT_MESSAGE = _default_message()
 def _kafka_conn_ids() -> list[str]:
     """conn_id всех kafka-соединений из Variable `local_connections` — для выпадающего списка.
 
-    Variable наполняет DAG `tools_show_connections`: {conn_type: [{conn_id, host, ...}]}.
-    Читаем на парсинге, как это делает test_connections._load_groups. Если Variable нет
-    (show_connections ещё не запускали) — остаются дефолты направлений, чтобы список не
+    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Читаем на парсинге. Если Variable нет
+    (test_connections ещё не запускали) — остаются дефолты направлений, чтобы список не
     оказался пустым; они же всегда в списке, иначе выпадашка откроется без своего значения.
     """
     conn_ids = {SND_CONN, RCV_CONN}

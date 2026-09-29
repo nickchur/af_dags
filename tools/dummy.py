@@ -41,7 +41,7 @@ def _sec(a, b):
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
-        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. show_connections.py)
+        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. test_connections.py)
         'priority_weight': 900,
         'weight_rule': 'absolute',
         'execution_timeout': timedelta(minutes=5),
