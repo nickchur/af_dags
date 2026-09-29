@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-29 08:47 MSK · v1.39 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:06 MSK · v1.40 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -391,7 +391,7 @@ failed — как кнопка Mark failed: незавершённые зада�
     `tfs_kafka_snd` с весом 1 проигрывал весам 22–1921 и закрывался по `dagrun_timeout` без
     старта. Разбор целиком — `queue_cleanup/<дата>/<время>_analyze.json` в бакете логов.
 *   **Параметры**: `stale_min`, `queues`, `min_junk_share`, `max_delete`,
-    `schedule` (по умолчанию `10 6 * * *` = 09:10 MSK; плановый прогон брокер не чистит) сохраняются в `tools_queue_analyze_params`;
+    `schedule` (по умолчанию `10 9 * * *`, MSK, как у соседей; плановый прогон брокер не чистит) сохраняются в `tools_queue_analyze_params`;
     пока её нет, умолчания берутся из прежней `tools_queue_cleanup_cfg`. `purge` не сохраняется.
 
 **`broker` и `purge`** — прежняя разметка и чистка, перенесены без изменений:

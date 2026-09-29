@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-28 17:43 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:06 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -81,15 +81,18 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log` | ничего |
 | `tools_test_connections` | `15 23 * * *` | Доступность каждого подключения, важные — `critical` | ничего |
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
-| `tools_queue_analyze` | `10 6 * * *` (09:10 MSK) | Почему задачи ждут; брокер | брокер — только при `purge` |
+| `tools_queue_analyze` | `10 9 * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
-| `tools_db_cleanup` | `0 2 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
-| `tools_log_cleanup` | `17 5 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
+| `tools_db_cleanup` | `0 2 * * *` (UTC, 05:00 MSK) | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
+| `tools_log_cleanup` | `17 5 * * *` (UTC, 08:17 MSK) | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
 | `tools_show_connections` | `0 23 * * *` | Подключения secret backend → Variable `local_connections` | Variable |
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |
 | `tools_dummy` | `3 * * * *` | Шедулер и воркер живы: `dummy_task` (`EmptyOperator`, отмечает шедулер) → `ping` на воркере; в заметке `ping` — сколько думал шедулер и ждала очередь; красный по `dagrun_timeout` (50 мин) | ничего |
+
+Cron — по Москве (зона `start_date` дага), кроме помеченных UTC. `tools_queue_analyze` до
+29.09.2026 шёл по UTC (`10 6`), время прогона то же.
 
 ## 3. Разбор по симптому (общее)
 

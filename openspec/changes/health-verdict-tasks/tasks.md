@@ -11,7 +11,7 @@
 - [x] 2.3 `log_events`: `report` → `push_health` (выше порога `error`, есть сбои `warn`), `params` через `store_params_task`, `is_paused_upon_creation=False`; проверка: стенд (2 сбоя) → `health_warn` ✅, ран зелёный
 - [x] 2.4 `test_connections`: параметр `critical`, словарь `task_id → conn_id`, `summary` → `report` с `connections_critical`/`connections` и колонкой «важное»; убрать `raise`; проверка: стенд — с важным среди упавших ран красный, без — зелёный с ⚠️
 - [x] 2.5 `test_dags`: `summary` → `report`, `push_health` (`bad` → `error`, немые сравнения → `warn`), убрать `raise`; проверка: стенд, стабильная сериализация → `health_*` skipped
-- [x] 2.6 `queue_analyze`: расписание по умолчанию `'10 6 * * *'`, `report` → `push_health` не выше `warn`, тег `health` вместо `clean`, `is_paused_upon_creation=False`; проверка: стенд без `purge` — брокер не тронут, `schedule_interval` = `10 6 * * *`
+- [x] 2.6 `queue_analyze`: расписание по умолчанию `'10 9 * * *'` (MSK), `report` → `push_health` не выше `warn`, тег `health` вместо `clean`, `is_paused_upon_creation=False`; проверка: стенд без `purge` — брокер не тронут, `schedule_interval` = `10 6 * * *`
 - [x] 2.7 Убрать прямые вызовы `report_health` из c072ffa; `REPORT_TTL_SEC` и `skill` передаются в `health_tasks`; проверка: `grep report_health tools/` — только в `plugins/utils.py`
 
 ## 3. Единообразие

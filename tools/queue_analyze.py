@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-28 12:14 MSK · v3.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-29 09:06 MSK · v3.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -120,11 +120,12 @@ DEFAULTS = {
     # Как STALE_AFTER_SEC карточки Health (etl-core celery_health_plugin): младше — обычное
     # ожидание цикла шедулера
     "stale_min": 5,
-    # Раз в сутки в 06:10 UTC = 09:10 MSK (start_date в UTC — cron в его зоне): в начале
-    # рабочего дня очередь занята, ночью разбирать нечего
-    "schedule": "10 6 * * *",
+    # Раз в сутки в 09:10 MSK (cron в зоне start_date, как у соседних дагов; до 29.09.2026 —
+    # UTC, «10 6 * * *»): в начале рабочего дня очередь занята, ночью разбирать нечего
+    "schedule": "10 9 * * *",
 }
 ONE_SHOT = ("purge",)
+MSK = timezone(timedelta(hours=3))
 # Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
 REPORT_TTL_SEC = 26 * 3600
 # Навык агента, на который отчёт плагина отсылает толкование выводов
@@ -468,7 +469,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         "execution_timeout": timedelta(minutes=10),
         "on_failure_callback": on_callback,
     },
-    start_date=datetime(2026, 9, 10, tzinfo=timezone.utc),
+    start_date=datetime(2026, 9, 10, tzinfo=MSK),
     tags=["DataTools", "tools", "health"],
     catchup=False,
     # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
