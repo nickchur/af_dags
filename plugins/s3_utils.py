@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-09-17 10:41 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 18:02 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -63,7 +63,7 @@ def _md5_instead_of_checksum(request, **kwargs):
     body = request.body or b''
     if isinstance(body, str):
         body = body.encode()
-    request.headers['Content-MD5'] = base64.b64encode(hashlib.md5(body).digest()).decode()
+    request.headers['Content-MD5'] = base64.b64encode(hashlib.md5(body, usedforsecurity=False).digest()).decode()
 
 
 def s3_set_ttl(conn, bucket, days, prefix='', status='Enabled'):

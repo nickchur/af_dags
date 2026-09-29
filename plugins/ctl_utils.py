@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-26 22:31 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 18:02 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -704,7 +704,7 @@ def ctl_obj_save(key, data, var=False, ext='json'):
         else:
             content = data
             
-        new_md5 = hashlib.md5(content).hexdigest()
+        new_md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
 
         # 2. Проверяем текущий ETag в S3 (boto3 хранит MD5 в ETag для обычных загрузок)
         if hook.check_for_key(key_ext, bucket_name=bucket):

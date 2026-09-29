@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-27 17:05 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 18:02 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -81,7 +81,7 @@ def sign(x):
     return (x > 0) - (x < 0)
 
 def md5_hash(data):
-    return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8'), usedforsecurity=False).hexdigest()
 
 @provide_session
 def pool_slots(pool_name, slots, session=None):
