@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-29 18:36 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 08:40 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -25,9 +25,11 @@
 | `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
+from airflow import settings
 from airflow.models import DagModel, TaskInstance, Pool
 from airflow.utils.session import provide_session, create_session
 from airflow.utils.state import State
+from sqlalchemy import text
 from airflow.operators.python import get_current_context
 
 from pprint import PrettyPrinter
@@ -200,9 +202,16 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
     
-    # Используем новый контекстный менеджер для чистой сессии
+    # Своя сессия, не create_session(): тот отдаёт scoped-сессию потока — ту же, где вызывающий
+    # держит несохранённые изменения (autoflush у Airflow выключен). refresh ниже перечитывал
+    # его объект и затирал их: handle_failure ставит FAILED в памяти, зовёт on_callback, и
+    # callback зомби оставлял задачу running навсегда (альфа 30.09.2026, три run_prm по 5 ч).
+    # lock_timeout — чтобы не ждать строку, которую держит транзакция вызывающего
     try:
-        with create_session() as session:
+        session = settings.Session.session_factory()
+        try:
+            if session.bind.dialect.name == 'postgresql':
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
             # sorted, а не set: порядок блокировок должен быть одинаковым у всех тасков.
             # Общая строка тут одна (ран), свои task_instance у каждого свои, так что
             # взаимной блокировки не выходит, но полагаться на порядок set нельзя.
@@ -245,7 +254,9 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 # Лимит длины
                 obj.note = new_note[:MAX_NOTE_LEN]
             
-            session.commit() # Явный коммит внутри контекста
+            session.commit()
+        finally:
+            session.close()
     except Exception as e:
         logger.warning(f"Failed to update note: {e}")
 
