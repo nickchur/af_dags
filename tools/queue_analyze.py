@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 16:06 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 18:16 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -74,6 +74,7 @@ import base64
 import json
 import logging
 import time
+import uuid
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
@@ -435,6 +436,35 @@ def _reply(res):
     return res if isinstance(res, int) else repr(res)[:200]
 
 
+def _probe(client, full: str) -> dict:
+    """Какие удаления брокер выполняет на самом деле: на маленьком временном сете и на большом.
+
+    Альфа и сигма dev 30.09: DEL сета ответил 1, SREM — `[]`, а сет не изменился; на стенде те же
+    команды работают. kombu убирает привязку ответной очереди тем же SREM — если он на контуре
+    не работает, это и есть утечка. Временный ключ с тем же хэштегом (тот же узел), живёт минуту.
+    """
+    out = {}
+    tmp = full.split("}", 1)[0] + "}_tools_probe:" + uuid.uuid4().hex[:8] if full.startswith("{") \
+        else "_tools_probe:" + uuid.uuid4().hex[:8]
+    try:
+        out["tmp_sadd"] = _reply(client.sadd(tmp, "a", "b", "c"))
+        client.expire(tmp, 60)
+        out["tmp_srem"] = _reply(client.srem(tmp, "a"))
+        out["tmp_scard"] = _reply(client.scard(tmp))
+        out["tmp_del"] = _reply(client.delete(tmp))
+        out["tmp_exists"] = _reply(client.exists(tmp))
+        member = client.srandmember(full)
+        if member is not None:
+            out["big_srem1"] = _reply(client.srem(full, member))
+            out["big_ismember"] = _reply(client.sismember(full, member))
+            before = client.scard(full)
+            out["big_spop"] = repr(client.spop(full))[:120]
+            out["big_spop_delta"] = before - client.scard(full)
+    except Exception as exc:  # noqa: BLE001 — проба, не повод падать
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
 def reply_bindings(purge: bool = False) -> dict:
     """Размер сета привязок ответных очередей; purge — удалить сет целиком.
 
@@ -468,6 +498,7 @@ def reply_bindings(purge: bool = False) -> dict:
                 out["server"] = {k: info.get(k) for k in ("redis_version", "redis_mode", "server_name", "os")}
             except Exception as exc:  # noqa: BLE001 — сведения, не повод падать
                 out["server"] = f"{type(exc).__name__}: {exc}"
+            out["probe"] = _probe(client, full)
             out["del"] = _reply(client.delete(full))
             left = client.scard(full)
             # DEL ответил, а сет на месте — добираем пачками SSCAN + SREM. Проход по сету, после
@@ -922,7 +953,8 @@ def tools_queue_analyze():
         text = f"привязок ответных очередей: {res['count']}"
         if "left" in res:
             text += f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}, SREM {res['srem']})"
-            text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "")
+            text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "") \
+                + (f"\nпроба удалений: `{res['probe']}`" if res.get("probe") else "")
         if res["sample"]:
             text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
         add_note(text, context=context, level="Task", title="📮 pidbox")
