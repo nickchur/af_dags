@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 16:03 MSK · v3.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 16:06 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -422,6 +422,19 @@ def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list,
             "median_dispatched": median, "dispatched_1h": len(dispatched)}
 
 
+def _count(res) -> int:
+    """Число из ответа Redis. Альфа dev 30.09: SREM ответил списком, а не числом, — похоже на
+    прокси перед брокером, который шлёт команду на несколько узлов и возвращает их ответы."""
+    if isinstance(res, (list, tuple)):
+        return sum(_count(r) for r in res)
+    return res if isinstance(res, int) else 0
+
+
+def _reply(res):
+    """Ответ как есть, если он не число: по нему видно, что вернул сервер."""
+    return res if isinstance(res, int) else repr(res)[:200]
+
+
 def reply_bindings(purge: bool = False) -> dict:
     """Размер сета привязок ответных очередей; purge — удалить сет целиком.
 
@@ -449,7 +462,13 @@ def reply_bindings(purge: bool = False) -> dict:
         out = {"key": full, "count": count,
                "sample": [(m.decode() if isinstance(m, bytes) else m).split(sep)[-1] for m in sample[:REPLY_SAMPLE]]}
         if purge and count:
-            out["del"] = client.delete(full)
+            # Сервер — чтобы по отчёту было видно, кто отвечает: Redis или прокси перед ним
+            try:
+                info = client.info("server")
+                out["server"] = {k: info.get(k) for k in ("redis_version", "redis_mode", "server_name", "os")}
+            except Exception as exc:  # noqa: BLE001 — сведения, не повод падать
+                out["server"] = f"{type(exc).__name__}: {exc}"
+            out["del"] = _reply(client.delete(full))
             left = client.scard(full)
             # DEL ответил, а сет на месте — добираем пачками SSCAN + SREM. Проход по сету, после
             # которого он не уменьшился, — удаление не работает: крутить до предела бессмысленно
@@ -458,7 +477,9 @@ def reply_bindings(purge: bool = False) -> dict:
             while left and time.monotonic() < deadline:
                 cursor, batch = client.sscan(full, cursor, count=PURGE_BATCH)
                 if batch:
-                    out["srem"] += client.srem(full, *batch)
+                    res = client.srem(full, *batch)
+                    out.setdefault("srem_raw", repr(res)[:200])
+                    out["srem"] += _count(res)
                 if not cursor:
                     left = client.scard(full)
                     if not batch or left >= before:
@@ -901,6 +922,7 @@ def tools_queue_analyze():
         text = f"привязок ответных очередей: {res['count']}"
         if "left" in res:
             text += f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}, SREM {res['srem']})"
+            text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "")
         if res["sample"]:
             text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
         add_note(text, context=context, level="Task", title="📮 pidbox")
