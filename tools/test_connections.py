@@ -140,13 +140,13 @@ def _group(conn_id: str, conn_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Локальная копия plugins.ctl_core.chk_any_conn (Postgres / S3 / KerberosHttp)
+# Локальная копия ctl_worker.ctl_core.chk_any_conn (Postgres / S3 / KerberosHttp)
 # ---------------------------------------------------------------------------
 
 def _chk_any_conn(conn_id: str, conn_type: str, context: dict) -> None:
     """Проверяет доступность соединения (Postgres / S3 / KerberosHttp).
 
-    Самодостаточная копия `plugins.ctl_core.chk_any_conn` — чтобы тест не зависел от
+    Самодостаточная копия `ctl_worker.ctl_core.chk_any_conn` — чтобы тест не зависел от
     импорта ctl_core. Логика pool_slots / get_config из оригинала здесь не нужна: тест
     всегда проверяет одно соединение без пулов. При успехе пишет ноту, при ошибке —
     пробрасывает AirflowFailException.

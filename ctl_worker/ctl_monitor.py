@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-30 07:27 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -28,8 +28,8 @@ from airflow.utils.session import create_session
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN, ctl_wf_owner, ctl_subtree_names  # type: ignore
+from ctl_worker.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
+from ctl_worker.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN, ctl_wf_owner, ctl_subtree_names  # type: ignore
 
 import ast
 import json
@@ -70,7 +70,7 @@ SLA_SHOW = 10
 
 monitor_interval = str2timedelta(get_config().get('monitor_interval','minutes=15'))
 # Пороги разбора загрузок — в конфиге, значения по умолчанию прежние (были зашиты в код).
-# Лестница, с которой они обязаны сходиться, — в plugins/ctl_core.py.
+# Лестница, с которой они обязаны сходиться, — в ctl_worker/ctl_core.py.
 new_grace = get_config().get('new_grace', 'minutes=60')     # моложе — загрузка «новая»
 lock_stale = get_config().get('lock_stale', 'hours=5')      # LOCK / LOCK-WAIT → reStarted
 wait_grace = cfg_delta('wait_grace', 'minutes=15')          # просрочка TIME-WAIT → reStarted
@@ -625,7 +625,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
 
         Порог берётся из конфига (`zombie_after`, по умолчанию 6 часов) и обязан быть
         больше потолка запроса в Greenplum (`gp_timeout` + 10 мин): лестница проверяется до
-        любой уборки (`timeout_ladder`, plugins/ctl_core.py). Параметр формы
+        любой уборки (`timeout_ladder`, ctl_worker/ctl_core.py). Параметр формы
         `zombie_dry_run` показывает список, ничего не трогая.
         """
         dry = bool(context['params'].get('zombie_dry_run'))

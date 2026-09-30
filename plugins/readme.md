@@ -1,70 +1,22 @@
-# 🛠️ CTL Plugins для Apache Airflow
-*2026-09-26 13:28 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+# 🛠️ Общие модули `plugins/`
+*2026-09-30 09:26 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Этот модуль содержит набор плагинов для интеграции Apache Airflow с системой CTL (Control Layer) и управления ETL-процессами.
+Модули, которыми пользуются даги нескольких каталогов: утилиты Airflow, S3, тракт ТФС.
+
+Модули CTL — `ctl_core.py` и `ctl_utils.py` — живут рядом со своими дагами, в `ctl_worker/`:
+кроме дагов CTL их никто не импортирует. Описание — в [`ctl_worker/readme.md`](../ctl_worker/readme.md),
+раздел «Модули ctl_core и ctl_utils».
 
 ## 📁 Структура модуля
 
 ```
 plugins/
-├── ctl_core.py      # Ядро логики управления retry, событиями, ожиданием и загрузками
-├── ctl_utils.py     # Утилиты: API, БД, S3, логирование, сериализация
 ├── s3_utils.py      # Расширенные утилиты для работы с S3
 ├── utils.py         # Общие утилиты Airflow: pool slots, заметки, обратные вызовы
 └── readme.md        # Документация
 ```
 
 ## 🔧 Основные компоненты
-
-### ctl_core.py — Ядро логики CTL
-
-Содержит основные функции для управления процессами загрузки данных:
-
-- **retry-логика** (`ctl_get_retry`): Получение и восстановление конфигурации повторов
-- **Проверка времени** (`ctl_chk_wait`, `ctl_chk_new`): Управление TIME-WAIT состояниями
-- **Проверка событий** (`ctl_chk_event`, `ctl_events_mon`): Мониторинг событий с поддержкой стратегий AND/OR
-- **Отправка HTML** (`ctl_send_html`): Отправка HTML-содержимого в CTL как статистики
-- **Нормализация данных** (`ctl_loading_norm`, `ctl_wf_norm`): Преобразование сырых данных в удобный формат
-- **Проверка соединений** (`chk_any_conn`, `chk_conn`): Проверка доступности соединений (Postgres, S3, HTTP)
-- **Управление статусами** (`ctl_get_status`, `ctl_chk_status`): Проверка и отображение статусов загрузок
-- **Подбор ответа после обрыва** (`ctl_exe_recover`): что стало с прошлой попыткой `run_exe`
-  — см. ниже «Обрыв не останавливает работу в Greenplum»
-- **Лестница таймаутов** (`gp_timeout`, `timeout_ladder`, `cfg_delta`): потолок запроса в GP из `wf_timeout` или `gp_timeout` с предупреждением выше серверного лимита — один разбор для воркера и монитора; проверка согласованности порогов для санитара. Сама лестница — в [`ctl_worker/readme.md`](../ctl_worker/readme.md), раздел «Таймауты»
-
-Константы:
-- `MAX_HTML = 5000` — Максимальная длина фрагмента HTML для отправки
-- `conns` — Конфигурация соединений (ctl, gp, pg, s3, s3_files)
-
-### ctl_utils.py — Утилиты
-
-Содержит вспомогательные функции:
-
-- **`get_config()`** — Ленивая загрузка конфигурации из Airflow Variable `ctl_config`. Результат кешируется. **Импортируйте `get_config`, а не `config`.**
-- **`eval_delta`** — Расчёт времени с использованием delta-выражений
-- **`logging`** — Централизованное логирование с эмодзи-кодированием
-- **`ctl_api`** — Обёртка для API вызовов CTL с retry-логикой и rate limiting
-- **`gp_exe`** — Выполнение SQL в Greenplum с retry-логикой
-- **`gp_loading_result`** — ответ по загрузке из журнала движка (`vw_swf_ctl_log`) или `None`
-- **`gp_backend_busy`** — pid серверных процессов, выполняющих запуск загрузки с этим номером
-  (`pg_stat_activity`); pid берётся из XCom, куда его кладёт `gp_exe`
-- **`pg_exe`** — Выполнение SQL в PostgreSQL с retry-логикой
-- **`ctl_obj_load`/`ctl_obj_save`** — Загрузка и сохранение объектов в S3 (папка `ctl/` бакета логов) или Airflow Variables.
-  Читатель берёт сначала Variable и идёт в S3 только при её отсутствии, поэтому переменная
-  пишется **всегда**, даже когда тело в S3 не изменилось: раньше совпадение MD5 выходило из
-  функции раньше записи, и отставшая однажды переменная не догоняла никогда. Возвращаемый
-  признак по-прежнему про S3 — «записи не было»
-- **`ctl_obj_etag`** — Получение ETag (MD5-хеша) объекта из S3
-- **`gp_upload_s3_csv`** — потоковая загрузка CSV/ZIP/GZ из S3 в Greenplum. Усечение таблицы
-  (`truncate=True`) идёт **один раз на объект S3**: внутри архива каждый файл грузится своей
-  транзакцией, и усечение на каждом оставляло в таблице только последний файл
-- **`eval_delta`** — временные смещения. Неразобранный кусок дельты поднимает `ValueError` с
-  его текстом и всей дельтой: из дельты считается время следующей попытки, и молчаливый
-  пропуск давал неверное время без следа. Пустое значение (`hours=`, лишняя запятая)
-  пропускается
-
-Функции retry используют:
-- `tenacity` для автоматических повторов
-- `log_retry_attempt` для логирования попыток
 
 ### tfs_utils.py — Тракт ТФС
 
@@ -105,40 +57,12 @@ plugins/
 
 ```python
 st, ld_sts = ctl_chk_status(lid, wf['name'], step='RUN')
-raise_status(st, ld_sts)      # skip → AirflowSkipException, fail → AirflowFailException
+raise_status(st, ld_sts)      # ctl_worker/ctl_core.py: skip → AirflowSkipException, fail → AirflowFailException
 ```
 
 `skip` — это штатный пропуск, поэтому у следующего таска в цепочке нужен
 `trigger_rule=NONE_FAILED`, иначе пропуск утянет всю цепочку. На исключениях остаются
 только транспортные функции: HTTP, SQL, S3.
-
-### Обрыв не останавливает работу в Greenplum
-
-Проверено на боевом кластере: если клиент отвалился, запрос **продолжает выполняться** и
-коммитится сам. Отсюда устройство `ctl_exe_recover`, которого иначе не понять.
-
-`pr_swf_start_ctl` атомарна — коммита внутри функции в Greenplum нет, — и свой ответ она
-кладёт в журнал той же транзакцией. Значит ответ в журнале означает «работа выполнена и
-закоммичена». Но **отсутствие ответа не означает «работы не было»**: пока транзакция идёт,
-её записи не видны другим сессиям, а идти она может ещё час после того, как воркер умер.
-
-Поэтому состояний три, и различает их `pg_stat_activity` — по номеру загрузки в тексте
-запроса (`gp_backend_busy(lid)`). Не по pid прошлой попытки: он лежал в XCom, а Airflow
-стирает XCom задачи в начале каждой попытки, и до 26.09.2026 повтор всегда кончался «pid
-неизвестен».
-
-| Журнал | Запуск в Greenplum | Что делает `ctl_exe_recover` |
-|---|---|---|
-| ответ есть | — | отдаёт его: `('ok', ответ)` |
-| ответа нет | идёт | ждёт завершения, потом отдаёт ответ; не дождался — `('fail', …)` |
-| ответа нет | нет | ещё раз спрашивает журнал; пусто — `('lost', …)`: транзакция откачена |
-
-`lost` — исход достоверный: `run_exe` отдаёт `res = -9`, и `run_end` сразу применяет повторы
-воркфлоу. `fail` и недоступный Greenplum — неизвестность: таск падает, ETL заново не
-запускается, загрузку разбирает монитор. Объявить работу несостоявшейся, пока она идёт,
-значит отдать загрузку на повтор и получить второй ETL параллельно первому. По той же
-причине сам вызов `pr_swf_start_ctl` идёт одной попыткой, без повторов `gp_exe` на
-`OperationalError`.
 
 ### utils.py — Общие утилиты
 
@@ -203,87 +127,19 @@ celery не собирается. Поэтому на альфа-стенде `E
 Проверить, что вышло, можно дампом `tfs_utils.get_config()`: там рядом стоят выведенный
 `ENV_SPACE` и сама `ENVIRONMENT`, по которой вывод сделан.
 
-### Настройки CTL
-
-Конфигурация хранится в Airflow Variable `ctl_config` (JSON):
-
-```json
-{
-  "tz": "Europe/Moscow",
-  "ctl_timeout": [10, 30],
-  "ctl_limit": 0,
-  "expire": "days=-1",
-  "gp_conn_id": "greenplum"
-}
-```
-
-## 💡 Примеры использования
-
-### Проверка событий
-
-```python
-from plugins.ctl_core import ctl_events_mon
-import pendulum
-
-wf = {
-    'name': 'my_workflow',
-    'eventAwaitStrategy': 'and',
-    'wf_event_sched': {
-        'profile1/entity1/stat1': True,
-        'profile2/entity2/stat2': True
-    },
-    'start_dttm': '2024-01-01 10:00:00'
-}
-
-result = ctl_events_mon(wf['start_dttm'], wf, pendulum.now())
-if result['chk']:
-    # Нужно продолжать ожидание
-    raise AirflowSkipException("Waiting for events")
-else:
-    # События наступили, можно продолжать
-    pass
-```
-
-### Отправка HTML-отчета
-
-```python
-from plugins.ctl_core import ctl_send_html
-
-html_content = [
-    "<table><tr><th>Col1</th><th>Col2</th></tr><tr><td>Val1</td><td>Val2</td></tr></table>"
-]
-
-ctl_send_html(html_content, loading_id=123, entity_id=456)
-```
-
-### Управление retry
-
-```python
-from plugins.ctl_core import ctl_get_retry
-
-retry = ctl_get_retry(
-    params={'wf_retry_on': 'error', 'wf_retry_cnt': 3},
-    wf={'faultTolerance': {'numAttempts': 3, 'retryDelayMs': 5000}}
-)
-# retry = {'try': 1, 'left': 2, 'delay': None, 'add': None}
-```
-
 ## 📦 Зависимости
 
 - Airflow
 - tenacity (для retry-логики)
 - psycopg2 (для Greenplum/PostgreSQL)
 - boto3 (для S3)
-- hrp_operators (для KerberosHttpHook)
 - pendulum (для работы с датами)
 - PyYAML (для сериализации YAML)
 
 ## 📝 Примечания
 
 - Все функции с сетевыми вызовами имеют retry-логику
-- Используется rate limiting для API вызовов (100 запросов/сек)
 - Объекты сохраняются в S3 с проверкой MD5-хеша
-- Логи записываются в Greenplum для аудита
 - Конфигурация и список S3-бакетов инициализируются лениво — импорт модулей безопасен при отсутствии Airflow Variables или недоступных соединениях
 
 ---

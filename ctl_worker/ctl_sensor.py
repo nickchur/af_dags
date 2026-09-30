@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -28,8 +28,8 @@ from airflow.utils.session import create_session
 
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load  # type: ignore
-from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, ctl_obj_save # type: ignore 
-from plugins.ctl_core import ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry, raise_status # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_api, ctl_obj_load, ctl_obj_save # type: ignore 
+from ctl_worker.ctl_core import ctl_loading_load, ctl_chk_new, ctl_chk_expire, ctl_chk_wait, ctl_set_status, ctl_get_retry, raise_status # type: ignore
 
 # from datetime import timedelta
 from psycopg2 import errors

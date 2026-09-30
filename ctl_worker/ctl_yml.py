@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -13,7 +13,7 @@ from airflow import DAG
 from airflow.operators.python import task
 
 from plugins.utils import add_note, default_args # type: ignore
-from plugins.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
 
 import json
 import pendulum

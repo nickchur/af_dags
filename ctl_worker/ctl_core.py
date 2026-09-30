@@ -1,5 +1,5 @@
-"""### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-26 21:26 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🛠️ Ядро логики CTL (`ctl_worker/ctl_core.py`)
+*2026-09-30 09:25 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -33,7 +33,7 @@ import time
 import json
 
 from plugins.utils import query_to_dict, pool_slots, on_callback, add_note, str2timedelta # type: ignore
-from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -147,7 +147,7 @@ def ctl_exe_recover(lid, deadline=None, poll=30):
     стирает XCom задачи в начале каждой попытки, и до 26.09.2026 повтор всегда заканчивался
     «pid неизвестен». Недоступный Greenplum — исключение из справок, его разбирает таск.
     """
-    from plugins.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
+    from ctl_worker.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
 
     waited = 0
     while True:

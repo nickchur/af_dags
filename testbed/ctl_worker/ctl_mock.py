@@ -4,7 +4,7 @@
 Отвечает так, как отвечает CTL нашим дагам: справочники — из фикстур (снимок боевого
 бакета `edpetl-ctl`, развёрнутый `fixtures_from_cache.py`), состояние загрузок — в
 postgres, схема `ctl_mock` (`schema.sql`). Ничего, кроме нашего кода, эмулятор не
-обслуживает: набор эндпоинтов снят с `plugins/ctl_utils.py`, `plugins/ctl_core.py`
+обслуживает: набор эндпоинтов снят с `ctl_worker/ctl_utils.py`, `ctl_worker/ctl_core.py`
 и каталога `ctl_worker/`.
 
 Запуск (юнит `ctl-mock.service` делает то же самое):

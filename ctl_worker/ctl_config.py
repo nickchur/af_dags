@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-30 07:27 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -79,7 +79,7 @@ conns = {
         'default': True,
     },
     # Своего S3 у CTL нет с 25.09.2026: снимки (ctl_obj_save) лежат в папке ctl/ бакета логов
-    # и живут по его сроку (plugins/ctl_utils.py, _ctl_s3)
+    # и живут по его сроку (ctl_worker/ctl_utils.py, _ctl_s3)
     'files': {
         'type': 'S3',
         'conn_id': 's3-archive',
@@ -115,7 +115,7 @@ config = {
     'ue_category': "p1080.sdpue",
     "archive_category": "p1080.ARCHIVE",
     "event_expire": "time=0:00",
-    # Лестница таймаутов (plugins/ctl_core.py): сервер GP рвёт запрос через 4 ч 30 (правило
+    # Лестница таймаутов (ctl_worker/ctl_core.py): сервер GP рвёт запрос через 4 ч 30 (правило
     # GPCC «Query Time 4,5H (GLOBAL)»), наш statement_timeout на 5 мин ниже. exe_timeout и
     # sla_time убраны 22.09.2026: первый потолком не был, второй (Airflow-SLA) не срабатывал
     'gp_server_limit': 'minutes=270',
@@ -215,7 +215,7 @@ with DAG(f'CTL.{config["profile"]}.config',
         config = context["params"]
         pin = config.pop('CTL_PIN')
         if pin == get_scrt("AIRFLOW__CTL_PIN"):
-            from plugins.ctl_utils import ctl_obj_save # type: ignore
+            from ctl_worker.ctl_utils import ctl_obj_save # type: ignore
             # Save config to Variable
             ctl_obj_save('ctl_config', config, var=True)
             

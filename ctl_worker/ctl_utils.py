@@ -1,5 +1,5 @@
-"""### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-29 21:28 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
+*2026-09-30 09:26 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
