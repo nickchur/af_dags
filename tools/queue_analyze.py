@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 18:38 MSK · v3.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 19:11 MSK · v3.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -559,8 +559,8 @@ def reply_bindings(purge: bool = False) -> dict:
                     left = now_left
             out["deleted"] = count - left
             out["left"] = left
-            logger.warning("📮 сет %s: было %s, DEL=%s, SREM=%s, SPOP=%s, осталось %s",
-                           full, count, out["del"], out["srem"], out.get("spop"), left)
+            logger.warning("📮 сет %s: было %s, DEL=%s, UNLINK=%s, SREM=%s, SPOP=%s, осталось %s",
+                           full, count, out["del"], out.get("unlink"), out["srem"], out.get("spop"), left)
     return out
 
 

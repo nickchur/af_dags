@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-30 12:30 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 19:10 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -245,8 +245,13 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 # Транзакция короткая (чтение и запись одной строки), планировщик ждёт
                 # миллисекунды. Не получилось перечитать под блокировкой — работаем как
                 # раньше: потерянная строка заметки лучше упавшей задачи.
+                # OF — только своя таблица: у task_instance в запрос входит dag_run, и без OF
+                # блокировалась строка рана, которую держит планировщик (сигма dev 30.09: lock
+                # timeout). SAVEPOINT — чтобы сорвавшаяся блокировка не оставила транзакцию
+                # в ошибке: иначе и запись без блокировки падала с InFailedSqlTransaction.
                 try:
-                    session.refresh(obj, with_for_update=True)
+                    with session.begin_nested():
+                        session.refresh(obj, with_for_update={'of': type(obj)})
                 except Exception as e:
                     logger.warning(f"note: строка не заблокирована ({e}), пишем без блокировки")
                     session.expire(obj)
