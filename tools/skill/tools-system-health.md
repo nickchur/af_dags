@@ -1,11 +1,11 @@
 ---
 name: tools-system-health
-description: tools_system_pulse (раз в 5 мин — компоненты, celery, control-канал celery и брокер, метабаза, доставка) и tools_system_health (раз в час — бакет логов, пулы, разбор файлов, раны, scheduled, сторож отчётов плагинов) и их отчёты в get_system_health → plugins. Используй, когда спрашивают «что показал tools_system_health / tools_system_pulse», «plugins.tools_system_health», «plugins.tools_system_pulse», «control warn/error», «workers: 0 при идущих задачах», «воркеры перезапускаются по liveness», «ошибки импорта», «ран висит в running, last_scheduling_decision замер», «деактивированные даги», «плагин молчит», «tools_system_health красный».
+description: tools_system_pulse (раз в 5 мин — компоненты, celery, control-канал celery и брокер, метабаза, доставка) и tools_system_health (раз в час — бакет логов, пулы, разбор файлов, раны, scheduled, сторож отчётов плагинов) и их отчёты в get_system_health → plugins. Используй, когда спрашивают «что показал tools_system_health / tools_system_pulse», «plugins.tools_system_health», «plugins.tools_system_pulse», «control warn/error», «workers: 0 при идущих задачах», «воркеры перезапускаются по liveness», «ошибки импорта», «ран висит в running, last_scheduling_decision замер», «деактивированные даги», «плагин молчит», «tools_system_health красный», «перегрузка воркеров», «default_pool забит», «сотни задач в scheduled».
 ---
 
 # `tools_system_pulse` и `tools_system_health` — состояние контура
 
-*2026-09-29 16:56 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 09:58 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и концепцию `health_warn` / `health_errors` — навык **`tools`**.
 
@@ -65,6 +65,33 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
   каналы закрыты правами пользователя; «не прочитаны» — команда закрыта правами, это не поломка.
 
 Это вопрос к владельцам Redis, не к дагам.
+
+**Перегрузка воркеров — считай от ёмкости воркеров, не от пулов.** Одновременно задач идёт
+не больше, чем `подов × worker_concurrency` (`get_config_value celery worker_concurrency`; воркеров —
+в `celery` пульса, «воркеров N, слоты M из K»). Отсюда:
+- **пул больше ёмкости воркеров — не узкое место.** `occupied_slots` пула — это `running` плюс
+  `queued`; при 100 слотах пула и 32 слотах воркеров «пул забит» значит «очередь celery полна».
+  Поднять такой пул — переложить задачи из `scheduled` в очередь брокера, быстрее не станет;
+- **`scheduled_slots` пула (`list_pools`) — все задачи пула в `scheduled`, по любой причине**, а
+  не «ждут пула». Почему ждут — `scheduled_dag_limit` / `scheduled_pool_full` в карточке Health
+  и навык **`tools-queue-analyze`**;
+- **лимит `max_active_tasks` у тяжёлых дагов при занятых воркерах — защита, а не причина**: он не
+  даёт одному дагу на тысячу задач забрать все слоты. Снимать его при перегрузке — хуже;
+- **«ответили 0» в `control`** при идущих задачах (`busy_pods` > 0) — ответы опоздали
+  (`reply_sec`), а не поды умерли. «Воркеры мигают, OOM» так не доказывается: смотри перезапуски
+  подов и `celery` по отбивкам;
+- **`info.evicted_keys` — счётчик с запуска узла брокера**, а не скорость. Судить о нём можно по
+  приросту между двумя ранами пульса. Прирост есть — брокер вытесняет ключи и может терять
+  сообщения celery (задачи в `queued_stale`): у брокера должна быть `maxmemory-policy noeviction`,
+  это вопрос к владельцам Redis;
+- **ран сам слотов не держит** — только его задачи в `running`/`queued`. Многодневный ран без
+  таких задач нагрузку не создаёт; не советуй закрывать его ради слотов;
+- **`слоты ? из N` / `slots_busy: null`** — занятость не измерена; вывод «все заняты» тогда бери
+  из `delivery` и возраста `scheduled`, а не додумывай.
+
+Ёмкости мало (все слоты заняты, `delivery` и `oldest_scheduled_sec` растут) — это вопрос
+платформе: больше подов или выше `worker_concurrency` с оглядкой на память пода. Пулы и лимиты
+дагов при этом не трогать.
 
 **`collect` ❌ `canceling statement due to statement timeout`** — метабаза перегружена или
 таблица раздута; сама проверка ни при чём. `health_errors` назовёт `collect` «не выполнился».
