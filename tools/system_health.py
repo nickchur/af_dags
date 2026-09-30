@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-30 17:48 MSK · v3.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 22:13 MSK · v3.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -153,6 +153,8 @@ DB_PING_WARN_SEC = 1.0
 DB_CONN_WARN = 0.80
 DB_CONN_ERROR = 0.95
 DB_STATEMENT_TIMEOUT_MS = 5000
+# scheduled считает активные задачи по каждому ждущему дагу: на сигме dev 30.09 не уложился в 5 с
+SCHEDULED_TIMEOUT_MS = 20000
 # Сколько имён показывать в строке проверки: XCom-бэкенд контура не берёт списков длиннее
 # 500, а заметка режется по 1000 символов — поимённо нужны только первые
 SHOW = 5
@@ -225,7 +227,12 @@ def _run(name: str, fn, *args) -> dict:
         result = fn(*args)
     except Exception as exc:
         logger.warning("%s: проверка упала", name, exc_info=True)
-        result = {"status": "error", "summary": _short_reason(exc)}
+        if type(getattr(exc, "orig", None)).__name__ == "QueryCanceled":
+            # Свой лимит запроса к метабазе: медленная метабаза — повод посмотреть, но не
+            # неисправность того, что проверка меряет (сигма dev 30.09: красный ран пульса)
+            result = {"status": "warn", "summary": "метабаза не ответила за лимит проверки"}
+        else:
+            result = {"status": "error", "summary": _short_reason(exc)}
     result["sec"] = round(time.time() - ts, 2)
     logger.info("%s %s (%.2f с): %s", ICON[result["status"]], name, result["sec"], result["summary"])
     return result
@@ -1128,7 +1135,7 @@ def check_scheduled() -> dict:
     неисправность, в warn не идёт; warn — только если застряли даги не на лимите.
     """
     rows = _pg_rows(SQL_SCHEDULED, {"stale": f"{SCHEDULED_STALE_SEC} seconds",
-                                    "recent": f"{LIMIT_RECENT_SEC} seconds"})
+                                    "recent": f"{LIMIT_RECENT_SEC} seconds"}, SCHEDULED_TIMEOUT_MS)
     for row in rows:
         busy = row["active"] + (row.get("recent") or 0)
         row["at_limit"] = row["max_active_tasks"] is not None and busy >= row["max_active_tasks"]

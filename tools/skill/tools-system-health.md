@@ -5,7 +5,7 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
 
 # `tools_system_pulse` и `tools_system_health` — состояние контура
 
-*2026-09-30 17:49 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 22:13 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и концепцию `health_warn` / `health_errors` — навык **`tools`**.
 
@@ -22,6 +22,8 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
 - ⚠️ `health_warn` зелёный с заметкой — есть предупреждения;
 - ❌ `health_errors` красный, ран красный, уведомление — есть ошибки; в заметке строка на ошибку;
 - оба ☮️ — всё здорово.
+
+Проверка, чей запрос к метабазе не уложился в свой лимит, — ⚠️ «метабаза не ответила за лимит проверки»: метабаза медленная, а не неисправно то, что проверка меряет. Повторяется от рана к рану — смотреть нагрузку метабазы (`tools_pg_activity`).
 
 Отчёт плагина (`get_system_health` → `plugins.<dag_id>.checks.<имя>`) пишет `health_errors`. Полный результат — XCom `return_value` таска `collect`
 (`{status, reasons, checks, took_sec}`); тебе он недоступен, читай заметку `report` и отчёт.
