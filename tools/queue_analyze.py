@@ -446,7 +446,7 @@ def reply_bindings(purge: bool = False) -> dict:
         if purge and count:
             out["del"] = client.delete(REPLY_BINDINGS_KEY)
             left = client.scard(full)
-            # Сигма dev 30.09: DEL ответил, а сет остался целым (122360 → 122360). Добираем
+            # Альфа dev 30.09: DEL ответил, а сет остался целым (122360 → 122360). Добираем
             # пачками SSCAN + SREM — SREM kombu сам шлёт этому брокеру на отвязке очереди
             cursor, deadline = 0, time.monotonic() + PURGE_SREM_SEC
             while left and time.monotonic() < deadline:
