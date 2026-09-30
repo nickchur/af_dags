@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 18:30 MSK · v3.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 18:33 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -518,6 +518,10 @@ def reply_bindings(purge: bool = False) -> dict:
             out["probe"] = _probe(client, full)
             out["del"] = _reply(client.delete(full))
             left = client.scard(full)
+            if left:
+                # Альфа dev 30.09 (проба): DEL и SREM брокер не выполняет, UNLINK и SPOP — выполняет
+                out["unlink"] = _reply(client.unlink(full))
+                left = client.scard(full)
             # DEL ответил, а сет на месте — добираем пачками SSCAN + SREM. Проход по сету, после
             # которого он не уменьшился, — удаление не работает: крутить до предела бессмысленно
             out["srem"] = 0
@@ -983,7 +987,8 @@ def tools_queue_analyze():
         res = reply_bindings(purge=p["purge_pidbox"])
         text = f"привязок ответных очередей: {res['count']}"
         if "left" in res:
-            text += (f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}, SREM {res['srem']}"
+            text += (f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}"
+                     + (f", UNLINK {res['unlink']}" if "unlink" in res else "") + f", SREM {res['srem']}"
                      + (f", SPOP {res['spop']}" if "spop" in res else "") + ")")
             text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "") \
                 + (f"\nпроба удалений: `{res['probe']}`" if res.get("probe") else "")
