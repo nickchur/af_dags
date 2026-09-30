@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 18:33 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 18:38 MSK · v3.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -451,6 +451,12 @@ def _probe(client, full: str) -> dict:
         client.expire(tmp, 60)
         out["tmp_srem"] = _reply(client.srem(tmp, "a"))
         out["tmp_scard"] = _reply(client.scard(tmp))
+        # SMOVE во временный ключ + UNLINK — обход SREM, которым etl-core снимает привязку
+        moved = tmp + ":m"
+        out["smove"] = _reply(client.smove(tmp, moved, "b"))
+        client.expire(moved, 60)
+        out["smove_left"] = _reply(client.sismember(tmp, "b"))
+        out["smove_dst"] = _reply(client.scard(moved))
         out["tmp_del"] = _reply(client.delete(tmp))
         out["tmp_exists"] = _reply(client.exists(tmp))
         out["tmp_ttl"] = _reply(client.ttl(tmp))
