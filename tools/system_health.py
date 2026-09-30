@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-30 12:31 MSK · v3.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 17:48 MSK · v3.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -21,7 +21,7 @@
 |---|---|---|---|
 | `components` (пульс) | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` (пульс) | воркеры из отбивок `health_beacon` (нет отбивок — `broadcast` брокеру), длина очередей, счётчики `task_instance`, возраст задач в `queued` (`oldest_queued_sec`, `queued_over_timeout`), ёмкость исполнителя шедулера (`parallelism` × живые шедулеры против `queued`+`running`, `executor_open`) | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть, задачи в `queued` дольше `task_queued_timeout`, исполнитель заполнен при свободных слотах воркеров | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны, размер сета привязок ответных очередей (`reply_bindings`); приросты от прошлого отчёта пульса — `evicted_delta`, `reply_bindings_delta` | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс; `reply_bindings` ≥ 1000; брокер вытесняет ключи (`evicted_delta` > 0) | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны, размер сета привязок ответных очередей (`reply_bindings`), привязки рабочих очередей (`queue_bindings`), `maxmemory_policy`; приросты от прошлого отчёта пульса — `evicted_delta`, `reply_bindings_delta` | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс; `reply_bindings` ≥ 1000; брокер вытесняет ключи (`evicted_delta` > 0, с политикой памяти в тексте) | нет привязки рабочей очереди (задачи в неё теряются молча); не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` (час) | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` (пульс) | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` (час) | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -137,7 +137,7 @@ LATENCY_SAMPLES = 3
 # Поля INFO узла брокера: хватает, чтобы отличить перегруз и failover от сети
 INFO_FIELDS = ("redis_version", "role", "uptime_in_seconds", "connected_clients", "blocked_clients",
                "pubsub_channels", "pubsub_patterns", "instantaneous_ops_per_sec", "used_memory_human",
-               "rejected_connections", "evicted_keys")
+               "rejected_connections", "evicted_keys", "maxmemory_human", "maxmemory_policy")
 # S3 — как у промежуточной выгрузки лога (etl-core PR #35, hrp_adapter/logging/handlers.py):
 # живой S3 отвечает за доли секунды, сломанный шлюз альфы 11.09.2026 отвечал 504 примерно
 # через минуту — одна попытка и короткие таймауты, чтобы проверка не висела вместе с ним
@@ -490,7 +490,24 @@ def _median_ms(samples: list) -> float | None:
     return round(samples[len(samples) // 2] * 1000, 1) if samples else None
 
 
-def _broker_pubsub(app) -> dict:
+def _queue_bindings(channel, names) -> dict:
+    """Сколько привязок у каждой рабочей очереди (сет `_kombu.binding.<очередь>`), 0 — нет.
+
+    Без привязки kombu не находит получателя и молча выбрасывает задачу: очереди для
+    недоставленного у Redis-транспорта нет (kombu 5.6.2, virtual/base.py `deadletter_queue =
+    None`). Привязку объявляет отправитель один раз на процесс, так что вытесненный брокером
+    сет сам не вернётся, пока не перезапустится шедулер или воркер. SMEMBERS здесь дёшев:
+    в сете рабочей очереди единицы записей, и kombu читает его на каждую отправку задачи.
+    """
+    out = {}
+    sep = getattr(channel, "sep", "\x06\x16")
+    for name in names:
+        members = channel.client.smembers(channel.keyprefix_queue % (name,)) or ()
+        out[name] = sum(1 for m in members if _plain(m).split(sep)[-1] == name)
+    return out
+
+
+def _broker_pubsub(app, names=()) -> dict:
     """Узел брокера, куда ходит сам celery: задержка команд и pub/sub, INFO, права, подписки."""
     out = {}
     # Канал kombu, а не сырой клиент: он уже привязан к узлу кластера по global_keyprefix
@@ -504,6 +521,10 @@ def _broker_pubsub(app) -> dict:
             out["reply_bindings"] = cli.scard((getattr(channel, "global_keyprefix", "") or "") + REPLY_BINDINGS_KEY)
         except Exception as exc:
             out["reply_bindings"] = f"не прочитан: {_short_reason(exc)}"
+        try:
+            out["queue_bindings"] = _queue_bindings(channel, names)
+        except Exception as exc:
+            out["queue_bindings"] = f"не прочитаны: {_short_reason(exc)}"
 
         samples = []
         for _ in range(LATENCY_SAMPLES):
@@ -579,6 +600,7 @@ def check_control() -> dict:
     liveness-проба воркера (перезапускает под после 20 мин молчания) и число воркеров в
     карточке Health; check_celery видит только итог — меньше воркеров, — а не причину.
     """
+    from airflow.configuration import conf
     from airflow.providers.celery.executors.celery_executor import app
 
     busy = int(_pg_rows(SQL_BUSY_HOSTS, {"age": f"{BUSY_HEARTBEAT_SEC} seconds"})[0]["busy"] or 0)
@@ -596,7 +618,9 @@ def check_control() -> dict:
     notes, status = [], "healthy"
 
     try:
-        result.update(_broker_pubsub(app))
+        names = {conf.get("operators", "default_queue", fallback="default")}
+        names.update(r["queue"] for r in _pg_rows(SQL_QUEUES) if r["queue"])
+        result.update(_broker_pubsub(app, sorted(names)))
     except Exception as exc:
         logger.warning("control: pub/sub брокера не проверен", exc_info=True)
         notes.append(f"pub/sub не проверен: {_short_reason(exc)}")
@@ -608,7 +632,14 @@ def check_control() -> dict:
     if (result.get("evicted_delta") or 0) > 0:
         status = _worst([status, "warn"])
         notes.append(f"брокер вытесняет ключи: +{result['evicted_delta']} за {result['delta_sec'] // 60} мин — "
-                     "сообщения celery могут теряться; брокеру нужна политика памяти noeviction (владельцам Redis)")
+                     "сообщения celery могут теряться; брокеру нужна политика памяти noeviction, сейчас "
+                     f"{(result.get('info') or {}).get('maxmemory_policy', '?')} (владельцам Redis)")
+    lost = [n for n, v in (result.get("queue_bindings") or {}).items() if not v] \
+        if isinstance(result.get("queue_bindings"), dict) else []
+    if lost:
+        status = "error"
+        notes.append(f"нет привязки очереди {', '.join(lost)} — задачи в неё молча теряются, пока не перезапустят "
+                     "шедулер или воркер; похоже на вытеснение ключей брокером")
 
     if result.get("loopback") is False:
         status = "error"

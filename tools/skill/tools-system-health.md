@@ -5,7 +5,7 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
 
 # `tools_system_pulse` и `tools_system_health` — состояние контура
 
-*2026-09-30 11:22 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 17:49 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и концепцию `health_warn` / `health_errors` — навык **`tools`**.
 
@@ -67,6 +67,13 @@ description: tools_system_pulse (раз в 5 мин — компоненты, ce
   зависают в `queued`). Совет — политика памяти `noeviction`, владельцам Redis. Сам
   `info.evicted_keys` — счётчик с запуска узла, по нему не суди. `reply_bindings_delta` — растёт
   ли сет привязок после чистки;
+- `info.maxmemory_policy` / `info.maxmemory_human` — политика памяти брокера и потолок. Всё, кроме
+  `noeviction`, при потолке выбрасывает ключи; `0B` — потолка нет;
+- `queue_bindings` — сколько привязок у каждой рабочей очереди (`default` и очереди задач в
+  `queued`/`running`). 0 — ❌: без привязки kombu молча выбрасывает задачу (очереди для
+  недоставленного у Redis нет), задачи висят в `queued` и отзываются по `task_queued_timeout`;
+  привязку заново объявит перезапуск шедулера или воркера. Причина почти всегда — вытеснение
+  ключей (`evicted_delta`, `maxmemory_policy`);
 - `reply_bindings` — записей в сете привязок ответных очередей (`_kombu.binding.reply.celery.pidbox`).
   Отвечая на ping/inspect, воркер читает его целиком в главном цикле: от тысячи — ⚠️, и
   «ответили 0 при идущих задачах», пропавшие окна без приёма задач и перезапуски стаей
