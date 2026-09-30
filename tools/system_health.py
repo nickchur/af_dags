@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-30 11:21 MSK · v3.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 12:31 MSK · v3.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -81,11 +81,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        HEALTH_PREFIX, TOOLS_POOL, add_note, ensure_pool, env_stand, health_tasks, on_callback, push_health,
+        HEALTH_PREFIX, TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, health_tasks, on_callback, push_health,
         saved_params, saved_schedule, store_params_task)
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        HEALTH_PREFIX, TOOLS_POOL, add_note, ensure_pool, env_stand, health_tasks, on_callback, push_health,
+        HEALTH_PREFIX, TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, health_tasks, on_callback, push_health,
         saved_params, saved_schedule, store_params_task)
 
 logger = logging.getLogger("airflow.task")
@@ -1213,7 +1213,8 @@ def _finish(name: str, checks: dict, started: float, context) -> dict:
     """Итог проверок: строка в лог, вердикты в XCom health; находками не падает."""
     took = round(time.time() - started, 1)
     status, reasons = verdict(checks)
-    logger.info("%s %s %s за %.1f с%s", ICON[status], name, env_stand() or "?", took,
+    where = f"{env_platform() or '?'} {env_stand() or '?'}"
+    logger.info("%s %s %s за %.1f с%s", ICON[status], name, where, took,
                 "".join(f"\n  {r}" for r in reasons))
     push_health(checks, context)
     return {"status": status, "reasons": reasons, "checks": checks, "took_sec": took}
@@ -1272,7 +1273,7 @@ def tools_system_health():
     @task(task_id="report")
     def report(result: dict, **context) -> str:
         """🧾 Заметка: нездоровые проверки по строке, здоровые одной строкой с временами."""
-        title = f"{ICON[result['status']]} {result['took_sec']} sec system_health {env_stand() or '?'}"
+        title = f"{ICON[result['status']]} {result['took_sec']} sec system_health {env_platform() or '?'} {env_stand() or '?'}"
         add_note(note_text(result["checks"]), context, level="task,DAG", title=title)
         return title
 
@@ -1350,7 +1351,7 @@ def tools_system_pulse():
             "delivery": _run("delivery", check_delivery, ti, dag_run),
         }
         result = _finish("system_pulse", checks, started, context)
-        title = f"{ICON[result['status']]} {result['took_sec']} sec system_pulse {env_stand() or '?'}"
+        title = f"{ICON[result['status']]} {result['took_sec']} sec system_pulse {env_platform() or '?'} {env_stand() or '?'}"
         add_note(note_text(checks), context, level="task,DAG", title=title)
         return result
 

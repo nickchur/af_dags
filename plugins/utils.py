@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-30 09:50 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 12:30 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -23,6 +23,7 @@
 | `chk_conn()` | Проверка доступности подключения Postgres / S3 / KerberosHttp |
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
+| `env_platform()` | Платформа: `alpha`, `sigma` или пустая строка |
 | `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
@@ -79,6 +80,20 @@ def env_stand() -> str:
     тестовый (`/opt/aftest/airflow.env`).
     """
     return (os.getenv('ENV_STAND') or os.getenv('ENVIRONMENT') or '').strip().upper()
+
+def env_platform() -> str:
+    """Платформа: `alpha`, `sigma` или пустая строка, если не опознана.
+
+    `ENV_SPACE` не годится — в образе альфы он тоже `sigma`. У альфы один образ на все роли,
+    и роль выбирает переменная `ENTRYPOINT` (`worker`, `scheduler`, ...); на сигме у каждого
+    компонента свой образ с `APPLICATION_NAME=app-dataplatform-etl-<компонент>`, а
+    `ENTRYPOINT` — директива Dockerfile, не переменная (под сигмы dev, 30.09.2026).
+    """
+    if os.getenv('ENTRYPOINT'):
+        return 'alpha'
+    if os.getenv('APPLICATION_NAME', '').startswith('app-dataplatform-'):
+        return 'sigma'
+    return ''
 
 def sign(x):
     return (x > 0) - (x < 0)
@@ -913,6 +928,8 @@ def report_health(checks, context=None, ttl_sec=7200):
     report = {
         'schema': HEALTH_SCHEMA,
         'source': dag.dag_id,
+        'platform': env_platform(),
+        'stand': env_stand(),
         'run_id': context['run_id'],
         'version': version.group(1) if version else None,
         'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),

@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 12:24 MSK · v3.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 12:31 MSK · v3.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -83,12 +83,12 @@ from airflow.utils.trigger_rule import TriggerRule
 try:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
-        store_params_task,
+        env_platform, env_stand, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
-        store_params_task,
+        env_platform, env_stand, store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -973,7 +973,7 @@ def tools_queue_analyze():
             now = datetime.now(timezone.utc)
             key = f"{PREFIX}{now:%Y-%m-%d}/{now:%H%M%S}_analyze.json"
             S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).load_string(
-                json.dumps({"conclusions": found, "scheduler": sched, "capacity": cap,
+                json.dumps({"platform": env_platform(), "stand": env_stand(), "conclusions": found, "scheduler": sched, "capacity": cap,
                             "broker": {k: v for k, v in (snapshot or {}).items() if k != "keys"},
                             "purge": purged, "pidbox": bindings}, ensure_ascii=False, indent=2, default=str),
                 key=key, bucket_name=BUCKET_NAME, replace=True,
