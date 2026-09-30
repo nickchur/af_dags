@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-30 09:26 MSK · v3.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 09:50 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -792,7 +792,7 @@ profile = get_config()['profile']   # ленивая загрузка при п�
 - **Проверка событий** (`ctl_chk_event`, `ctl_events_mon`): Мониторинг событий с поддержкой стратегий AND/OR
 - **Отправка HTML** (`ctl_send_html`): Отправка HTML-содержимого в CTL как статистики
 - **Нормализация данных** (`ctl_loading_norm`, `ctl_wf_norm`): Преобразование сырых данных в удобный формат
-- **Проверка соединений** (`chk_any_conn`, `chk_conn`): Проверка доступности соединений (Postgres, S3, HTTP)
+- **Проверка соединений** (`chk_any_conn`): подключение из конфига CTL и размер его пула; сама проверка (Postgres, S3, HTTP) — общая `chk_conn` из `plugins/utils.py`
 - **Управление статусами** (`ctl_get_status`, `ctl_chk_status`): Проверка и отображение статусов загрузок
 - **Подбор ответа после обрыва** (`ctl_exe_recover`): что стало с прошлой попыткой `run_exe`
   — см. ниже «Обрыв не останавливает работу в Greenplum»

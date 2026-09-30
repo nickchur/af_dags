@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-29 15:46 MSK · v3.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:50 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
@@ -48,11 +48,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, chk_conn, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, chk_conn, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -79,7 +79,7 @@ SKILL = "tools-test-connections"
 DEFAULT_CRITICAL = sorted({"airflowdb", "ctl", "s3", conf.get("logging", "remote_log_conn_id", fallback="") or "s3"})
 
 
-# Маппинг Airflow conn_type → тип для chk_any_conn / нативная логика
+# Маппинг Airflow conn_type → тип для chk_conn / нативная логика
 _CONN_CONFIG: dict[str, str] = {
     "postgres":   "Postgres",
     "aws":         "S3",
@@ -140,104 +140,13 @@ def _group(conn_id: str, conn_type: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Локальная копия ctl_worker.ctl_core.chk_any_conn (Postgres / S3 / KerberosHttp)
-# ---------------------------------------------------------------------------
-
-def _chk_any_conn(conn_id: str, conn_type: str, context: dict) -> None:
-    """Проверяет доступность соединения (Postgres / S3 / KerberosHttp).
-
-    Самодостаточная копия `ctl_worker.ctl_core.chk_any_conn` — чтобы тест не зависел от
-    импорта ctl_core. Логика pool_slots / get_config из оригинала здесь не нужна: тест
-    всегда проверяет одно соединение без пулов. При успехе пишет ноту, при ошибке —
-    пробрасывает AirflowFailException.
-    """
-    import time
-
-    from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-    try:
-        from plugins.utils import add_note  # type: ignore
-    except ImportError:
-        from CI06932748.tools.utils import add_note  # type: ignore
-
-    ti = context["ti"]
-    try_number = ti.try_number
-    sdt = ti.start_date.astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
-    ts = time.time()
-    try:
-        if conn_type == "Postgres":
-            from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
-            hook = PostgresHook(postgres_conn_id=conn_id)
-            result = hook.get_first("SELECT current_user, current_database(), inet_server_addr()")
-
-        elif conn_type == "S3":
-            from airflow.providers.amazon.aws.hooks.s3 import S3Hook  # type: ignore
-            from botocore.config import Config  # type: ignore
-
-            extra = S3Hook.get_connection(conn_id).extra_dejson
-            verify = extra.get("verify", True)
-            if isinstance(verify, str):
-                verify = verify.lower() == "true"
-
-            # config_kwargs соединения нельзя терять: явно переданный config подменяет их
-            # целиком (connection_wrapper.py: `if not self.botocore_config and config_kwargs`),
-            # а секрет-бэкенд кладёт туда signature_version, payload_signing_enabled и
-            # request_checksum_calculation — без них шлюз отвергает запросы.
-            # merge накладывает таймауты поверх, не затирая остального.
-            config = Config(**extra.get("config_kwargs", {})).merge(Config(connect_timeout=15, read_timeout=15))
-
-            hook = S3Hook(aws_conn_id=conn_id, verify=verify, config=config)
-            result = hook.get_conn().list_buckets()["Buckets"]
-
-        elif conn_type == "KerberosHttp":
-            from hrp_operators.utils.kerberos_http import KerberosHttpHook  # type: ignore
-
-            hook = KerberosHttpHook(method="GET", http_conn_id=conn_id)
-            verify = hook.get_connection(conn_id).extra_dejson.get("verify", True)
-            if isinstance(verify, str):
-                verify = verify.lower() == "true"
-            response = hook.run(
-                "/v5/api/info",
-                headers={"Accept": "application/json"},
-                extra_options={"timeout": 15, "verify": verify},
-            )
-            response.raise_for_status()
-            result = response.json()
-        else:
-            result = None
-
-        logger.info("🔍 %s", result)
-        add_note({"try": try_number, "sdt": sdt}, context, title=f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn")
-
-    except AirflowSkipException:
-        raise
-
-    except ImportError as err:
-        msg = f"☮️ {conn_id}: провайдер не установлен — {err}"
-        add_note(msg, context, level="task", title=f"☮️ {conn_id}")
-        logger.warning(msg)
-        raise AirflowSkipException(msg) from err
-
-    except Exception as err:
-        logger.error("❌ %s: %s", conn_id, err, exc_info=True)
-        # is not None обязательно: у requests.Response __bool__ == False на 4xx/5xx,
-        # то есть проверка на истинность отбросила бы ровно те ответы, ради которых всё и логируется
-        response = getattr(err, "response", None)
-        if response is not None:
-            logger.error("HTTP %s: %s", getattr(response, "status_code", "?"), str(getattr(response, "text", ""))[:500])
-        msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {try_number} {sdt}"
-        add_note(err, context, level="Task,DAG", title=msg)
-        raise AirflowFailException(f"{msg}: {err}") from err
-
-
-# ---------------------------------------------------------------------------
 # Объединенная функция проверки соединений
 # ---------------------------------------------------------------------------
 
 def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     """Единая точка входа для проверки всех типов соединений.
 
-    Postgres/S3/HTTP — через chk_any_conn (типы ctl* маппятся на KerberosHttp);
+    Postgres/S3/HTTP — через общую `chk_conn` из plugins.utils (типы ctl* маппятся на KerberosHttp);
     ClickHouse/Kafka/Trino/Redis — напрямую.
     """
     import time
@@ -266,8 +175,8 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     try:
         # 2. Выполнение проверки
         if chk_type in ("Postgres", "S3", "KerberosHttp"):
-            _chk_any_conn(conn_id, chk_type, context)
-            result = "Success via chk_any_conn"
+            chk_conn(chk_type, conn_id, context)
+            result = "Success via chk_conn"
 
         elif chk_type == "ClickHouse":
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
@@ -324,7 +233,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         else:
             raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")
 
-        # 3. Логирование и выход (для нативных проверок, chk_any_conn сам пишет ноту)
+        # 3. Логирование и выход (для нативных проверок, chk_conn сам пишет ноту)
         if chk_type not in ("Postgres", "S3", "KerberosHttp"):
             logger.info("🔍 %s", result)
             msg = f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn"

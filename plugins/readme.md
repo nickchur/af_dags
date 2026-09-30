@@ -1,5 +1,5 @@
 # 🛠️ Общие модули `plugins/`
-*2026-09-30 09:26 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 09:50 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модули, которыми пользуются даги нескольких каталогов: утилиты Airflow, S3, тракт ТФС.
 
@@ -72,6 +72,7 @@ raise_status(st, ld_sts)      # ctl_worker/ctl_core.py: skip → AirflowSkipExce
 - **`add_note`** — Добавление заметок к DAG Run / Task Instance. Строка перечитывается под блокировкой (`FOR UPDATE`): без неё параллельные задачи читают одно состояние и последний записавший затирает остальных — на стенде из восьми писателей выживали четыре.
 - **`on_callback`** — Обработчик событий (success/failed) с отправкой уведомлений
 - **`query_to_dict`** — Преобразование результатов запроса в список словарей
+- **`chk_conn`** — Проверка доступности подключения Postgres / S3 / KerberosHttp: заметка при успехе, заметка и `AirflowFailException` при сбое. Одна на всех: её зовут сторож подключений CTL (`chk_any_conn`) и `tools_test_connections`
 - **`readable_size`** — Конвертация размера файлов в читаемый формат (KB, MB, GB...)
 - **`s3_*`** — Утилиты для работы с S3 (TTL, размер бакета, список объектов)
 - **`str2timedelta`** — Парсинг timedelta из строки
