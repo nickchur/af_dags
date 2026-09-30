@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-26 21:38 MSK · v3.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 07:27 MSK · v3.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -707,7 +707,7 @@ retry = {
 | прочие задачи воркера | `task_timeout` | 1 ч | `execution_timeout`; у `run_tfs` его нет — файлов в заходе сколько угодно |
 | монитор, `RUNNING` | `run_stale` | 6 ч | `reRunned`, но не раньше `wf_timeout` + 10 мин |
 | санитар | `zombie_after` | 6 ч | зависшие задачи, осиротевшие раны, раны на паузе |
-| служебные сенсоры | `sensor_timeout` | 6 ч | окно `events`, `monitor`, `tfs_sensor`; ретраев — `sensor_retries` (10) |
+| служебные сенсоры | `sensor_timeout` | 1 ч | окно `events`, `monitor`, `tfs_sensor`; ретраев — `sensor_retries` (10). Больше не ставить: при reschedule лог копит все пробы окна и целиком перезаливается в S3 на каждой |
 
 Проверки (`timeout_ladder`, `plugins/ctl_core.py`) — санитар падает, ничего не закрыв:
 `gp_timeout < gp_server_limit`, `zombie_after > gp_timeout + 10 мин`, `run_stale ≥ zombie_after`.
@@ -739,7 +739,7 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 | `task_timeout` | `execution_timeout` задач воркера, кроме `run_exe` и `run_tfs` | `hours=1` |
 | `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` | Пороги санитара и монитора | см. «Таймауты» |
 | `ue_stale` / `ue_run_max` / `ue_grace` | Пороги монитора для потоков UE | `hours=24` / `hours=24` / `minutes=30` |
-| `sensor_timeout` / `sensor_retries` | Окно и ретраи служебных сенсоров | `hours=6` / `10` |
+| `sensor_timeout` / `sensor_retries` | Окно и ретраи служебных сенсоров | `hours=1` / `10` |
 | `ctl_conn_id` | Подключение к API CTL | `ctl` |
 | `conns.ctl.timeout` | Таймаут запроса к API (сек) | `30` |
 | `conns.ctl.pool_slots` | Размер пула `ctl_pool` (задаёт `test_conn`) | `20` |

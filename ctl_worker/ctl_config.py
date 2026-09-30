@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-26 21:38 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 07:27 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -130,7 +130,9 @@ config = {
     'ue_stale': 'hours=24',        # монитор UE: статус не меняется дольше → reStarted
     'ue_run_max': 'hours=24',      # монитор UE: RUNNING дольше (или wf_timeout) → reStarted
     'ue_grace': 'minutes=30',      # монитор UE: просрочка расписания/события → reStarted/Started
-    'sensor_timeout': 'hours=6',   # служебные сенсоры: events, monitor, tfs_sensor
+    # Час, а не 6 ч (30.09.2026): лог сенсора с reschedule копит все пробы окна и целиком
+    # перезаливается в S3 на каждой — у events (раз в минуту) было до 346 проб в файле
+    'sensor_timeout': 'hours=1',   # служебные сенсоры: events, monitor, tfs_sensor
     'sensor_retries': 10,
     'ctl_rps': 10,      # запросов к CTL в секунду из одного процесса (rate_limit); эмулятор держит тот же порог
     'ctl_limit': 1000,  #сколько записей запросить из CTL

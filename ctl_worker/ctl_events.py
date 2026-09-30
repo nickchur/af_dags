@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-09-22 13:26 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 07:27 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -40,7 +40,7 @@ events_interval = str2timedelta(get_config().get('events_interval','minutes=1'))
 # «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
 # Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
 # не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
-sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
 sensor_retries = int(get_config().get('sensor_retries', 10))
 
 with DAG(f'CTL.{get_config()["profile"]}.events',

@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-29 21:28 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 07:27 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -88,7 +88,7 @@ ue_grace = cfg_delta('ue_grace', 'minutes=30')
 # Потоки UE на расписании, у которых нет активной загрузки: {wf_id: когда заметили}.
 # Между проверками сенсор в reschedule теряет и память, и XCom — держим в Variable
 UE_LOST_VAR = 'ctl_ue_lost'
-sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
 sensor_retries = int(get_config().get('sensor_retries', 10))
 
 def time_wait_action(lid, log, wf, sdt, now, grace, context):
