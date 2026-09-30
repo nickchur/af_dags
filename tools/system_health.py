@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-30 10:27 MSK · v3.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 11:21 MSK · v3.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -20,8 +20,8 @@
 | Проверка | Что смотрит | ⚠️ warn | ❌ error |
 |---|---|---|---|
 | `components` (пульс) | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
-| `celery` (пульс) | воркеры из отбивок `health_beacon` (нет отбивок — `broadcast` брокеру), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны, размер сета привязок ответных очередей (`reply_bindings`) | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс; `reply_bindings` ≥ 1000 | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `celery` (пульс) | воркеры из отбивок `health_beacon` (нет отбивок — `broadcast` брокеру), длина очередей, счётчики `task_instance`, возраст задач в `queued` (`oldest_queued_sec`, `queued_over_timeout`), ёмкость исполнителя шедулера (`parallelism` × живые шедулеры против `queued`+`running`, `executor_open`) | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть, задачи в `queued` дольше `task_queued_timeout`, исполнитель заполнен при свободных слотах воркеров | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
+| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны, размер сета привязок ответных очередей (`reply_bindings`); приросты от прошлого отчёта пульса — `evicted_delta`, `reply_bindings_delta` | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс; `reply_bindings` ≥ 1000; брокер вытесняет ключи (`evicted_delta` > 0) | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` (час) | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` (пульс) | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` (час) | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -105,6 +105,8 @@ DEFAULT_SCHEDULE = "7 * * * *"
 REPORT_TTL_SEC = 2 * 3600 + 600
 # Навык агента, на который отчёт плагина отсылает толкование своих проверок
 SKILL = "tools-system-health"
+# Пульс: его прошлый отчёт — точка отсчёта приростов счётчиков брокера
+PULSE_DAG_ID = "tools_system_pulse"
 
 RANK = {"healthy": 0, "unknown": 1, "warn": 2, "error": 3}
 ICON = {"healthy": "✅", "unknown": "❔", "warn": "⚠️", "error": "❌"}
@@ -287,11 +289,26 @@ select
     count(*) filter (where state = 'scheduled'
                        and updated_at < now() - cast(:age as interval))   as scheduled_stale,
     count(*) filter (where state = 'running' and pid is null
-                       and start_date < now() - cast(:age as interval))   as running_no_pid
+                       and start_date < now() - cast(:age as interval))   as running_no_pid,
+    -- Возраст задач в queued: тот же проход по индексу состояния, без скана по времени.
+    -- Старше task_queued_timeout шедулер отзывает и шлёт заново (stuck in queued) — сигма dev
+    -- 30.09.2026: задачи по 7–9 минут лежали в брокере, видно было только в логе шедулера
+    coalesce(max(extract(epoch from now() - queued_dttm))
+             filter (where state = 'queued'), 0)                          as oldest_queued_sec,
+    count(*) filter (where state = 'queued'
+                       and queued_dttm < now() - cast(:queued_timeout as interval)) as queued_over_timeout
 from task_instance
 where state in ('queued', 'running', 'scheduled')
 """
 SQL_QUEUES = "select distinct queue from task_instance where state in ('queued', 'running')"
+# Живые шедулеры — по индексу job_type_heart: исполнитель каждого держит до parallelism задач
+SQL_SCHEDULERS = """
+select count(*) as schedulers
+  from job
+ where job_type = 'SchedulerJob'
+   and state = 'running'
+   and latest_heartbeat > now() - cast(:age as interval)
+"""
 
 
 def _queue_lengths(app, names) -> dict:
@@ -343,7 +360,9 @@ def check_celery() -> dict:
     from airflow.configuration import conf
     from airflow.providers.celery.executors.celery_executor import app
 
-    counters = _pg_rows(SQL_TASKS, {"age": f"{STALE_AFTER_SEC} seconds"})[0]
+    queued_timeout = conf.getfloat("scheduler", "task_queued_timeout", fallback=600.0)
+    counters = _pg_rows(SQL_TASKS, {"age": f"{STALE_AFTER_SEC} seconds",
+                                    "queued_timeout": f"{queued_timeout} seconds"})[0]
     counters = {k: int(v or 0) for k, v in counters.items()}
     result = {**counters}
     notes, status = [], "healthy"
@@ -409,6 +428,30 @@ def check_celery() -> dict:
     if counters["running_no_pid"]:
         status = _worst([status, "warn"])
         notes.append(f"running без pid: {counters['running_no_pid']}")
+    if counters["queued_over_timeout"]:
+        status = _worst([status, "warn"])
+        notes.append(f"в queued дольше task_queued_timeout ({queued_timeout:.0f} с): {counters['queued_over_timeout']}, "
+                     f"старейшая {counters['oldest_queued_sec'] // 60} мин — шедулер отзовёт и отправит заново")
+
+    # Исполнитель шедулера держит не больше parallelism задач в queued+running. Заполнен при
+    # свободных слотах воркеров — задачи «в полёте» не исполняются: лежат в брокере или
+    # потеряны (сигма dev 30.09.2026: slot_reconciler running=63 из 64, воркеры простаивали).
+    # parallelism — из конфига воркера, у шедулера он может быть другим (vault): сверять через
+    # MCP get_config_value → components
+    try:
+        threshold = conf.getint("scheduler", "scheduler_health_check_threshold", fallback=30)
+        schedulers = int(_pg_rows(SQL_SCHEDULERS, {"age": f"{threshold} seconds"})[0]["schedulers"] or 0)
+        capacity = conf.getint("core", "parallelism") * max(schedulers, 1)
+        result.update(schedulers=schedulers, executor_capacity=capacity,
+                      executor_open=capacity - counters["queued"] - counters["running"])
+        free = total - busy if total is not None and busy is not None else None
+        if result["executor_open"] <= 0 and free:
+            status = _worst([status, "warn"])
+            notes.append(f"исполнитель шедулера заполнен (queued+running {counters['queued'] + counters['running']} "
+                         f"из {capacity}), а у воркеров свободно {free} слотов — задачи в полёте не исполняются")
+    except Exception as exc:
+        logger.warning("celery: ёмкость исполнителя не посчитана", exc_info=True)
+        notes.append(f"ёмкость исполнителя не посчитана: {_short_reason(exc)}")
 
     queues = result.get("queues") or {}
     head = (f"воркеров {workers}, слоты {'?' if busy is None else busy} из {'?' if total is None else total}"
@@ -504,6 +547,29 @@ def _broker_pubsub(app) -> dict:
     return out
 
 
+def _broker_deltas(result: dict) -> dict:
+    """Приросты счётчиков брокера от прошлого отчёта пульса.
+
+    INFO отдаёт счётчики с запуска узла: 45 тыс. evicted_keys сами по себе ничего не значат,
+    важен прирост (сигма dev 30.09.2026 — сравнивали руками). Прошлое значение — в отчёте
+    пульса в бакете логов. Другой узел брокера или он перезапускался (uptime меньше интервала) —
+    прироста нет.
+    """
+    client, bucket = _log_bucket()
+    prev = json.loads(client.get_object(Bucket=bucket, Key=f"{HEALTH_PREFIX}{PULSE_DAG_ID}.json")["Body"].read())
+    data = ((prev.get("checks") or {}).get("control") or {}).get("data") or {}
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(prev["at"])).total_seconds()
+    out = {"delta_sec": round(elapsed)}
+    info, pinfo = result.get("info"), data.get("info")
+    if (isinstance(info, dict) and isinstance(pinfo, dict) and data.get("node") == result.get("node")
+            and (info.get("uptime_in_seconds") or 0) >= elapsed
+            and isinstance(info.get("evicted_keys"), int) and isinstance(pinfo.get("evicted_keys"), int)):
+        out["evicted_delta"] = info["evicted_keys"] - pinfo["evicted_keys"]
+    if isinstance(result.get("reply_bindings"), int) and isinstance(data.get("reply_bindings"), int):
+        out["reply_bindings_delta"] = result["reply_bindings"] - data["reply_bindings"]
+    return out
+
+
 def check_control() -> dict:
     """Control-канал celery: отвечают ли воркеры на ping через брокер.
 
@@ -534,6 +600,15 @@ def check_control() -> dict:
     except Exception as exc:
         logger.warning("control: pub/sub брокера не проверен", exc_info=True)
         notes.append(f"pub/sub не проверен: {_short_reason(exc)}")
+    try:
+        result.update(_broker_deltas(result))
+    except Exception as exc:
+        logger.warning("control: приросты счётчиков брокера не посчитаны", exc_info=True)
+        result["deltas"] = f"не посчитаны: {_short_reason(exc)}"
+    if (result.get("evicted_delta") or 0) > 0:
+        status = _worst([status, "warn"])
+        notes.append(f"брокер вытесняет ключи: +{result['evicted_delta']} за {result['delta_sec'] // 60} мин — "
+                     "сообщения celery могут теряться; брокеру нужна политика памяти noeviction (владельцам Redis)")
 
     if result.get("loopback") is False:
         status = "error"
