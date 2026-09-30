@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 15:39 MSK · v3.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 16:03 MSK · v3.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -431,11 +431,16 @@ def reply_bindings(purge: bool = False) -> dict:
     """
     from airflow.providers.celery.executors.celery_executor import app
 
+    import redis
+
     with app.connection_for_write() as connection:
         channel = connection.default_channel
-        client = channel.client
-        # SCARD и SSCAN kombu префиксом не снабжает (PREFIXED_SIMPLE_COMMANDS, kombu 5.6.2) —
-        # полный ключ собираем сами, как для LRANGE в _read_queues; DEL префикс получает сам
+        # Все команды — по полному имени через клиент без префикса на том же пуле. Клиент канала
+        # префикс дописывает сам, но только части команд (kombu 5.6.2: DEL и SREM — да, SCARD и
+        # SSCAN — нет), и на альфе dev 30.09 DEL и SREM по короткому имени сет не тронули
+        # (124571 → 124598), хотя SCARD по полному имени его видел: чтение и удаление смотрели
+        # в разные ключи. Один клиент и одно имя — одна и та же запись
+        client = redis.Redis(connection_pool=channel.client.connection_pool)
         full = (getattr(channel, "global_keyprefix", "") or "") + REPLY_BINDINGS_KEY
         count = client.scard(full)
         _, sample = client.sscan(full, 0, count=REPLY_SAMPLE)
@@ -444,22 +449,25 @@ def reply_bindings(purge: bool = False) -> dict:
         out = {"key": full, "count": count,
                "sample": [(m.decode() if isinstance(m, bytes) else m).split(sep)[-1] for m in sample[:REPLY_SAMPLE]]}
         if purge and count:
-            out["del"] = client.delete(REPLY_BINDINGS_KEY)
+            out["del"] = client.delete(full)
             left = client.scard(full)
-            # Альфа dev 30.09: DEL ответил, а сет остался целым (122360 → 122360). Добираем
-            # пачками SSCAN + SREM — SREM kombu сам шлёт этому брокеру на отвязке очереди
-            cursor, deadline = 0, time.monotonic() + PURGE_SREM_SEC
+            # DEL ответил, а сет на месте — добираем пачками SSCAN + SREM. Проход по сету, после
+            # которого он не уменьшился, — удаление не работает: крутить до предела бессмысленно
+            out["srem"] = 0
+            cursor, deadline, before = 0, time.monotonic() + PURGE_SREM_SEC, left
             while left and time.monotonic() < deadline:
                 cursor, batch = client.sscan(full, cursor, count=PURGE_BATCH)
                 if batch:
-                    client.srem(REPLY_BINDINGS_KEY, *batch)
+                    out["srem"] += client.srem(full, *batch)
                 if not cursor:
                     left = client.scard(full)
-                    if not batch:
+                    if not batch or left >= before:
                         break
+                    before = left
             out["deleted"] = count - left
             out["left"] = left
-            logger.warning("📮 сет %s: было %s, DEL=%s, осталось %s", full, count, out["del"], left)
+            logger.warning("📮 сет %s: было %s, DEL=%s, SREM=%s, осталось %s",
+                           full, count, out["del"], out["srem"], left)
     return out
 
 
@@ -892,7 +900,7 @@ def tools_queue_analyze():
         res = reply_bindings(purge=p["purge_pidbox"])
         text = f"привязок ответных очередей: {res['count']}"
         if "left" in res:
-            text += f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']})"
+            text += f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}, SREM {res['srem']})"
         if res["sample"]:
             text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
         add_note(text, context=context, level="Task", title="📮 pidbox")
@@ -957,7 +965,8 @@ def tools_queue_analyze():
             lines.append("| брокер | очередь пуста |" if s == "skipped" else f"| брокер | ❌ не отработал ({s}) |")
         if bindings:
             lines.append(f"| привязки ответов | {bindings['count']}"
-                         + (f", удалено {bindings['deleted']}, осталось {bindings['left']}" if "left" in bindings else "")
+                         + (f", удалено {bindings['deleted']}, осталось {bindings['left']} (DEL {bindings.get('del')}, "
+                            f"SREM {bindings.get('srem')})" if "left" in bindings else "")
                          + " |")
         else:
             lines.append(f"| привязки ответов | ❌ не прочитаны ({state('pidbox')}) |")

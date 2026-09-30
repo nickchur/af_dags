@@ -5,7 +5,7 @@ description: Отчёт tools_queue_analyze — почему задачи жду
 
 # `tools_queue_analyze` — разбор очереди
 
-*2026-09-30 12:25 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 16:03 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги (параметры, расписание, пул, `health_warn` / `health_errors`) —
 навык **`tools`**. Здесь — как читать этот отчёт.
@@ -40,7 +40,7 @@ Variable `tools_queue_analyze_params` сохранён пустой `schedule`, 
 | 🔒 Слоты executor'а заняты | `queued`+`running` ≥ `parallelism` × живые шедулеры | лог шедулера, строки `slot_reconciler` |
 | 📭 `queued` без сообщения в брокере | задач в `queued` больше, чем живых сообщений и занятых слотов | кандидаты в `stuck in queued`; навык **`tools-log-events`** |
 | 🗑️ Мусор в брокере | доля ≥ `min_junk_share` (0.5) | запуск с `purge` — человеку |
-| 📮 Привязок ответных очередей ≥ `max_reply_bindings` (1000) | сет `_kombu.binding.reply.celery.pidbox` раздут: воркер на каждый ping/inspect читает его целиком в главном цикле, минутами не берёт задачи и молчит на ping, liveness перезапускает поды стаей | запуск с `purge_pidbox` — человеку; задачи не теряются. В заметке `pidbox` — было, удалено, осталось и ответ `DEL`; осталось не 0 — повторить запуск (добор идёт не дольше 5 минут). Если сет снова растёт (пульс, `control.reply_bindings`) — утечка, платформе |
+| 📮 Привязок ответных очередей ≥ `max_reply_bindings` (1000) | сет `_kombu.binding.reply.celery.pidbox` раздут: воркер на каждый ping/inspect читает его целиком в главном цикле, минутами не берёт задачи и молчит на ping, liveness перезапускает поды стаей | запуск с `purge_pidbox` — человеку; задачи не теряются. В заметке `pidbox` — было, удалено, осталось, ответ `DEL` (1 — ключ удалён, 0 — ключа с таким именем нет) и сколько снял `SREM`. Осталось не 0 при `DEL 0` и `SREM 0` — брокер удаление не выполняет, это к платформе; иначе повторить запуск (добор не дольше 5 минут). Если сет снова растёт (пульс, `control.reply_bindings`) — утечка, платформе |
 
 `parallelism` в отчёте — **воркера**; у шедулера он может быть другим (vault перекрывает
 `airflow.cfg`) — сверяй через MCP `get_config_value`, поле `components`.
