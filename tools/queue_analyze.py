@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 10:27 MSK · v3.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 12:24 MSK · v3.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -73,6 +73,7 @@ from datetime import datetime, timedelta, timezone
 import base64
 import json
 import logging
+import time
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
@@ -147,6 +148,9 @@ WARN_MARKS = ("🗑️", "⚖️", "⏱️", "📮")
 REPLY_BINDINGS_KEY = "_kombu.binding.reply.celery.pidbox"
 # Сколько записей сета показать в заметке
 REPLY_SAMPLE = 5
+# Добор сета через SREM, если DEL его не удалил: записей за шаг и предел по времени
+PURGE_BATCH = 1000
+PURGE_SREM_SEC = 300
 
 SAVED = saved_params(PARAMS_VAR)
 _cfg = {**DEFAULTS, **{k: v for k, v in saved_params(OLD_VAR).items() if k in DEFAULTS}, **SAVED}
@@ -440,10 +444,22 @@ def reply_bindings(purge: bool = False) -> dict:
         out = {"key": full, "count": count,
                "sample": [(m.decode() if isinstance(m, bytes) else m).split(sep)[-1] for m in sample[:REPLY_SAMPLE]]}
         if purge and count:
-            client.delete(REPLY_BINDINGS_KEY)
-            out["deleted"] = count
-            out["left"] = client.scard(full)
-            logger.warning("📮 сет %s удалён: было %s, осталось %s", full, count, out["left"])
+            out["del"] = client.delete(REPLY_BINDINGS_KEY)
+            left = client.scard(full)
+            # Сигма dev 30.09: DEL ответил, а сет остался целым (122360 → 122360). Добираем
+            # пачками SSCAN + SREM — SREM kombu сам шлёт этому брокеру на отвязке очереди
+            cursor, deadline = 0, time.monotonic() + PURGE_SREM_SEC
+            while left and time.monotonic() < deadline:
+                cursor, batch = client.sscan(full, cursor, count=PURGE_BATCH)
+                if batch:
+                    client.srem(REPLY_BINDINGS_KEY, *batch)
+                if not cursor:
+                    left = client.scard(full)
+                    if not batch:
+                        break
+            out["deleted"] = count - left
+            out["left"] = left
+            logger.warning("📮 сет %s: было %s, DEL=%s, осталось %s", full, count, out["del"], left)
     return out
 
 
@@ -499,8 +515,9 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
         share = broker["junk"] / broker["total"]
         if share >= p["min_junk_share"]:
             out.append(f"🗑️ Мусора в брокере {broker['junk']} из {broker['total']} ({share:.0%}) — можно `purge`")
-    n = (pidbox or {}).get("count") or 0
-    if n >= p["max_reply_bindings"] and not pidbox.get("deleted"):
+    pidbox = pidbox or {}
+    n = pidbox.get("left", pidbox.get("count")) or 0
+    if n >= p["max_reply_bindings"]:
         out.append(f"📮 Привязок ответных очередей в брокере {n} (порог {p['max_reply_bindings']}) — каждый ответ "
                    "воркера на ping/inspect читает их все, и на тысячах главный цикл воркера стоит: задачи не "
                    "берутся, ping молчит, liveness перезапускает поды. Запустить с `purge_pidbox`")
@@ -873,8 +890,8 @@ def tools_queue_analyze():
         p = context["params"]
         res = reply_bindings(purge=p["purge_pidbox"])
         text = f"привязок ответных очередей: {res['count']}"
-        if res.get("deleted"):
-            text += f" · удалено {res['deleted']}, осталось {res['left']}"
+        if "left" in res:
+            text += f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']})"
         if res["sample"]:
             text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
         add_note(text, context=context, level="Task", title="📮 pidbox")
@@ -939,7 +956,7 @@ def tools_queue_analyze():
             lines.append("| брокер | очередь пуста |" if s == "skipped" else f"| брокер | ❌ не отработал ({s}) |")
         if bindings:
             lines.append(f"| привязки ответов | {bindings['count']}"
-                         + (f", удалено {bindings['deleted']}, осталось {bindings['left']}" if bindings.get("deleted") else "")
+                         + (f", удалено {bindings['deleted']}, осталось {bindings['left']}" if "left" in bindings else "")
                          + " |")
         else:
             lines.append(f"| привязки ответов | ❌ не прочитаны ({state('pidbox')}) |")
