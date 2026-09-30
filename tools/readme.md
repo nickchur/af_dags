@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-29 18:36 MSK · v1.43 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 10:27 MSK · v1.44 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -374,7 +374,7 @@ failed — как кнопка Mark failed: незавершённые зада�
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`), только брокер. Теперь даг прежде
 всего разбирает очередь, а чистка брокера — один таск по разовой галочке `purge`. Таски:
-после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` ждёт `broker`, `report` —
+после `params` параллельно `broker`, `scheduler`, `capacity`, `pidbox`; `purge` ждёт `broker`, `report` —
 всех. Дампы убирает `tools_log_cleanup` общим сроком бакета.
 
 *   **`scheduler`** — каждая живая задача в `scheduled` (даг не на паузе, ран `running`),
@@ -387,14 +387,21 @@ failed — как кнопка Mark failed: незавершённые зада�
     хартбит свежее `scheduler_health_check_threshold`); слоты воркеров из снимка отбивок
     (etl-core `health_beacon`), если он есть на контуре. `parallelism` — из конфига
     воркера: у шедулера он может быть другим, его значение даёт MCP `get_config_value`.
+*   **`pidbox`** — сет привязок ответных очередей control-канала celery
+    (`_kombu.binding.reply.celery.pidbox`): сколько записей и пять для примера. Отвечая на
+    ping/inspect, воркер читает сет целиком в главном цикле; на раздутом сете он минутами не
+    берёт задачи и молчит на ping (сигма dev 30.09.2026, стек `kill -USR1`). От
+    `max_reply_bindings` (1000) — вывод 📮 и ⚠️; разовая галочка `purge_pidbox` удаляет сет:
+    задачи не теряются, живые опрашивающие вернут свою запись при следующем опросе. Размер
+    сета раз в 5 минут показывает и пульс (`control.reply_bindings`).
 *   **`report`** — заметка на ран, сначала **выводы словами**, потом таблица по разделам.
     Правила вывода — в шапке модуля; они из разбора 23–24.09.2026 на сигме: 297 задач в
     `scheduled` были лимитом `max_active_tasks` дагов `raw_to_stable_*`, а не утечкой слотов;
     `tfs_kafka_snd` с весом 1 проигрывал весам 22–1921 и закрывался по `dagrun_timeout` без
     старта. Разбор целиком — `queue_cleanup/<дата>/<время>_analyze.json` в бакете логов.
-*   **Параметры**: `stale_min`, `queues`, `min_junk_share`, `max_delete`,
+*   **Параметры**: `stale_min`, `queues`, `min_junk_share`, `max_delete`, `max_reply_bindings`,
     `schedule` (по умолчанию `10 9 * * *`, MSK, как у соседей; плановый прогон брокер не чистит) сохраняются в `tools_queue_analyze_params`;
-    пока её нет, умолчания берутся из прежней `tools_queue_cleanup_cfg`. `purge` не сохраняется.
+    пока её нет, умолчания берутся из прежней `tools_queue_cleanup_cfg`. `purge` и `purge_pidbox` не сохраняются.
 
 **`broker` и `purge`** — прежняя разметка и чистка, перенесены без изменений:
 

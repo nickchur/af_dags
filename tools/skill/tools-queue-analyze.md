@@ -1,16 +1,16 @@
 ---
 name: tools-queue-analyze
-description: Отчёт tools_queue_analyze — почему задачи ждут в scheduled, ёмкость executor'а и воркеров, мусор в брокере; суточный плагин здоровья (не выше warn). Используй, когда спрашивают «почему задачи висят в scheduled», «очередь стоит», «даг ждёт, а слоты свободны», «мусор в брокере», «что показал tools_queue_analyze», «plugins.tools_queue_analyze warn».
+description: Отчёт tools_queue_analyze — почему задачи ждут в scheduled, ёмкость executor'а и воркеров, мусор в брокере; суточный плагин здоровья (не выше warn). Используй, когда спрашивают «почему задачи висят в scheduled», «очередь стоит», «даг ждёт, а слоты свободны», «мусор в брокере», «что показал tools_queue_analyze», «plugins.tools_queue_analyze warn», «привязки ответных очередей», «reply_bindings», «purge_pidbox».
 ---
 
 # `tools_queue_analyze` — разбор очереди
 
-*2026-09-30 09:58 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 10:27 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги (параметры, расписание, пул, `health_warn` / `health_errors`) —
 навык **`tools`**. Здесь — как читать этот отчёт.
 
-**Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` ждёт только
+**Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`, `pidbox`; `purge` ждёт только
 `broker`; `report` — всех (идёт при любом их исходе) → `health_warn` / `health_errors`.
 Дампы убирает `tools_log_cleanup` общим сроком бакета. Заметка `🔬 Разбор очереди` на ране: сначала **выводы**,
 потом таблица по разделам.
@@ -21,7 +21,8 @@ Variable `tools_queue_analyze_params` сохранён пустой `schedule`, 
 выбор человека.
 
 **Плагин здоровья, вердикт не выше ⚠️** (очередь — не авария): `health_warn` — мусор в брокере
-не ниже `min_junk_share`, голодание по приоритету, раны без старта, не отработавший сборщик;
+не ниже `min_junk_share`, голодание по приоритету, раны без старта, раздутый сет привязок
+ответных очередей, не отработавший сборщик;
 остальные выводы — справка. `health_errors` здесь всегда пропущен.
 
 У каждой живой задачи в `scheduled` (даг не на паузе, ран `running`), которая ждёт дольше
@@ -39,6 +40,7 @@ Variable `tools_queue_analyze_params` сохранён пустой `schedule`, 
 | 🔒 Слоты executor'а заняты | `queued`+`running` ≥ `parallelism` × живые шедулеры | лог шедулера, строки `slot_reconciler` |
 | 📭 `queued` без сообщения в брокере | задач в `queued` больше, чем живых сообщений и занятых слотов | кандидаты в `stuck in queued`; навык **`tools-log-events`** |
 | 🗑️ Мусор в брокере | доля ≥ `min_junk_share` (0.5) | запуск с `purge` — человеку |
+| 📮 Привязок ответных очередей ≥ `max_reply_bindings` (1000) | сет `_kombu.binding.reply.celery.pidbox` раздут: воркер на каждый ping/inspect читает его целиком в главном цикле, минутами не берёт задачи и молчит на ping, liveness перезапускает поды стаей | запуск с `purge_pidbox` — человеку; задачи не теряются. Если сет снова растёт (пульс, `control.reply_bindings`) — утечка, платформе |
 
 `parallelism` в отчёте — **воркера**; у шедулера он может быть другим (vault перекрывает
 `airflow.cfg`) — сверяй через MCP `get_config_value`, поле `components`.
@@ -46,6 +48,9 @@ Variable `tools_queue_analyze_params` сохранён пустой `schedule`, 
 Пример из жизни (сигма, 23.09.2026): 297 задач в `scheduled` — не утечка слотов
 (`slot_reconciler gap=0`), а лимит 4 у `raw_to_stable_*`; `tfs_kafka_snd` с весом 1 проигрывал
 весам 22–1921 и закрывался по `dagrun_timeout` без старта.
+
+Пример (сигма dev, 30.09.2026): поды простаивали при очереди в брокере, liveness убивал их
+стаей каждые ~23 мин; стек `kill -USR1` показал главный поток воркера в `SMEMBERS` этого сета.
 
 **Не советуй `parallelism`**, пока отчёт показывает 🚧 лимит дага: лечится лимитом в коде дага.
 Нет свежего рана — посоветуй ручной запуск без `purge` (разбор ничего не меняет).

@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-29 18:27 MSK · v3.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 10:27 MSK · v3.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -21,7 +21,7 @@
 |---|---|---|---|
 | `components` (пульс) | `get_airflow_health()` — та же функция, что за `/api/v1/health` | triggerer `unhealthy` | метабаза, шедулер или dag-processor `unhealthy` |
 | `celery` (пульс) | воркеры из отбивок `health_beacon` (нет отбивок — `broadcast` брокеру), длина очередей, счётчики `task_instance` | застрявший `scheduled`, `running` без pid, ждущие при занятых воркерах, занято слотов больше, чем есть | брокер недоступен, ни один воркер не ответил, ждущие при пустых воркерах |
-| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
+| `control` (пульс) | control-канал celery и брокер: `ping`: ответивших не меньше, чем подов, где сейчас идут задачи (`job`, индекс `job_type_heart`); на узле брокера — задержка команды (`cmd_ms`) и доставки pub/sub самому себе (`pubsub_ms`), `INFO`, права на каналы, подписки-шаблоны, размер сета привязок ответных очередей (`reply_bindings`) | ответили не все поды с задачами; все ответили, но дольше 2 с; команда > 100 мс или pub/sub > 500 мс; `reply_bindings` ≥ 1000 | не ответил ни один, петля не вернулась, подписок-шаблонов нет |
 | `s3_logs` (час) | бакет логов задач: запись, чтение со сверкой, удаление | всё прошло, но дольше `s3_slow_sec` | любая операция упала или прочитано не то |
 | `delivery` (пульс) | сколько эта задача ждала воркера и насколько шедулер опоздал с раном | доставка > 60 с, опоздание > 120 с | доставка > 300 с |
 | `pools` (час) | `Pool.slots_stats()`: пулы без свободных слотов, в которых ждут задачи | такой пул есть | — |
@@ -120,6 +120,12 @@ BROADCAST_TIMEOUT_SEC = 2
 # (хартбит job — каждые 5 с)
 PING_TIMEOUT_SEC = 5
 BUSY_HEARTBEAT_SEC = 120
+# Сет привязок ответных очередей control-канала (kombu: keyprefix_queue % exchange). Отвечая на
+# ping/inspect, воркер читает его целиком в главном цикле; на раздутом сете задачи не берутся и
+# ping молчит — сигма dev 30.09.2026 (стек kill -USR1). Тот же ключ чистит tools_queue_analyze
+# (purge_pidbox). Живых опрашивающих — единицы на под, тысяча уже значит утечку
+REPLY_BINDINGS_KEY = "_kombu.binding.reply.celery.pidbox"
+REPLY_BINDINGS_WARN = 1000
 # Звенья задержки control-канала: команда брокеру → доставка pub/sub → ответ воркера.
 # Пороги — порядок величины, а не замер: redis в одном ЦОД отвечает за единицы мс, и
 # сотни мс на команду или полсекунды на доставку уже объясняют опоздавшие ответы
@@ -446,9 +452,15 @@ def _broker_pubsub(app) -> dict:
     out = {}
     # Канал kombu, а не сырой клиент: он уже привязан к узлу кластера по global_keyprefix
     with app.connection_for_read() as conn:
-        cli = conn.default_channel.client
+        channel = conn.default_channel
+        cli = channel.client
         kw = cli.connection_pool.connection_kwargs
         out["node"] = f"{kw.get('host')}:{kw.get('port')}"
+        # SCARD kombu префиксом не снабжает — полный ключ собираем сами
+        try:
+            out["reply_bindings"] = cli.scard((getattr(channel, "global_keyprefix", "") or "") + REPLY_BINDINGS_KEY)
+        except Exception as exc:
+            out["reply_bindings"] = f"не прочитан: {_short_reason(exc)}"
 
         samples = []
         for _ in range(LATENCY_SAMPLES):
@@ -550,6 +562,11 @@ def check_control() -> dict:
         notes.append(f"pub/sub брокера доставляет за {pubsub_ms} мс при командах за {cmd_ms} мс")
     elif nodes and not missing and reply_sec > BROADCAST_TIMEOUT_SEC and pubsub_ms is not None:
         notes.append(f"брокер быстрый (команда {cmd_ms} мс, pub/sub {pubsub_ms} мс) — медлят сами воркеры")
+    bindings = result.get("reply_bindings")
+    if isinstance(bindings, int) and bindings >= REPLY_BINDINGS_WARN:
+        status = _worst([status, "warn"])
+        notes.append(f"привязок ответных очередей {bindings} — каждый ответ воркера читает их все, главный цикл "
+                     "стоит; чистит tools_queue_analyze с purge_pidbox")
     if busy and result.get("pattern_subs") == 0 and not nodes:
         status = "error"
         notes.append("на узле брокера нет ни одной подписки-шаблона — воркеры не слушают control-канал")

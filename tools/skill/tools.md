@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-30 09:58 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 10:27 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -107,6 +107,7 @@ Cron у всех — по Москве (зона `start_date` дага). До 29
 | `tools_dummy` ❌, `ping` не стартовал | задачи не доходят до воркера: `tools_system_pulse` (`celery`, `control`, `delivery`) и `tools_log_events` за этот час |
 | `tools_dummy` зелёный, в заметке `ping` шедулер или очередь — минуты | задержка планирования или доставки: `tools_queue_analyze`, `tools_log_events` |
 | Перегрузка воркеров: сотни задач в `scheduled`, пул забит, «ответили 0» | **`tools-system-health`**, раздел «Перегрузка воркеров»: считать от `подов × worker_concurrency` |
+| Воркеры простаивают при очереди в брокере, поды перезапускаются стаей, «ответили 0» | `control.reply_bindings` пульса ≥ 1000 — **`tools-queue-analyze`**, `purge_pidbox` |
 | Метабаза растёт | `tools_db_cleanup`: последний ран, заметка с размерами схемы и дельтой |
 
 ## 4. Норма, а не тревога
