@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 18:16 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 18:30 MSK · v3.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -453,6 +453,23 @@ def _probe(client, full: str) -> dict:
         out["tmp_scard"] = _reply(client.scard(tmp))
         out["tmp_del"] = _reply(client.delete(tmp))
         out["tmp_exists"] = _reply(client.exists(tmp))
+        out["tmp_ttl"] = _reply(client.ttl(tmp))
+        # Команды, которыми kombu подтверждает задачу (HDEL unacked, ZREM unacked_index) и снимает
+        # сообщение (LREM): не выполняются — подтверждённое вернётся в очередь по visibility_timeout
+        h, z, lst = tmp + ":h", tmp + ":z", tmp + ":l"
+        client.hset(h, "k", "v")
+        client.zadd(z, {"m": 1})
+        client.rpush(lst, "a")
+        for key in (h, z, lst):
+            client.expire(key, 60)
+        out["hdel"] = _reply(client.hdel(h, "k"))
+        out["hlen"] = _reply(client.hlen(h))
+        out["zrem"] = _reply(client.zrem(z, "m"))
+        out["zcard"] = _reply(client.zcard(z))
+        out["lrem"] = _reply(client.lrem(lst, 0, "a"))
+        out["llen"] = _reply(client.llen(lst))
+        out["unlink"] = _reply(client.unlink(tmp))
+        out["unlink_exists"] = _reply(client.exists(tmp))
         member = client.srandmember(full)
         if member is not None:
             out["big_srem1"] = _reply(client.srem(full, member))
@@ -516,10 +533,24 @@ def reply_bindings(purge: bool = False) -> dict:
                     if not batch or left >= before:
                         break
                     before = left
+            # Альфа dev 30.09: SREM и DEL брокер не выполняет вовсе (проба на временном ключе), SPOP
+            # — выполняет. SPOP снимает случайные записи, среди них может оказаться привязка живого
+            # опрашивающего: он не получит один ответ и заведёт привязку заново. Цена приемлема
+            if left and time.monotonic() < deadline:
+                out["spop"] = 0
+                while left and time.monotonic() < deadline:
+                    popped = client.spop(full, PURGE_BATCH)
+                    if not popped:
+                        break
+                    out["spop"] += len(popped) if isinstance(popped, (list, set)) else 1
+                    now_left = client.scard(full)
+                    if now_left >= left:
+                        break
+                    left = now_left
             out["deleted"] = count - left
             out["left"] = left
-            logger.warning("📮 сет %s: было %s, DEL=%s, SREM=%s, осталось %s",
-                           full, count, out["del"], out["srem"], left)
+            logger.warning("📮 сет %s: было %s, DEL=%s, SREM=%s, SPOP=%s, осталось %s",
+                           full, count, out["del"], out["srem"], out.get("spop"), left)
     return out
 
 
@@ -952,7 +983,8 @@ def tools_queue_analyze():
         res = reply_bindings(purge=p["purge_pidbox"])
         text = f"привязок ответных очередей: {res['count']}"
         if "left" in res:
-            text += f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}, SREM {res['srem']})"
+            text += (f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}, SREM {res['srem']}"
+                     + (f", SPOP {res['spop']}" if "spop" in res else "") + ")")
             text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "") \
                 + (f"\nпроба удалений: `{res['probe']}`" if res.get("probe") else "")
         if res["sample"]:
