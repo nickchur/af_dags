@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-10-01 14:08 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:23 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -79,13 +79,13 @@ from airflow.decorators import task, dag
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
+    from plugins.s3_utils import s3_account_usage, s3_drop_ttl, s3_fill_check, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, readable_size, saved_params,
         store_params_task, saved_schedule,
     )
 except ImportError:
-    from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
+    from CI06932748.tools.s3_utils import s3_account_usage, s3_drop_ttl, s3_fill_check, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, readable_size, saved_params,
         store_params_task, saved_schedule,
@@ -109,8 +109,6 @@ PREFIX = f"{PREFIX}/" if PREFIX else ""
 
 # Отчёт плагина здоровья: прогон раз в сутки, плюс запас на поздний старт
 REPORT_TTL_SEC = 26 * 3600
-# Заполнение бакета к квоте: warn / error
-FILL_WARN, FILL_ERROR = 0.8, 0.95
 # Доля объектов старше срока, найденных обходом: warn / error. Обход каждый день убирает
 # примерно день из срока (1/120), правило — почти всё; больше — уборка не справляется
 TTL_WARN, TTL_ERROR = 0.1, 0.5
@@ -139,64 +137,6 @@ def _roots(s3_hook, prefix: str = '') -> list:
     return [item['Prefix'] for page in pages for item in page.get('CommonPrefixes') or []]
 
 
-def _account_usage(s3_hook, log_bytes: int, log_full: bool, minutes: int, on_bucket=None) -> dict:
-    """Квота учётки S3 и занятое всеми её бакетами: ``{'quota', 'buckets': {бакет: байт}, 'full'}``.
-
-    Лимит выдаётся на учётку, а учётка видит только свои бакеты (``s3`` и ``s3-archive`` — разные
-    учётки на одном сервере, бакеты у них не пересекаются), поэтому занятое — сумма по
-    ``list_buckets``. Квота и объём бакета — из заголовков ``HEAD bucket`` Ceph RGW
-    (``x-rgw-quota-user-size``, ``x-rgw-bytes-used``); в стандартном S3 их нет, MinIO отдаёт квоту
-    только admin API — тогда квоту задаёт параметр ``quota_gb``. Без заголовка объём бакета логов
-    берётся из обхода (``log_bytes``), прочие бакеты листаются только ради суммы, не дольше
-    ``minutes``; не уложились или ``minutes=0`` (квота неизвестна, считать незачем) —
-    ``full=False``, занятое — нижняя оценка. Заголовки пишутся в лог:
-    по ним видно, что отдаёт корпоративный шлюз.
-    """
-    # ponytail: имена заголовков RGW по документации, на корпоративном шлюзе не проверены
-    client = s3_hook.get_conn()
-    deadline = time.monotonic() + minutes * 60
-    quota, buckets, full = None, {}, True
-
-    def num(headers, name):
-        try:
-            value = int(headers.get(name, -1))
-        except ValueError:
-            return None
-        return value if value >= 0 else None
-
-    try:
-        names = [item['Name'] for item in client.list_buckets()['Buckets']]
-    except Exception as e:
-        logger.warning(f"⚠️ список бакетов учётки не получен: {e}")
-        names, full = [BUCKET_NAME], False
-    for name in names:
-        started = time.monotonic()
-        try:
-            headers = client.head_bucket(Bucket=name)['ResponseMetadata']['HTTPHeaders']
-        except Exception as e:
-            logger.warning(f"⚠️ HEAD {name} не прочитан: {e}")
-            headers = {}
-        logger.info(f"HEAD {name}: {headers}")
-        quota = quota or num(headers, 'x-rgw-quota-user-size') or None
-        size = num(headers, 'x-rgw-bytes-used')
-        if size is None and name == BUCKET_NAME:
-            size, full = log_bytes, full and log_full
-        elif size is None and not minutes:
-            full = False
-            continue
-        elif size is None:
-            size = 0
-            for page in client.get_paginator('list_objects_v2').paginate(Bucket=name):
-                size += sum(obj.get('Size', 0) for obj in page.get('Contents') or [])
-                if time.monotonic() > deadline:
-                    full = False
-                    break
-        buckets[name] = size
-        if on_bucket:
-            on_bucket(name, size, time.monotonic() - started)
-    return {'quota': quota, 'buckets': buckets, 'full': full}
-
-
 def _walk_order(roots: list) -> list:
     """Порядок обхода: папка с логами задач последней.
 
@@ -219,19 +159,10 @@ def bucket_checks(swept: dict, quota_gb: int = 0) -> dict:
     over = sum(row['over_ttl'] for row in folders.values())
     checks = {}
 
-    account = swept.get('account') or {}
-    quota = account.get('quota') or quota_gb * 1024 ** 3
-    if quota:
-        buckets = account.get('buckets') or {swept.get('bucket', BUCKET_NAME): walked}
-        used = sum(buckets.values())
-        share = used / quota
-        status = 'error' if share >= FILL_ERROR else 'warn' if share >= FILL_WARN else 'healthy'
-        top = ', '.join(f"`{name}` {readable_size(size)}"
-                        for name, size in sorted(buckets.items(), key=lambda item: -item[1])[:3])
-        checks['fill'] = {'status': status, 'summary': (
-            f"учётка S3: занято {readable_size(used)} из {readable_size(quota)} ({share:.0%}"
-            + (', квота из quota_gb' if not account.get('quota') else '') + f"); крупнейшие: {top}"
-            + ('' if account.get('full', not swept.get('partial')) else '; подсчёт неполный — занято не меньше'))}
+    account = swept.get('account') or {'buckets': {swept.get('bucket', BUCKET_NAME): walked},
+                                        'full': not swept.get('partial')}
+    if fill := s3_fill_check(account, quota_gb):
+        checks['fill'] = fill
 
     share = over / objects if objects else 0
     status = 'error' if share > TTL_ERROR else 'warn' if share > TTL_WARN else 'healthy'
@@ -463,8 +394,9 @@ def tools_log_cleanup():
         deleted = sum(row['deleted'] for row in stats.values())
         over = sum(row['over_ttl'] for row in stats.values())
         log_bytes = sum(row['bytes'] - row['deleted_bytes'] for row in stats.values())
-        account = _account_usage(
-            s3_hook, log_bytes, not partial, params['max_minutes'] if params.get('quota_gb') else 0,
+        account = s3_account_usage(
+            AWS_CONN_ID, params['max_minutes'] if params.get('quota_gb') else 0,
+            known={BUCKET_NAME: (log_bytes, not partial)},
             on_bucket=lambda name, size, sec: add_note(f"📦 `{name}`: {readable_size(size)}, {sec:.0f} с", context))
         head = f"Сухой прогон: удалить нужно {over}" if params['dry_run'] else f"Удалено {deleted} объектов"
         add_note(f"{head}, папок осмотрено {len(stats)} из {len(walks)}", context, title='Обход')

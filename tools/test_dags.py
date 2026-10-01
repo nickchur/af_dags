@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 09:23 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 14:23 MSK · v3.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -19,8 +19,9 @@
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
 | **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
 | **`dag_size`** | Вне групп, с 28.09.2026 (до того — проверка часового `tools_system_health`): DAG'и по числу тасков — в определении и в последнем ране с раскрытыми mapped, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300. Больше 300 — ⚠️ в `health_warn`. Размер меняется только с выкладкой, поэтому раз в сутки |
+| **`s3_quota`** | Вне групп: заполнение учётки S3, из которой синхронизируются даги (подключение `s3`), к её квоте — сумма по всем бакетам учётки, строка 📦 на бакет. ⚠️ от 80 %, ❌ от 95 %. Квота — из заголовков хранилища (Ceph RGW), иначе параметр `quota_gb`; нет обеих — ☮️ skip. Учётка бакета логов — у `tools_log_cleanup` |
 | **`report`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга; вердикт здоровья в XCom `health` |
-| **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения, DAG больше 300 тасков; ❌ дрожащая сериализация — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
+| **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения, DAG больше 300 тасков, учётка S3 дагов от 80 %; ❌ дрожащая сериализация, учётка S3 дагов от 95 % — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
 
 **Исключения:** DAG'и с id по префиксам из `SKIP_DAG_PREFIXES` (сейчас `deadlocker_*`)
 не проверяются вовсе — ни в статистике сериализации, ни в версиях, ни в покрытии.
@@ -38,6 +39,7 @@ DAG'ов разом. Версии записываются все, а сравн
 |---|---|---|
 | `snapshot_limit` | `0` | Сколько DAG'ов обходить за прогон. `0` — все. Ненулевое включает ротацию: изменившиеся → без копии → с самой старой копией, полное покрытие за `ceil(всего / limit)` суток |
 | `schedule` | `0 23 * * *` | Расписание; пусто — только вручную. Сохраняется вместе со `snapshot_limit` галочкой `save_params` |
+| `quota_gb` | `0` | Квота учётки S3 с бакетом дагов (ГБ), если хранилище её не отдаёт; `0` — `s3_quota` пропускается. Сохраняется галочкой `save_params` |
 | `cleanup_deleted` | `False` | Удалять ли версии DAG'ов, которых больше нет в `serialized_dag`. Выключено намеренно: пропажа чаще временная (Broken DAG, неудачный парсинг, `dag_stale_not_seen_duration`), и копия как раз тогда и нужна |
 
 **Хранилище версий:**
@@ -98,14 +100,16 @@ from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 try:
+    from plugins.s3_utils import s3_account_usage, s3_fill_check  # type: ignore
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule,
-        store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, readable_size, saved_params,
+        saved_schedule, store_params_task,
     )
 except ImportError:
+    from CI06932748.tools.s3_utils import s3_account_usage, s3_fill_check  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule,
-        store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, readable_size, saved_params,
+        saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -128,6 +132,12 @@ REPORT_TTL_SEC = 26 * 3600
 # Навык агента, на который отчёт плагина отсылает толкование вердиктов сериализации
 SKILL = "tools-test-dags"
 ONE_SHOT = ("cleanup_deleted",)
+# Учётка S3 с бакетом дагов: из неё ядро синхронизирует даги (S3DagSyncManager(aws_conn_id="s3"),
+# бакет — service_config.bucket_name в extra подключения). Квота у неё своя, отдельная от
+# учётки бакета логов — ту проверяет tools_log_cleanup
+DAGS_CONN_ID = "s3"
+# Потолок листинга бакетов учётки, у которых хранилище не отдаёт объём заголовком
+QUOTA_LIST_MINUTES = 10
 
 # Соединение и бакет берём из настроек логирования, а не именем: на DEV бакет подменяет
 # airflow_entrypoint (REMOTE_BASE_LOG_FOLDER), и хардкод туда не поедет. conf читается из
@@ -497,13 +507,17 @@ def check_dag_size() -> dict:
         # пропажа чаще временная (Broken DAG, неудачный парсинг, деактивация по
         # dag_stale_not_seen_duration), и копия как раз тогда и нужна
         "cleanup_deleted": Param(False, type="boolean"),
+        # Квота учётки S3 с бакетом дагов, если хранилище её не отдаёт заголовком; 0 — не задана
+        "quota_gb": Param(int(SAVED.get("quota_gb", 0)), type="integer", minimum=0, title="Квота S3 дагов (ГБ)",
+                          description="Квота учётки S3 с бакетом дагов (подключение s3), если хранилище её не "
+                                      "отдаёт; 0 — не задана, заполнение не проверяется"),
         "schedule": Param(
             SAVED.get("schedule", DEFAULT_SCHEDULE), type=["string", "null"], title="Расписание",
             description="cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора",
         ),
         "save_params": Param(
             False, type="boolean", title="Сохранить параметры",
-            description=f"Записать schedule и snapshot_limit в {PARAMS_VAR} (cleanup_deleted — нет)",
+            description=f"Записать schedule, snapshot_limit и quota_gb в {PARAMS_VAR} (cleanup_deleted — нет)",
         ),
     },
 )
@@ -1462,7 +1476,7 @@ def tools_test_dags():
     # только свои ветки по task_id
     @task(task_id="params")
     def save_params(**context):
-        """💾 Сохраняет schedule и snapshot_limit как значения по умолчанию."""
+        """💾 Сохраняет schedule, snapshot_limit и quota_gb как значения по умолчанию."""
         return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     save_params()
@@ -1496,11 +1510,29 @@ def tools_test_dags():
         push_health({"dag_size": result}, context)
         return result
 
+    @task(task_id="s3_quota")
+    def s3_quota(**context) -> dict:
+        """🪣 Заполнение учётки S3 с бакетом дагов к её квоте. Находкой не падает; квоты нет — skip."""
+        from airflow.exceptions import AirflowSkipException
+
+        quota_gb = context["params"].get("quota_gb") or 0
+        account = s3_account_usage(
+            DAGS_CONN_ID, QUOTA_LIST_MINUTES if quota_gb else 0,
+            on_bucket=lambda name, size, sec: add_note(f"📦 `{name}`: {readable_size(size)}, {sec:.0f} с", context))
+        fill = s3_fill_check(account, quota_gb)
+        if not fill:
+            raise AirflowSkipException("квота учётки S3 дагов неизвестна: хранилище её не отдаёт, quota_gb=0")
+        icon = {"healthy": "✅", "warn": "⚠️", "error": "❌"}[fill["status"]]
+        add_note(f"{icon} **s3_fill** — {fill['summary']}", context, level="task")
+        push_health({"s3_fill": fill}, context)
+        return fill
+
     [tg_check, tg_compare, parse_time()] >> report_task
     # dag_size — сам по себе, как parse_time: про код DAG'ов, а не про сериализацию
     verdicts = health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
     report_task >> verdicts
     dag_size() >> verdicts
+    s3_quota() >> verdicts
 
 
 tools_test_dags()

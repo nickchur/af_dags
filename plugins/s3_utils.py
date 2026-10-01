@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-09-29 18:02 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 14:23 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -8,6 +8,7 @@
 | `get_s3_list()` | Ленивая инициализация списка бакетов по всем соединениям (кешируется) |
 | `s3_set_ttl` / `s3_get_ttl` / `s3_del_ttl` | Управление жизненным циклом объектов |
 | `s3_create_bucket` / `s3_get_buckets` / `s3_bucket_size` | Операции с бакетами |
+| `s3_account_usage` / `s3_fill_check` | Занятое всеми бакетами учётки и вердикт заполнения к её квоте |
 | `s3_path_parse` | Разбор `conn_id://bucket/prefix/mask` |
 | `s3_to_s3` / `s3_move_s3` / `s3_done` | Копирование, перемещение, `.done`-файлы |
 | `s3_from_zip` | Потоковое извлечение из ZIP без сохранения на диск |
@@ -227,6 +228,93 @@ def s3_get_buckets(conn):
         
     response = s3_client.list_buckets()
     return [bucket['Name'] for bucket in response['Buckets']]
+
+# Заполнение учётки к квоте: warn / error
+S3_FILL_WARN, S3_FILL_ERROR = 0.8, 0.95
+
+
+def s3_account_usage(conn, minutes, known=None, on_bucket=None) -> dict:
+    """Квота учётки S3 и занятое всеми её бакетами: ``{'quota', 'buckets': {бакет: байт}, 'full'}``.
+
+    Лимит выдаётся на учётку, а учётка видит только свои бакеты (``s3`` и ``s3-archive`` —
+    разные учётки на одном сервере, бакеты у них не пересекаются), поэтому занятое — сумма по
+    ``list_buckets``. Квота и объём бакета — из заголовков ``HEAD bucket`` Ceph RGW
+    (``x-rgw-quota-user-size``, ``x-rgw-bytes-used``); в стандартном S3 их нет, MinIO отдаёт
+    квоту только admin API — тогда её задаёт вызывающий (параметр ``quota_gb``).
+
+    ``known`` — ``{бакет: (байт, полный ли)}`` для уже измеренных вызывающим бакетов (бакет логов
+    меряет обход ``tools_log_cleanup``). Прочие бакеты без заголовка листаются ради суммы, не
+    дольше ``minutes``; не уложились или ``minutes=0`` (квота неизвестна, считать незачем) —
+    ``full=False``, занятое — нижняя оценка. Заголовки пишутся в лог: по ним видно, что отдаёт
+    корпоративный шлюз.
+    """
+    # ponytail: имена заголовков RGW по документации, на корпоративном шлюзе не проверены
+    client = S3Hook(aws_conn_id=conn, verify=False).get_conn()
+    known = known or {}
+    deadline = time.monotonic() + minutes * 60
+    quota, buckets, full = None, {}, True
+
+    def num(headers, name):
+        try:
+            value = int(headers.get(name, -1))
+        except ValueError:
+            return None
+        return value if value >= 0 else None
+
+    try:
+        names = [item['Name'] for item in client.list_buckets()['Buckets']]
+    except Exception as e:
+        logger.warning(f"⚠️ список бакетов учётки {conn} не получен: {e}")
+        names, full = list(known), False
+    for name in names:
+        started = time.monotonic()
+        try:
+            headers = client.head_bucket(Bucket=name)['ResponseMetadata']['HTTPHeaders']
+        except Exception as e:
+            logger.warning(f"⚠️ HEAD {name} не прочитан: {e}")
+            headers = {}
+        logger.info(f"HEAD {name}: {headers}")
+        quota = quota or num(headers, 'x-rgw-quota-user-size') or None
+        size = num(headers, 'x-rgw-bytes-used')
+        if size is None and name in known:
+            size, done = known[name]
+            full = full and done
+        elif size is None and not minutes:
+            full = False
+            continue
+        elif size is None:
+            size = 0
+            for page in client.get_paginator('list_objects_v2').paginate(Bucket=name):
+                size += sum(obj.get('Size', 0) for obj in page.get('Contents') or [])
+                if time.monotonic() > deadline:
+                    full = False
+                    break
+        buckets[name] = size
+        if on_bucket:
+            on_bucket(name, size, time.monotonic() - started)
+    return {'quota': quota, 'buckets': buckets, 'full': full}
+
+
+def s3_fill_check(account, quota_gb=0):
+    """Вердикт здоровья ``fill`` по итогу ``s3_account_usage``: занятое к квоте учётки.
+
+    Квота — из заголовков хранилища, иначе ``quota_gb``; нет обеих — None (проверки нет).
+    ⚠️ от 80 %, ❌ от 95 %; в сводке три крупнейших бакета — видно, кто съедает лимит.
+    """
+    quota = account.get('quota') or (quota_gb or 0) * 1024 ** 3
+    if not quota:
+        return None
+    buckets = account.get('buckets') or {}
+    used = sum(buckets.values())
+    share = used / quota
+    status = 'error' if share >= S3_FILL_ERROR else 'warn' if share >= S3_FILL_WARN else 'healthy'
+    top = ', '.join(f"`{name}` {readable_size(size)}"
+                    for name, size in sorted(buckets.items(), key=lambda item: -item[1])[:3])
+    return {'status': status, 'summary': (
+        f"учётка S3: занято {readable_size(used)} из {readable_size(quota)} ({share:.0%}"
+        + (', квота из quota_gb' if not account.get('quota') else '') + f"); крупнейшие: {top}"
+        + ('' if account.get('full', True) else '; подсчёт неполный — занято не меньше'))}
+
 
 def s3_get_pages(conn, bucket, prefix='', page_size=1000, max_items=10000):
     """Создаёт S3-paginator для list_objects_v2 и возвращает (hook, pages_iterator)."""
