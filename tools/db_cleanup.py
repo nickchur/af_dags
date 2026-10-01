@@ -1,23 +1,13 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 17:54 MSK · v2.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v2.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
 удаление остатков прерванного REINDEX. Таск `integrity` проверяет целостность метабазы
 (плагин здоровья: находки → `health_warn` / `health_errors`).
 
-| Параметр | Описание |
-|---|---|
-| 📅 `retention_days` | Хранить не старше N дней *(180, минимум 30)* |
-| 🔍 `dry_run` | Только подсчёт в `clean`, без удаления; на остальные таски не влияет |
-| 🧹 `vacuum` ¹ | VACUUM ANALYZE очищенных таблиц *(вкл.)* |
-| 🔁 `reindex` ¹ | Разово: перестроить индексы `main` по одному, от меньших к большим |
-| 🩹 `drop_leftovers` ¹ | Разово: удалить остатки прерванного REINDEX (`*_ccnew`/`*_ccold`) |
-| ➕ `custom` | Чистить ещё `dag_code` и `dag_pickle` |
-| ⏰ `schedule` | cron или пресет; пусто — только вручную *(`0 5 * * *`)* |
-| 💾 `save_params` | Сохранить параметры запуска в `tools_db_cleanup_params` |
-
-¹ Только при админской учётке метабазы в Vault, иначе нет ни галки, ни таска.
+Вакуум, переиндексация и удаление остатков (галки `vacuum`, `reindex`, `drop_leftovers`) —
+только при админской учётке метабазы в Vault, иначе нет ни галок, ни тасков.
 
 **Таски:** `params` → `drop_leftovers` → `clean` → `vacuum` → `reindex` → `report`, `integrity` →
 `health_warn` / `health_errors`.
@@ -747,7 +737,7 @@ params = {
     'dry_run': _param(
         'dry_run', False,
         type='boolean',
-        description='True — только подсчёт, False — реальное удаление',
+        description='True — только подсчёт в clean, False — реальное удаление. На vacuum, reindex и drop_leftovers не влияет',
     ),
     'custom': _param(
         'custom', False,
@@ -782,7 +772,7 @@ if ADMIN:
         'vacuum': _param(
             'vacuum', True,
             type='boolean',
-            description='True — VACUUM ANALYZE, False — пропустить',
+            description='True — VACUUM ANALYZE очищенных таблиц, False — пропустить',
         ),
         # Разовые: из кода, не из SAVED, и в ONE_SHOT — ключ reindex: true, оставшийся в
         # Variable от v1.10, их не включит (так 18.09.2026 «выключенный» реиндекс запускался)
@@ -790,13 +780,13 @@ if ADMIN:
             False,
             type='boolean',
             description='True — перестроить индексы main по одному (REINDEX INDEX CONCURRENTLY), '
-                        'от меньших к большим; dry_run не отменяет',
+                        'от меньших к большим. Разовая: в Variable не сохраняется',
         ),
         'drop_leftovers': Param(
             False,
             type='boolean',
             description='True — удалить остатки прерванного REINDEX (индексы *_ccnew/*_ccold), '
-                        'у которых исходный индекс есть и валиден',
+                        'у которых исходный индекс есть и валиден. Разовая: в Variable не сохраняется',
         ),
     })
 

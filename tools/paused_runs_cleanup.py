@@ -1,20 +1,10 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-10-01 17:59 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час находит раны в `running` / `queued` у дагов на паузе старше `older_than_hours` и,
 если попросили, закрывает их как **Mark failed**: незавершённые задачи → `skipped`, ран →
 `failed`. Шедулер запаузенный даг не разбирает, а `trigger_dag` паузу не смотрит — такой ран
 иначе висит вечно. Паузу даг не снимает. Создаётся на паузе.
-
-| Параметр | Описание |
-|---|---|
-| `older_than_hours` | Порог возраста, ч *(24)* |
-| `states` | Какие раны брать *(`running`, `queued`)* |
-| `dag_id_like` | Фильтр `dag_id`, SQL `LIKE` (`CTL.%`); пусто — все |
-| `close` | Закрывать найденное; иначе только отчёт. Сохраняемый |
-| `max_runs` | Найдено больше — не закрываем ничего, таск красный *(200)* |
-| `schedule` | cron или пресет; пусто — только вручную *(`0 * * * *`)* |
-| `save_params` | Сохранить параметры запуска в `tools_paused_runs_cleanup_params` |
 
 **Таски:** `params` → `collect` (отчёт: раны, задачи, кто поставил паузу) → `close`.
 
@@ -124,11 +114,12 @@ def classify(runs, tis, now, older_than_hours):
     params={
         'older_than_hours': Param(
             SAVED.get('older_than_hours', 24), type='integer', minimum=1, title='Старше, ч',
-            description='queued — от постановки в очередь, running — от последнего движения задач',
+            description='Порог возраста рана, ч: queued — от постановки в очередь, running — от последнего движения задач',
         ),
         'states': Param(
             SAVED.get('states', RUN_STATES), type='array', examples=RUN_STATES,
             items={'type': 'string', 'enum': RUN_STATES}, title='Состояния рана',
+            description='Какие раны брать: queued — возраст от постановки в очередь, running — от последнего движения задач',
         ),
         'dag_id_like': Param(
             SAVED.get('dag_id_like', ''), type=['string', 'null'], title='Фильтр dag_id',

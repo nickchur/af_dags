@@ -1,17 +1,10 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-01 18:00 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
 содержимого → сводка ✅/❌/☮️ в заметке → cleanup. Запуск вручную (`@once`), параллельные
 прогоны не поддержаны.
-
-| Параметр | Описание |
-|---|---|
-| `pg_conn_id` / `ch_conn_id` / `s3_conn_id` / `s3_bucket` | Где создавать тестовые таблицы и файлы |
-| `test_pg` / `test_ch` / `test_s3` | Проверки по системам; кросс-системная идёт, только если включены обе *(вкл.)* |
-| `run_known_broken` | Карантин: проверки, не проходящие на текущей сборке или без кластера `datalab` *(выкл.)* |
-| `run_cleanup` | Удалить таблицы и ключи S3 после прогона; выкл. — оставить для отладки *(вкл.)* |
 
 Подробно: [tools/readme.md — test_hrp_operators](../../_plugin_dag_docs/?doc=tools/readme.md#test_hrp_operatorspytest_hrp_operatorspy)
 """
@@ -310,17 +303,17 @@ def _ch_insert_sql(table: str) -> str:
         "on_skipped_callback": on_callback,
     },
     params={
-        "pg_conn_id": Param(DEFAULT_PG_CONN, type="string"),
-        "ch_conn_id": Param(DEFAULT_CH_CONN, type="string"),
-        "s3_conn_id": Param(DEFAULT_S3_CONN, type="string"),
-        "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string"),
+        "pg_conn_id": Param(DEFAULT_PG_CONN, type="string", description="Postgres для тестовых таблиц (схема public)"),
+        "ch_conn_id": Param(DEFAULT_CH_CONN, type="string", description="ClickHouse для тестовых таблиц (схема technical)"),
+        "s3_conn_id": Param(DEFAULT_S3_CONN, type="string", description="S3-подключение для тестовых файлов"),
+        "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string", description="Бакет для тестовых файлов (префикс hrp_tests/)"),
         # Флаги систем: каждая проверка гейтуется по системам, которые она задействует (AND).
         # Кросс-системные проверки идут только при включённых ОБЕИХ системах: pg→s3 требует
         # test_pg И test_s3, s3→ch — test_s3 И test_ch, ch→pg — test_ch И test_pg и т.д.
         # Выключение системы уводит все её проверки (в т.ч. кросс) в ☮️ skipped.
-        "test_pg": Param(default=True, type="boolean"),
-        "test_ch": Param(default=True, type="boolean"),
-        "test_s3": Param(default=True, type="boolean"),
+        "test_pg": Param(default=True, type="boolean", description="Проверки с Postgres; кросс-системные идут, только если включены обе системы"),
+        "test_ch": Param(default=True, type="boolean", description="Проверки с ClickHouse"),
+        "test_s3": Param(default=True, type="boolean", description="Проверки с S3"),
         # Отдельный «карантин» поверх системных флагов: проверки, пока не проходящие на текущей
         # сборке пакета / требующие кластера datalab. По умолчанию False (☮️ skipped):
         #   pg_to_s3_list     — баг prepare_row в HrpPostgresToS3ListOperator (до пересборки пакета);
@@ -329,10 +322,10 @@ def _ch_insert_sql(table: str) -> str:
         #   pg_incarnation    — баг insert_incarnation (sql.Literal вместо sql.SQL) (до пересборки);
         #   ch_table_query_s3 — требует clusterAllReplicas(datalab, system.query_log);
         #   cluster           — требует system.clusters('datalab').
-        "run_known_broken": Param(default=False, type="boolean"),
+        "run_known_broken": Param(default=False, type="boolean", description="Карантин: проверки, не проходящие на текущей сборке или требующие кластера datalab"),
         # На время отладки: False оставляет все PG/CH таблицы и S3-ключи, чтобы можно было
         # переразобрать/перезапустить отдельный упавший таск (иначе cleanup сносит всё).
-        "run_cleanup": Param(default=True, type="boolean"),
+        "run_cleanup": Param(default=True, type="boolean", description="Удалить тестовые таблицы и ключи S3 после прогона; выкл. — оставить для отладки"),
     },
     doc_md=__doc__,
     description='Регрессионный стенд операторов hrp_operators: pg, ch, s3',

@@ -1,17 +1,10 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-01 18:00 MSK · v3.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v3.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), mapped `check` — по экземпляру на подключение,
 `report` — таблица ✅/❌/☮️ в заметке. Упало важное (`critical`) — ❌, ран красный;
 вспомогательное — ⚠️, ран зелёный.
-
-| Параметр | Описание |
-|---|---|
-| `critical` | Шаблоны `conn_id` (fnmatch) важных подключений *(`airflowdb`, `ctl`, `s3`, подключение логов)* |
-| `skip_<группа>` | Не проверять группу (`tfs`, `s3`, `postgres`, `ctl`, `clickhouse`, `kafka`, `trino`, `redis`) |
-| `schedule` | cron или пресет; пусто — только вручную *(`15 23 * * *`)* |
-| `save_params` | Сохранить параметры запуска в `tools_test_connections_params` |
 
 **Таски:** `params` → `collect` → `check` (mapped) → `report` → `health_warn` / `health_errors`.
 

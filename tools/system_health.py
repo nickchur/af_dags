@@ -1,16 +1,10 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-10-01 17:59 MSK · v3.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час — «почему задачи не идут»: бакет логов (`s3_logs`), пулы, разбор файлов, раны и
 `scheduled`, сторож отчётов остальных плагинов здоровья. Сетка DAG'а — лента здоровья
 контура: ❌ — был `error`. Дешёвое «лежит ли контур» раз в 5 минут — `tools_system_pulse`
 из этого же файла.
-
-| Параметр | Описание |
-|---|---|
-| ⏰ `schedule` | cron или пресет; пусто — только вручную *(`7 * * * *`)* |
-| 🐢 `s3_slow_sec` | Норма на запись, чтение и удаление в S3 вместе, секунды *(5)* |
-| 💾 `save_params` | Сохранить параметры запуска в `tools_system_health_params` |
 
 **Таски:** `params` → `collect` (проверки, находками не падает) → `report` и `health_warn` /
 `health_errors`.

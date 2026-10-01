@@ -1,19 +1,11 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 17:58 MSK · v3.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v3.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в сутки (23:00 MSK) ищет DAG'и, у которых сериализация переписывается на каждом разборе
 файла, и выясняет причину. Группа `check_serialized` ловит дрожание (ждёт следующего разбора,
 бывает часами), группа `compare` ведёт версии сериализации в S3 и показывает, что изменилось.
 Вне групп: `parse_time` — медленные файлы, `dag_size` — DAG'и больше 300 тасков, `s3_quota` —
 заполнение учётки S3 дагов. Находками не падает: итог — `health_warn` / `health_errors`.
-
-| Параметр | Описание |
-|---|---|
-| `snapshot_limit` | Сколько DAG'ов обходить за прогон; `0` — все *(0)* |
-| `quota_gb` | Квота учётки S3 дагов (ГБ), если хранилище её не отдаёт; `0` — `s3_quota` пропускается |
-| `cleanup_deleted` | Удалять версии DAG'ов, которых больше нет в `serialized_dag` *(выкл.)* |
-| `schedule` | cron или пресет; пусто — только вручную *(`0 23 * * *`)* |
-| `save_params` | Сохранить параметры запуска как значения по умолчанию |
 
 **Таски:** `check_serialized` (`check_serialized_dag` → `recheck_serialized_dag`), `compare`
 (`find_changed` → `snapshot_dags` → `compare_changed`) и `parse_time` → `report`; он, `dag_size` и
@@ -454,11 +446,13 @@ def check_dag_size() -> dict:
         # 0 — без ограничения, копируем все DAG'и. Ненулевое значение включает ротацию
         # (изменившиеся и самые старые копии вперёд): полное покрытие набирается за
         # ceil(всего / snapshot_limit) суток
-        "snapshot_limit": Param(int(SAVED.get("snapshot_limit", 0)), type="integer", minimum=0),
+        "snapshot_limit": Param(int(SAVED.get("snapshot_limit", 0)), type="integer", minimum=0,
+                                description="Сколько DAG'ов обходить за прогон; 0 — все. Иначе ротация: полный круг за ceil(всего / limit) суток"),
         # Удаление копий DAG'ов, которых больше нет в serialized_dag — только вручную:
         # пропажа чаще временная (Broken DAG, неудачный парсинг, деактивация по
         # dag_stale_not_seen_duration), и копия как раз тогда и нужна
-        "cleanup_deleted": Param(False, type="boolean"),
+        "cleanup_deleted": Param(False, type="boolean",
+                                 description="Удалять версии DAG'ов, которых больше нет в serialized_dag. Пропажа чаще временная — по умолчанию копии хранятся"),
         # Квота учётки S3 с бакетом дагов, если хранилище её не отдаёт заголовком; 0 — не задана
         "quota_gb": Param(int(SAVED.get("quota_gb", 0)), type="integer", minimum=0, title="Квота S3 дагов (ГБ)",
                           description="Квота учётки S3 с бакетом дагов (подключение s3), если хранилище её не "

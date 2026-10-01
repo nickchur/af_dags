@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-10-01 17:59 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два ручных DAG'а для проверки Kafka-связки (коннект, топик, формат сообщения) без
 прикладного пайплайна: 📤 `tools_test_kafka_snd` шлёт одно сообщение (по умолчанию —
@@ -8,15 +8,6 @@
 ⚠️ Отправка в боевой топик ТФС идёт мимо очереди `export.er_sent_files` и лимитов маршрута.
 ⚠️ Режим `wait` читает в группе боевого `tfs_kafka_rcv` и может забрать квитанцию — только при
 остановленном `tfs_kafka_rcv`. По умолчанию `read_last`: свежая группа, ничего не перехватывает.
-
-| Параметр | Описание |
-|---|---|
-| `conn_id` | Kafka-подключение (список — из Variable `local_connections`) |
-| `topic` | Топик; по умолчанию сигма: пишем `TFS.HRPLT.IN`, читаем `TFS.HRPLT.OUT` |
-| `message` | Только отправка: текст; `{RqUID}` и `{RqTm}` подставляются |
-| `mode` | Только приём: `read_last` / `wait` |
-| `timeout` | Только приём: сколько ждать, секунды |
-| `max_messages` | Только приём: сколько последних сообщений читать |
 
 Подробно: [tools/readme.md — test_kafka](../../_plugin_dag_docs/?doc=tools/readme.md#test_kafkapytest_kafkapy)
 """
@@ -204,8 +195,10 @@ _TAGS = ["DataTools", "tools", "AutoQA"]
     doc_md=__doc__,
     description='Kafka: отправить одно сообщение в топик',
     params={
-        "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
-        "topic":    Param(SND_TOPIC, type="string", title="Topic"),
+        "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS,
+                          description="Kafka-подключение; список — из Variable local_connections (наполняет tools_test_connections)"),
+        "topic":    Param(SND_TOPIC, type="string", title="Topic",
+                          description="Топик. По умолчанию сигма (TFS.HRPLT.IN); на альфе — TFS.PKAPHR.IN, задаётся руками. ⚠️ Мимо очереди и лимитов маршрута ТФС"),
         "message":  Param(
             DEFAULT_MESSAGE, type="string", format="multiline", title="Message",
             description="Уходит в топик как есть. Маркеры {RqUID} и {RqTm} заменяются "
@@ -243,8 +236,10 @@ tools_test_kafka_snd()
     doc_md=__doc__,
     description='Kafka: прочитать сообщение из топика',
     params={
-        "conn_id":  Param(RCV_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
-        "topic":    Param(RCV_TOPIC, type="string", title="Topic"),
+        "conn_id":  Param(RCV_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS,
+                          description="Kafka-подключение; список — из Variable local_connections (наполняет tools_test_connections)"),
+        "topic":    Param(RCV_TOPIC, type="string", title="Topic",
+                          description="Топик. По умолчанию сигма (TFS.HRPLT.OUT); на альфе — TFS.PKAPHR.OUT, задаётся руками"),
         "mode":     Param(
             "read_last",
             type="string",
@@ -258,7 +253,8 @@ tools_test_kafka_snd()
             180, type="integer", minimum=5, title="Timeout, sec",
             description="Сколько ждать сообщение: poll_timeout (wait), окно чтения (read_last).",
         ),
-        "max_messages": Param(1, type="integer", minimum=1, title="Max messages (read_last)"),
+        "max_messages": Param(1, type="integer", minimum=1, title="Max messages (read_last)",
+                              description="Сколько последних сообщений топика прочитать в режиме read_last"),
     },
 )
 def tools_test_kafka_rcv():

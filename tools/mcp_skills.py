@@ -1,16 +1,10 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-10-01 18:00 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 30 минут публикует для вебсервера то, чего у него нет: навыки агента
 (`*/skill/*.md`) — в Variables `mcp_skill__<имя>` для MCP-ресурсов `airflow://skill/<имя>`,
 остальные `.md` — в `docs/` бакета логов для пункта Docs → DAG Docs и `airflow://doc/{path}`.
 Пишет только изменившееся, снимает исчезнувшее.
-
-| Параметр | Описание |
-|---|---|
-| `purge_docs` | Разово удалить прежние тексты `af_doc__*` из Variables |
-| `schedule` | cron или пресет; пусто — только вручную *(раз в 30 минут)* |
-| `save_params` | Сохранить параметры запуска в `tools_mcp_skills_params` |
 
 **Таски:** `params` → `publish` (навыки), `publish_docs` (документы).
 
