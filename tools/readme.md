@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-09-30 15:39 MSK · v1.47 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 09:12 MSK · v1.48 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -378,7 +378,7 @@ failed — как кнопка Mark failed: незавершённые зада�
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`), только брокер. Теперь даг прежде
 всего разбирает очередь, а чистка брокера — один таск по разовой галочке `purge`. Таски:
-после `params` параллельно `broker`, `scheduler`, `capacity`, `pidbox`; `purge` ждёт `broker`, `report` —
+после `params` параллельно `broker`, `scheduler`, `capacity`, `pidbox`; `purge` ждёт `broker`, `purge_pidbox` — `pidbox`, `report` —
 всех. Дампы убирает `tools_log_cleanup` общим сроком бакета.
 
 *   **`scheduler`** — каждая живая задача в `scheduled` (даг не на паузе, ран `running`),
@@ -395,7 +395,7 @@ failed — как кнопка Mark failed: незавершённые зада�
     (`_kombu.binding.reply.celery.pidbox`): сколько записей и пять для примера. Отвечая на
     ping/inspect, воркер читает сет целиком в главном цикле; на раздутом сете он минутами не
     берёт задачи и молчит на ping (сигма dev 30.09.2026, стек `kill -USR1`). От
-    `max_reply_bindings` (1000) — вывод 📮 и ⚠️; разовая галочка `purge_pidbox` удаляет сет
+    `max_reply_bindings` (1000) — вывод 📮 и ⚠️; разовая галочка `purge_pidbox` удаляет сет отдельным таском `purge_pidbox`
     (`DEL`, а если брокер его не выполнил — пачками `SREM`, до 5 минут; альфа dev 30.09):
     задачи не теряются, живые опрашивающие вернут свою запись при следующем опросе. Размер
     сета раз в 5 минут показывает и пульс (`control.reply_bindings`).
