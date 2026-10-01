@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-10-01 18:18 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час находит раны в `running` / `queued` у дагов на паузе старше `older_than_hours` и,
 если попросили, закрывает их как **Mark failed**: незавершённые задачи → `skipped`, ран →

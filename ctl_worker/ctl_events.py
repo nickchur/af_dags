@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Asset
-*2026-10-01 18:02 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Asset'ы для оркестрации DAG'ов.
 

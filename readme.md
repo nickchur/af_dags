@@ -1,6 +1,6 @@
 # af3_dags — даги HR-платформы под Airflow 3
 
-*2026-09-21 18:44 MSK · v0.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v0.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Перенос дагов из `af_dags` (Airflow 2) на Airflow 3.3.1 — этап 8 плана миграции
 `etl-core-3/openspec/changes/airflow-3-migration/tasks.md`. **Приватный**: сюда можно то, что
@@ -31,6 +31,7 @@
 - Сообщение celery — `execute_workload` с JSON `ExecuteTask` (в нём токен задачи), а не
   `airflow tasks run`. Подключение из задачи — `airflow.sdk.Connection.get`.
 - Логи задач в S3 без gzip (`*.log`, не `*.log.gz`).
+- `[core] dags_folder` не указывает на даги, пришедшие бандлом: корень — от `__file__`.
 - `current_schema()` не годится для поиска схемы метабазы: на стенде AF3 есть пустая `main`
   рядом с таблицами в `public`; схему даёт `af_meta.schema()` (куда разрешается `dag_run`).
 
@@ -50,11 +51,10 @@ SQL привязан к схеме 3.3.1 и сверяется при обнов
 
 | Путь | Что |
 |---|---|
-| `plugins/` | `utils`, `ctl_utils`, `ctl_core`, `s3_utils` (порт `af_dags@d9813ec`) + `af_meta` |
-| `ctl_worker/` | оркестрация CTL (порт `af_dags@d9813ec`), без `ctl_tfs.py` — тракт ТФС отдельно |
-| `check/` | служебные даги (порт `af_dags@8822591`): чистка метабазы, логов и очередей, сторож метабазы, отчёт журнала, здоровье, проверка подключений, Kafka; `test_dags` ещё не перенесён |
-| `tools/` | S3-инструменты, `dummy`, `test_package` (порт `af_dags@8822591`) |
-| `check/test_hrp_operators.py` | регрессионный стенд `hrp_operators` (порт `af_dags` v1.1), см. docstring |
+| `plugins/` | `utils`, `s3_utils` (порт `af_dags@364f822`) + `af_meta` |
+| `ctl_worker/` | оркестрация CTL, с `ctl_core` и `ctl_utils` (порт `af_dags@364f822`), без `ctl_tfs.py` — тракт ТФС отдельно |
+| `tools/` | служебные даги (порт `af_dags@364f822`, бывший `check/`): чистка метабазы, логов, раны запаузенных дагов, сторож метабазы, разбор очереди, отчёт журнала, здоровье, проверка подключений, Kafka, навыки MCP, регрессия `hrp_operators` (+ группы `click_to_click`, `lineage`); `test_dags` не перенесён — см. ниже |
+| `s3_tools/` | S3-инструменты, `test_package` (порт `af_dags@364f822`, бывший `tools/`) |
 | `tests/` | сторож внутреннего интерфейса запуска DAG-а (`python -m pytest tests`, окружение AF3) |
 
 `plugins/` — обычный пакет (`__init__.py`): namespace-пакет проигрывает любому одноимённому
@@ -63,3 +63,11 @@ SQL привязан к схеме 3.3.1 и сверяется при обнов
 Проверка — только на стенде AF3 (`etl-core-3/docs/STAND.md`, раздел «Живой AF3»): даги
 кладутся в `/opt/aftest/home3/dags/`. Сквозной прогон CTL — эмулятор `testbed/ctl_worker` из
 `af_dags`; переменные `ctl_*` и подключения GP стенда — копией из метабазы AF2.
+
+**`tools_test_dags` не перенесён.** Он ловит нестабильную сериализацию по смене `dag_hash`;
+в AF3 такая смена заводит новую `dag_version`, и проверке нужно своё решение, а не замена SQL.
+
+**Стенд AF3 делит с AF2 эмулятор CTL и бакет логов.** Даги `CTL.*` ставятся незапаузенными —
+их сразу после разбора ставят на паузу (scheduler остановлен, пока не поставлены), иначе
+сенсор и монитор AF3 поведут загрузки эмулятора наравне с AF2. `tools_mcp_skills` пишет
+`docs/` в общий бакет: после прогона вернуть версии AF2 по оглавлению `af_docs` AF2.

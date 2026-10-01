@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 19:13 MSK · v2.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v2.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,

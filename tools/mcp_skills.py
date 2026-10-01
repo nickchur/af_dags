@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-10-01 18:18 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 30 минут публикует для вебсервера то, чего у него нет: навыки агента
 (`*/skill/*.md`) — в Variables `mcp_skill__<имя>` для MCP-ресурсов `airflow://skill/<имя>`,

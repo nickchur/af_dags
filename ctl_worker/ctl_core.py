@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`ctl_worker/ctl_core.py`)
-*2026-09-30 09:50 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 

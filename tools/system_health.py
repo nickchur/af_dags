@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-10-01 18:18 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час — «почему задачи не идут»: бакет логов (`s3_logs`), пулы, разбор файлов, раны и
 `scheduled`, сторож отчётов остальных плагинов здоровья. Сетка DAG'а — лента здоровья

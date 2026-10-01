@@ -1,6 +1,6 @@
 """
 ### 🫀 DAG: задачи выполняются
-*2026-10-01 17:33 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:26 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час два таска подряд:
 - `dummy_task` (`EmptyOperator`) — шедулер отмечает его успешным сам, до воркера он не
