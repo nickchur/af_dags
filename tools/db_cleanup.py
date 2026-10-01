@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 13:09 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:34 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -657,12 +657,17 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
     return done, failed, left
 
 
-def drop_leftovers(names):
+def drop_leftovers(names, on_step=None):
     """DROP INDEX CONCURRENTLY остатков REINDEX — только если исходный индекс есть и валиден.
 
     Под коннектом владельца (get_af_conn): у штатного пользователя Airflow прав нет. По одному
     и автокоммитом: CONCURRENTLY в транзакции не работает. Индекс, который держит ограничение,
     PG удалить не даст — это строка в итоге, а не падение.
+
+    Каждый DROP … CONCURRENTLY ждёт конца всех транзакций, трогающих таблицу; на занятой
+    ``dag_run`` это секунды на индекс, и 551 остаток сигмы dev (01.10.2026) удалялся почти час
+    без единой строки в заметке. Поэтому ход — в лог на каждый индекс и в ``on_step(i, n, done,
+    kept)``, вызывающий решает, как часто писать заметку.
     """
     import re
     from psycopg2 import sql as psql
@@ -683,16 +688,21 @@ def drop_leftovers(names):
                 return [], [f'не выполнено: {problem}']
             cur.execute("SET lock_timeout = '30s'")
             cur.execute("SET statement_timeout = '10min'")
-            for name in names:
+            for i, name in enumerate(names, 1):
+                if on_step:
+                    on_step(i, len(names), done, kept)
                 base = re.sub(LEFTOVER_SUFFIX, '', name)
                 if base == name or base not in valid:
                     kept.append(f'{name}: исходного {base} нет или он невалиден')
                     continue
+                started = time.monotonic()
                 try:
                     cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS main.{}').format(psql.Identifier(name)))
                     done.append(name)
+                    logger.info(f"🧹 {i}/{len(names)} {name}: удалён за {time.monotonic() - started:.1f} с")
                 except Exception as exc:
                     kept.append(f'{name}: {str(exc).strip()[:120]}')
+                    logger.warning(f"🧹 {i}/{len(names)} {kept[-1]}")
     finally:
         conn.close()
     logger.info(f"🧹 остатков удалено {len(done)}, оставлено {len(kept)}")
@@ -714,6 +724,8 @@ def _param(key, default, **kwargs):
 DEFAULT_SCHEDULE = '0 5 * * *'
 MSK = timezone(timedelta(hours=3))
 ONE_SHOT = ('drop_leftovers', 'reindex')
+# Строка хода удаления остатков в заметке integrity — не чаще (как NOTE_EVERY_SEC у clean)
+DROP_NOTE_EVERY_SEC = 300
 # Админская учётка метабазы в Vault (get_af_conn). Без неё VACUUM, REINDEX и удаление индексов
 # невозможны — ни задач, ни параметров для них не создаём: спрашивать о том, что даг сделать
 # не может, незачем. Права самой учётки проверяет таск перед работой (owner_problem)
@@ -1234,7 +1246,17 @@ def tools_db_cleanup():
         leftovers = checks['indexes'].get('leftovers') or []
         if leftovers and context['params'].get('drop_leftovers'):
             try:
-                done, kept = drop_leftovers(leftovers)
+                # Как clean: строка хода сверху не чаще раза в NOTE_EVERY_SEC — остатков бывают сотни
+                started, last = time.time(), {'at': time.time()}
+
+                def step(i, n, done, kept):
+                    if time.time() - last['at'] < DROP_NOTE_EVERY_SEC:
+                        return
+                    last['at'] = time.time()
+                    add_note(f"⏳ остатки: {i - 1}/{n}, удалено {len(done)}, оставлено {len(kept)}, "
+                             f"{time.time() - started:.0f} с", context=context, level='Task')
+
+                done, kept = drop_leftovers(leftovers, on_step=step)
             except Exception as exc:  # нет коннекта владельца или метабаза отказала — вердикт важнее
                 logger.warning('drop_leftovers: не выполнено', exc_info=True)
                 done, kept = [], [f'не выполнено: {type(exc).__name__}: {str(exc)[:160]}']
