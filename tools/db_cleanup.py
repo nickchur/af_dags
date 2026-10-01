@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 18:18 MSK · v2.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:43 MSK · v2.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
@@ -327,6 +327,10 @@ LONG_TX = '1 hour'
 # xmin на 2,1 млн, вакуум не убирал старые версии строк task_instance, и проверка пула шла
 # 1,5 с вместо 1 мс — шаг шедулера 25–35 с вместо 3 с
 XMIN_WARN, XMIN_ERROR = 100_000, 1_000_000
+# Логические слоты (CDC чужих систем читают метабазу; сигма dev 01.10.2026 — три source_*) держат
+# только catalog_xmin: вакуум каталога, не task_instance. Их риск — WAL, который мастер копит,
+# пока потребитель стоит. ponytail: порог в ГБ без знания размера диска; поднять, если шумит
+LOGICAL_WAL_WARN_GB, LOGICAL_WAL_ERROR_GB = 5, 20
 CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
 
 
@@ -461,11 +465,12 @@ def check_long_tx():
 
 
 def check_xmin_horizon():
-    """Кто держит горизонт вакуума: слоты репликации (с hot_standby_feedback — и запросы на
-    реплике) и сессии самой базы."""
+    """Кто держит горизонт вакуума таблиц: физические слоты реплик (с hot_standby_feedback — и
+    запросы на реплике) и сессии самой базы. Логические слоты — в check_logical_slots."""
     rows = _catalog("""
         SELECT 'слот ' || slot_name AS who, greatest(age(xmin), age(catalog_xmin)) AS age
-        FROM pg_replication_slots WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL
+        FROM pg_replication_slots
+        WHERE slot_type = 'physical' AND (xmin IS NOT NULL OR catalog_xmin IS NOT NULL)
         UNION ALL
         SELECT 'pid ' || pid || coalesce(' ' || nullif(application_name, ''), ''), age(backend_xmin)
         FROM pg_stat_activity WHERE backend_xmin IS NOT NULL AND pid <> pg_backend_pid()
@@ -478,6 +483,30 @@ def check_xmin_horizon():
                         + (' транзакций — вакуум не убирает версии строк новее, индексы метабазы тяжелеют'
                            if status != 'healthy' else ' транзакций'))
                        if rows else 'горизонт никто не держит'}
+
+
+
+def check_logical_slots():
+    """Логические слоты: сколько WAL держат на мастере и стоит ли потребитель."""
+    rows = _catalog("""
+        SELECT slot_name, active, age(catalog_xmin) AS age,
+               pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()
+                                    ELSE pg_current_wal_lsn() END, restart_lsn) AS wal
+        FROM pg_replication_slots WHERE slot_type = 'logical'
+        ORDER BY wal DESC NULLS LAST
+    """)
+    if not rows:
+        return {'status': 'healthy', 'summary': 'логических слотов нет'}
+    gb = 1024 ** 3
+    worst = max(r['wal'] or 0 for r in rows) / gb
+    idle = [r['slot_name'] for r in rows if not r['active']]
+    status = ('error' if worst > LOGICAL_WAL_ERROR_GB
+              else 'warn' if worst > LOGICAL_WAL_WARN_GB or idle else 'healthy')
+    parts = [f"{r['slot_name']}{'' if r['active'] else ' (не подключён)'}: WAL {readable_size(r['wal'] or 0)}, "
+             f"catalog_xmin {format(r['age'] or 0, ',').replace(',', ' ')}" for r in rows[:3]]
+    return {'status': status,
+            'summary': '; '.join(parts) + (' — мастер копит WAL, пока потребитель не дочитает: к владельцу слота / DBA'
+                                           if status != 'healthy' else '')}
 
 
 def check_constraints():
@@ -493,7 +522,7 @@ def check_constraints():
 
 
 INTEGRITY_CHECKS = (check_indexes, check_wraparound, check_sequences, check_vacuum, check_long_tx, check_xmin_horizon,
-                    check_constraints)
+                    check_logical_slots, check_constraints)
 
 
 def owner_problem(cur, tables=None):

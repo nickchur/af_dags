@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-01 18:00 MSK · v1.68 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:43 MSK · v1.69 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -213,7 +213,8 @@ system.query_log)` — в окружении без кластера `datalab` �
     | `sequences` | доля израсходованного у последовательностей `main` (`job`, `log`, `celery_taskmeta` — int4) | > 70 % | > 90 % |
     | `vacuum` | мёртвые строки `dag_run`, `task_instance`, `job`, `log`, `xcom`, `celery_taskmeta` | > 20 % и > 100 тыс. | — |
     | `long_tx` | транзакции дольше часа (держат вакуум; чужие без `pg_read_all_stats` не видны) | есть | — |
-    | `xmin_horizon` | возраст xmin у слотов репликации и сессий: с `hot_standby_feedback` горизонт держит и запрос на реплике | > 100 тыс. транзакций | > 1 млн |
+    | `xmin_horizon` | возраст xmin у физических слотов реплик и сессий: с `hot_standby_feedback` горизонт держит и запрос на реплике | > 100 тыс. транзакций | > 1 млн |
+    | `logical_slots` | логические слоты внешних потребителей (CDC): WAL, который мастер держит до их чтения, и `catalog_xmin` (держит только вакуум каталога, не таблиц) | WAL > 5 ГБ или потребитель не подключён | WAL > 20 ГБ |
     | `constraints` | ограничения `NOT VALID`, так и не проверенные | есть | — |
 
     Отчёт плагина пишет `health_errors`, срок 26 ч.
