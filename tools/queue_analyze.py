@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-10-01 09:32 MSK · v3.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 15:12 MSK · v3.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -33,6 +33,7 @@
 |---|---|
 | Даг ждёт, `queued`+`running` у него ≥ `max_active_tasks` | Упёрся в свой лимит: поднимать лимит в коде дага, а не `parallelism`. Сигма 23.09: 297 задач в `scheduled`, `raw_to_stable_*` с лимитом 4, `slot_reconciler gap=0` — слоты не текли |
 | Ждёт слот пула, пул занят целиком | Пул исчерпан |
+| Ждёт дольше `stale_min`, дагу и пулу есть место, а впереди по весу и дате рана — окно шедулера (`max_tis_per_query`, не больше `parallelism`), в котором есть задачи дагов на лимите | Окно забито: шедулер берёт голову очереди и кончает цикл, как только в ней нашлось что запустить, — до хвоста не доходит при свободных воркерах и том же весе. Сигма dev 01.10.2026: окно 63, ~53 на лимите дагов, 306 ждали «без причины». Лечится шириной окна (`parallelism`), лимитами этих дагов или весом срочных; лишний шедулер — нет |
 | Ждёт дольше `stale_min`, дагу и пулу есть место, вес ниже медианы ушедших в работу за час | Голодает из-за приоритета: `downstream` даёт большим дагам вес в сотни и тысячи (`tfs_kafka_snd` с весом 1 против 22–1921) — `priority_weight` + `weight_rule='absolute'` |
 | Ран failed за сутки, ни одна задача не стартовала, есть `skipped` | Закрыт `dagrun_timeout` без старта — след того же голодания (`tfs_kafka_snd` 12:00–15:00) |
 | `queued`+`running` ≥ `parallelism` × шедулеры | Слоты executor'а заняты: смотреть `slot_reconciler` в логе шедулера |
@@ -365,25 +366,51 @@ def _median(values: list):
     return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
 
 
-def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list, now, stale_min: int) -> dict:
+def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list, now, stale_min: int,
+                     window: int = None) -> dict:
     """Почему ждут задачи в ``scheduled`` — без Airflow, чтобы проверялось тестом.
 
     Args:
-        waiting: ``[{dag_id, pool, priority_weight, updated_at, is_paused, run_state, max_active_tasks}]``.
+        waiting: ``[{dag_id, pool, priority_weight, updated_at, is_paused, run_state, max_active_tasks,
+            logical_date}]``.
         active: ``{dag_id: queued+running}``.
         pools: ``{pool: {'slots': n, 'used': n}}``.
         dispatched: веса задач, стартовавших за последний час.
         now: Текущее время (aware).
         stale_min: Порог «давно ждёт», мин.
+        window: Сколько задач шедулер берёт из scheduled за цикл (``max_tis_per_query``, не больше
+            ``parallelism``); None — окно не оцениваем.
 
     Returns:
-        ``{'live', 'parked', 'stale', 'by_cause': {причина: n}, 'dags': [...], 'median_dispatched'}``.
-        Причина у давно ждущей живой задачи одна, по порядку проверки: лимит дага → пул →
-        приоритет → прочее. Лимит дага первым: при нём шедулер задачу не возьмёт при любом
-        весе и любом пуле.
+        ``{'live', 'parked', 'stale', 'by_cause': {причина: n}, 'dags': [...], 'median_dispatched',
+        'window'}``. Причина у давно ждущей живой задачи одна, по порядку проверки: лимит дага →
+        пул → окно → приоритет → прочее. Лимит дага первым: при нём шедулер задачу не возьмёт при
+        любом весе и любом пуле.
+
+        «Окно»: шедулер AF 2 берёт из scheduled первые ``window`` задач по весу, затем по дате рана,
+        и кончает цикл, как только среди них нашлось что запустить (``is_done`` в
+        ``_executable_task_instances_to_queued``). Если голову занимают задачи дагов на своём
+        лимите, задача за окном не рассматривается вовсе — при свободных воркерах и том же весе,
+        что у ушедших в работу (медиана тут не поможет). Сигма dev 01.10.2026: окно 63, из них ~53
+        на лимите дагов, 306 задач ждали без видимой причины, ручной tools_db_cleanup — 43 мин.
     """
     edge = now - timedelta(minutes=stale_min)
     median = _median(dispatched)
+
+    def at_limit(w):
+        limit = w.get("max_active_tasks")
+        return limit is not None and active.get(w["dag_id"], 0) >= limit
+
+    # Порядок выборки шедулера: вес по убыванию, затем дата рана
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    order = sorted((w for w in waiting if not w.get("is_paused") and w.get("run_state") == "running"),
+                   key=lambda w: (-(w.get("priority_weight") or 0), w.get("logical_date") or floor))
+    rank = {id(w): i for i, w in enumerate(order)}
+    head = order[:window] if window else []
+    blocked = {}
+    for w in head:
+        if at_limit(w):
+            blocked[w["dag_id"]] = blocked.get(w["dag_id"], 0) + 1
     dags, by_cause = {}, {}
     live = parked = stale = 0
     for w in waiting:
@@ -409,6 +436,8 @@ def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list,
             cause = "лимит дага"
         elif pool and pool["slots"] >= 0 and pool["used"] >= pool["slots"]:
             cause = f"пул {w.get('pool')}"
+        elif window and rank[id(w)] >= window and blocked:
+            cause = "окно"
         elif median is not None and (w.get("priority_weight") or 0) < median:
             cause = "приоритет"
         else:
@@ -422,7 +451,20 @@ def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list,
         out.append(d)
     out.sort(key=lambda d: (-d["stale"], -d["waiting"]))
     return {"live": live, "parked": parked, "stale": stale, "by_cause": by_cause, "dags": out,
-            "median_dispatched": median, "dispatched_1h": len(dispatched)}
+            "median_dispatched": median, "dispatched_1h": len(dispatched),
+            "window": {"size": window, "blocked": sum(blocked.values()),
+                       "blocked_dags": sorted(blocked.items(), key=lambda x: -x[1]),
+                       "behind": max(len(order) - window, 0)} if window else None}
+
+
+def _scheduler_window() -> int:
+    """Сколько задач шедулер берёт из scheduled за цикл: ``max_tis_per_query`` (0 — без предела),
+    не больше ``parallelism``. Верхняя оценка: занятые слоты executor'а окно сужают ещё.
+    ``parallelism`` — из конфига воркера, на котором идёт таск; у шедулера он обычно тот же.
+    """
+    parallelism = conf.getint("core", "parallelism")
+    per_query = conf.getint("scheduler", "max_tis_per_query", fallback=16)
+    return parallelism if not per_query else min(per_query, parallelism)
 
 
 def _count(res) -> int:
@@ -580,6 +622,16 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
         pools = {c: n for c, n in sched.get("by_cause", {}).items() if c.startswith("пул ")}
         for c, n in pools.items():
             out.append(f"🏊 {c.capitalize()} исчерпан, ждут слота: {n}")
+        behind = sched.get("by_cause", {}).get("окно")
+        if behind:
+            win = sched["window"]
+            names = ", ".join(f"`{d}` {n}" for d, n in win["blocked_dags"][:5])
+            out.append(f"🧱 Окно шедулера забито: из первых {win['size']} задач по весу и дате рана "
+                       f"{win['blocked']} — даги на своём лимите ({names}); за окном ждут дольше {stale_min} мин "
+                       f"{behind} и не рассматриваются вовсе — цикл кончается, как только в окне нашлось что "
+                       "запустить. Лечится шириной окна (`parallelism`, `max_tis_per_query`), лимитами этих дагов "
+                       "или весом срочных (`priority_weight` + `weight_rule='absolute'`); ещё шедулер тут не "
+                       "поможет — очередь ставит один за раз")
         starving = [d for d in sched.get("dags", []) if d["causes"].get("приоритет")]
         if starving:
             names = ", ".join(f"`{d['dag_id']}` (вес {d['weight']}, {d['oldest_min']} мин)" for d in starving[:5])
@@ -588,7 +640,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
                        "`priority_weight` + `weight_rule='absolute'`")
         other = sched.get("by_cause", {}).get("прочее")
         if other:
-            out.append(f"❓ Ждут дольше {stale_min} мин без видимой причины (лимит дага, пул, приоритет — нет): "
+            out.append(f"❓ Ждут дольше {stale_min} мин без видимой причины (лимит дага, пул, окно, приоритет — нет): "
                        f"{other} — смотреть лог шедулера")
         timeout = sched.get("timeout_runs") or []
         if timeout:
@@ -808,10 +860,13 @@ def tools_queue_analyze():
         with create_session() as session:
             waiting = [r._asdict() for r in (
                 session.query(TI.dag_id, TI.pool, TI.priority_weight, TI.updated_at,
-                              DagModel.is_paused, DagModel.max_active_tasks, DagRun.state.label("run_state"))
+                              DagModel.is_paused, DagModel.max_active_tasks, DagRun.state.label("run_state"),
+                              DagRun.execution_date.label("logical_date"))
                 .outerjoin(DagModel, DagModel.dag_id == TI.dag_id)
                 .outerjoin(DagRun, and_(DagRun.dag_id == TI.dag_id, DagRun.run_id == TI.run_id))
                 .filter(TI.state == "scheduled", TI.dag_id != me)
+                # В порядке шедулера: при обрезке по лимиту остаётся голова — окно
+                .order_by(TI.priority_weight.desc(), DagRun.execution_date)
                 .limit(SCHEDULED_LIMIT)
             )]
             active = dict(session.query(TI.dag_id, func.count())
@@ -848,7 +903,7 @@ def tools_queue_analyze():
                                    DagRun.dag_id != me)
                            .scalar())
 
-        out = scheduler_causes(waiting, active, pools, dispatched, now, p["stale_min"])
+        out = scheduler_causes(waiting, active, pools, dispatched, now, p["stale_min"], window=_scheduler_window())
         out.update(timeout_runs=timeout_runs, paused_runs=paused_runs, truncated=len(waiting) >= SCHEDULED_LIMIT,
                    pools={k: v for k, v in pools.items() if v["slots"] >= 0 and v["used"] >= v["slots"]})
         rows = ["| Даг | Ждут | Давно | Старейшая, мин | В работе / лимит | Вес | Причины |",
