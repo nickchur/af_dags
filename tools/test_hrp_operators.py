@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-01 18:18 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 19:05 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
@@ -285,7 +285,8 @@ def _ch_insert_sql(table: str) -> str:
     is_paused_upon_creation=False,
     max_active_runs=1,
     dagrun_timeout=dt.timedelta(hours=2),
-    tags=["DataTools", "tools", "AutoQA"],
+    # pg_export — политика etl-core 1.2.5 (task_policy): даг с ClickHouse → Postgres без тега не импортируется
+    tags=["DataTools", "tools", "AutoQA", "pg_export"],
     # retries — переживаем transient «Connection reset by peer» от общего ClickHouse/S3
     default_args={
         "owner": "DataLab (CI02420667)",
