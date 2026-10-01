@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-17 08:15 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -14,16 +14,13 @@
 | ☮️ `Skipped` | Пропуск без изменений |
 """
 
-from airflow import DAG
-from airflow.decorators import task, task_group
-from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.models import DagModel, Param
-from airflow.utils.session import create_session
-from airflow.sensors.base import PokeReturnValue # type: ignore
+from airflow.sdk import DAG, Param, PokeReturnValue, task, task_group
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
 from plugins.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
 from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until  # type: ignore
+from plugins import af_meta  # type: ignore
 
 import ast
 import re
@@ -66,7 +63,7 @@ timeout = timedelta(hours=24)
 with DAG(f'CTL.{get_config()["profile"]}.monitor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'logger'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=monitor_interval,
+    schedule=monitor_interval,
     catchup=False,
     default_args={
         'owner': 'EDP.ETL',
@@ -365,15 +362,12 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # Один запрос на все увиденные даги: без него пришлось бы ходить в метабазу
         # на каждую загрузку, а их до ctl_limit за круг.
         if paused_wait:
-            with create_session() as session:
-                # is_active обязателен: у выпавшего из ctl_workflows воркфлоу строка в dag
-                # остаётся, и без фильтра его загрузка попала бы в «ждут снятия паузы»
-                # вместо диагностики пропавшего дага — а ждать ей нечего.
-                paused = {r[0] for r in session.query(DagModel.dag_id).filter(
-                    DagModel.dag_id.in_(sorted({v[0] for v in paused_wait.values()})),
-                    DagModel.is_paused.is_(True),
-                    DagModel.is_active.is_(True),
-                ).all()}
+            # «Не устаревший» обязателен: у выпавшего из ctl_workflows воркфлоу строка в dag
+            # остаётся, и без фильтра его загрузка попала бы в «ждут снятия паузы»
+            # вместо диагностики пропавшего дага — а ждать ей нечего. (Airflow 3: флаг
+            # is_active стал is_stale с обратным смыслом.)
+            paused = {d for d, s in af_meta.dags_states(v[0] for v in paused_wait.values()).items()
+                      if s['is_paused'] and not s['is_stale']}
             waiting = {lid: (f"⏸️ {wfn} {age}", t)
                        for lid, (dag_id, wfn, age, t) in paused_wait.items() if dag_id in paused}
             if waiting:
@@ -501,22 +495,24 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # несколько кругов, а «покажи» и «сделай» считают одинаково.
         LIMIT = 500
 
-        # Критерий один на выборку и на правку: таск в RUNNING, а его job либо не
-        # зарегистрирован, либо не бился дольше порога. Живой таск со свежим heartbeat
+        # Критерий один на выборку и на правку: таск в RUNNING, а его пульс либо не
+        # приходил вовсе, либо не приходил дольше порога. Живой таск со свежим heartbeat
         # сюда не попадает ни при каких условиях — это главное свойство запроса.
+        #
+        # Airflow 3: у task_instance больше нет job_id (таблица job задач не описывает),
+        # пульс задачи лежит в самой строке — last_heartbeat_at, его обновляет Execution
+        # API. «Пульса не было» считаем от start_date: между «встал в running» и первым
+        # пульсом есть окно, и попадать в него санитару незачем.
         where = (
             "ti.state = 'running' AND ("
-            "  ti.job_id IS NULL"
-            "  OR j.id IS NULL"
-            "  OR j.state <> 'running'"
-            f"  OR j.latest_heartbeat < now() - interval '{secs} seconds')"
+            f"  (ti.last_heartbeat_at IS NULL AND ti.start_date < now() - interval '{secs} seconds')"
+            f"  OR ti.last_heartbeat_at < now() - interval '{secs} seconds')"
         )
 
         stuck = pg_exe(
             "SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.start_date,"
-            "       j.state AS job_state, j.latest_heartbeat"
+            "       ti.last_heartbeat_at"
             "  FROM task_instance ti"
-            "  LEFT JOIN job j ON j.id = ti.job_id"
             f" WHERE {where}"
             " ORDER BY ti.start_date LIMIT 500"
         )
@@ -525,7 +521,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             f"{r['dag_id']}.{r['task_id']}": {
                 'run_id': r['run_id'],
                 'start': str(r['start_date'])[:19],
-                'heartbeat': str(r['latest_heartbeat'])[:19] if r['latest_heartbeat'] else 'нет job',
+                'heartbeat': str(r['last_heartbeat_at'])[:19] if r['last_heartbeat_at'] else 'пульса не было',
             }
             for r in stuck
         }
@@ -545,7 +541,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         #
         # «Поедет, но позже» — ран закрывается, ЗАГРУЗКА НЕ ТРОГАЕТСЯ:
         #
-        #   3. QUEUED у запаузенного дага: trigger_dag состояние паузы не смотрит и
+        #   3. QUEUED у запаузенного дага: запуск состояние паузы не смотрит и
         #      создаёт ран сразу в очереди, а планировщик запаузенный даг не разбирает.
         #      Такой ран не поедет, пока паузу не снимут, — и копится в очереди.
         #
@@ -563,7 +559,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # собственный ран монитора.
         LIVE_TASK = "('running','queued','scheduled','up_for_retry','deferred'," \
                     "'up_for_reschedule','restarting')"
-        AGE = ("coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
+        # Airflow 3: execution_date стал logical_date и может быть пустым; момент, «когда ран
+        # мог начаться», теперь run_after — он есть всегда
+        AGE = ("coalesce(dr.start_date, dr.queued_at, dr.run_after)"
                f" < now() - interval '{secs} seconds'")
 
         dead_where = (
@@ -590,7 +588,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             return (
                 f"{action} WHERE dr.id IN ("
                 f"  SELECT dr.id FROM dag_run dr WHERE {where}"
-                "   ORDER BY coalesce(dr.start_date, dr.queued_at, dr.execution_date)"
+                "   ORDER BY coalesce(dr.start_date, dr.queued_at, dr.run_after)"
                 f"  LIMIT {LIMIT})"
             )
 
@@ -628,19 +626,11 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # что база действительно поменяла, а не то, что показала выборка секунду назад.
         failed = []
         if stuck:
+            # Одним запросом: в Airflow 3 нет job, и «без job» больше не отдельный случай
             failed = pg_exe(
                 "UPDATE task_instance ti SET state = 'failed', end_date = now()"
-                "  FROM job j WHERE j.id = ti.job_id AND " + where +
+                " WHERE " + where +
                 " RETURNING ti.dag_id, ti.task_id, ti.run_id"
-            )
-            # Таски без job вообще (ti.job_id пуст) отдельным запросом: JOIN их не поймает.
-            # Порог здесь тот же, что и везде: между «таск встал в running» и «job
-            # записался» есть окно, и попадать в него санитару незачем.
-            failed += pg_exe(
-                "UPDATE task_instance SET state = 'failed', end_date = now()"
-                " WHERE state = 'running' AND job_id IS NULL"
-                f"   AND start_date < now() - interval '{secs} seconds'"
-                " RETURNING dag_id, task_id, run_id"
             )
 
         upd = "UPDATE dag_run dr SET state = 'failed', end_date = now()"

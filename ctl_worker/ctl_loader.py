@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-09-17 09:24 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут выгружает данные из CTL и сохраняет в S3 + Airflow Variables.
 
@@ -14,9 +14,8 @@
 Данные доступны через `ctl_obj_load()`.
 """
 
-from airflow import DAG
-from airflow.decorators import task, task_group
-from airflow.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
+from airflow.sdk import DAG, task, task_group
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException, AirflowRescheduleException
 
 
 from plugins.utils import add_note, on_callback, readable_size, str2timedelta, md5_hash # type: ignore
@@ -91,7 +90,7 @@ def dangling_events(events, sources, entities, profiles):
 with DAG(f'CTL.{get_config()["profile"]}.loader',
     tags=['CTL', 'CTL_agent', 'logger'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=str2timedelta(get_config().get('loader_interval','minutes=5')),
+    schedule=str2timedelta(get_config().get('loader_interval','minutes=5')),
     catchup=False,
     default_args={
         'owner': 'EDP.ETL',

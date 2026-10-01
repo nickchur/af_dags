@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-21 12:41 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -65,9 +65,9 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from airflow.decorators import dag, task
-from airflow.models import Variable
-from airflow.models.param import Param
+from airflow.sdk import dag, task
+from airflow.sdk import Variable
+from airflow.sdk import Param
 from airflow.providers.apache.kafka.operators.consume import ConsumeFromTopicOperator
 from airflow.providers.apache.kafka.operators.produce import ProduceToTopicOperator
 
@@ -141,7 +141,7 @@ def _kafka_conn_ids() -> list[str]:
     """
     conn_ids = {SND_CONN, RCV_CONN}
     try:
-        var_data = Variable.get("local_connections", deserialize_json=True, default_var=None) or {}
+        var_data = Variable.get("local_connections", deserialize_json=True, default=None) or {}
         conn_ids |= {c["conn_id"] for c in var_data.get("kafka", []) if c.get("conn_id")}
     except Exception as exc:
         logger.warning("Не прочитали local_connections, список conn_id только из дефолтов: %s", exc)
@@ -166,7 +166,7 @@ def produce_test_msg():
     """
     import uuid
 
-    from airflow.operators.python import get_current_context
+    from airflow.sdk import get_current_context
 
     context = get_current_context()
     message = context["params"]["message"]
@@ -188,7 +188,7 @@ def produce_test_msg():
 
 def on_delivery(err: Exception | None, msg) -> None:
     """Колбэк подтверждения доставки Kafka: падает с AirflowFailException при ошибке."""
-    from airflow.exceptions import AirflowFailException
+    from airflow.sdk.exceptions import AirflowFailException
 
     if err:
         raise AirflowFailException(f"Kafka delivery failed: {err}")
@@ -201,7 +201,7 @@ def consume_msg(msg) -> None:
     Выполняется на воркере; get_current_context даёт доступ к ti для xcom_push.
     Отображение — в общей задаче show.
     """
-    from airflow.operators.python import get_current_context
+    from airflow.sdk import get_current_context
 
     text = msg.value().decode("utf-8", errors="replace")
     logger.info("Received Kafka message: %s", text)
@@ -340,8 +340,8 @@ def tools_test_kafka_rcv():
         import time
         import uuid
 
-        from airflow.exceptions import AirflowFailException
-        from airflow.hooks.base import BaseHook
+        from airflow.sdk.exceptions import AirflowFailException
+        from airflow.sdk import BaseHook
         from confluent_kafka import Consumer, TopicPartition
 
         p = context["params"]

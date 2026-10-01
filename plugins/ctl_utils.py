@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-17 10:41 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -7,7 +7,7 @@
 |---|---|
 | `get_config()` | Ленивая загрузка `ctl_config` из Airflow Variable (кешируется) |
 | `ctl_api()` | HTTP-клиент CTL с Kerberos, retry и rate_limit |
-| `pg_exe()` | SQL в Airflow metadata DB через `create_session` |
+| `pg_exe()` | SQL в метабазе Airflow (Airflow 3: через `af_meta.sql`, ORM у задачи нет) |
 | `gp_exe()` | SQL в Greenplum с retry |
 | `gp_upload_s3_csv()` | Потоковая загрузка CSV/ZIP/GZ из S3 в Greenplum |
 | `ctl_obj_load/save()` | JSON/YAML объекты в S3 + Airflow Variables |
@@ -19,13 +19,17 @@
 > Импортируйте `get_config`, а не `config` напрямую.
 """
 
-from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.models import Variable, Pool
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+from airflow.sdk import Variable
 
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
-from airflow.utils.session import create_session
-from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
+try:
+    from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
+except ImportError:
+    # hrp_operators верхнего уровня есть там, где plugins_folder Airflow указывает в пакет
+    # etl-core (контуры); иначе — полным именем пакета (стенд AF3)
+    from sber_app_dataplatform_etl_core.hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
 from tenacity import retry, stop_after_attempt, wait_exponential, wait_fixed, retry_if_exception_type
 from requests.exceptions import ReadTimeout, ConnectTimeout, ConnectionError
 
@@ -38,9 +42,9 @@ from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
 from pprint import PrettyPrinter
 from psycopg2 import OperationalError, InterfaceError, DatabaseError
-from sqlalchemy import text
 
 from plugins.utils import query_to_dict, add_note, readable_size, pool_size # type: ignore #, on_callback
+from plugins import af_meta  # type: ignore
 from plugins.s3_utils import s3_IterStream  # type: ignore
 
 from logging import getLogger
@@ -52,7 +56,7 @@ CTL_API_CALS = 100 #в секунду
 
 def ctl_get_config():
     """Читает Airflow Variable `ctl_config` и возвращает её как dict. При отсутствии возвращает {}."""
-    config = Variable.get("ctl_config", default_var={}, deserialize_json=True)
+    config = Variable.get("ctl_config", default={}, deserialize_json=True)
     return config
 
 _config = None
@@ -156,25 +160,15 @@ def log_retry_attempt(retry_state):
     )
 
 def pg_exe(sql='select 1', timeout=300):
-    """Выполняет SQL в Airflow DB (PostgreSQL) через create_session и возвращает список dict-строк.
+    """Выполняет SQL в метабазе Airflow и возвращает список dict-строк.
 
     Для запросов без результата (UPDATE/DELETE без RETURNING) возвращает пустой список.
+    Airflow 3: `create_session` в задаче запрещён — запрос идёт через `af_meta.sql`
+    (подключение `conns.pg`, одна транзакция, `search_path = main, public`).
     """
     ts_start = time.time()
-    with create_session() as session:
-        session.execute(text("SET LOCAL search_path = main"))
-        if timeout:
-            session.execute(text(f"SET LOCAL statement_timeout = '{timeout}s'"))
-        result = session.execute(text(sql))
-        # UPDATE/DELETE без RETURNING строк не отдают, и result.keys() на них бросает
-        # ResourceClosedError. Раньше через pg_exe ходили только SELECT-ы, поэтому
-        # незаметно; теперь функция годится и для правок — вернёт пустой список.
-        if not result.returns_rows:
-            logger.info(f"✅ {result.rowcount} rows affected in {time.time() - ts_start:.2f}s")
-            return []
-        cols = [col for col in result.keys()]
-        records = [dict(zip(cols, row)) for row in result.fetchall()]
-    logger.info(f"✅ {len(records)} records loaded in {time.time() - ts_start:.2f}s")
+    records = af_meta.sql(sql, timeout=timeout)
+    logger.info(f"✅ {len(records)} records in {time.time() - ts_start:.2f}s")
     return records
 
 
@@ -256,7 +250,9 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         logger.error(error_msg)
         
         # Если это ошибка клиента (4xx, кроме таймаутов 408/429), повторы не помогут
-        if resp_text.startswith('4') or 300 <= status_code < 500:
+        # status_code пуст у таймаута и обрыва связи: сравнение с None падало TypeError-ом
+        # вместо повтора (дефект с Airflow 2, всплыл на таймаутах эмулятора CTL 21.09.2026)
+        if resp_text.startswith('4') or (status_code is not None and 300 <= status_code < 500):
             add_note(error_msg, level='Task,DAG', title='Ошибка API')
             if skip:
                 raise AirflowSkipException(error_msg)
@@ -541,7 +537,7 @@ def ctl_obj_load(key, s3_id=None, bucket=None):
     
     key_ext = f'{key}.json'
 
-    data  = Variable.get(key, default_var={}, deserialize_json=True)
+    data  = Variable.get(key, default={}, deserialize_json=True)
     if data:
         logger.info(f'Объект {key} загружен из Airflow.')
         # content = json.dumps(data, indent=4, ensure_ascii=False).encode('utf-8')
@@ -704,9 +700,8 @@ def category_recursive(cat_id=1):
 
     Вложенные TaskGroup создаются для дочерних категорий. Используется при генерации DAG-структуры CTL.
     """
-    from airflow.utils.task_group import TaskGroup
-    from airflow.operators.empty import EmptyOperator
-    from airflow import Dataset
+    from airflow.sdk import Asset, TaskGroup
+    from airflow.providers.standard.operators.empty import EmptyOperator
     
     cat_dict = ctl_obj_load('ctl_categories')
     wfs_dict = ctl_obj_load('ctl_workflows')
@@ -728,7 +723,7 @@ def category_recursive(cat_id=1):
         for wf in [w for w in wfs_dict.values() if w['category'] == cat_id]:
             EmptyOperator(
                 task_id=wf['name'],
-                outlets=[Dataset(f'CTL/wf/{wf["id"]}/{wf["name"]}')],
+                outlets=[Asset(f'CTL/wf/{wf["id"]}/{wf["name"]}')],
             )
         
         children = [c for c in cat_dict.values() if c['parent'] == cat_id]

@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-04 10:25 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -11,7 +11,7 @@
 
 | `owner_alive` | Что это | Что делать |
 |---|---|---|
-| `true` | таск идёт и бьётся (хартбит `job` свежее `zombie_after_sec`) | ничего: транзакция закроется вместе с таском. Висит сутками — вопрос к владельцам дага |
+| `true` | таск идёт и бьётся (пульс задачи свежее `zombie_after_sec`) | ничего: транзакция закроется вместе с таском. Висит сутками — вопрос к владельцам дага |
 | `false` | таск числится в работе, но хартбит протух, либо уже завершился | сессия брошена: процесса нет, соединение осталось |
 | `null` | владельца не опознали (чужой pid, не разобрался `application_name`) | то же, но без имени |
 
@@ -38,6 +38,9 @@
 даг убирает сам: наш S3-шлюз не принимает lifecycle-правило (`PutBucketLifecycleConfiguration`
 требует заголовок `Content-MD5`, которого boto3 больше не шлёт).
 
+> **Airflow 3 (v2.0).** Пульс задачи — `task_instance.last_heartbeat_at` (его пишет Execution
+> API; `job_id` у задачи удалён). SQL — через `af_meta.meta_session`, схема не зашита.
+
 > Пороги берутся из Variable `tools_pg_activity_cfg`, форма запуска ими предзаполняется.
 > Поменять порог для расписания — запуск с галкой «Сохранить настройки».
 """
@@ -47,14 +50,17 @@ import json
 import logging
 
 from airflow.configuration import conf
-from airflow.decorators import dag, task
-from airflow.models import Param, Variable
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, Variable, dag, task
 
 try:
     from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 except ImportError:
     from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -85,10 +91,10 @@ DEFAULTS = {
     "dry_run": True,
 }
 
-# default_var={} обязателен: без него отсутствующая переменная роняет разбор файла
+# default={} обязателен: без него отсутствующая переменная роняет разбор файла
 # и вешает Broken DAG на весь даг, а не на один запуск.
 try:
-    _cfg = {**DEFAULTS, **(Variable.get(CFG_VAR, default_var={}, deserialize_json=True) or {})}
+    _cfg = {**DEFAULTS, **(Variable.get(CFG_VAR, default={}, deserialize_json=True) or {})}
 except Exception:  # битый JSON в переменной не должен ломать разбор
     logger.warning("Variable %s не разобрана, берём значения по умолчанию", CFG_VAR, exc_info=True)
     _cfg = dict(DEFAULTS)
@@ -120,17 +126,16 @@ SELECT a.pid,
 # application_name соединения (db_utils.failover_connect).
 #
 # Берём не только running: сессия переживает свою задачу — процесс умер, а соединение
-# осталось, — и такую находку нужно уметь отличать от долгой, но живой задачи. Отсюда же
-# join к main.job: state='running' в task_instance ставится один раз и живёт до конца,
-# а бьётся LocalTaskJob, и только его latest_heartbeat говорит, жив ли владелец сейчас.
+# осталось, — и такую находку нужно уметь отличать от долгой, но живой задачи.
+# state='running' в task_instance ставится один раз и живёт до конца, а жив ли владелец
+# сейчас, говорит пульс. Airflow 3: пульс — ti.last_heartbeat_at (его пишет Execution API,
+# task_instances.py:930, 3.3.1); job_id у задачи удалён, и join к job больше не к чему.
 # Окно в шесть часов — чтобы не читать всю таблицу ради недавних покойников.
 SQL_OWNERS = r"""
 SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
-       round(extract(epoch FROM now() - ti.start_date))       AS age,
-       j.state                                                AS job_state,
-       round(extract(epoch FROM now() - j.latest_heartbeat))  AS hb_age
-  FROM main.task_instance ti
-  LEFT JOIN main.job j ON j.id = ti.job_id
+       round(extract(epoch FROM now() - ti.start_date))          AS age,
+       round(extract(epoch FROM now() - ti.last_heartbeat_at))   AS hb_age
+  FROM task_instance ti
  WHERE ti.pid IS NOT NULL
    AND (ti.state = 'running' OR ti.end_date > now() - interval '6 hours')
 """
@@ -218,10 +223,9 @@ def _fetch(sql: str) -> list:
     create_session как контекст, а не своя долгоживущая сессия: сторож не должен
     попадать в собственный отчёт.
     """
-    from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
+    with af_meta.meta_session() as session:
         session.execute(text("SET LOCAL statement_timeout = '30s'"))
         result = session.execute(text(sql))
         cols = list(result.keys())
@@ -250,7 +254,7 @@ def _fetch(sql: str) -> list:
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
-    schedule_interval='*/10 * * * *',
+    schedule='*/10 * * * *',
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
     tags=['DataLab', 'tools', 'check'],
     catchup=False,
@@ -378,7 +382,7 @@ def tools_pg_activity():
     @task(task_id='save')
     def save(snapshot: dict, **context) -> str:
         """💾 Кладёт снимок в S3. Пустые снимки не пишем — их 144 в сутки и ноль пользы."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
         if not context['params']['save_s3']:
@@ -398,8 +402,7 @@ def tools_pg_activity():
     @task(task_id='terminate', trigger_rule=TriggerRule.NONE_FAILED)
     def terminate(snapshot: dict, **context) -> list:
         """🔪 Гасит найденные сессии. По умолчанию выключено, и даже включённое — dry-run."""
-        from airflow.exceptions import AirflowSkipException
-        from airflow.utils.session import create_session
+        from airflow.sdk.exceptions import AirflowSkipException
         from sqlalchemy import text
 
         p = context['params']
@@ -442,7 +445,9 @@ def tools_pg_activity():
                 logger.info("🧪 dry-run: %s", line)
                 killed.append(f"[dry-run] {line}")
                 continue
-            with create_session() as session:
+            # Та же учётка, что у Airflow (как create_session в Airflow 2): полномочий сторожу
+            # не прибавляем — гасить можно только то, что могла погасить и прежняя версия
+            with af_meta.meta_session() as session:
                 ok = session.execute(text(f"SELECT {fn}(:pid)"), {'pid': f['pid']}).scalar()
             logger.warning("🔪 %s → %s", line, ok)
             killed.append(f"{line} → {ok}")
@@ -460,7 +465,7 @@ def tools_pg_activity():
         заголовок давно не шлёт, он заменён на контрольные суммы. Поэтому чистим
         сами, благо ключ снимка начинается с даты и ходить за метаданными не нужно.
         """
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
         if not context['params']['save_s3']:
@@ -498,7 +503,7 @@ def tools_pg_activity():
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
         """🧾 Сводка в заметку и, если просили, красный таск с уведомлением."""
-        from airflow.exceptions import AirflowFailException
+        from airflow.sdk.exceptions import AirflowFailException
 
         p = context['params']
         counts = snapshot['counts']

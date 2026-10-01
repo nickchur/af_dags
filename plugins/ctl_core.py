@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -21,9 +21,8 @@ payload)`, а решение принимает вызывающий таск �
 бросают исключения сами: они отдают данные, и «ошибка → исключение» для них уместнее.
 """
 
-from airflow.exceptions import AirflowSkipException, AirflowFailException
-from airflow.decorators import task, task_group
-from airflow.operators.python import get_current_context
+from airflow.sdk.exceptions import AirflowSkipException, AirflowFailException
+from airflow.sdk import get_current_context, task, task_group
 
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
@@ -714,12 +713,10 @@ def chk_any_conn(id, data=None, manage_pool=False, **context):
     try:
         if data['type'] == 'Postgres':
             if data.get('default'):
-                from airflow.utils.session import create_session
-                from sqlalchemy import text
-                with create_session() as session:
-                    result = dict(session.execute(text(
-                        'SELECT current_user, current_database(), inet_server_addr()'
-                    )).fetchone())
+                # Метабаза: в Airflow 3 не create_session, а af_meta (тот же conns.pg)
+                from plugins import af_meta  # type: ignore
+                result = af_meta.sql('SELECT current_user, current_database(), inet_server_addr()',
+                                     timeout=15)[0]
             else:
                 from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
                 hook = PostgresHook(postgres_conn_id=data['conn_id'])
@@ -745,7 +742,7 @@ def chk_any_conn(id, data=None, manage_pool=False, **context):
             result = hook.get_conn().list_buckets()['Buckets']
             
         elif data['type'] == 'KerberosHttp':
-            from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
+            from plugins.ctl_utils import KerberosHttpHook # type: ignore  # там же и запасной путь
             hook = KerberosHttpHook(method='GET', http_conn_id=data['conn_id'])
             
             # HttpHook.run принимает параметры requests через extra_options

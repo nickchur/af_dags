@@ -1,36 +1,27 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-17 11:24 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
-Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
+Поддерживает расписание: `Asset`, `Cron`, `AssetOrTimeSchedule`, `startCondition (AND/OR)`.
 
 | Задача | Описание |
 |---|---|
 | `run_prm` | Инициализация, создание `loading_id` в CTL, определение типа запуска |
 | `run_tfs` | (опц.) Загрузка файлов из S3/TFS в Greenplum |
 | `run_exe` | Выполнение SQL-процедуры в Greenplum |
-| `run_out` | (опц.) Экспорт данных, генерация Dataset-событий |
+| `run_out` | (опц.) Экспорт данных, генерация Asset-событий |
 | `run_end` | Публикация метрик, финализация загрузки |
 
 🧪 Тестовый режим (`test_mode` в `ctl_config`, только контуры DEV и IFT): вместо процедуры
 воркфлоу выполняется ожидание, а код результата берётся из профиля — `ok`, `ok-no` или
 `ok-no-error`. Параметр воркфлоу из CTL режим не включает.
 """
-# Airflow 2.10.1
-
-from airflow import DAG
-
-from airflow.datasets import DatasetAlias, Dataset
-from airflow.timetables.datasets import DatasetOrTimeSchedule
+# Airflow 3.3.1 (v2.0): Dataset → Asset, ORM у задачи нет — состояние run_exe ставит af_meta
+from airflow.sdk import DAG, Asset, AssetAlias, Param, TaskInstanceState, task
+from airflow.timetables.assets import AssetOrTimeSchedule
 from airflow.timetables.trigger import CronTriggerTimetable
-
-from airflow.utils.state import State
-from airflow.utils.session import create_session #, provide_session
-from airflow.models import  Param, TaskInstance
-
 # from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
-from airflow.decorators import task
-from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 # from datetime import timedelta
 # from functools import partial
@@ -48,6 +39,7 @@ from pprint import PrettyPrinter
 
 
 from plugins.utils import add_note, env_stand, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
+from plugins import af_meta  # type: ignore
 from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
 from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
@@ -57,7 +49,7 @@ from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_
 from logging import  getLogger
 logger = getLogger('airflow.task')
 
-# repr по умолчанию печатает адрес объекта — <...DatasetOrTimeSchedule object at 0x7f40…>,
+# repr по умолчанию печатает адрес объекта — <...AssetOrTimeSchedule object at 0x7f40…>,
 # и он в каждом процессе разбора свой. Через doc_md адрес попадает в сериализацию, dag_hash
 # меняется на каждом парсинге, и serialized_dag переписывается вхолостую раз в
 # min_file_process_interval. default=str не помогает: str() у такого объекта — тот же repr.
@@ -207,7 +199,7 @@ def parse_condition(cond, enames):
     # 1. Базовые элементы
     if ctype == 'statVal':
         e_id = cond['entityId']
-        return Dataset(f"CTL/{cond['profile']}/{e_id}/{enames.get(e_id, 'unknown')}")
+        return Asset(f"CTL/{cond['profile']}/{e_id}/{enames.get(e_id, 'unknown')}")
     
     if ctype == 'cronExpression':
         return CronTriggerTimetable(cond['expr'], timezone="Europe/Moscow")
@@ -232,7 +224,7 @@ def parse_condition(cond, enames):
         if timetable and combined_ds:
             if ctype == 'or':
                 # Обязательно список [combined_ds]
-                return DatasetOrTimeSchedule(timetable=timetable, datasets=[combined_ds])
+                return AssetOrTimeSchedule(timetable=timetable, assets=[combined_ds])
             else:
                 logger.warning("parse_condition: AND + timetable is not supported, schedule will be None")
                 return None
@@ -247,7 +239,7 @@ def get_schedule(w, enames):
     is_dataset_run = get_config().get('dug_run') == 'dataset'
     
     # 1. Начальный schedule
-    schedule = Dataset(f"CTL/wf/{w['id']}/{w['name']}", extra={}) if is_dataset_run else None
+    schedule = Asset(f"CTL/wf/{w['id']}/{w['name']}", extra={}) if is_dataset_run else None
     
     # 2. Если воркер в архиве — возвращаем как есть
     if w.get('category') == archive:
@@ -274,21 +266,21 @@ def get_schedule(w, enames):
         # у воркфлоу «на расписании в CTL и с источником ТФС» приход файла не поднимал
         # ничего. Это расходилось с границей ответственности: режим делит расписания и
         # зависимости, а не источники событий.
-        ds = Dataset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
+        ds = Asset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
         schedule = (schedule | ds) if schedule else ds
         tag = 'AF_tfs-in'
 
     if owns_schedule:
         # Вариант TFS
         if tfs_path := wf_params.get('wf_tfs_in'):
-            ds = Dataset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
+            ds = Asset(f"TFS/{profile}/{tfs_path.lstrip('/')}")
             schedule = (schedule | ds) if schedule else ds
             tag = 'AF_tfs-in'
 
         # Вариант Events
         elif event_sched_dict := w.get('wf_event_sched'):
             datasets = [
-                Dataset(f"CTL/{pes.split('/')[0]}/{pes.split('/')[1]}/{enames.get(int(pes.split('/')[1]), pes.split('/')[1])}")
+                Asset(f"CTL/{pes.split('/')[0]}/{pes.split('/')[1]}/{enames.get(int(pes.split('/')[1]), pes.split('/')[1])}")
                 for pes, active in event_sched_dict.items() if active
             ]
             if datasets:
@@ -299,7 +291,7 @@ def get_schedule(w, enames):
         # Вариант Time
         elif time_sched := w.get('wf_time_sched'):
             cron = CronTriggerTimetable(time_sched.get("sched", '0 0 1 1 *'), timezone="Europe/Moscow")
-            schedule = DatasetOrTimeSchedule(timetable=cron, datasets=[schedule]) if schedule else cron
+            schedule = AssetOrTimeSchedule(timetable=cron, assets=[schedule]) if schedule else cron
         
         elif cond_dict := w.get('startCondition'):
             parsed_cond = parse_condition(cond_dict, enames)
@@ -374,16 +366,18 @@ def _emit_datasets(lid, eids, result, context):
             ext[f"{ind}/{v['stat_id']}"] = v['avalue'][0]
         add_note(msg, context, level='task')
         if res > 0:
-            ds = Dataset(f'CTL/{profile}/{eid}/{ent_name}')
+            ds = Asset(f'CTL/{profile}/{eid}/{ent_name}')
             add_note(ds, context, level='task')
             outlet_key = f"CTL/{profile}/{eid}"
-            if outlet_key in context['outlet_events']:
-                context['outlet_events'][outlet_key].add(ds, extra=ext)
+            # Airflow 3: outlet_events ленивый и до первой записи пуст, поэтому «объявлен ли
+            # алиас» проверяем по outlets самой задачи, а ключом служит объект, не строка.
+            if outlet_key in {getattr(o, 'name', None) for o in context['task'].outlets}:
+                context['outlet_events'][AssetAlias(outlet_key)].add(ds, extra=ext)
             else:
                 logger.warning("outlet_events missing key %s — entity not in w_eids, dataset publish skipped", outlet_key)
     logger.info(f"✅ {context['outlet_events']}")
     for outlet, value in context['outlet_events'].items():
-        add_note(value.extra, context, level='task', title=outlet)
+        add_note(value.extra, context, level='task', title=getattr(outlet, 'name', str(outlet)))
     return msg
 
 
@@ -496,7 +490,9 @@ def build_worker_dag(w):
     # exe_task_to = tfs_task_to + exe_timeout + task_time
     # end_task_to = exe_task_to + task_time
     # dagrun_timeout =  end_task_to + task_time
-    sla_time = str2timedelta(get_config().get('sla_time', 'hours=2'))
+    # sla_time (ключ ctl_config) больше не читается: SLA в Airflow 3 удалён вместе с sla= у
+    # задач (было у run_exe). Замена в Airflow 3.1+ — Deadline Alerts; при переносе (8.3,
+    # 21.09.2026) не подключены — отдельное решение, если промахи понадобятся.
 
             
     conf = dict(
@@ -602,17 +598,20 @@ def build_worker_dag(w):
                 raise AirflowSkipException(msg)
                 
 
-            all_events = context.get("triggering_dataset_events", {})
+            all_events = context.get("triggering_asset_events", {})
             if all_events:
                 # Проходим по всем датасетам, которые триггернули запуск и берем последнее событие
                 run_type = 'AF-UNKNOWN'
                 ds_url = None
-                for dataset_uri, events in all_events.items():
-                    ds_url = dataset_uri
+                for asset, events in all_events.items():
+                    # Airflow 3: ключ — объект Asset, а не строка URI
+                    ds_url = getattr(asset, 'uri', None) or str(asset)
                     for event in events:
                         af_sdt = ''
                         af_event = ''
-                        run_id = event.source_dag_run.run_id if event.source_dag_run else ''
+                        # source_run_id напрямую: event.source_dag_run в Airflow 3 — лишний
+                        # запрос к супервизору ради того же run_id
+                        run_id = event.source_run_id or ''
                         
                         if event.extra.get("af_sdt"):
                             params = {**params, **event.extra}
@@ -849,7 +848,7 @@ def build_worker_dag(w):
         # retries=1 — не для повтора ETL, а чтобы подобрать потерянный ответ: pr_swf_start_ctl
         # по-прежнему неидемпотентна, и повторная попытка её не зовёт (см. ниже). Повторами
         # самой загрузки распоряжается CTL через TIME-WAIT.
-        @task(pool='gp_pool', sla=sla_time, retries=1) # execution_timeout=exe_task_to,)
+        @task(pool='gp_pool', retries=1) # execution_timeout=exe_task_to,)
         def run_exe(wf, **context):
             """### Выполнение бизнес-логики в Greenplum
 
@@ -971,11 +970,11 @@ def build_worker_dag(w):
             # Без пула намеренно: тело пустое, в Greenplum таск не ходит, а слотов в
             # gp_pool меньше, чем разрешено запросов в самом Greenplum — они оставлены под
             # короткие служебные запросы, и занимать их публикацией датасета незачем.
-            @task(outlets=[ DatasetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
+            @task(outlets=[ AssetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
             def run_out(wf, **context):
                 pass
 
-        outlets = [DatasetAlias(f"CTL/{profile}/{e}") for e in w_eids]
+        outlets = [AssetAlias(f"CTL/{profile}/{e}") for e in w_eids]
         @task(outlets=outlets,)
         def run_end(wf, **context):
             ti = context['task_instance']
@@ -1021,15 +1020,11 @@ def build_worker_dag(w):
             note = f"{res_icon} {result.get('msg') or res_msg.upper()}\n\n"
             add_note(note, context, level='task,DAG', title=title)
 
-            state = State.FAILED if res_msg == 'error' else (State.SKIPPED if res_msg == 'no' else State.SUCCESS)
-            with create_session() as session:
-                other_ti = session.query(TaskInstance).filter(
-                    TaskInstance.dag_id == ti.dag_id,
-                    TaskInstance.run_id == ti.run_id,
-                    TaskInstance.task_id == 'run_exe'
-                ).first()
-                if other_ti:
-                    other_ti.set_state(state)
+            state = (TaskInstanceState.FAILED if res_msg == 'error'
+                     else TaskInstanceState.SKIPPED if res_msg == 'no' else TaskInstanceState.SUCCESS)
+            # Airflow 3: у задачи нет ORM, а Execution API чужую задачу менять не даёт —
+            # состояние run_exe ставим SQL-ом (af_meta.set_ti_state, как TaskInstance.set_state)
+            af_meta.set_ti_state(ti.dag_id, ti.run_id, 'run_exe', state)
 
             if action == 'retry':
                 raise AirflowSkipException()

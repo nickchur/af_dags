@@ -1,7 +1,10 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-17 10:41 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
+
+Airflow 3 (v2.0): ORM-доступа к метабазе у задачи нет — заметки, пулы и пауза идут SQL-ом
+через `plugins/af_meta.py`, `Variable` и контекст — из Task SDK (`airflow.sdk`).
 
 | Функция | Описание |
 |---|---|
@@ -24,10 +27,12 @@
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
 """
 
-from airflow.models import DagModel, TaskInstance, Pool
-from airflow.utils.session import provide_session, create_session
-from airflow.utils.state import State
-from airflow.operators.python import get_current_context
+from airflow.sdk import Variable, get_current_context
+
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 from pprint import PrettyPrinter
 from datetime import timedelta, datetime, timezone
@@ -82,8 +87,7 @@ def sign(x):
 def md5_hash(data):
     return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8')).hexdigest()
 
-@provide_session
-def pool_slots(pool_name, slots, session=None):
+def pool_slots(pool_name, slots):
     """Задаёт размер пула; если пула нет — создаёт. Пишет в slot_pool.
 
     Звать только из сторожа подключений (CTL.<profile>.test_conn через
@@ -99,13 +103,8 @@ def pool_slots(pool_name, slots, session=None):
         raise TypeError(f"pool_slots({pool_name!r}): нужно целое число слотов, а не {slots!r}")
     slots = max(slots, 0)
 
-    pool = session.query(Pool).filter(Pool.pool == pool_name).first()
-    if pool:
-        pool.slots = slots
-    else:
-        session.add(Pool(pool=pool_name, slots=slots, description='CTL_worker', include_deferred=False))
+    if af_meta.pool_set_slots(pool_name, slots, 'CTL_worker'):
         logger.warning(f'Pool {pool_name} created')
-    session.commit()
 
     if slots > 0:
         logger.info(f'Pool {pool_name} set to {slots} slots')
@@ -114,11 +113,9 @@ def pool_slots(pool_name, slots, session=None):
     return slots
 
 
-@provide_session
-def pool_size(pool_name, session=None) -> int:
+def pool_size(pool_name) -> int:
     """Размер пула, только чтение: слотов в slot_pool или 0, если пула нет. Ничего не создаёт."""
-    slots = session.query(Pool.slots).filter(Pool.pool == pool_name).scalar()
-    return int(slots or 0)
+    return af_meta.pool_size(pool_name)
 
 
 TOOLS_POOL = 'tools_pool'
@@ -126,8 +123,7 @@ TOOLS_POOL_SLOTS = 16  # с запасом под tools_test_dags с его max_
 
 _ensured_pools = set()
 
-@provide_session
-def ensure_pool(pool_name, slots=TOOLS_POOL_SLOTS, description='DataLab tools', session=None):
+def ensure_pool(pool_name, slots=TOOLS_POOL_SLOTS, description='DataLab tools'):
     """Создаёт пул, если его нет; существующий не трогает.
 
     Не pool_slots(): та выставляет слоты на каждом вызове, а нас зовут при каждом
@@ -139,44 +135,24 @@ def ensure_pool(pool_name, slots=TOOLS_POOL_SLOTS, description='DataLab tools', 
     удалённый руками пул восстановится только после перезапуска процесса.
 
     Исключения гасим: DAG-файл не должен уходить в Broken DAG из-за метабазы.
+
+    Airflow 3: ORM при разборе DAG-файла запрещён, поэтому SQL через af_meta — он работает и
+    в dag-processor, если там доступно подключение метабазы.
     """
     if pool_name in _ensured_pools:
         return
 
     try:
-        if not session.query(Pool).filter(Pool.pool == pool_name).first():
-            session.add(Pool(
-                pool=pool_name,
-                slots=slots,
-                description=description,
-                include_deferred=False
-            ))
-            session.commit()
+        if af_meta.pool_create_if_missing(pool_name, slots, description):
             logger.warning(f'Pool {pool_name} created with {slots} slots')
         _ensured_pools.add(pool_name)
     except Exception:
         logger.warning(f'Не удалось проверить пул {pool_name}', exc_info=True)
 
-@provide_session
-def get_current_load(pool_name, pool=True, session=None):
-    # Считаем задачи в очереди и в работе для этого пула
-    queued = session.query(TaskInstance).filter(
-        TaskInstance.pool == pool_name, 
-        TaskInstance.state == State.QUEUED
-    ).count()
-    
-    running = session.query(TaskInstance).filter(
-        TaskInstance.pool == pool_name, 
-        TaskInstance.state == State.RUNNING
-    ).count()
-
-    scheduled = session.query(TaskInstance).filter(
-        TaskInstance.pool == pool_name, 
-        TaskInstance.state == State.SCHEDULED
-    ).count()
-    
-    res = dict(queued=queued, running=running, scheduled=scheduled)
-    if pool: res['pool_slots'] = pool_size(pool_name, session=session)
+def get_current_load(pool_name, pool=True):
+    """Задачи пула в очереди, в работе и запланированные; с pool=True — и размер пула."""
+    res = af_meta.pool_load(pool_name)
+    if pool: res['pool_slots'] = pool_size(pool_name)
 
     return res
     
@@ -198,55 +174,35 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
         msg = '```\n' + msg + '\n```'
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
-    
-    # Используем новый контекстный менеджер для чистой сессии
-    try:
-        with create_session() as session:
-            # sorted, а не set: порядок блокировок должен быть одинаковым у всех тасков.
-            # Общая строка тут одна (ран), свои task_instance у каждого свои, так что
-            # взаимной блокировки не выходит, но полагаться на порядок set нельзя.
-            for l in sorted(set(level.upper().split(',')))[:2]:
-                new_note = msg.strip()
-                # Определяем объект (DagRun или TaskInstance)
-                if l == 'DAG':
-                    obj = session.merge(context['dag_run'])
-                else:
-                    obj = session.merge(context['task_instance'])
-                # Перечитываем строку под блокировкой: заметка дописывается «прочитал —
-                # склеил — записал», и без FOR UPDATE двое параллельных тасков читают
-                # одно и то же, а записывает последний — строка первого пропадает. У нас
-                # это живой случай: семь задач ctl_loader пишут в заметку одного рана.
-                # Транзакция короткая (чтение и запись одной строки), планировщик ждёт
-                # миллисекунды. Не получилось перечитать под блокировкой — работаем как
-                # раньше: потерянная строка заметки лучше упавшей задачи.
-                try:
-                    session.refresh(obj, with_for_update=True)
-                except Exception as e:
-                    logger.warning(f"note: строка не заблокирована ({e}), пишем без блокировки")
-                    session.expire(obj)
-                
-                # Логика заголовка
-                if title:
-                    import unicodedata
-                    # Если первый символ не эмодзи, то добавляем эмодзи
-                    if not unicodedata.category(title[0]) == 'So':
-                        title = "📝 " + title
 
-                    new_note = f"{title}\n---\n{new_note}"
+    # Логика заголовка
+    new_note = msg.strip()
+    if title:
+        import unicodedata
+        # Если первый символ не эмодзи, то добавляем эмодзи
+        if not unicodedata.category(title[0]) == 'So':
+            title = "📝 " + title
+        new_note = f"{title}\n---\n{new_note}"
 
-                if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
-                    continue
-                    
-                # Логика склейки заметки
-                if add:
-                    new_note = f"{ new_note}\n\n---\n{obj.note if obj.note else '' }"
-                    
-                # Лимит длины
-                obj.note = new_note[:MAX_NOTE_LEN]
-            
-            session.commit() # Явный коммит внутри контекста
-    except Exception as e:
-        logger.warning(f"Failed to update note: {e}")
+    def change(old):
+        if old and old.startswith(new_note[:MAX_NOTE_LEN]):
+            return None
+        # Логика склейки заметки и лимит длины
+        return (f"{new_note}\n\n---\n{old or ''}" if add else new_note)[:MAX_NOTE_LEN]
+
+    # Airflow 3: Execution API заметки из задачи не принимает, пишем SQL-ом в dag_run_note /
+    # task_instance_note (af_meta.update_note — там же блокировка «прочитал — склеил —
+    # записал»). sorted, а не set: порядок блокировок одинаков у всех тасков. Ошибку глотаем:
+    # потерянная строка заметки лучше упавшей задачи.
+    for l in sorted(set(level.upper().split(',')))[:2]:
+        try:
+            if l == 'DAG':
+                dr = context['dag_run']
+                af_meta.update_note('dag', (dr.dag_id, dr.run_id), change)
+            else:
+                af_meta.update_note('task', context['task_instance'].id, change)
+        except Exception as e:
+            logger.warning(f"Failed to update note: {e}")
 
 def add_xcom(key, value, context=None):
     """Кладёт значение в XCom, обрезая коллекции до MAX_XCOM элементов.
@@ -293,10 +249,14 @@ default_args = {
 }
 
 def _on_callback(context, level=None):
-    """ 
-    Обработчик события on_callback
     """
-    from airflow.utils.state import TaskInstanceState
+    Обработчик события on_callback
+
+    Airflow 3: колбэк уровня DAG исполняет dag-processor, и в контексте уже лежит последняя
+    задача рана (`last_ti` сервера) — перебирать задачи рана, как в Airflow 2, не нужно
+    (`dag_processing/processor.py:_execute_dag_callbacks`, 3.3.1).
+    """
+    from airflow.sdk import TaskInstanceState
 
     ti = context.get('task_instance')
     dag_run = context.get('dag_run')
@@ -310,22 +270,13 @@ def _on_callback(context, level=None):
             level = 'task'
     
     
-    if level == 'DAG':
-        tis = dag_run.get_task_instances()
-        finished_tis = [ti for ti in tis if ti.end_date is not None ][-10:]
-        last_ti = sorted(finished_tis, key=lambda x: x.end_date, reverse=True)[0] if finished_tis else []
-        # failed_tis = [ti for ti in tis if ti.state == 'failed']
-        # first_fail = sorted(failed_tis, key=lambda x: x.end_date)[0] if failed_tis else []
-    
-        task = last_ti
-    else:
-        task = ti
+    task = ti
         
     task_id = task.task_id
     map_index = task.map_index
     map_ind_str = getattr(task, 'rendered_map_index', '')
-    try_number = task.try_number
-    state = task.state
+    try_number = task.try_number or 0
+    state = str(getattr(task.state, 'value', task.state) or '')
         
     msg = context.get('exception') # or getattr(ti, 'error', None) or "No exception trace available"
 
@@ -360,9 +311,9 @@ def _on_callback(context, level=None):
     
     add_note(message, context, level, add=True)
     
-    if state == TaskInstanceState.SUCCESS:
+    if state == TaskInstanceState.SUCCESS.value:
         logger.info(message)
-    elif state == TaskInstanceState.FAILED:
+    elif state == TaskInstanceState.FAILED.value:
         logger.error(message)
         if level != 'DAG':
             add_note(message, context, level='DAG', add=True)
@@ -396,13 +347,12 @@ def get_dict_from_ch(ch_hook, sql):
 
 def get_conns_by_type(conn_type='aws'):
     from airflow.configuration import get_custom_secret_backend
-    from airflow.models import Connection
-    
+
     backend = get_custom_secret_backend()
-    
+
     if not hasattr(backend, '_local_connections'):
         return []
-    local_conn: dict[str, Connection] = backend._local_connections
+    local_conn: dict = backend._local_connections
     
     if conn_type:
         return [id for id,conn in local_conn.items() if conn.conn_type == conn_type.lower()]
@@ -411,13 +361,12 @@ def get_conns_by_type(conn_type='aws'):
 
 def get_conn(conn_id):
     from airflow.configuration import get_custom_secret_backend
-    from airflow.models import Connection
-    
+
     backend = get_custom_secret_backend()
-    
+
     if not hasattr(backend, '_local_connections'):
         return []
-    local_conn: dict[str, Connection] = backend._local_connections
+    local_conn: dict = backend._local_connections
     
     connection = local_conn.get(conn_id)
     return {
@@ -536,9 +485,8 @@ def saved_params(var_name) -> dict:
     Args:
         var_name: Имя переменной Airflow с JSON-словарём параметров.
     """
-    from airflow.models import Variable
     try:
-        return Variable.get(var_name, default_var={}, deserialize_json=True) or {}
+        return Variable.get(var_name, default={}, deserialize_json=True) or {}
     except Exception as e:
         logger.warning(f"⚠️ {var_name}: {e} — беру значения по умолчанию из кода")
         return {}
@@ -570,8 +518,6 @@ def store_params(var_name, saved, context=None, flag='save_params'):
         если ``'skip'`` превращается в ``AirflowSkipException``, иначе штатный пропуск
         утянет в skip всю цепочку.
     """
-    from airflow.models import Variable
-
     context = context or get_current_context()
     p = dict(context['params'])
     if not p.pop(flag, False):
@@ -598,9 +544,9 @@ def store_params(var_name, saved, context=None, flag='save_params'):
     return 'ok', msg
 
 
-@provide_session
-def update_dag_pause(dag_id, paused=True, session=None):
-    session.query(DagModel).filter(DagModel.dag_id == dag_id).update({"is_paused": paused})
+def update_dag_pause(dag_id, paused=True):
+    """Ставит или снимает паузу DAG-а (Airflow 3: SQL через af_meta, ORM у задачи нет)."""
+    return af_meta.set_paused(dag_id, paused)
 
 # rand = int(safe_eval(test_mode_str) * 45*60)
 def safe_eval(expr):
@@ -673,8 +619,18 @@ def get_af_conn():
     # и закэшированный в env коннект пережил бы правку параметров подключения.
     env_key = f'AIRFLOW_CONN_{AF_ID.upper()}'
 
-    with open(VAULT_PATH) as f:
-        secrets = json.load(f)
+    try:
+        with open(VAULT_PATH) as f:
+            secrets = json.load(f)
+    except OSError:
+        secrets = {}
+    if not secrets.get('DB_HOST_1'):
+        # Нет учётки метабазы в Vault (стенд AF3: эмуляция без DB_*) — берём обычное
+        # подключение метабазы. VACUUM под ним может пропустить чужие таблицы: это видно
+        # в отчёте, db_vacuum ловит «skipping». Контуры DB_* держат — там путь прежний.
+        meta = af_meta.meta_conn_id()
+        logger.warning(f"🔑 В {VAULT_PATH} нет DB_HOST_1 — вместо учётки владельца беру {meta}")
+        return meta
 
     def _b64(s: str) -> str:
         """base64 → текст; если значение не base64 — возвращаем как есть.

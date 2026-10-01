@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 15:53 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -55,9 +55,7 @@
 from datetime import datetime, timedelta, timezone
 import logging
 
-from airflow.decorators import dag, task
-from airflow.models import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 
 try:
     from CI06932748.tools.utils import (  # type: ignore
@@ -145,10 +143,15 @@ def _fetch(sql: str, args: dict) -> list:
     имеет смысл, когда появится третий потребитель, — пока это было бы обобщение по двум
     точкам.
     """
-    from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
+    try:
+        from plugins import af_meta  # type: ignore
+    except ImportError:
+        from CI06932748.tools import af_meta  # type: ignore
+
+    # Airflow 3: create_session в задаче запрещён — сессия af_meta, SQL прежний
+    with af_meta.meta_session() as session:
         # Отчёт не должен висеть на метабазе: журнал большой, а индексы по dttm и event
         # есть, так что укладываться обязан с запасом.
         session.execute(text("SET LOCAL statement_timeout = '60s'"))
@@ -157,7 +160,7 @@ def _fetch(sql: str, args: dict) -> list:
 
 # Границу окна считаем один раз в Python и передаём во все запросы: иначе у числителя и
 # знаменателя оказался бы свой now(), и доля «сбоев на запусков» считалась бы по разным
-# отрезкам. Заодно схема указана явно — как у соседей (pg_activity, db_cleanup).
+# отрезкам. Схема не указана: search_path ставит af_meta (main на контуре, public на стенде AF3).
 # Задача считается по адресу попытки: даг, задача, прогон, индекс отображения, номер
 # попытки. `count(DISTINCT (...))` по кортежу — конструкция PostgreSQL (row value
 # expression), не общий SQL; на другой БД пришлось бы склеивать ключ строкой.
@@ -168,7 +171,7 @@ def _fetch(sql: str, args: dict) -> list:
 SQL_TOTALS = """
 SELECT count(*) AS cnt,
        count(DISTINCT (dag_id, task_id, run_id, map_index, try_number)) AS tasks
-  FROM main.log
+  FROM log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
 """
@@ -176,7 +179,7 @@ SELECT count(*) AS cnt,
 SQL_BY_EVENT = """
 SELECT event, count(*) AS cnt,
        count(DISTINCT (dag_id, task_id, run_id, map_index, try_number)) AS tasks
-  FROM main.log
+  FROM log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
  GROUP BY event
@@ -199,7 +202,7 @@ SELECT coalesce(dag_id, '—') AS dag_id, coalesce(task_id, '—') AS task_id,
        count(*) AS cnt, count(DISTINCT event) AS kinds,
        count(DISTINCT (run_id, map_index, try_number)) AS tasks,
        max(dttm AT TIME ZONE INTERVAL '+03:00') AS last_seen
-  FROM main.log
+  FROM log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
  GROUP BY dag_id, task_id
@@ -215,7 +218,7 @@ SQL_BY_DAY = """
 SELECT date_trunc('day', dttm AT TIME ZONE INTERVAL '+03:00')::date AS day,
        count(*) AS cnt,
        count(DISTINCT (dag_id, task_id, run_id, map_index, try_number)) AS tasks
-  FROM main.log
+  FROM log
  WHERE dttm > :cutoff
    AND event = ANY(:events)
  GROUP BY day
@@ -224,7 +227,7 @@ SELECT date_trunc('day', dttm AT TIME ZONE INTERVAL '+03:00')::date AS day,
 
 SQL_STARTS = """
 SELECT count(*) AS cnt
-  FROM main.log
+  FROM log
  WHERE dttm > :cutoff
    AND event = :starts
 """
@@ -237,7 +240,7 @@ SELECT count(*) AS cnt
 # вовсе: ровно в этом случае его ответ и нужен — тишина настоящая или имена разъехались.
 SQL_UNKNOWN = """
 SELECT event, count(*) AS cnt
-  FROM main.log
+  FROM log
  WHERE dttm > :cutoff
    AND (event ILIKE '%stuck%' OR event ILIKE '%heartbeat%'
         OR event ILIKE '%mismatch%' OR event ILIKE '%zombie%')
@@ -310,7 +313,7 @@ def tools_log_events():
     @task(task_id='params')
     def save_params(**context) -> str:
         """💾 Сохраняет параметры запуска как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
         status, msg = store_params(PARAMS_VAR, SAVED, context)
         if status == 'skip':
@@ -417,7 +420,7 @@ def tools_log_events():
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
         """🧾 Сводка в заметку; при превышении порога — красный таск и уведомление."""
-        from airflow.exceptions import AirflowFailException
+        from airflow.sdk.exceptions import AirflowFailException
 
         p = context['params']
         limit = int(p['alert_after'])

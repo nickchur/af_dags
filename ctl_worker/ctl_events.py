@@ -1,20 +1,17 @@
-"""### 🔔 DAG: События CTL → Airflow Dataset
-*2026-09-15 10:00 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🔔 DAG: События CTL → Airflow Asset
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
+Каждые 5 минут получает события из CTL и публикует Asset'ы для оркестрации DAG'ов.
 
-| Dataset | Описание |
+| Asset | Описание |
 |---|---|
 | `CTL/wf/{wid}/{wf_name}` | Событие workflow |
 | `CTL/entity/{eid}/{ename}` | Событие сущности |
 | `CTL/{profile}/entities` | Алиас всех сущностей профиля |
 """
 
-from airflow import DAG, Dataset
-from airflow.datasets import DatasetAlias
-from airflow.decorators import task
+from airflow.sdk import DAG, Asset, AssetAlias, PokeReturnValue, task
 # from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.sensors.base import PokeReturnValue
 
 from plugins.utils import add_note, on_callback, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
@@ -34,10 +31,11 @@ profile =  get_config()['profile']
 enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 
 events_interval = str2timedelta(get_config().get('events_interval','minutes=1'))
+events_alias = AssetAlias("CTL/events")
 
 with DAG(f'CTL.{get_config()["profile"]}.events',
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-    schedule_interval=events_interval,
+    schedule=events_interval,
     default_args={ 
     'owner': 'EDP.ETL',
         'depends_on_past': False,
@@ -87,9 +85,9 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
                 , (string_to_array(b.key, '/'))[3] as sid
                 , max(b.value::json #>> '{}')::bool value
                 , max(c.updated_at)
-            from main.variable a
+            from variable a
             CROSS JOIN lateral json_each(a.val::json ) b
-            left join main.dataset c on c.uri LIKE 'CTL/'||(string_to_array(b.key, '/'))[1]||'/'||(string_to_array(b.key, '/'))[2]||'/%'
+            left join asset c on c.uri LIKE 'CTL/'||(string_to_array(b.key, '/'))[1]||'/'||(string_to_array(b.key, '/'))[2]||'/%'
             where a."key" = 'ctl_events'
             """ + whr + """
                 and b.key like '%/%/%'
@@ -154,9 +152,9 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
                     """
                 sql= f"""
                     select a.timestamp ts
-                    FROM main.dataset_event a 
+                    FROM asset_event a
                     CROSS JOIN lateral json_each(a.extra::json) b
-                    join main.dataset c on a.dataset_id = c.id
+                    join asset c on a.asset_id = c.id
                     WHERE c.uri LIKE 'CTL/%' 
                         {whr}
                     order by 1 desc
@@ -203,18 +201,18 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
             return PokeReturnValue(is_done=True, xcom_value=ret)        
     
     
-    # default_pool: Dataset'ы пишутся в метабазу, CTL и GP не трогаются (раньше — pg_pool,
+    # default_pool: Asset'ы пишутся в метабазу, CTL и GP не трогаются (раньше — pg_pool,
     # пул метабазы, который больше не нужен); одновременность держит max_active_tis_per_dag
-    @task(pool='default_pool', outlets=[DatasetAlias(f"CTL/events")],
+    @task(pool='default_pool', outlets=[events_alias],
         max_active_tis_per_dag=15, 
         map_index_template="{{ event[0] }}"
     )
     def set_events(event, **context): 
 
-        # ds = Dataset(f'CTL/entity/{event[0]}')
-        ds = Dataset(f'CTL/{event[0]}')
+        # ds = Asset(f'CTL/entity/{event[0]}')
+        ds = Asset(f'CTL/{event[0]}')
         add_note(event[1], context, level='Task', title=event[0])
-        context['outlet_events'][f"CTL/events"].add(ds,extra=event[1]) 
+        context['outlet_events'][events_alias].add(ds,extra=event[1])  
     
         return event[1]
     

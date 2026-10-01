@@ -1,15 +1,15 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
+Генерирует нагрузку: события сущностей, Asset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
 
 | `simulator` | Что делает |
 |---|---|
 | `off` (умолчание) | ничего, таск уходит в пропуск |
 | `event` | POST значений событий в CTL API — **только DEV** |
-| `dataset` | публикует Dataset-сигналы в Airflow |
-| `trigger` | случайно запускает даги воркфлоу через `trigger_dag` — только те, что реально поедут: не на паузе, активные, сериализованные |
+| `dataset` | публикует Asset-сигналы в Airflow |
+| `trigger` | случайно запускает даги воркфлоу через Execution API (`af_meta.trigger_dag_run`) — только те, что реально поедут: не на паузе, не устаревшие, сериализованные |
 
 ⚠️ Запуск дага воркфлоу — это **настоящая загрузка в CTL**: `run_prm` создаёт её через
 `POST /v4/api/wf/{wid}/loading`. Поэтому симулятор существует только на DEV, IFT и PSI, а
@@ -17,22 +17,19 @@
 только там, где разрешён `test_mode` (см. `ctl_worker.py`) — это отдельный ключ.
 """
 
-from airflow import DAG, Dataset
-from airflow.datasets import DatasetAlias
-from airflow.api.common.trigger_dag import trigger_dag           
-from airflow.decorators import task
+from airflow.sdk import DAG, Asset, AssetAlias, task
 
-from airflow.exceptions import (AirflowFailException, AirflowSkipException,
-                                AirflowRescheduleException, DagRunAlreadyExists)
+from airflow.sdk.exceptions import (AirflowFailException, AirflowSkipException,
+                                AirflowRescheduleException)
 # from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from plugins.utils import add_note, env_stand, on_callback, get_current_load, str2timedelta  # type: ignore
 from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
 from plugins.ctl_core import chk_any_conn  # type: ignore
 
-# Отбор запускаемых дагов идёт по метабазе: пауза и сериализация живут там, а не в CTL
-from airflow.models import DagModel
-from airflow.models.serialized_dag import SerializedDagModel
-from airflow.utils.session import create_session
+# Отбор запускаемых дагов идёт по метабазе: пауза и сериализация живут там, а не в CTL.
+# Airflow 3: ORM у задачи нет — SQL и запуск через plugins/af_meta.py
+from plugins import af_meta  # type: ignore
+from plugins.af_meta import DagRunAlreadyExists  # type: ignore
 
 import random
 import pendulum
@@ -44,7 +41,7 @@ logger = getLogger("airflow.task")
 MAX_XCOM = 500
 
 # get_config() — ленивый синглтон, один запрос на процесс парсинга, и убрать его нельзя:
-# от него зависят dag_id, schedule_interval и tags, а они нужны в момент разбора файла.
+# от него зависят dag_id, schedule и tags, а они нужны в момент разбора файла.
 # А вот ctl_obj_load кэша не имеет: каждый вызов это Variable.get, при промахе ещё и поход
 # в S3. Раньше ctl_enames грузились здесь же, хотя нужны единственному месту — set_events
 profile =  get_config()['profile']
@@ -62,8 +59,8 @@ OFF = ('', 'off', 'false', 'none', '0')
 def runnable_dags(dag_ids: list) -> set:
     """Из списка дагов оставляет те, что действительно поедут.
 
-    `trigger_dag` состояние паузы не смотрит (`airflow/api/common/trigger_dag.py`): он
-    создаёт ран сразу в QUEUED, а планировщик запаузенный даг не разбирает. Такой ран
+    Запуск состояние паузы не смотрит (в Airflow 2 — `airflow/api/common/trigger_dag.py`,
+    в 3 — Execution API): ран создаётся сразу, а планировщик запаузенный даг не разбирает. Такой ран
     висит в очереди навсегда — место в списке занимает, для дага считается активным, и
     очередь по нему перестаёт читаться.
 
@@ -72,25 +69,15 @@ def runnable_dags(dag_ids: list) -> set:
     `is_paused_upon_creation = not w['scheduled']`), а из выборки ниже исключены как раз
     воркфлоу «на расписании и с единственной загрузкой».
 
-    Сериализацию проверяем заодно: без неё `trigger_dag` бросает DagNotFound — этому мы
+    Сериализацию проверяем заодно: без неё запуск бросает DagNotFound — этому мы
     научены отдельно, в сенсоре.
     """
     if not dag_ids:
         return set()
 
-    # Два запроса, оба пакетом на весь список, а не по одному на кандидата. sorted —
-    # ради детерминизма в логах: на план запроса порядок не влияет.
-    with create_session() as session:
-        active = {r[0] for r in session.query(DagModel.dag_id).filter(
-            DagModel.dag_id.in_(sorted(set(dag_ids))),
-            DagModel.is_paused.is_(False),
-            DagModel.is_active.is_(True),
-        ).all()}
-        if not active:
-            return set()
-        # Второй запрос уже сужен списком active, поэтому его результат и есть ответ.
-        return {r[0] for r in session.query(SerializedDagModel.dag_id).filter(
-            SerializedDagModel.dag_id.in_(sorted(active))).all()}
+    # Один запрос пакетом на весь список, а не по одному на кандидата.
+    return {d for d, s in af_meta.dags_states(dag_ids).items()
+            if not s['is_paused'] and not s['is_stale'] and s['serialized']}
 
 
 # Симулятор существует не везде: даг воркфлоу, запущенный отсюда, создаёт настоящую
@@ -100,9 +87,11 @@ if STAND not in SIM_STANDS:
     logger.warning(f"DAG CTL.{profile}.test_simulator не регистрируется: "
                    f"контур {STAND or 'не задан'}, симулятор разрешён на {'/'.join(SIM_STANDS)}")
 else:
+    events_alias = AssetAlias("CTL/events")
+
     with DAG(f'CTL.{get_config()["profile"]}.test_simulator',
         start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
-        schedule_interval=str2timedelta(get_config().get('simulator_interval','minutes=5')),
+        schedule=str2timedelta(get_config().get('simulator_interval','minutes=5')),
         default_args={ 
         'owner': 'EDP.ETL',
             'depends_on_past': False,
@@ -181,7 +170,7 @@ else:
                     evn = random.choice(events)
                     ret.append(evn)
                 
-            else: # trigger_dag
+            else: # запуск дагов
                 # Кандидаты отбираются заранее, а не по одному в цикле: запускать можно
                 # только те даги, что реально поедут, и это два запроса к метабазе на
                 # весь список сразу.
@@ -252,7 +241,7 @@ else:
                     logger.info(f"🔍 Triggering {wf_name} with run_id={run_id}")
                 
                     try:
-                        trigger_dag(
+                        af_meta.trigger_dag_run(
                             dag_id=f'CTL.{wf_name}',
                             run_id=run_id,
                             conf=extra,
@@ -290,9 +279,9 @@ else:
             return ret if mode == 'dataset' else []
     
     
-        # default_pool: Dataset'ы пишутся в метабазу, CTL и GP не трогаются (раньше — pg_pool,
+        # default_pool: Asset'ы пишутся в метабазу, CTL и GP не трогаются (раньше — pg_pool,
         # пул метабазы, который больше не нужен); одновременность держит max_active_tis_per_dag
-        @task(pool='default_pool', outlets=[DatasetAlias(f"CTL/events")],
+        @task(pool='default_pool', outlets=[events_alias],
             max_active_tis_per_dag=15, 
             map_index_template="{{ event }}"
         )
@@ -301,10 +290,10 @@ else:
             enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 
             prf, eid, sid = event.split('/')
-            ds = Dataset(f'CTL/{prf}/{eid}/{enames[int(eid)]}')
+            ds = Asset(f'CTL/{prf}/{eid}/{enames[int(eid)]}')
             extra = { f"0/{event}": pendulum.now().format('YYYY-MM-DD HH:mm:ss') }
             add_note(event, context, level='Task', title=event)
-            context['outlet_events'][f"CTL/events"].add(ds,extra=extra) 
+            context['outlet_events'][events_alias].add(ds,extra=extra)  
     
             return event[1]
     

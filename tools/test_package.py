@@ -1,5 +1,5 @@
 """### 📦 Тестовый пакет для единого репликатора / TFS
-*2026-08-19 14:20 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает тестовые ZIP-пакеты в S3 с актуальными таймштампами.
 По умолчанию используются встроенные тестовые данные (3 части, 36/37/38 строк).
@@ -28,8 +28,8 @@ from io import BytesIO
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger("airflow.task")
-from airflow.decorators import dag, task
-from airflow.models import Param
+from airflow.sdk import dag, task
+from airflow.sdk import Param
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
 
@@ -56,7 +56,7 @@ else:
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
-    schedule_interval=None,
+    schedule=None,
     params={
         "prefix": Param("hrplatform_datalab", type="string", description="Префикс имени файла (базовая реплика)"),
         "group": Param("0", type="string", description="Суффикс группы поставок — в имени архива стоит за таймштампом"),

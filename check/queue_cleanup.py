@@ -1,5 +1,5 @@
 """### 🧽 Чистка очереди celery от сообщений без задач
-*2026-09-16 20:52 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Обходит очереди брокера, размечает каждое сообщение на живое и мусорное по метабазе и
 точечно удаляет мусор. Мусор — это сообщение, чья задача либо отсутствует в метабазе, либо
@@ -32,6 +32,12 @@
 
 > Пороги берутся из Variable `tools_queue_cleanup_cfg`, форма запуска ими предзаполняется.
 > Поменять порог — запуск с галкой «Сохранить настройки».
+
+**Airflow 3 (v2.0).** Сообщение celery — `execute_workload` с JSON `ExecuteTask` (цель — в его
+`ti`), а не `airflow tasks run`: `_target` понимает оба. ⚠️ В теле `ExecuteTask` лежит токен
+задачи для Execution API, и в дамп он попадает вместе с телом — без тела сообщение не вернуть в
+очередь (`lpush`) и не удалить точно (`lrem`). Токен ограничен `scope=workload`; доступ к дампу —
+тот же, что к бакету логов. Метабаза — через `af_meta` (`settings.engine` в задаче AF3 снят).
 """
 
 # tuple | None в сигнатуре: на 3.9 аннотация вычисляется при определении функции и
@@ -47,14 +53,17 @@ import logging
 import re
 
 from airflow.configuration import conf
-from airflow.decorators import dag, task
-from airflow.models import Param, Variable
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, Variable, dag, task
 
 try:
     from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 except ImportError:
     from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -108,10 +117,10 @@ DATE_DIR_RE = re.compile(r"^\d{4}-\d{2}-\d{2}/")
 # тысяч ничем не лучше одной на двести.
 READ_LIMIT = 50_000
 
-# default_var={} обязателен: без него отсутствующая переменная роняет разбор файла и
+# default={} обязателен: без него отсутствующая переменная роняет разбор файла и
 # вешает Broken DAG на весь даг, а не на один запуск.
 try:
-    _cfg = {**DEFAULTS, **(Variable.get(CFG_VAR, default_var={}, deserialize_json=True) or {})}
+    _cfg = {**DEFAULTS, **(Variable.get(CFG_VAR, default={}, deserialize_json=True) or {})}
 except Exception:  # битый JSON в переменной не должен ломать разбор
     logger.warning("Variable %s не разобрана, берём значения по умолчанию", CFG_VAR, exc_info=True)
     _cfg = dict(DEFAULTS)
@@ -120,7 +129,7 @@ except Exception:  # битый JSON в переменной не должен �
 # Очереди, к которым задачи привязаны в метабазе. Смотрим не только queued: сообщение
 # переживает свою задачу, и очередь давно завершившейся задачи всё ещё нужно обойти.
 SQL_QUEUES = """
-SELECT DISTINCT queue FROM main.task_instance WHERE queue IS NOT NULL
+SELECT DISTINCT queue FROM task_instance WHERE queue IS NOT NULL
 """
 
 # Состояние задач, названных в сообщениях. Отбор по первичному ключу
@@ -133,7 +142,7 @@ SELECT DISTINCT queue FROM main.task_instance WHERE queue IS NOT NULL
 # удалить. Поэтому он здесь только для сверки в отчёте.
 SQL_TARGETS = """
 SELECT dag_id, task_id, run_id, map_index, state, external_executor_id
-  FROM main.task_instance
+  FROM task_instance
  WHERE (dag_id, task_id, run_id, map_index) IN :keys
 """
 
@@ -147,14 +156,17 @@ def _decode(raw) -> dict:
     body = msg.get("body")
     if props.get("body_encoding") == "base64":
         body = base64.b64decode(body)
-    # Протокол celery v2: тело — [args, kwargs, embed]. Команда Airflow лежит первым
-    # позиционным аргументом execute_command. Разбираем тело, а не headers.argsrepr:
-    # repr придётся парсить как питон, а тело — обычный JSON.
+    # Протокол celery v2: тело — [args, kwargs, embed]. Разбираем тело, а не headers.argsrepr:
+    # repr придётся парсить как питон, а тело — обычный JSON. Первый позиционный аргумент:
+    #   Airflow 2 — execute_command, список `airflow tasks run …`;
+    #   Airflow 3 — execute_workload, JSON-строка ExecuteTask с полем ti
+    #   (providers-celery, celery_executor_utils.py:436, 3.3.1).
     args = json.loads(body)[0] if body else []
+    first = args[0] if args else None
     return {
         "id": headers.get("id"),
         "task": headers.get("task"),
-        "command": args[0] if args and isinstance(args[0], list) else None,
+        "command": first if isinstance(first, (list, str)) else None,
     }
 
 
@@ -163,7 +175,17 @@ def _target(command) -> tuple | None:
 
     None — цель не читается: не `airflow tasks run`, укороченная команда, чужая задача
     celery. Такое сообщение остаётся в очереди.
+
+    Airflow 3: команда — JSON-строка ExecuteTask, цель в её `ti`.
     """
+    if isinstance(command, str):
+        try:
+            ti = (json.loads(command) or {}).get("ti") or {}
+        except (ValueError, AttributeError):
+            return None
+        if not all(ti.get(k) for k in ("dag_id", "task_id", "run_id")):
+            return None
+        return ti["dag_id"], ti["task_id"], ti["run_id"], int(ti.get("map_index", -1))
     if not command or command[:3] != ["airflow", "tasks", "run"] or len(command) < 6:
         return None
     map_index = -1
@@ -181,14 +203,14 @@ def _states(keys: list) -> dict:
     Порциями: список ключей приходит из очереди и на инциденте бывает в тысячи строк,
     а IN по кортежам с таким числом элементов планировщик разбирает заметно дольше.
     """
-    from airflow import settings
     from sqlalchemy import bindparam, text
 
     out = {}
     if not keys:
         return out
     sql = text(SQL_TARGETS).bindparams(bindparam("keys", expanding=True))
-    with settings.engine.connect() as conn:
+    # Airflow 3: settings.engine в задаче снят (block_orm_access) — сессия af_meta
+    with af_meta.meta_session() as conn:
         for i in range(0, len(keys), STATE_BATCH):
             rows = conn.execute(sql, {"keys": keys[i:i + STATE_BATCH]})
             for dag_id, task_id, run_id, map_index, state, eid in rows:
@@ -345,9 +367,8 @@ def tools_queue_cleanup():
     @task(task_id="collect", retries=1)
     def collect(**context) -> dict:
         """📸 Обход очередей, разметка по метабазе и дамп мусора в S3."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-        from airflow import settings
         from sqlalchemy import text
 
         p = context["params"]
@@ -358,7 +379,7 @@ def tools_queue_cleanup():
         names = [n.strip() for n in (p["queues"] or "").split(",") if n.strip()]
         if not names:
             names = {conf.get("operators", "default_queue", fallback="default")}
-            with settings.engine.connect() as conn:
+            with af_meta.meta_session() as conn:
                 names.update(q for (q,) in conn.execute(text(SQL_QUEUES)) if q)
             names = sorted(names)
         logger.info("очереди: %s", ", ".join(names))
@@ -397,7 +418,10 @@ def tools_queue_cleanup():
                 "queue": m["queue"],
                 "priority": m["priority"],
                 "celery_id": m["info"].get("id"),
-                "command": m["info"].get("command"),
+                # Airflow 3: команда — JSON ExecuteTask с токеном задачи; в поле кладём только
+                # цель, токен остаётся в одном месте — в payload, без него не вернуть сообщение
+                "command": (m["info"].get("command") if isinstance(m["info"].get("command"), list)
+                            else _target(m["info"].get("command"))),
                 "payload": m["raw"].decode() if isinstance(m["raw"], bytes) else m["raw"],
             }
             for m in junk
@@ -437,7 +461,7 @@ def tools_queue_cleanup():
     @task(task_id="purge", trigger_rule=TriggerRule.NONE_FAILED)
     def purge(snapshot: dict = None, **context) -> dict:
         """🧹 Удаляет размеченный мусор. По умолчанию выключено."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         from airflow.providers.celery.executors.celery_executor import app
 
@@ -523,8 +547,11 @@ def tools_queue_cleanup():
         p = context["params"]
         purged = purged or {}
         if not snapshot:
-            done = context["dag_run"].get_task_instance("collect")
-            state = getattr(done, "state", None)
+            # Airflow 3: у DagRun в задаче нет get_task_instance — состояние соседа по рану
+            # спрашиваем у Task SDK: {run_id: {task_id: state}}
+            dr = context["dag_run"]
+            states = context["ti"].get_task_states(dag_id=dr.dag_id, task_ids=["collect"], run_ids=[dr.run_id])
+            state = ((states or {}).get(dr.run_id) or {}).get("collect")
             note = (
                 "очередь пуста — размечать было нечего"
                 if state == "skipped"

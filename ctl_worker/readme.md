@@ -1,5 +1,8 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-17 11:28 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-21 16:09 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+
+> **Airflow 3 (v2.0, 21.09.2026).** Порт `af_dags@d9813ec` без `ctl_tfs.py`. Метабаза и запуск
+> DAG-ов — через `plugins/af_meta.py`, отличия от Airflow 2 — в `readme.md` корня репозитория.
 
 ---
 

@@ -1,5 +1,5 @@
 """### 👁️ DAG: Просмотр файлов S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список объектов по маске, сортирует и читает содержимое файлов (txt, gz, zip).
 
@@ -16,10 +16,10 @@
 """
 
 from datetime import datetime, timedelta, timezone
-from airflow.models import Param
-from airflow.decorators import task, dag
+from airflow.sdk import Param
+from airflow.sdk import task, dag
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.exceptions import AirflowFailException
+from airflow.sdk.exceptions import AirflowFailException
 
 from plugins.utils import get_conns_by_type, readable_size, add_note, on_callback  # type: ignore
 
@@ -50,7 +50,7 @@ def _split_mask(full_path):
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule_interval=None,
+    schedule=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,
@@ -60,7 +60,7 @@ def _split_mask(full_path):
     on_success_callback=on_callback,
     params={
         'aws_conn_id': Param('s3', type='string', enum=get_conns_by_type(conn_type='aws'), title='ID подключения'),
-        'prefix': Param('dataplatform-monitoring/dataplatform-etl/*.log.gz', type=['string', 'null'], title='bucket/prefix/mask'),
+        'prefix': Param('dataplatform-monitoring/dataplatform-etl/*.log', type=['string', 'null'], title='bucket/prefix/mask'),
         'order_by': Param('Date', type='string', enum=['None', 'Key', 'Date', 'Size', 'Name', 'Ext']),
         'reverse': Param(True, type='boolean'),
         'items': Param(10, type='integer', minimum=1, maximum=100),

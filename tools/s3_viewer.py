@@ -1,5 +1,5 @@
 """### 🗂️ DAG: Просмотрщик S3
-*2026-09-02 09:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список ключей из S3-бакета и читает содержимое файлов.
 
@@ -18,10 +18,13 @@ PR #15 применяет к ним потолок прямо в `__init__`, г�
 """
 
 from datetime import datetime, timedelta, timezone
-from airflow.models import Param
-from airflow.decorators import task, dag
+from airflow.sdk import Param
+from airflow.sdk import task, dag
 
-from hrp_operators.s3_viewer_operator import HrpS3ListKeysOperator, HrpS3FileReadOperator  # type: ignore
+try:
+    from hrp_operators.s3_viewer_operator import HrpS3ListKeysOperator, HrpS3FileReadOperator  # type: ignore
+except ImportError:  # hrp_operators верхнего уровня — только на контурах (plugins_folder)
+    from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import HrpS3ListKeysOperator, HrpS3FileReadOperator  # type: ignore
 from plugins.utils import add_note, on_callback  # type: ignore
 
 from logging import getLogger
@@ -65,7 +68,7 @@ def _late_template(op, **fields):
         'on_retry_callback': on_callback,
     },
     start_date=datetime(2026, 1, 21, tzinfo=timezone.utc),
-    schedule_interval=None,
+    schedule=None,
     tags=['EDP_ETL', 'tools', 's3'],
     catchup=False,
     is_paused_upon_creation=True,
