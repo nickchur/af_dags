@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-10-01 14:23 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:44 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -246,6 +246,12 @@ params = {
         'pool': TOOLS_POOL,
         'retries': 2,
         'retry_delay': timedelta(seconds=30),
+        # Иначе вес по потомкам (у sweep — 4) против сотен у больших дагов: планировщик берёт из
+        # scheduled верхушку по весу и заканчивает цикл, как только в ней нашлось что запустить
+        # (scheduler_job_runner, is_done), и до чистильщика очередь не доходит. Сигма dev
+        # 01.10.2026: db_cleanup.clean полчаса в scheduled при пустом пуле. Как у соседей по пулу — 900
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
         # Обход сам укладывается в max_minutes (30); потолок — от зависшего запроса к S3
         'execution_timeout': timedelta(hours=2),
         'on_failure_callback': on_callback,

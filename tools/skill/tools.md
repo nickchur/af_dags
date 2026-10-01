@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-10-01 14:08 MSK · v2.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:44 MSK · v2.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -51,8 +51,10 @@ description: Индекс служебных дагов Airflow (каталог 
   удаляет; `AutoQA` — регрессия и проверка «работает ли» (`dummy` раз в час). Плагины: `system_pulse`, `system_health`, `pg_activity`, `log_events`,
   `test_connections`, `test_dags`, `queue_analyze`, `db_cleanup`, `log_cleanup` (последние два — и `clean`).
 - **Пул `tools_pool`** (16 слотов). Короткие проверки идут с `priority_weight 900`,
-  `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Тяжёлые `test_dags`,
-  `test_hrp_operators` и чистильщики приоритета не получают намеренно.
+  `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Чистильщики — тоже
+  900: с весом по потомкам их вытесняли большие даги (`clean` полчаса в `scheduled` при пустом
+  пуле, сигма dev 01.10.2026). Тяжёлые `test_dags`, `test_hrp_operators` приоритета не получают
+  намеренно — висят в `scheduled` дольше, это не поломка (причину называет `tools_queue_analyze`).
 - **Сохраняемые параметры.** Форма запуска предзаполняется из Variable `tools_<имя>_params`
   (у `pg_activity` — `tools_pg_activity_cfg`), при её отсутствии — из кода. Записывает её
   только запуск с галочкой **`save_params`** — таск `params` (☮️, если галочки нет или значения

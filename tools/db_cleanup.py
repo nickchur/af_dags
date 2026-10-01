@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 14:34 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:44 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -806,6 +806,12 @@ if ADMIN:
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
+        # Иначе вес по потомкам (у clean — 7) против сотен у больших дагов: планировщик берёт из
+        # scheduled верхушку по весу и заканчивает цикл, как только в ней нашлось что запустить
+        # (scheduler_job_runner, is_done), и до чистильщика очередь не доходит. Сигма dev
+        # 01.10.2026: clean полчаса в scheduled при пустом пуле. Как у соседей по пулу — 900
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
         # Потолок от зависания на блокировке, а не от медленной чистки: VACUUM по таблице
         # сам ограничен часом (db_vacuum), удаление идёт порциями
         'execution_timeout': timedelta(hours=4),
