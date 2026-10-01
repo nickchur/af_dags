@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-10-01 17:44 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -7,6 +7,8 @@
 |---|---|
 | `categories.yml` | Категории и сущности |
 | `workflows.yml` | Workflow'ы с параметрами и расписанием |
+
+Подробно: [ctl_worker/readme.md — ctl_yml](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_ymlpy--экспорт-в-yaml)
 """
 
 from airflow import DAG

@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-10-01 17:44 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -15,6 +15,8 @@
 `POST /v4/api/wf/{wid}/loading`. Поэтому симулятор существует только на DEV, IFT и PSI, а
 на боевом и неизвестном контуре не регистрируется вовсе. Притворяться выполнение будет
 только там, где разрешён `test_mode` (см. `ctl_worker.py`) — это отдельный ключ.
+
+Подробно: [ctl_worker/readme.md — ctl_test](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_testpy--симулятор-нагрузки)
 """
 
 from airflow import DAG, Dataset

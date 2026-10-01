@@ -1,42 +1,17 @@
 """### 📁 CTL TFS → S3
-*2026-10-01 17:45 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
+Два DAG'а копируют файлы из TFS в `edpetl-files`:
 
----
+- **`CTL.<profile>.tfs_sensor`** — каждые `tfs_interval` минут (5) опрашивает `tfs-in`-источники
+  из конфига, копирует найденное и публикует `DatasetAlias("TFS/<profile>")`. Вручную — с
+  `path` (`conn_id://bucket/prefix/mask`), `tfs_id`, `compress`, `done`, `unzip`.
+- **`CTL.<profile>.tfs_kafka`** — по триггеру читает `TransferFileCephRq` из Kafka, копирует файлы
+  из XML и отправляет квитанцию `TransferFileCephRs` (0 — успех, 104 — ошибка). `ScenarioId`
+  становится `tfs_id`. Параметры: те же плюс `kafka_rcv`/`topic_rcv`, `kafka_snd`/`topic_snd`
+  (пустой — без квитанции), `timeout` (мин, 60).
 
-#### `CTL.<profile>.tfs_sensor` — по расписанию
-
-Каждые N минут (параметр `tfs_interval`, по умолчанию 5 мин) опрашивает все `tfs-in`-источники из конфига. При обнаружении файлов копирует их в S3 и публикует `DatasetAlias("TFS/<profile>")`.
-
-| Параметр (UI) | Описание |
-|---|---|
-| `path` | `conn_id://bucket/prefix/mask` (при ручном запуске) |
-| `tfs_id` | Идентификатор источника |
-| `compress` | Сжать при копировании |
-| `done` | Удалить исходник после копирования |
-| `unzip` | Распаковать ZIP-архив |
-
----
-
-#### `CTL.<profile>.tfs_kafka` — по событию Kafka
-
-Запускается внешним триггером. Читает сообщение `TransferFileCephRq` из Kafka, копирует указанные в XML файлы в S3, затем отправляет квитанцию `TransferFileCephRs` (StatusCode=0 при успехе, 104 при ошибке).
-
-`ScenarioId` из XML используется как `tfs_id`; `RqUID` — в квитанцию.
-
-| Параметр (UI) | Описание |
-|---|---|
-| `path` | Базовый путь в TFS: `conn_id://bucket/prefix/` |
-| `tfs_id` | Fallback-идентификатор (если `ScenarioId` пуст) |
-| `compress` | Сжать при копировании |
-| `done` | Удалить исходник после копирования |
-| `unzip` | Распаковать ZIP-архив |
-| `kafka_rcv` | `kafka_config_id` для чтения — по умолчанию `tfs-kafka-out`; список kafka-коннектов берётся из Variable `local_connections` |
-| `topic_rcv` | Топик входящих сообщений |
-| `timeout` | Таймаут ожидания (мин, по умолчанию 60) |
-| `kafka_snd` | `kafka_config_id` для квитанции — по умолчанию `tfs-kafka-in` |
-| `topic_snd` | Топик квитанций (необязательно: пустой — квитанция не отправляется) |
+Подробно: [ctl_worker/readme.md — ctl_tfs](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_tfspy--перемещение-файлов-из-tfs)
 """
 
 from airflow import DAG
@@ -461,12 +436,10 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
 
     @task(task_id='kafka_wait')
     def kafka_wait(**context):
-        """⏳ Ждёт любое сообщение из топика опросом на воркере.
-
-        Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
-        таск уходит в deferred и висит со статусом unknown. Поведение сохранено:
-        ждём не дольше params.timeout минут, по истечении — skip (был soft_fail=True).
-        """
+        """⏳ Ждёт любое сообщение из топика опросом на воркере."""
+        # Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
+        # таск уходит в deferred и висит со статусом unknown. Поведение сохранено:
+        # ждём не дольше params.timeout минут, по истечении — skip (был soft_fail=True).
         p = context['params']
         if not p.get('kafka_rcv') or not p.get('topic_rcv'):
             raise AirflowFailException("Params 'kafka_rcv' and 'topic_rcv' are required")

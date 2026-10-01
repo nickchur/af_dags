@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-10-01 17:44 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
@@ -12,6 +12,8 @@
 | `ctl_events` / `ctl_ue_events` / `ctl_entity_events` | События за последние N дней; висячие ссылки (нет сущности или профиля в CTL) отсекаются |
 
 Данные доступны через `ctl_obj_load()`.
+
+Подробно: [ctl_worker/readme.md — ctl_loader](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_loaderpy--загрузчик-метаданных)
 """
 
 from airflow import DAG
@@ -154,15 +156,13 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
     
     @task(pool='ctl_pool')
     def load_profile(**context):
-        """### Загрузка профиля CTL
-
-        Получает информацию о текущем профиле из API CTL по имени.
-        Сохраняет данные в переменную `ctl_profile` через `ctl_obj_save(var=True)`,
-        чтобы другие DAG'и могли получить к ним доступ.
-
-        **Источник:** `/v4/api/profile/name/{profile_name}`  
-        **Сохранение:** `ctl_profile` 
-        """            
+        """Загрузка профиля CTL"""
+        # Получает информацию о текущем профиле из API CTL по имени.
+        # Сохраняет данные в переменную `ctl_profile` через `ctl_obj_save(var=True)`,
+        # чтобы другие DAG'и могли получить к ним доступ.
+        #
+        # **Источник:** `/v4/api/profile/name/{profile_name}`
+        # **Сохранение:** `ctl_profile`
         data = ctl_api(f'/v4/api/profile/name/{get_config()["profile"]}')
         
         # Сохраняем в S3
@@ -231,22 +231,20 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         
     @task(pool='ctl_pool')
     def load_categories(**context):
-        """### Загрузка дерева категорий
-
-        Выгружает все категории из CTL и строит иерархическое дерево,
-        начиная с корневой (`root_category`). Фильтрует только те категории,
-        которые принадлежат иерархии корня (включая потомков).
-
-        Особое внимание — категории `ue_category`, которая сохраняется отдельно.
-
-        **Функционал:**
-        - Трёхпроходная сборка дерева (на случай неупорядоченных данных).
-        - Добавление `parent_name` для удобства.
-        - Сохранение в `ctl_categories` (публично).
-
-        **Источник:** `/v4/api/category`  
-        **Сохранение:** `ctl_categories`, `ctl_ue_category`
-        """            
+        """Загрузка дерева категорий"""
+        # Выгружает все категории из CTL и строит иерархическое дерево,
+        # начиная с корневой (`root_category`). Фильтрует только те категории,
+        # которые принадлежат иерархии корня (включая потомков).
+        #
+        # Особое внимание — категории `ue_category`, которая сохраняется отдельно.
+        #
+        # **Функционал:**
+        # - Трёхпроходная сборка дерева (на случай неупорядоченных данных).
+        # - Добавление `parent_name` для удобства.
+        # - Сохранение в `ctl_categories` (публично).
+        #
+        # **Источник:** `/v4/api/category`
+        # **Сохранение:** `ctl_categories`, `ctl_ue_category`
         # all_cats = ctl_api('/v5/api/category/m')
         all_cats = ctl_api('/v4/api/category')
         categories = {}
@@ -286,22 +284,20 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
 
     @task(pool='ctl_pool')
     def load_workflows(**context):
-        """### Загрузка и нормализация workflow'ов
-
-        Для каждой категории из `ctl_categories` выгружает все workflows.
-        Нормализует структуру:
-        - Параметры → словарь `param: value`.
-        - Уведомления → `status: emails`.
-        - События → список `(entity_id, profile, stat_id, active)`.
-
-        Также:
-        - Собирает сущности, участвующие в событиях.
-        - Строит иерархию имён сущностей (`Parent/child`).
-        - Сохраняет `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events`.
-
-        **Источник:** `/v4/api/wf?category_id={id}`  
-        **Сохранение:** `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events` (все публично)
-        """
+        """Загрузка и нормализация workflow'ов"""
+        # Для каждой категории из `ctl_categories` выгружает все workflows.
+        # Нормализует структуру:
+        # - Параметры → словарь `param: value`.
+        # - Уведомления → `status: emails`.
+        # - События → список `(entity_id, profile, stat_id, active)`.
+        #
+        # Также:
+        # - Собирает сущности, участвующие в событиях.
+        # - Строит иерархию имён сущностей (`Parent/child`).
+        # - Сохраняет `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events`.
+        #
+        # **Источник:** `/v4/api/wf?category_id={id}`
+        # **Сохранение:** `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events` (все публично)
 
         category_ids = ctl_obj_load('ctl_categories') or {}
         if not category_ids:
@@ -372,22 +368,20 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
 
     @task(pool='ctl_pool')
     def load_workflows_old(**context):
-        """### Загрузка и нормализация workflow'ов
-
-        Для каждой категории из `ctl_categories` выгружает все workflows.
-        Нормализует структуру:
-        - Параметры → словарь `param: value`.
-        - Уведомления → `status: emails`.
-        - События → список `(entity_id, profile, stat_id, active)`.
-
-        Также:
-        - Собирает сущности, участвующие в событиях.
-        - Строит иерархию имён сущностей (`Parent/child`).
-        - Сохраняет `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events`.
-
-        **Источник:** `/v4/api/wf?category_id={id}`  
-        **Сохранение:** `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events` (все публично)
-        """
+        """Загрузка и нормализация workflow'ов"""
+        # Для каждой категории из `ctl_categories` выгружает все workflows.
+        # Нормализует структуру:
+        # - Параметры → словарь `param: value`.
+        # - Уведомления → `status: emails`.
+        # - События → список `(entity_id, profile, stat_id, active)`.
+        #
+        # Также:
+        # - Собирает сущности, участвующие в событиях.
+        # - Строит иерархию имён сущностей (`Parent/child`).
+        # - Сохраняет `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events`.
+        #
+        # **Источник:** `/v4/api/wf?category_id={id}`
+        # **Сохранение:** `ctl_workflows`, `ctl_entities`, `ctl_enames`, `ctl_entity_events` (все публично)
         # category_ids = context['ti'].xcom_pull(key=f'categories', task_ids=f'ctl_load.load_categories')
         category_ids = ctl_obj_load('ctl_categories') or {}
         wfs_old = ctl_obj_load('ctl_workflows') or {}
@@ -504,19 +498,17 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
     
     @task(pool='ctl_pool')
     def load_ue_events(**context):
-        """### Загрузка событий UE-категории
-
-        Выгружает загрузки (loadings) из категории `ue_category` за последние N дней.
-        Используется для мониторинга активности внешних систем.
-
-        **Фильтрация:**
-        - По `category_ids` (ID `ue_category`).
-        - При наличии `ctl_days` — по дате старта.
-
-        **Сохранение:** не сохраняется напрямую, только логируется.
-
-        **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
-        """
+        """Загрузка событий UE-категории"""
+        # Выгружает загрузки (loadings) из категории `ue_category` за последние N дней.
+        # Используется для мониторинга активности внешних систем.
+        #
+        # **Фильтрация:**
+        # - По `category_ids` (ID `ue_category`).
+        # - При наличии `ctl_days` — по дате старта.
+        #
+        # **Сохранение:** не сохраняется напрямую, только логируется.
+        #
+        # **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
         ue_cat = ctl_obj_load('ctl_ue_category')
         if not ue_cat:
             msg = "❌ No ue_category found"
@@ -536,19 +528,17 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
 
     @task(pool='ctl_pool')
     def load_prf_events(**context):
-        """### Загрузка событий по профилю
-
-        Выгружает загрузки (loadings), связанные с текущим профилем, за последние N дней.
-        Используется для аудита и анализа активности CTL.
-
-        **Фильтрация:**
-        - По `profile_ids`.
-        - При наличии `ctl_days` — по дате старта.
-
-        **Сохранение:** не сохраняется напрямую, только логируется.
-
-        **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
-        """
+        """Загрузка событий по профилю"""
+        # Выгружает загрузки (loadings), связанные с текущим профилем, за последние N дней.
+        # Используется для аудита и анализа активности CTL.
+        #
+        # **Фильтрация:**
+        # - По `profile_ids`.
+        # - При наличии `ctl_days` — по дате старта.
+        #
+        # **Сохранение:** не сохраняется напрямую, только логируется.
+        #
+        # **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
         profile = ctl_obj_load('ctl_profile')
         if not profile:
             msg = "❌ No profile found"

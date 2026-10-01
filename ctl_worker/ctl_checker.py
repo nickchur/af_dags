@@ -1,5 +1,5 @@
 """### 🔍 DAG: Проверка API CTL
-*2026-10-01 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск HTTP-запроса к CTL API для диагностики и отладки.
 
@@ -12,6 +12,8 @@
 | `lid` | ID загрузки |
 | `limit` | Лимит результатов |
 | `data` | JSON-тело для POST/PUT |
+
+Подробно: [ctl_worker/readme.md — ctl_checker](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_checkerpy--диагностика-ctl-api)
 """
 
 from airflow import DAG
@@ -113,31 +115,29 @@ with DAG(
 
     @task
     def chk_ctl_api(**context):
-        """### 🔍 Проверка API CTL
-
-    Выполняет HTTP-запрос к API CTL с параметрами из `context['params']`.
-
-    **Функционал:**
-    - Подставляет значения в шаблон URL (`{lid}`, `{wid}`, `{eid}`, `{limit}`).
-    - Парсит тело запроса (`data`) как Python-объект.
-    - Отправляет запрос через `ctl_api`.
-    - Логирует:
-      - URL, метод, данные.
-      - Ответ в формате `pprint` (читаемый JSON).
-    - Возвращает сырой ответ.
-
-    **Использование:**
-    - Для отладки новых интеграций.
-    - Проверка доступности сущностей, workflow'ов, загрузок.
-    - Тестирование прав доступа и параметров.
-
-    **Примеры URL:**
-    - `/v5/api/info`
-    - `/v4/api/permission`
-    - `/v4/api/wf/{wid}/loading`
-
-    **XCom Output:** полный ответ API (dict/list).
-    """
+        """🔍 Проверка API CTL"""
+        # Выполняет HTTP-запрос к API CTL с параметрами из `context['params']`.
+        #
+        # **Функционал:**
+        # - Подставляет значения в шаблон URL (`{lid}`, `{wid}`, `{eid}`, `{limit}`).
+        # - Парсит тело запроса (`data`) как Python-объект.
+        # - Отправляет запрос через `ctl_api`.
+        # - Логирует:
+        #   - URL, метод, данные.
+        #   - Ответ в формате `pprint` (читаемый JSON).
+        # - Возвращает сырой ответ.
+        #
+        # **Использование:**
+        # - Для отладки новых интеграций.
+        # - Проверка доступности сущностей, workflow'ов, загрузок.
+        # - Тестирование прав доступа и параметров.
+        #
+        # **Примеры URL:**
+        # - `/v5/api/info`
+        # - `/v4/api/permission`
+        # - `/v4/api/wf/{wid}/loading`
+        #
+        # **XCom Output:** полный ответ API (dict/list).
         # from pprint import pformat
         import json
         
