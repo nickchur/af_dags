@@ -1,5 +1,5 @@
 """### 🗂️ DAG: Просмотрщик S3
-*2026-10-01 17:35 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:04 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список ключей из S3-бакета и читает содержимое файлов.
 
@@ -99,13 +99,11 @@ def tools_s3_viewer():
 
     @task
     def prepare_keys(list_from_s3, **context):
-        """Ключи для чтения — вместе с числом строк.
-
-        rows возвращается отсюда числом, а не шаблоном у оператора: у mapped-задачи
-        Airflow вызывает __init__ ВНУТРИ render_template_fields (unmap), то есть до
-        подстановки, и старое ядро ловит на `rows + 1` строку '{{ params.rows }}'.
-        Значение из expand_kwargs приезжает уже готовым — работает на любом ядре.
-        """
+        """Ключи для чтения — вместе с числом строк."""
+        # rows возвращается отсюда числом, а не шаблоном у оператора: у mapped-задачи
+        # Airflow вызывает __init__ ВНУТРИ render_template_fields (unmap), то есть до
+        # подстановки, и старое ядро ловит на `rows + 1` строку '{{ params.rows }}'.
+        # Значение из expand_kwargs приезжает уже готовым — работает на любом ядре.
         if not list_from_s3 or not isinstance(list_from_s3, list):
             add_note("Список объектов пуст", context)
             return []
