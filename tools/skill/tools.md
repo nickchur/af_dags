@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-30 10:27 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 09:32 MSK · v2.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -81,7 +81,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log` | ничего |
 | `tools_test_connections` | `15 23 * * *` | Список подключений secret backend (`collect`) и доступность каждого, важные — `critical` | Variable `local_connections` |
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
-| `tools_queue_analyze` | `10 9 * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
+| `tools_queue_analyze` | `10 * * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
 | `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
 | `tools_log_cleanup` | `17 8 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
