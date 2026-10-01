@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-28 12:35 MSK · v3.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 09:23 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -446,9 +446,18 @@ def check_dag_size() -> dict:
     from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
-        session.execute(text(f"set local statement_timeout = {DAG_SIZE_TIMEOUT_MS}"))
-        rows = [dict(r) for r in session.execute(text(SQL_DAG_SIZE)).mappings()]
+    try:
+        with create_session() as session:
+            session.execute(text(f"set local statement_timeout = {DAG_SIZE_TIMEOUT_MS}"))
+            rows = [dict(r) for r in session.execute(text(SQL_DAG_SIZE)).mappings()]
+    except Exception as exc:
+        # Свой лимит запроса — медленная метабаза, а не неисправность того, что меряем: warn,
+        # как в tools_system_health. Сигма dev 30.09.2026 23:35 MSK: в ту же минуту по таймауту
+        # падали и фоновые запросы вебсервера; на стенде запрос — 94 мс на 73 DAG'а, всё по индексам
+        if type(getattr(exc, "orig", None)).__name__ != "QueryCanceled":
+            raise
+        return {"status": "warn",
+                "summary": f"метабаза не ответила за {DAG_SIZE_TIMEOUT_MS // 1000} с — размер DAG'ов не посчитан"}
     return dag_size_verdict(rows)
 
 
