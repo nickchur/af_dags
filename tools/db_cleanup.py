@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 18:43 MSK · v2.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:58 MSK · v2.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
@@ -327,11 +327,54 @@ LONG_TX = '1 hour'
 # xmin на 2,1 млн, вакуум не убирал старые версии строк task_instance, и проверка пула шла
 # 1,5 с вместо 1 мс — шаг шедулера 25–35 с вместо 3 с
 XMIN_WARN, XMIN_ERROR = 100_000, 1_000_000
+# reindex: индекс, похудевший меньше, в итоговую заметку отдельной строкой не попадает
+REINDEX_NOTE_MIN = 1024 ** 2
 # Логические слоты (CDC чужих систем читают метабазу; сигма dev 01.10.2026 — три source_*) держат
 # только catalog_xmin: вакуум каталога, не task_instance. Их риск — WAL, который мастер копит,
 # пока потребитель стоит. ponytail: порог в ГБ без знания размера диска; поднять, если шумит
 LOGICAL_WAL_WARN_GB, LOGICAL_WAL_ERROR_GB = 5, 20
 CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
+# Заметка в AF 2 — 1000 символов (колонка метабазы); запас на заголовок
+NOTE_BUDGET = 900
+
+
+class Feed:
+    """Заметка таска одним проходом: строки хода сверху вниз, в конце итог — строкой над ними.
+
+    Таблиц нет: в 1000 символов заметки широкая таблица вытесняла строки (сигма dev 01.10.2026 —
+    reindex на 116 индексов обрывался на десятом). Не влезает — в ходе видны последние строки,
+    в итоге — те, что передал done(keep=…), и «ещё N».
+    """
+
+    def __init__(self, context, title):
+        self.context, self.title, self.lines = context, title, []
+
+    def line(self, text, replace_last=False):
+        if replace_last and self.lines:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
+        self._write('', self.lines, tail=True)
+
+    def done(self, summary, keep=None, rest=''):
+        self._write(summary, self.lines if keep is None else keep, tail=False, rest=rest)
+
+    def _write(self, head, lines, tail, rest=''):
+        budget = NOTE_BUDGET - len(self.title) - len(head) - len(rest) - 40
+        picked, size = [], 0
+        for ln in (reversed(lines) if tail else lines):
+            if size + len(ln) + 1 > budget:
+                break
+            picked.append(ln)
+            size += len(ln) + 1
+        if tail:
+            picked.reverse()
+        cut = len(lines) - len(picked)
+        more = f'… ещё {cut}' if cut else ''
+        body = [head] if head else []
+        body += ([more] if tail and more else []) + picked + ([more] if not tail and more else [])
+        body += [rest] if rest else []
+        add_note('\n'.join(body), context=self.context, level='Task', add=False, title=self.title)
 
 
 def _catalog(sql, **bind):
@@ -1010,18 +1053,6 @@ def tools_db_cleanup():
             return {'count': count, 'min_date': min_date, 'max_date': max_date,
                     'idx': idx, 'batches': batches}
 
-        def _note_rows(res):
-            return [
-                f"|{t}|{readable_size(r['count'], base=1000)}"
-                f"|{_fmt_date(r['min_date'])}"
-                f"|{r['idx']}"
-                f"|{r.get('duration', '')}|"
-                for t, r in res.items()
-            ]
-
-        HDR = ['|Таблица|Строк|Min|Idx|Время|',
-               '|-|-|-|-|-|']
-
         custom = p.get('custom', False)
         table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
         try:
@@ -1037,10 +1068,11 @@ def tools_db_cleanup():
         n = len(table_names)
         # Заметка дописывается сверху строкой на таблицу, а не переписывается таблицей целиком:
         # свежее — наверху, ход чистки виден, итоговая таблица ложится сверху в конце.
-        # Внутри долгой таблицы — строка не чаще раза в NOTE_EVERY_SEC: порций бывают сотни,
-        # а заметка ограничена MAX_NOTE_LEN
+        # Внутри долгой таблицы — строка хода не чаще раза в NOTE_EVERY_SEC, и она заменяет
+        # прошлую строку хода той же таблицы: порций бывают сотни
         NOTE_EVERY_SEC = 300
-        last_note = {'at': time.time()}
+        last_note = {'at': time.time(), 'progress': False}
+        feed = Feed(context, f'🗑️ clean ({mode}, {retention_days}d)')
 
         for i, tbl in enumerate(table_names, 1):
             _ts = time.time()
@@ -1049,8 +1081,9 @@ def tools_db_cleanup():
                 if time.time() - last_note['at'] < NOTE_EVERY_SEC:
                     return
                 last_note['at'] = time.time()
-                add_note(f"⏳ {_tbl} ({_i}/{n}): порция {done}/{total}, {readable_size(count, base=1000)} строк, "
-                         f"{round(time.time() - _ts, 1)} с", context=context, level='Task')
+                feed.line(f"⏳ {_tbl} ({_i}/{n}): порция {done}/{total}, {readable_size(count, base=1000)} строк, "
+                          f"{round(time.time() - _ts, 1)} с", replace_last=last_note['progress'])
+                last_note['progress'] = True
 
             try:
                 with create_session() as session:
@@ -1059,8 +1092,8 @@ def tools_db_cleanup():
                 logger.warning(f"⚠️ {tbl}: {e}")
                 results[tbl] = {'count': 0, 'min_date': None, 'idx': '⚠️',
                                  'duration': str(e)[:40], 'batches': 0}
-                add_note(f"⚠️ {tbl} ({i}/{n}): {str(e)[:120]}", context=context, level='Task')
-                last_note['at'] = time.time()
+                feed.line(f"⚠️ {tbl} ({i}/{n}): {str(e)[:120]}", replace_last=last_note['progress'])
+                last_note.update(at=time.time(), progress=False)
                 continue
             info['duration'] = round(time.time() - _ts, 2)
             results[tbl] = info
@@ -1070,18 +1103,18 @@ def tools_db_cleanup():
                 f"idx={info['idx']} batches={info['batches']} {info['duration']}s"
             )
 
-            add_note(f"✅ {tbl} ({i}/{n}): {readable_size(info['count'], base=1000)} строк, {info['duration']} с",
-                     context=context, level='Task')
-            last_note['at'] = time.time()
+            feed.line(f"✅ {tbl} ({i}/{n}): {readable_size(info['count'], base=1000)} строк, {info['duration']} с",
+                      replace_last=last_note['progress'])
+            last_note.update(at=time.time(), progress=False)
 
         duration = round(time.time() - _ts_total, 2)
 
         if results:
             total = sum(r['count'] for r in results.values())
-            footer = f"|**Итого**|**{readable_size(total, base=1000)}**|||**{duration}**|"
-            lines = HDR + _note_rows(results) + [footer]
-            add_note('\n'.join(lines), context=context, level='Task',
-                     title=f'🗑️ clean ({mode}, {retention_days}d)')
+            # В итоге — только таблицы, где что-то было: пустые не интересны
+            feed.done(f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}'
+                      f' ⏱ {duration}s',
+                      keep=[ln for ln in feed.lines if not ln.startswith('✅') or ': 0 строк' not in ln])
             add_note(
                 f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}'
                 f' ⏱ {duration}s',
@@ -1119,8 +1152,9 @@ def tools_db_cleanup():
 
         results, skipped = [], []
         n = len(tables)
-        # Как у clean: строка на таблицу сверху — ход виден, пока идёт вакуум (до 15 мин на
-        # таблицу); итоговая таблица с мёртвыми строками до/после ложится сверху в конце
+        # Как у clean: строка на таблицу — ход виден, пока идёт вакуум (до 15 мин на таблицу);
+        # в конце строки с мёртвыми до/после и итог над ними
+        feed = Feed(context, '🧹 vacuum')
         for i, tbl in enumerate(tables, 1):
             _ts = time.time()
             icon, why = '✅', ''
@@ -1134,8 +1168,7 @@ def tools_db_cleanup():
                 icon, why = '❌', str(e)[:60]
             row = {'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': f'{icon} {why}'.strip()}
             (results if icon == '✅' else skipped).append(row)
-            add_note(f"{icon} {tbl} ({i}/{n}): {row['duration']} с" + (f" — {why}" if why else ''),
-                     context=context, level='Task')
+            feed.line(f"{icon} {tbl} ({i}/{n}): {row['duration']} с" + (f" — {why}" if why else ''))
 
         if not results and not skipped:
             add_note('нет таблиц для вакуума', context=context, level='DAG,Task', title='🧹 vacuum')
@@ -1154,18 +1187,13 @@ def tools_db_cleanup():
             r['last_vacuum'] = _fmt_ts(last_vac)
             logger.info(f"🔎 {r['table']}: мёртвых {r['dead']} | last_vacuum={last_vac}")
 
-        # Узко: заметка в AF 2 — 1000 символов (колонка метабазы), широкая таблица вытесняла
-        # строки по таблицам. Причины пропусков — строками под таблицей
-        lines = ['|Таблица|с|Мёртвых||', '|-|-|-|-|'] + [
-            f"|{r['table']}|{r['duration']}|{r['dead']}|{r['status'][:2].strip()}|" for r in results + skipped
-        ]
         total = round(sum(r['duration'] for r in results + skipped), 2)
-        lines.append(f"|**Итого**|**{total}**||**{len(results)}/{len(tables)}**|")
-        lines += [f"\n{r['status'][:2].strip()} {r['table']}: {r['status'][2:].strip()}" for r in skipped]
-        add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
-        add_note(f'{len(results)}/{len(tables)} таблиц за {total} с'
-                 + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
-                 context=context, level='DAG', title='🧹 vacuum')
+        summary = (f'{len(results)}/{len(tables)} таблиц за {total} с'
+                   + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''))
+        feed.done(summary, keep=[f"{r['status'][:2].strip()} {r['table']}: {r['duration']} с, мёртвых {r['dead']}"
+                                 + (f" — {r['status'][2:].strip()}" if r['status'][2:].strip() else '')
+                                 for r in skipped + results])
+        add_note(summary, context=context, level='DAG', title='🧹 vacuum')
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
@@ -1219,17 +1247,9 @@ def tools_db_cleanup():
                 'dead_rows':  readable_size(dead or 0, base=1000),
             })
 
-        lines = [
-            '|Таблица|Current|Δ|Записей|Удалённых|',
-            '|-|-|-|-|-|',
-        ] + [
-            f"|{r['table']}|{r['after']}|{r['delta']}|{r['live_rows']}|{r['dead_rows']}|"
-            for r in data
-        ]
-
-        report_md = '\n'.join(lines)
-        logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
-        add_note(report_md, context=context, level='Task', title='📊 Схема main')
+        lines = [f"{r['table']}: {r['after']}" + (f" ({r['delta']})" if r['delta'] else '')
+                 + f", записей {r['live_rows']}, мёртвых {r['dead_rows']}" for r in data]
+        logger.info("📊 Отчёт по схеме main:\n" + '\n'.join(lines))
 
         total_after = sum(r[1] or 0 for r in rows)
         total_live  = sum(r[2] or 0 for r in rows)
@@ -1242,16 +1262,10 @@ def tools_db_cleanup():
         else:
             delta_str  = '—'
             before_str = '—'
-        summary = (
-            f"| Таблиц | Last | Current | Δ | Записей | Удалённых |\n"
-            f"|--------|-----|-------|---|---------|----------|\n"
-            f"| {readable_size(len(rows), base=1000)}"
-            f" | {before_str}"
-            f" | {readable_size(total_after)}"
-            f" | {delta_str}"
-            f" | {readable_size(total_live, base=1000)}"
-            f" | {readable_size(total_dead, base=1000)} |"
-        )
+        summary = (f"{len(rows)} таблиц: {before_str} → {readable_size(total_after)} ({delta_str}), "
+                   f"записей {readable_size(total_live, base=1000)}, мёртвых {readable_size(total_dead, base=1000)}")
+        # Таблицы — от крупных: в 1000 символов заметки влезают главные
+        Feed(context, '📊 Схема main').done(summary, keep=lines)
         if not ADMIN:
             summary += ('\n\n☮️ Админской учётки метабазы в Vault нет: вакуум, переиндексация и '
                         'удаление остатков не создаются — статистику ведёт автовакуум')
@@ -1262,25 +1276,23 @@ def tools_db_cleanup():
     @task(task_id='integrity', trigger_rule=TriggerRule.ALL_DONE)
     def integrity(**context):
         """🩺 Целостность метабазы: индексы, wraparound, последовательности, вакуум, транзакции."""
-        def line(name, c, suffix=''):
-            add_note(f"{CHECK_ICON[c['status']]} **{name}**{suffix} ({c['sec']} с) — {c['summary']}",
-                     context=context, level='Task')
-
-        # Как у clean и vacuum: строка на проверку сверху, по мере выполнения. Идём с конца,
-        # чтобы главная — indexes — оказалась наверху
+        # Как у clean и vacuum: строка на проверку по мере выполнения, в конце итог над ними —
+        # сначала находки, потом здоровые
+        feed = Feed(context, '🩺 integrity')
         checks = {}
-        for fn in reversed(INTEGRITY_CHECKS):
+        for fn in INTEGRITY_CHECKS:
             name = fn.__name__.removeprefix('check_')
-            checks[name] = _run_check(fn)
-            line(name, checks[name])
-        lines = []
+            c = checks[name] = _run_check(fn)
+            feed.line(f"{CHECK_ICON[c['status']]} {name} ({c['sec']} с) — {c['summary']}")
+        hint = ''
         if checks['indexes'].get('leftovers'):
-            lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` — отдельный таск в начале '
+            hint = ('Удалить остатки: ручной запуск с галкой `drop_leftovers` — отдельный таск в начале '
                          'рана, исходные индексы проверяются перед удалением' if ADMIN else
                          'Удалить остатки — вручную одной командой `DROP INDEX` с `lock_timeout`: админской учётки '
                          'метабазы в Vault нет, галки `drop_leftovers` в форме нет')
-        if lines:
-            add_note('\n'.join(lines), context=context, level='Task')
+        bad = [n for n, c in checks.items() if c['status'] != 'healthy']
+        feed.done(f"{len(checks) - len(bad)}/{len(checks)} в порядке" + (f", находки: {', '.join(bad)}" if bad else ''),
+                  keep=sorted(feed.lines, key=lambda ln: ln.startswith('✅')), rest=hint)
         push_health({n: {k: v for k, v in c.items() if k in ('status', 'summary', 'sec')}
                      for n, c in checks.items()}, context)
         return {n: c['status'] for n, c in checks.items()}
@@ -1314,34 +1326,37 @@ def tools_db_cleanup():
         p = context['params']
         if not p.get('reindex'):
             raise AirflowSkipException('галка reindex не стоит')
-        total = {'n': 0}
+        feed = Feed(context, '🔁 reindex')
 
         def step(r, error):
-            # Как у clean и vacuum: строка на индекс сверху, итоговая таблица — в конце
-            total['n'] += 1
-            add_note(f"{'❌' if error else '✅'} {r['idx']} ({r['tbl']}, {total['n']}): "
-                     + (error[:100] if error else f"{readable_size(r['bytes'])} → "
-                        f"{readable_size(r['after']) if r['after'] is not None else '—'}, {r['sec']} с"),
-                     context=context, level='Task')
+            # Как у clean и vacuum: строка на индекс по ходу, в конце итог над главными строками
+            feed.line(f"{'❌' if error else '✅'} {r['idx']} ({r['tbl']}): "
+                      + (error[:100] if error else f"{readable_size(r['bytes'])} → "
+                         f"{readable_size(r['after']) if r['after'] is not None else '—'}, {r['sec']} с"))
 
         res = reindex_one_by_one(on_step=step)
         if isinstance(res, str):
             add_note(res, context=context, level='DAG,Task', title='🔁 reindex ☮️')
             raise AirflowSkipException(res)
         done, failed, left = res
-        lines = ['| Индекс | Таблица | Было | Стало | с |', '|---|---|---|---|---|'] + [
-            f"| `{r['idx']}` | {r['tbl']} | {readable_size(r['bytes'])} | "
-            f"{readable_size(r['after']) if r['after'] is not None else '—'} | {r['sec']} |" for r in done]
-        lines += [f"\n❌ `{r['idx']}` ({r['tbl']}): {r['error']}"
-                  + (f"; копия удалена: {', '.join(r['dropped'])}" if r['dropped'] else '')
-                  + (f"; **копия осталась: {', '.join(r['kept'])}**" if r['kept'] else '') for r in failed]
+        # В итоге — отказы и индексы, похудевшие от REINDEX_NOTE_MIN, крупные первыми;
+        # мелочь (8 КБ → 8 КБ) одной строкой «ещё N»
+        lines = [f"❌ {r['idx']} ({r['tbl']}): {r['error'][:100]}"
+                 + (f"; копия удалена: {', '.join(r['dropped'])}" if r['dropped'] else '')
+                 + (f"; копия осталась: {', '.join(r['kept'])}" if r['kept'] else '') for r in failed]
+        gained = sorted((r for r in done if r['bytes'] - (r['after'] or r['bytes']) >= REINDEX_NOTE_MIN),
+                        key=lambda r: r['bytes'] - (r['after'] or r['bytes']), reverse=True)
+        lines += [f"✅ {r['idx']} ({r['tbl']}): {readable_size(r['bytes'])} → {readable_size(r['after'])}, "
+                  f"{r['sec']} с" for r in gained]
+        rest = (f"остальные {len(done) - len(gained)} — меньше {readable_size(REINDEX_NOTE_MIN)} разницы"
+                if len(done) > len(gained) else '')
         if left:
-            lines.append(f"\n⏱️ не начаты (бюджет {REINDEX_BUDGET_SEC // 3600} ч или отказ на таблице): {len(left)}, крупнейшие — "
-                         + ', '.join(f"{r['idx']} ({readable_size(r['bytes'])})" for r in left[-5:]))
-        add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
+            rest += (f"\n⏱️ не начаты (бюджет {REINDEX_BUDGET_SEC // 3600} ч или отказ на таблице): {len(left)}, "
+                     "крупнейшие — " + ', '.join(f"{r['idx']} ({readable_size(r['bytes'])})" for r in left[-3:]))
         saved = sum(r['bytes'] - (r['after'] or r['bytes']) for r in done)
         summary = (f"перестроено {len(done)}, освобождено {readable_size(max(saved, 0))}"
                    + (f", отказов {len(failed)}" if failed else '') + (f", не начаты {len(left)}" if left else ''))
+        feed.done(summary, keep=lines, rest=rest.strip())
         add_note(summary, context=context, level='DAG', title='🔁 reindex')
         if failed:
             raise AirflowFailException(f"отказов {len(failed)}: " + ', '.join(r['idx'] for r in failed))
