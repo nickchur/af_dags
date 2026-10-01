@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 15:10 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 16:10 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -71,6 +71,7 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 | `sequences` | доля израсходованного у последовательностей `main` (`job`, `log`, `celery_taskmeta` — int4) | > 70 % | > 90 % |
 | `vacuum` | мёртвые строки `dag_run`, `task_instance`, `job`, `log`, `xcom`, `celery_taskmeta` | > 20 % и > 100 тыс. | — |
 | `long_tx` | транзакции дольше часа (держат вакуум; чужие без `pg_read_all_stats` не видны) | есть | — |
+| `xmin_horizon` | возраст xmin у слотов репликации и сессий: с `hot_standby_feedback` горизонт держит и запрос на реплике | > 100 тыс. транзакций | > 1 млн |
 | `constraints` | ограничения `NOT VALID`, так и не проверенные | есть | — |
 
 Остатки удаляет только разовая галка `drop_leftovers` — отдельным таском сразу после `params`,
@@ -388,6 +389,10 @@ SEQ_WARN, SEQ_ERROR = 0.7, 0.9
 VACUUM_TABLES = ('dag_run', 'task_instance', 'job', 'log', 'xcom', 'celery_taskmeta')
 DEAD_SHARE, DEAD_MIN = 0.2, 100_000
 LONG_TX = '1 hour'
+# Возраст горизонта вакуума в транзакциях. Сигма dev 01.10.2026: физический слот реплики держал
+# xmin на 2,1 млн, вакуум не убирал старые версии строк task_instance, и проверка пула шла
+# 1,5 с вместо 1 мс — шаг шедулера 25–35 с вместо 3 с
+XMIN_WARN, XMIN_ERROR = 100_000, 1_000_000
 CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
 
 
@@ -521,6 +526,26 @@ def check_long_tx():
                        if rows else 'транзакций дольше часа нет'}
 
 
+def check_xmin_horizon():
+    """Кто держит горизонт вакуума: слоты репликации (с hot_standby_feedback — и запросы на
+    реплике) и сессии самой базы."""
+    rows = _catalog("""
+        SELECT 'слот ' || slot_name AS who, greatest(age(xmin), age(catalog_xmin)) AS age
+        FROM pg_replication_slots WHERE xmin IS NOT NULL OR catalog_xmin IS NOT NULL
+        UNION ALL
+        SELECT 'pid ' || pid || coalesce(' ' || nullif(application_name, ''), ''), age(backend_xmin)
+        FROM pg_stat_activity WHERE backend_xmin IS NOT NULL AND pid <> pg_backend_pid()
+        ORDER BY 2 DESC LIMIT 3
+    """)
+    worst = rows[0]['age'] if rows else 0
+    status = 'error' if worst > XMIN_ERROR else 'warn' if worst > XMIN_WARN else 'healthy'
+    return {'status': status,
+            'summary': ('старше всех: ' + ', '.join(f"{r['who']} {r['age']:,}".replace(',', ' ') for r in rows)
+                        + (' транзакций — вакуум не убирает версии строк новее, индексы метабазы тяжелеют'
+                           if status != 'healthy' else ' транзакций'))
+                       if rows else 'горизонт никто не держит'}
+
+
 def check_constraints():
     """Ограничения, заведённые NOT VALID и не проверенные: данные могут их нарушать."""
     rows = _catalog("""
@@ -533,7 +558,8 @@ def check_constraints():
                        if rows else 'все ограничения проверены'}
 
 
-INTEGRITY_CHECKS = (check_indexes, check_wraparound, check_sequences, check_vacuum, check_long_tx, check_constraints)
+INTEGRITY_CHECKS = (check_indexes, check_wraparound, check_sequences, check_vacuum, check_long_tx, check_xmin_horizon,
+                    check_constraints)
 
 
 def owner_problem(cur, tables=None):
