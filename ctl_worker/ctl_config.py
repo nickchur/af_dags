@@ -1,21 +1,7 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-10-01 18:02 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
-
-| Параметр | Описание |
-|---|---|
-| `profile` / `root_category` / `root_entity` / `ue_category` | Профиль и иерархия CTL |
-| `gp_conn_id` / `gp_schema` | Подключение Greenplum |
-| `gp_server_limit` / `gp_timeout` / `task_timeout` / `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` / `sensor_timeout` / `sensor_retries` | Лестница таймаутов — `ctl_worker/readme.md`, раздел «Таймауты» |
-| `ue_stale` / `ue_run_max` / `ue_grace` | Пороги монитора для потоков `ue_category` — `ctl_worker/readme.md`, раздел «Потоки UE» |
-| `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
-| `conns.<id>.pool_slots` / `ctl_rps` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
-| `tz` / `expire` | Часовой пояс и таймаут ожидания |
-| `orchestrator` / `pause_new_dags` | Кто владеет расписаниями (`ctl`/`mixed`/`af`) и пауза при создании дага |
-| `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
-| `test_real` | Префиксы имён потоков, которые и в тестовом режиме выполняются по-настоящему (по умолчанию отчёты `pc1080.mail_`, `pc1080.check_`) |
-| `CTL_PIN` | PIN подтверждения (скрыто) |
 
 Подробно: [ctl_worker/readme.md — ctl_config](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_configpy--управление-конфигурацией)
 """
@@ -158,6 +144,45 @@ if not conf:
     config['conns']['ctl']['url'] = f"{ctl.get('schema', 'https')}://{ctl.get('host')}:{ctl.get('port','9080')}"
     Variable.set('ctl_config', config, serialize_json=True, description=str(pendulum.now(config['tz']))[:19])
 
+# Подписи полей формы: что за ключ и где о нём подробно (ctl_worker/readme.md).
+# Ключ без подписи — пережиток Variable от прошлых версий, код его не читает.
+CONFIG_DESCR = {
+    'profile': 'Имя профиля CTL',
+    'root_entity': 'Корневая сущность нашего поддерева CTL',
+    'root_category': 'Корневая категория наших воркфлоу',
+    'ue_category': 'Наши потоки, которые исполняет не Airflow (монитор действует, пороги ue_*)',
+    'archive_category': 'Категория архивных воркфлоу: их даги не создаются',
+    'event_expire': 'Срок ожидания события по умолчанию (time=Ч:ММ), если у воркфлоу нет wf_expire',
+    'expire': 'Прежнее имя event_expire — читается, если event_expire не задан',
+    'gp_server_limit': 'Серверный лимит запроса в Greenplum (факт, не рычаг): 4 ч 30',
+    'gp_timeout': 'statement_timeout загрузки, если у воркфлоу нет wf_timeout; на 5 мин ниже серверного',
+    'task_timeout': 'execution_timeout задач воркера, кроме run_exe и run_tfs',
+    'zombie_after': 'Санитар: таск RUNNING с мёртвым хартбитом старше — закрыть (> gp_timeout + 10 мин)',
+    'run_stale': 'Монитор: загрузка RUNNING дольше — reRunned (не меньше zombie_after)',
+    'lock_stale': 'Монитор: LOCK / LOCK-WAIT дольше — reStarted',
+    'new_grace': 'Монитор: загрузка моложе — «новая», не трогаем',
+    'wait_grace': 'Монитор: просрочка TIME-WAIT больше — reStarted',
+    'ue_stale': 'Монитор UE: статус не меняется дольше — reStarted',
+    'ue_run_max': 'Монитор UE: RUNNING дольше (или wf_timeout) — reStarted',
+    'ue_grace': 'Монитор UE: просрочка расписания или события больше — reStarted / Started',
+    'sensor_timeout': 'Окно служебных сенсоров (events, monitor, tfs_sensor)',
+    'sensor_retries': 'Ретраи служебных сенсоров',
+    'ctl_rps': 'Запросов к CTL в секунду из одного процесса',
+    'ctl_limit': 'Сколько записей запрашивать из CTL за раз',
+    'ctl_days': 'Глубина выгрузки событий из CTL, дней',
+    'test_sleep': 'Фиктивное выполнение: верхняя граница ожидания вместо процедуры',
+    'test_real': 'Префиксы имён потоков, которые и в тестовом режиме выполняются по-настоящему',
+    'tz': 'Часовой пояс расписаний и заметок',
+    'conns': 'Подключения: ctl (url, timeout, pool_slots), gp, files. Пулы задаёт test_conn — после смены перезапустить его',
+    'loader_interval': 'Интервал CTL.<профиль>.loader',
+    'events_interval': 'Интервал CTL.<профиль>.events',
+    'monitor_interval': 'Интервал CTL.<профиль>.monitor',
+    'tfs_interval': 'Интервал CTL.<профиль>.tfs_sensor',
+    'simulator_interval': 'Интервал симулятора нагрузки',
+    'dagrun_timeout': 'dagrun_timeout этого дага и служебных',
+}
+
+
 with DAG(f'CTL.{config["profile"]}.config',
     tags=['CTL', 'CTL_agent', 'tools'],
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
@@ -173,23 +198,27 @@ with DAG(f'CTL.{config["profile"]}.config',
     on_success_callback=on_callback,
     dagrun_timeout=str2timedelta(config.get('dagrun_timeout','minutes=10')),
     params={
-        **config,
+        **{k: Param(v, description=CONFIG_DESCR.get(k)) for k, v in config.items()},
         # Списком, а не руками: значения разбираются кодом, опечатка молча выключает режим.
         # В сам config кладутся простые строки — он же уходит в Variable, а Param не
         # сериализуется.
         'orchestrator': Param(enum_default(config.get('orchestrator'), ORCHESTRATOR_MODES, 'mixed'),
                               type='string', enum=ORCHESTRATOR_MODES,
-                              title='Кто владеет расписаниями (переключение перестроит все даги)'),
+                              title='Кто владеет расписаниями (переключение перестроит все даги)',
+                              description='ctl / mixed / af — этапы переноса оркестрации (openspec/project.md)'),
         'pause_new_dags': Param(enum_default(config.get('pause_new_dags'), PAUSE_NEW_MODES, 'auto'),
                                 type='string', enum=PAUSE_NEW_MODES,
-                                title='Новый даг создаётся запаузенным'),
+                                title='Новый даг создаётся запаузенным',
+                              description='auto — по режиму orchestrator, yes/no перебивают режим'),
         'simulator': Param(enum_default(config.get('simulator'), SIMULATOR_MODES), type='string',
                            enum=SIMULATOR_MODES,
-                           title='Симулятор нагрузки (event — только DEV)'),
+                           title='Симулятор нагрузки (event — только DEV)',
+                              description='Генератор нагрузки ctl_test.py: off / event / dataset / trigger'),
         'test_mode': Param(enum_default(config.get('test_mode'), TEST_MODES), type='string',
                            enum=TEST_MODES,
-                           title='Фиктивное выполнение (только DEV и IFT)'),
-        "CTL_PIN": '',
+                           title='Фиктивное выполнение (только DEV и IFT)',
+                              description='ctl_worker.py: off / ok / ok-no / ok-no-error'),
+        "CTL_PIN": Param('', description='PIN подтверждения; сравнивается с AIRFLOW__CTL_PIN из vault'),
     },
     doc_md=__doc__,
     description='Конфигурация CTL: параметры в Variable ctl_config, ручной запуск по PIN',

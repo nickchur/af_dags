@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-10-01 18:02 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -12,6 +12,7 @@
 """
 
 from airflow import DAG
+from airflow.models import Param
 from airflow.operators.python import task
 
 from plugins.utils import add_note, default_args # type: ignore
@@ -47,9 +48,9 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
     catchup=False, 
     default_args=default_args,
     params={
-        'wfs': wfs,
-        'profiles': profiles,
-        'safe': True,
+        'wfs': Param(wfs, description='Префиксы имён воркфлоу для экспорта'),
+        'profiles': Param(profiles, description='Профили CTL, заменяемые переменными шаблона (справочно: код берёт их из модуля)'),
+        'safe': Param(True, type='boolean', description='Без расписаний и событий чужих сущностей (не 9410…)'),
     },
     doc_md=__doc__
 ) as dag:

@@ -1,15 +1,14 @@
 """### 📁 CTL TFS → S3
-*2026-10-01 18:02 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два DAG'а копируют файлы из TFS в `edpetl-files`:
 
 - **`CTL.<profile>.tfs_sensor`** — каждые `tfs_interval` минут (5) опрашивает `tfs-in`-источники
-  из конфига, копирует найденное и публикует `DatasetAlias("TFS/<profile>")`. Вручную — с
-  `path` (`conn_id://bucket/prefix/mask`), `tfs_id`, `compress`, `done`, `unzip`.
+  из конфига, копирует найденное и публикует `DatasetAlias("TFS/<profile>")`. Вручную — по
+  `path` из формы.
 - **`CTL.<profile>.tfs_kafka`** — по триггеру читает `TransferFileCephRq` из Kafka, копирует файлы
   из XML и отправляет квитанцию `TransferFileCephRs` (0 — успех, 104 — ошибка). `ScenarioId`
-  становится `tfs_id`. Параметры: те же плюс `kafka_rcv`/`topic_rcv`, `kafka_snd`/`topic_snd`
-  (пустой — без квитанции), `timeout` (мин, 60).
+  становится `tfs_id`.
 
 Подробно: [ctl_worker/readme.md — ctl_tfs](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_tfspy--перемещение-файлов-из-tfs)
 """
@@ -297,11 +296,12 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     dagrun_timeout=sensor_timeout + timedelta(hours=1),
     render_template_as_native_obj=True,
     params={ 
-        "path": Param('', type="string", examples=list(tfs_conns.keys())), 
-        "tfs_id": "manual",
-        "compress": False, 
-        "done": False,
-        "unzip": False, 
+        "path": Param('', type="string", examples=list(tfs_conns.keys()),
+                      description="Ручной запуск: conn_id://bucket/prefix/mask; пусто — все tfs-in-источники конфига"),
+        "tfs_id": Param("manual", type="string", description="Идентификатор источника для ручного запуска (в tfs_kafka — если ScenarioId пуст)"),
+        "compress": Param(False, type="boolean", description="Сжать при копировании"),
+        "done": Param(False, type="boolean", description="Удалить исходник после копирования"),
+        "unzip": Param(False, type="boolean", description="Распаковать ZIP-архив"),
     },
     on_failure_callback=on_callback,
     on_success_callback=None,
@@ -415,11 +415,12 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     catchup=False,
     render_template_as_native_obj=True,
     params={
-        "path":     Param('', type="string", examples=list(tfs_conns.keys())),
-        "tfs_id":   "manual",
-        "compress": False,
-        "done":     False,
-        "unzip":    False,
+        "path":     Param('', type="string", examples=list(tfs_conns.keys()),
+                          description="Базовый путь в TFS: conn_id://bucket/prefix/"),
+        "tfs_id": Param("manual", type="string", description="Идентификатор источника для ручного запуска (в tfs_kafka — если ScenarioId пуст)"),
+        "compress": Param(False, type="boolean", description="Сжать при копировании"),
+        "done": Param(False, type="boolean", description="Удалить исходник после копирования"),
+        "unzip": Param(False, type="boolean", description="Распаковать ZIP-архив"),
         # направления по стороне TFS: читаем через tfs-kafka-out, пишем через tfs-kafka-in
         "kafka_rcv": Param(KAFKA_RCV_CONN, type="string", description="kafka_config_id для чтения",
                            examples=KAFKA_CONN_IDS),
