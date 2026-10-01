@@ -5,7 +5,7 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-10-01 14:00 MSK · v2.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:08 MSK · v2.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -84,7 +84,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_queue_analyze` | `10 * * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
 | `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180); целостность метабазы (`integrity`, плагин здоровья с v2.0) | **удаляет**; `dry_run=False` по умолчанию; индексы — только при `reindex` / `drop_leftovers` и админской учётке |
-| `tools_log_cleanup` | `17 8 * * *` | Один срок бакета логов, уборка, статистика по папкам; заполнение к квоте или `budget_gb` (плагин здоровья с v2.5) — навык **`tools-log-cleanup`** | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
+| `tools_log_cleanup` | `17 8 * * *` | Один срок бакета логов, уборка, статистика по папкам; заполнение учётки S3 к квоте (плагин здоровья с v2.5) — навык **`tools-log-cleanup`** | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |

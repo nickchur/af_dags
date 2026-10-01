@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-10-01 14:00 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 14:08 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -28,7 +28,7 @@ remote_base_log_folder`.
 |---|---|
 | 📅 `days`        | Срок хранения всего бакета (дни, default: `120`; на деве — `30` через `save_params`) |
 | ♻️ `lifecycle`   | `True` — выставлять правило жизненного цикла *(default)* |
-| 📦 `budget_gb`   | Бюджет бакета логов (ГБ) — его доля в общем лимите S3; `0` — не задан *(default)* |
+| 📦 `quota_gb`    | Квота учётки S3 (ГБ) на все её бакеты, если хранилище её не отдаёт; `0` — не задана *(default)* |
 | 🧪 `dry_run`     | `True` — ничего не удалять и правил не менять, только посчитать |
 | ⏱ `max_minutes` | Потолок обхода бакета (минуты, default: `30`) |
 | ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 8 * * *`)* |
@@ -53,16 +53,18 @@ remote_base_log_folder`.
 
 | Проверка | ⚠️ warn | ❌ error |
 |---|---|---|
-| `fill` — занято к квоте бакета или к `budget_gb` | ≥ 80 % | ≥ 95 % |
+| `fill` — занято всеми бакетами учётки к её квоте | ≥ 80 % | ≥ 95 % |
 | `ttl` — доля объектов старше срока среди осмотренных | > 10 % | > 50 % |
 | `sweep` — обход не закончен за `max_minutes` | всегда | — |
 
-Квота на сам бакет берётся из заголовков `HEAD bucket` (Ceph RGW: `x-rgw-quota-bucket-size`),
-иначе сравнение идёт с `budget_gb`; нет ни того, ни другого — `fill` не проверяется. Лимит S3
-обычно выдаётся на всю учётку, а в ней есть и другие бакеты; их объём без полного обхода не
-узнать. Поэтому `budget_gb` — не лимит хранилища, а доля этого лимита, отведённая логам.
-В стандартном S3 запроса квоты нет, MinIO отдаёт её только admin API. `ttl` после уменьшения `days` разово краснеет: старое
-обход удаляет в том же прогоне, но считает. Падение `layout` или `sweep` — `health_errors`
+Лимит S3 выдаётся на учётку, и учётка видит только свои бакеты (`s3` и `s3-archive` — разные
+учётки), поэтому `fill` считает сумму по всем бакетам учётки. Квота и объёмы — из заголовков
+`HEAD bucket` (Ceph RGW: `x-rgw-quota-user-size`, `x-rgw-bytes-used`); без квоты — параметр
+`quota_gb`, нет и его — `fill` не проверяется. Без объёма в заголовках бакет логов меряется
+обходом, прочие бакеты листаются ради суммы не дольше `max_minutes`, строка на бакет (📦) — в
+заметке `sweep`. В стандартном S3 запроса квоты нет, MinIO отдаёт её только admin API.
+
+`ttl` после уменьшения `days` разово краснеет: старое обход удаляет в том же прогоне, но считает. Падение `layout` или `sweep` — `health_errors`
 «таск не выполнился».
 """
 
@@ -137,32 +139,62 @@ def _roots(s3_hook, prefix: str = '') -> list:
     return [item['Prefix'] for page in pages for item in page.get('CommonPrefixes') or []]
 
 
-def _bucket_quota(s3_hook) -> tuple:
-    """Квота и занятый объём бакета из заголовков ``HEAD bucket``: ``(квота, занято)`` в байтах или None.
+def _account_usage(s3_hook, log_bytes: int, log_full: bool, minutes: int, on_bucket=None) -> dict:
+    """Квота учётки S3 и занятое всеми её бакетами: ``{'quota', 'buckets': {бакет: байт}, 'full'}``.
 
-    В стандартном S3 запроса квоты нет. Ceph RGW отдаёт квоту бакета заголовком
-    ``x-rgw-quota-bucket-size`` (вместе с ``x-rgw-bytes-used``), MinIO — только через свой admin
-    API, поэтому на стенде здесь (None, None), и бюджет задаёт параметр ``budget_gb``. Квота
-    учётки (``x-rgw-quota-user-size``) не берётся: она общая на все бакеты учётки, а объём
-    чужих бакетов без их полного обхода не узнать. Заголовки пишутся в лог: по ним видно, что
-    отдаёт корпоративный шлюз.
+    Лимит выдаётся на учётку, а учётка видит только свои бакеты (``s3`` и ``s3-archive`` — разные
+    учётки на одном сервере, бакеты у них не пересекаются), поэтому занятое — сумма по
+    ``list_buckets``. Квота и объём бакета — из заголовков ``HEAD bucket`` Ceph RGW
+    (``x-rgw-quota-user-size``, ``x-rgw-bytes-used``); в стандартном S3 их нет, MinIO отдаёт квоту
+    только admin API — тогда квоту задаёт параметр ``quota_gb``. Без заголовка объём бакета логов
+    берётся из обхода (``log_bytes``), прочие бакеты листаются только ради суммы, не дольше
+    ``minutes``; не уложились или ``minutes=0`` (квота неизвестна, считать незачем) —
+    ``full=False``, занятое — нижняя оценка. Заголовки пишутся в лог:
+    по ним видно, что отдаёт корпоративный шлюз.
     """
     # ponytail: имена заголовков RGW по документации, на корпоративном шлюзе не проверены
-    try:
-        headers = s3_hook.get_conn().head_bucket(Bucket=BUCKET_NAME)['ResponseMetadata']['HTTPHeaders']
-    except Exception as e:
-        logger.warning(f"⚠️ HEAD bucket не прочитан: {e}")
-        return None, None
-    logger.info(f"HEAD {BUCKET_NAME}: {headers}")
+    client = s3_hook.get_conn()
+    deadline = time.monotonic() + minutes * 60
+    quota, buckets, full = None, {}, True
 
-    def num(name):
+    def num(headers, name):
         try:
             value = int(headers.get(name, -1))
         except ValueError:
             return None
-        return value if value > 0 else None
+        return value if value >= 0 else None
 
-    return num('x-rgw-quota-bucket-size'), num('x-rgw-bytes-used')
+    try:
+        names = [item['Name'] for item in client.list_buckets()['Buckets']]
+    except Exception as e:
+        logger.warning(f"⚠️ список бакетов учётки не получен: {e}")
+        names, full = [BUCKET_NAME], False
+    for name in names:
+        started = time.monotonic()
+        try:
+            headers = client.head_bucket(Bucket=name)['ResponseMetadata']['HTTPHeaders']
+        except Exception as e:
+            logger.warning(f"⚠️ HEAD {name} не прочитан: {e}")
+            headers = {}
+        logger.info(f"HEAD {name}: {headers}")
+        quota = quota or num(headers, 'x-rgw-quota-user-size') or None
+        size = num(headers, 'x-rgw-bytes-used')
+        if size is None and name == BUCKET_NAME:
+            size, full = log_bytes, full and log_full
+        elif size is None and not minutes:
+            full = False
+            continue
+        elif size is None:
+            size = 0
+            for page in client.get_paginator('list_objects_v2').paginate(Bucket=name):
+                size += sum(obj.get('Size', 0) for obj in page.get('Contents') or [])
+                if time.monotonic() > deadline:
+                    full = False
+                    break
+        buckets[name] = size
+        if on_bucket:
+            on_bucket(name, size, time.monotonic() - started)
+    return {'quota': quota, 'buckets': buckets, 'full': full}
 
 
 def _walk_order(roots: list) -> list:
@@ -175,12 +207,11 @@ def _walk_order(roots: list) -> list:
     return sorted(roots, key=lambda name: (bool(PREFIX) and PREFIX.startswith(name), name))
 
 
-def bucket_checks(swept: dict, budget_gb: int = 0) -> dict:
+def bucket_checks(swept: dict, quota_gb: int = 0) -> dict:
     """Вердикты здоровья бакета по итогам обхода: ``fill``, ``ttl``, ``sweep``.
 
-    ``fill`` — занятое к квоте бакета из заголовков хранилища, иначе к ``budget_gb``; нет обоих —
-    проверки нет. Занятое — из тех же заголовков, иначе сумма обхода (при неполном обходе —
-    нижняя оценка). ``ttl`` — доля объектов старше срока среди осмотренных.
+    ``fill`` — занятое всеми бакетами учётки к её квоте из заголовков хранилища, иначе к
+    ``quota_gb``; нет обеих — проверки нет. ``ttl`` — доля объектов старше срока среди осмотренных.
     """
     folders = swept['folders']
     objects = sum(row['objects'] for row in folders.values())
@@ -188,15 +219,19 @@ def bucket_checks(swept: dict, budget_gb: int = 0) -> dict:
     over = sum(row['over_ttl'] for row in folders.values())
     checks = {}
 
-    quota = swept.get('quota') or budget_gb * 1024 ** 3
+    account = swept.get('account') or {}
+    quota = account.get('quota') or quota_gb * 1024 ** 3
     if quota:
-        used = swept.get('used') or walked
+        buckets = account.get('buckets') or {swept.get('bucket', BUCKET_NAME): walked}
+        used = sum(buckets.values())
         share = used / quota
         status = 'error' if share >= FILL_ERROR else 'warn' if share >= FILL_WARN else 'healthy'
-        source = 'квоты бакета' if swept.get('quota') else 'бюджета budget_gb'
+        top = ', '.join(f"`{name}` {readable_size(size)}"
+                        for name, size in sorted(buckets.items(), key=lambda item: -item[1])[:3])
         checks['fill'] = {'status': status, 'summary': (
-            f"занято {readable_size(used)} из {readable_size(quota)} {source} ({share:.0%})"
-            + (", обход неполный — занято не меньше" if swept.get('partial') and not swept.get('used') else ''))}
+            f"учётка S3: занято {readable_size(used)} из {readable_size(quota)} ({share:.0%}"
+            + (', квота из quota_gb' if not account.get('quota') else '') + f"); крупнейшие: {top}"
+            + ('' if account.get('full', not swept.get('partial')) else '; подсчёт неполный — занято не меньше'))}
 
     share = over / objects if objects else 0
     status = 'error' if share > TTL_ERROR else 'warn' if share > TTL_WARN else 'healthy'
@@ -241,12 +276,12 @@ params = {
         minimum=1,
         description='Потолок обхода бакета (минуты): не уложились — отчёт скажет, что обход неполный',
     ),
-    'budget_gb': _param(
-        'budget_gb', 0,
+    'quota_gb': _param(
+        'quota_gb', 0,
         type='integer',
         minimum=0,
-        description='Бюджет бакета логов (ГБ) — его доля в общем лимите S3, если квоты на сам бакет нет; '
-                    '0 — не задан, заполнение не проверяется',
+        description='Квота учётки S3 (ГБ) на все её бакеты, если хранилище её не отдаёт; '
+                    '0 — не задана, заполнение не проверяется',
     ),
     'dry_run': _param(
         'dry_run', False,
@@ -427,7 +462,10 @@ def tools_log_cleanup():
             row['newest'] = row['newest'].isoformat(timespec='seconds') if row['newest'] else None
         deleted = sum(row['deleted'] for row in stats.values())
         over = sum(row['over_ttl'] for row in stats.values())
-        quota, used = _bucket_quota(s3_hook)
+        log_bytes = sum(row['bytes'] - row['deleted_bytes'] for row in stats.values())
+        account = _account_usage(
+            s3_hook, log_bytes, not partial, params['max_minutes'] if params.get('quota_gb') else 0,
+            on_bucket=lambda name, size, sec: add_note(f"📦 `{name}`: {readable_size(size)}, {sec:.0f} с", context))
         head = f"Сухой прогон: удалить нужно {over}" if params['dry_run'] else f"Удалено {deleted} объектов"
         add_note(f"{head}, папок осмотрено {len(stats)} из {len(walks)}", context, title='Обход')
         return {
@@ -436,8 +474,7 @@ def tools_log_cleanup():
             'dry_run': bool(params['dry_run']),
             'checked_at': now.isoformat(timespec='seconds'),
             'partial': partial,
-            'quota': quota,
-            'used': used,
+            'account': account,
             'folders': stats,
         }
 
@@ -477,7 +514,7 @@ def tools_log_cleanup():
             lines.insert(1, f"объектов старше срока при обходе: {over_ttl}")
         add_note("\n".join(lines), context, title='Бакет логов', level='task,DAG')
         # Как у db_cleanup: строка на проверку сверху; с конца, чтобы главная — fill — была наверху
-        checks = bucket_checks(swept, context['params'].get('budget_gb') or 0)
+        checks = bucket_checks(swept, context['params'].get('quota_gb') or 0)
         for name, check in reversed(checks.items()):
             add_note(f"{CHECK_ICON[check['status']]} **{name}** — {check['summary']}", context, level='Task')
         push_health(checks, context)
