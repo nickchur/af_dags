@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-30 19:11 MSK · v3.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 07:45 MSK · v3.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -958,6 +958,9 @@ def tools_queue_analyze():
         dump = json.loads(
             S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).read_key(snapshot["dump_key"], BUCKET_NAME)
         )
+        # С v3.9 дамп — объект с меткой контура, сообщения в "messages"; до того — список
+        if isinstance(dump, dict):
+            dump = dump["messages"]
         removed, missing = 0, 0
         with app.connection_for_write() as connection:
             client = connection.default_channel.client
