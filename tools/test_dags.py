@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 14:23 MSK · v3.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 14:32 MSK · v3.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -18,7 +18,7 @@
 | **`compare.snapshot_dags`** | Пишет новые версии в S3 — всех изменившихся, сколько бы их ни было — и возвращает для `expand` пары «прошлая версия → новая», не больше `COMPARE_LIMIT` (100), свежие первыми. Статистика — в XCom `snapshot_stats`, пары сверх лимита — в `not_compared` |
 | **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
 | **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
-| **`dag_size`** | Вне групп, с 28.09.2026 (до того — проверка часового `tools_system_health`): DAG'и по числу тасков — в определении и в последнем ране с раскрытыми mapped, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300. Больше 300 — ⚠️ в `health_warn`. Размер меняется только с выкладкой, поэтому раз в сутки |
+| **`dag_size`** | Вне групп, с 28.09.2026 (до того — проверка часового `tools_system_health`): DAG'и по числу тасков — в определении и в последнем ране с раскрытыми mapped, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300. Больше 300 — ⚠️ в `health_warn`. Заметка — таблица по классам и таблица DAG'ов больше 300 тасков. Размер меняется только с выкладкой, поэтому раз в сутки |
 | **`s3_quota`** | Вне групп: заполнение учётки S3, из которой синхронизируются даги (подключение `s3`), к её квоте — сумма по всем бакетам учётки, строка 📦 на бакет. ⚠️ от 80 %, ❌ от 95 %. Квота — из заголовков хранилища (Ceph RGW), иначе параметр `quota_gb`; нет обеих — ☮️ skip. Учётка бакета логов — у `tools_log_cleanup` |
 | **`report`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга; вердикт здоровья в XCom `health` |
 | **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения, DAG больше 300 тасков, учётка S3 дагов от 80 %; ❌ дрожащая сериализация, учётка S3 дагов от 95 % — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
@@ -449,6 +449,25 @@ def dag_size_verdict(rows: list[dict]) -> dict:
         names += f" и ещё {len(big) - SIZE_SHOW}"
     return {**result, "status": "warn",
             "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/в последнем ране): {names}"}
+
+
+def dag_size_note(result: dict) -> str:
+    """Заметка dag_size: вердикт строкой, классы и крупные DAG'и таблицами."""
+    icon = {"healthy": "✅", "warn": "⚠️"}.get(result["status"], "❌")
+    if "classes" not in result:
+        return f"{icon} {result['summary']}"
+    lines = [f"{icon} DAG'ов {result['dags']}, больше {TASKS_ALERT} тасков: {result['over_alert']}", "",
+             "| Тасков | DAG'ов |", "|---|---|"]
+    lines += [f"| {c} | {n} |" for c, n in result["classes"].items() if n]
+    if result["unknown"]:
+        lines.append(f"| без данных | {result['unknown']} |")
+    if result["top"]:
+        lines += ["", "| DAG | в DAG'е | в ране | |", "|---|---|---|---|"]
+        lines += [f"| `{d}` | {v['tasks'] if v['tasks'] is not None else '?'} | {v['max_ti']} | "
+                  f"{'⏸' if v['paused'] else ''} |" for d, v in result["top"].items()]
+        if result["over_alert"] > len(result["top"]):
+            lines.append(f"\nи ещё {result['over_alert'] - len(result['top'])}")
+    return "\n".join(lines)
 
 
 def check_dag_size() -> dict:
@@ -1506,7 +1525,7 @@ def tools_test_dags():
     def dag_size(**context) -> dict:
         """📏 DAG'и по числу тасков: больше TASKS_ALERT — warn. Находкой не падает."""
         result = check_dag_size()
-        add_note(result["summary"], context, level="task", title="📏 dag_size")
+        add_note(dag_size_note(result), context, level="task", title="📏 dag_size")
         push_health({"dag_size": result}, context)
         return result
 
