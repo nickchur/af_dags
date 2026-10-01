@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 16:10 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 16:15 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -49,7 +49,7 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 `health_warn` / `health_errors`; без админской учётки — `params` → `clean` → `report` и `integrity`.
 `integrity` идёт последним, чтобы не принять копию идущей перестройки за остаток.
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
-- **drop_leftovers** (v2.6) — остатки прерванного REINDEX, только по разовой галке; строка хода раз в 5 мин
+- **drop_leftovers** (v2.6) — остатки прерванного REINDEX, только по разовой галке; с v2.8 одной командой
 - **clean** — подсчёт и удаление по каждой таблице; заметка дописывается **сверху** строкой на таблицу
   (в долгой таблице — строка хода не чаще раза в 5 мин), итоговая таблица ложится сверху в конце (v2.2;
   до того заметка переписывалась целиком на каждой порции). Так же с v2.3 и остальные: `vacuum` —
@@ -76,8 +76,10 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 
 Остатки удаляет только разовая галка `drop_leftovers` — отдельным таском сразу после `params`,
 до `clean`, `vacuum` и `reindex` (с остатками каждая запись и VACUUM обновляют все лишние
-индексы); `dry_run` её не отменяет. `DROP INDEX CONCURRENTLY` по одному под коннектом владельца
-(`get_af_conn`), и только тот остаток, у которого исходный индекс (имя без суффиксов) есть и
+индексы); `dry_run` её не отменяет. С v2.8 — одной командой `DROP INDEX` на все остатки под
+коннектом владельца (`get_af_conn`): секунды вместо 2 мин на индекс у `CONCURRENTLY` (сигма dev
+01.10.2026). Блокировку ждёт 3 с и повторяет до 20 раз через 15 с, чтобы не держать очередь
+запросов к таблице. Удаляется только тот остаток, у которого исходный индекс (имя без суффиксов) есть и
 валиден. Остальное — строкой в заметке. `amcheck` не используется: читает индексы целиком.
 
 > `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
@@ -686,20 +688,24 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
     return done, failed, left
 
 
-def drop_leftovers(names, on_step=None):
-    """DROP INDEX CONCURRENTLY остатков REINDEX — только если исходный индекс есть и валиден.
+# Остатки удаляются одной командой без CONCURRENTLY: каталог и файлы, секунды на все. Ей нужна
+# эксклюзивная блокировка таблиц, и пока она ждёт, остальные запросы к ним стоят за ней — поэтому
+# ждём недолго и повторяем. CONCURRENTLY по одному на сигме dev (01.10.2026) шёл 2 мин на индекс:
+# каждый дважды ждёт конца всех транзакций по dag_run, 551 остаток — это 18 ч
+DROP_LOCK_TIMEOUT = '3s'
+DROP_TRIES, DROP_PAUSE_SEC = 20, 15
 
-    Под коннектом владельца (get_af_conn): у штатного пользователя Airflow прав нет. По одному
-    и автокоммитом: CONCURRENTLY в транзакции не работает. Индекс, который держит ограничение,
-    PG удалить не даст — это строка в итоге, а не падение.
 
-    Каждый DROP … CONCURRENTLY ждёт конца всех транзакций, трогающих таблицу; на занятой
-    ``dag_run`` это секунды на индекс, и 551 остаток сигмы dev (01.10.2026) удалялся почти час
-    без единой строки в заметке. Поэтому ход — в лог на каждый индекс и в ``on_step(i, n, done,
-    kept)``, вызывающий решает, как часто писать заметку.
+def drop_leftovers(names):
+    """DROP INDEX остатков REINDEX одной командой — только тех, у кого исходный индекс есть и валиден.
+
+    Под коннектом владельца (get_af_conn): у штатного пользователя Airflow прав нет. Не взяли
+    блокировку за ``DROP_LOCK_TIMEOUT`` — пауза и повтор, до ``DROP_TRIES`` раз. Команда упала по
+    другой причине (индекс держит ограничение) — по одному, чтобы назвать виновного; это строка
+    в итоге, а не падение.
     """
     import re
-    from psycopg2 import sql as psql
+    from psycopg2 import errors as pg_errors, sql as psql
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     valid = {r['idx'] for r in _catalog("""
@@ -707,31 +713,57 @@ def drop_leftovers(names, on_step=None):
         JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
         WHERE n.nspname = 'main' AND i.indisvalid AND i.indisready
     """)}
-    done, kept = [], []
+    todo, done, kept = [], [], []
+    for name in names:
+        base = re.sub(LEFTOVER_SUFFIX, '', name)
+        if base == name or base not in valid:
+            kept.append(f'{name}: исходного {base} нет или он невалиден')
+        else:
+            todo.append(name)
+    if not todo:
+        return done, kept
     conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
             problem = owner_problem(cur)
             if problem:
-                return [], [f'не выполнено: {problem}']
-            cur.execute("SET lock_timeout = '30s'")
+                return [], kept + [f'не выполнено: {problem}']
+            cur.execute(f"SET lock_timeout = '{DROP_LOCK_TIMEOUT}'")
             cur.execute("SET statement_timeout = '10min'")
-            for i, name in enumerate(names, 1):
-                if on_step:
-                    on_step(i, len(names), done, kept)
-                base = re.sub(LEFTOVER_SUFFIX, '', name)
-                if base == name or base not in valid:
-                    kept.append(f'{name}: исходного {base} нет или он невалиден')
-                    continue
-                started = time.monotonic()
-                try:
-                    cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS main.{}').format(psql.Identifier(name)))
-                    done.append(name)
-                    logger.info(f"🧹 {i}/{len(names)} {name}: удалён за {time.monotonic() - started:.1f} с")
-                except Exception as exc:
-                    kept.append(f'{name}: {str(exc).strip()[:120]}')
-                    logger.warning(f"🧹 {i}/{len(names)} {kept[-1]}")
+
+            def drop(batch):
+                """None — удалены; иначе причина. lock — не взяли блокировку ни разу."""
+                stmt = psql.SQL('DROP INDEX IF EXISTS {}').format(
+                    psql.SQL(', ').join(psql.Identifier('main', n) for n in batch))
+                for attempt in range(1, DROP_TRIES + 1):
+                    try:
+                        cur.execute(stmt)
+                        return None
+                    except pg_errors.LockNotAvailable:
+                        logger.info(f"🧹 {len(batch)} шт.: блокировка не взята за {DROP_LOCK_TIMEOUT}, "
+                                    f"попытка {attempt}/{DROP_TRIES}")
+                        if attempt < DROP_TRIES:
+                            time.sleep(DROP_PAUSE_SEC)
+                    except Exception as exc:
+                        return str(exc).strip()[:120]
+                return f'lock: блокировку не взяли за {DROP_TRIES} попыток по {DROP_LOCK_TIMEOUT}'
+
+            started = time.monotonic()
+            error = drop(todo)
+            if error is None:
+                done = todo
+            elif error.startswith('lock:'):
+                kept += [f'{n}: {error[6:]}' for n in todo]
+            else:
+                logger.warning(f"🧹 одной командой не вышло ({error}) — по одному")
+                for name in todo:
+                    error = drop([name])
+                    if error is None:
+                        done.append(name)
+                    else:
+                        kept.append(f"{name}: {error.removeprefix('lock: ')}")
+            logger.info(f"🧹 остатков удалено {len(done)} за {time.monotonic() - started:.1f} с")
     finally:
         conn.close()
     logger.info(f"🧹 остатков удалено {len(done)}, оставлено {len(kept)}")
@@ -754,7 +786,6 @@ DEFAULT_SCHEDULE = '0 5 * * *'
 MSK = timezone(timedelta(hours=3))
 ONE_SHOT = ('drop_leftovers', 'reindex')
 # Строка хода удаления остатков в заметке integrity — не чаще (как NOTE_EVERY_SEC у clean)
-DROP_NOTE_EVERY_SEC = 300
 # Админская учётка метабазы в Vault (get_af_conn). Без неё VACUUM, REINDEX и удаление индексов
 # невозможны — ни задач, ни параметров для них не создаём: спрашивать о том, что даг сделать
 # не может, незачем. Права самой учётки проверяет таск перед работой (owner_problem)
@@ -1281,7 +1312,7 @@ def tools_db_cleanup():
         if checks['indexes'].get('leftovers'):
             lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` — отдельный таск в начале '
                          'рана, исходные индексы проверяются перед удалением' if ADMIN else
-                         'Удалить остатки — вручную `DROP INDEX CONCURRENTLY`: админской учётки '
+                         'Удалить остатки — вручную одной командой `DROP INDEX` с `lock_timeout`: админской учётки '
                          'метабазы в Vault нет, галки `drop_leftovers` в форме нет')
         if lines:
             add_note('\n'.join(lines), context=context, level='Task')
@@ -1304,17 +1335,8 @@ def tools_db_cleanup():
         if not leftovers:
             add_note('🩹 остатков прерванного REINDEX нет', context=context, level='Task')
             return {'done': 0, 'kept': 0}
-        # Как clean: строка хода сверху не чаще раза в DROP_NOTE_EVERY_SEC — остатков бывают сотни
-        started, last = time.time(), {'at': time.time()}
-
-        def step(i, n, done, kept):
-            if time.time() - last['at'] < DROP_NOTE_EVERY_SEC:
-                return
-            last['at'] = time.time()
-            add_note(f"⏳ остатки: {i - 1}/{n}, удалено {len(done)}, оставлено {len(kept)}, "
-                     f"{time.time() - started:.0f} с", context=context, level='Task')
-
-        done, kept = drop_leftovers(leftovers, on_step=step)
+        started = time.time()
+        done, kept = drop_leftovers(leftovers)
         add_note(f'🧹 остатков удалено {len(done)}, оставлено {len(kept)}, {time.time() - started:.0f} с'
                  + ''.join(f'\n- {k}' for k in kept[:20]), context=context, level='Task', title='🩹 drop_leftovers')
         return {'done': len(done), 'kept': len(kept)}
