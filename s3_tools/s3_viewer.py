@@ -1,16 +1,7 @@
 """### 🗂️ DAG: Просмотрщик S3
-*2026-09-02 09:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список ключей из S3-бакета и читает содержимое файлов.
-
-| Параметр | Описание |
-|---|---|
-| `aws_conn_id` | ID подключения к S3 (default: `s3`) |
-| `bucket` | Имя бакета |
-| `prefix` | Префикс объектов |
-| `page_size` | Размер страницы (1–500, default: `100`) |
-| `max_items` | Макс. количество объектов (1–500, default: `200`) |
-| `rows` | Количество строк для вывода (1–1000, default: `300`) |
 
 ⚠️ `max_items` и `rows` до операторов доезжают в обход конструктора: ядро до etl-core
 PR #15 применяет к ним потолок прямо в `__init__`, где вместо числа лежит нерендеренный
@@ -52,6 +43,7 @@ def _late_template(op, **fields):
 
 @dag(
     doc_md=__doc__,
+    description='Ключи бакета S3 и содержимое файлов',
     owner_links={
         'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab',
         'Korchagin Viacheslav': 'mailto:VYurKorchagin@sberbank.ru',
@@ -98,13 +90,11 @@ def tools_s3_viewer():
 
     @task
     def prepare_keys(list_from_s3, **context):
-        """Ключи для чтения — вместе с числом строк.
-
-        rows возвращается отсюда числом, а не шаблоном у оператора: у mapped-задачи
-        Airflow вызывает __init__ ВНУТРИ render_template_fields (unmap), то есть до
-        подстановки, и старое ядро ловит на `rows + 1` строку '{{ params.rows }}'.
-        Значение из expand_kwargs приезжает уже готовым — работает на любом ядре.
-        """
+        """Ключи для чтения — вместе с числом строк."""
+        # rows возвращается отсюда числом, а не шаблоном у оператора: у mapped-задачи
+        # Airflow вызывает __init__ ВНУТРИ render_template_fields (unmap), то есть до
+        # подстановки, и старое ядро ловит на `rows + 1` строку '{{ params.rows }}'.
+        # Значение из expand_kwargs приезжает уже готовым — работает на любом ядре.
         if not list_from_s3 or not isinstance(list_from_s3, list):
             add_note("Список объектов пуст", context)
             return []

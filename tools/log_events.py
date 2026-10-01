@@ -1,55 +1,14 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-04 15:53 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
-доехала до воркера или не доработала:
+Раз в сутки считает по журналу `log` метабазы сбои доставки задач — `stuck in queued`,
+`heartbeat timeout`, `state mismatch` — в числах задач, а не событий, и в доле от запусков
+за то же окно; с разбивкой по дням и топом «даг · задача». Отдельно — наши события
+(`ctl dag paused`). Только читает журнал. Плагин здоровья: выше `alert_after` — ❌, иначе ⚠️.
 
-| Событие | Что оно значит |
-|---|---|
-| `stuck in queued reschedule` | Задача пролежала в `queued` дольше `task_queued_timeout` (600 с) и возвращена в `scheduled`: её отдали celery, а воркер не начал |
-| `stuck in queued tries exceeded` | Перезапросов было больше `num_stuck_in_queued_retries` — планировщик сдался и пометил задачу упавшей |
-| `heartbeat timeout` | Процесс задачи перестал слать хартбит (`scheduler_zombie_task_threshold`, 300 с) — так выглядит внезапная смерть процесса, а не медленный запрос |
-| `state mismatch` | Исполнитель отрапортовал об окончании задачи, пока она числилась `queued` — классика для воркера, убитого сигналом |
+**Таски:** `params` → `collect` → `report` → `health_warn` / `health_errors`.
 
-Все четыре — про доставку и жизнь процесса, а не про логику дага. В интерфейсе они видны
-по одной задаче за раз (вкладка Event Log), поэтому вопрос «это у нас или у всех» без
-такого отчёта не имеет ответа.
-
-Отдельной строкой считаются **наши собственные события** — их пишет код тракта:
-
-| Событие | Кто пишет | Что значит |
-|---|---|---|
-| `ctl dag paused` | `ctl_sensor` | загрузка пропущена: даг воркфлоу на паузе, запускать нечего |
-
-В число сбоев доставки они не входят и порога не трогают: запаузенный даг — не поломка
-инфраструктуры, а решение человека. Но и молчать о них нельзя: из-за паузы загрузка стоит,
-и «сколько раз за сутки» — это и есть ответ на «часто ли».
-
-**Событие и задача — разные вещи.** О зависшей задаче планировщик пишет не однажды, а на
-каждом круге проверки: одна мёртвая задача даёт тысячи записей. Поэтому рядом с числом
-событий всегда стоит число различных попыток — даг, задача, прогон, индекс отображения,
-номер попытки, — и доля с порогом считаются по ним. Само число событий никуда не девается:
-по его отношению к числу задач залипание как раз и видно.
-
-**Знаменатель обязателен.** Десять сбоев на четыре тысячи запусков и десять на сорок —
-разные новости, поэтому рядом всегда стоит число запусков за то же окно (события
-`running`) и доля. Совпадение единиц при этом неполное: часть сбоев относится к попыткам,
-которые так и не стартовали, а значит в знаменатель не попали. Доля — оценка порядка, а не
-строгая часть целого.
-
-| Параметр | Описание |
-|---|---|
-| 🕐 `hours` | Окно отчёта, часов *(default: `24`, максимум `168` — см. замеры в коде)* |
-| 📈 `days` | Глубина разбивки по дням *(default: `7`, максимум `30`)* |
-| 🔝 `top` | Сколько строк «даг · задача» показать *(default: `10`)* |
-| 🚨 `alert_after` | Порог: **задач** больше — таск краснеет; `0` — только показывать *(default: `0`)* |
-| ⏰ `schedule` | Расписание (МСК): cron или пресет, пусто — только вручную *(default: `30 6 * * *`)* |
-| 💾 `save_params` | Сохранить параметры запуска как значения по умолчанию *(default: `False`)* |
-
-Отчёт только читает журнал: ничего не удаляет и не правит. Чистит `log` отдельный даг —
-`db_cleanup`, и от его `retention_days` зависит, насколько глубоко видно разбивку по дням.
-
-**Таски:** `params` → `collect` → `report`.
+Подробно: [tools/readme.md — log_events](../../_plugin_dag_docs/?doc=tools/readme.md#log_eventspylog_eventspy)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -60,11 +19,11 @@ from airflow.models import Param
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, valid_schedule)
-except ImportError:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, store_params, valid_schedule)
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task)
+except ImportError:
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task)
 
 logger = logging.getLogger("airflow.task")
 
@@ -103,6 +62,10 @@ PARAMS_VAR = 'tools_log_events_params'
 SAVED = saved_params(PARAMS_VAR)
 
 DEFAULT_SCHEDULE = '30 6 * * *'
+# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+REPORT_TTL_SEC = 26 * 3600
+# Навык агента, на который отчёт плагина отсылает толкование сбоев
+SKILL = 'tools-log-events'
 
 
 def names_drifted() -> str:
@@ -124,15 +87,6 @@ def names_drifted() -> str:
 def _param(key, default, **kwargs):
     """Param со значением по умолчанию из переменной, если оно там есть."""
     return Param(SAVED.get(key, default), **kwargs)
-
-
-def _schedule():
-    """Расписание DAG-а: из переменной, если оно осмысленное, иначе из кода."""
-    value = SAVED.get('schedule', DEFAULT_SCHEDULE)
-    if not valid_schedule(value):
-        logger.warning(f"⚠️ {PARAMS_VAR}: расписание '{value}' не разобрано — беру {DEFAULT_SCHEDULE}")
-        return DEFAULT_SCHEDULE
-    return None if value in (None, '', 'None') else str(value).strip()
 
 
 def _fetch(sql: str, args: dict) -> list:
@@ -248,6 +202,7 @@ SELECT event, count(*) AS cnt
 
 @dag(
     doc_md=__doc__,
+    description='Отчёт по журналу метабазы: задачи, не доехавшие до воркера или не доработавшие',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
@@ -268,13 +223,14 @@ SELECT event, count(*) AS cnt
         'on_failure_callback': on_callback,
     },
     # Часовой пояс DAG-а берётся из start_date.tzinfo, поэтому расписание московское —
-    # как у соседей по каталогу (show_connections, test_connections).
+    # как у соседей по каталогу (test_connections).
     start_date=datetime(2026, 9, 4, tzinfo=MSK),
-    schedule=_schedule(),
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'check'],
+    tags=['DataTools', 'tools', 'health'],
     catchup=False,
-    is_paused_upon_creation=True,
+    # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
+    is_paused_upon_creation=False,
     max_active_runs=1,
     # Потолок на прогон, а не только на таск: при max_active_runs=1 зависший прогон
     # закрывает дорогу всем следующим — так же, как у сторожа метабазы.
@@ -307,21 +263,12 @@ SELECT event, count(*) AS cnt
 )
 def tools_log_events():
 
+    # Негодное расписание переменную не переписывает, и таск падает: битое значение уронило
+    # бы разбор файла и убрало из UI саму форму, через которую его можно починить
     @task(task_id='params')
     def save_params(**context) -> str:
         """💾 Сохраняет параметры запуска как значения по умолчанию."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
-
-        status, msg = store_params(PARAMS_VAR, SAVED, context)
-        if status == 'skip':
-            raise AirflowSkipException(msg)
-        # Негодное расписание переменную не переписывает, и таск обязан упасть: битое
-        # значение уронило бы разбор файла и убрало из UI саму форму, через которую его
-        # можно починить (см. спеку check, сценарий «Негодное расписание в форме»).
-        if status == 'fail':
-            raise AirflowFailException(msg)
-        add_note(msg, context=context, level='task')
-        return msg
+        return store_params_task(PARAMS_VAR, SAVED, context)
 
     @task(task_id='collect', trigger_rule=TriggerRule.NONE_FAILED)
     def collect(**context) -> dict:
@@ -416,9 +363,7 @@ def tools_log_events():
 
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
-        """🧾 Сводка в заметку; при превышении порога — красный таск и уведомление."""
-        from airflow.exceptions import AirflowFailException
-
+        """🧾 Сводка в заметку и вердикт здоровья: выше порога — error, есть сбои — warn."""
         p = context['params']
         limit = int(p['alert_after'])
         total, tasks, runs = snapshot['total'], snapshot['tasks'], snapshot['runs']
@@ -448,6 +393,8 @@ def tools_log_events():
             msg = f"✅ чисто: {head}"
             add_note({msg: ours} if ours else msg,
                      context=context, level='task,dag', title='📊 log_events ')
+            push_health({'log_events': {'status': 'healthy', 'summary': head,
+                                        'ours': snapshot['ours_total']}}, context)
             return msg
 
         lines = [f"{k}: {v['cnt']} (задач {v['tasks']})"
@@ -467,14 +414,19 @@ def tools_log_events():
 
         add_note({f"⚠️ {head}": lines + ours}, context=context, level='task,dag', title='📊 log_events ')
 
-        # Порог — по задачам, а не по событиям (почему — в docstring модуля).
-        if limit and tasks > limit:
-            raise AirflowFailException(f"⚠️ {head} — задач больше порога {limit}\n"
-                                       + "\n".join(lines))
+        # Порог — по задачам, а не по событиям (почему — в docstring модуля). Выше порога —
+        # error: таск не падает, ран краснеет через health_errors
+        over = bool(limit and tasks > limit)
+        push_health({'log_events': {'status': 'error' if over else 'warn',
+                                    'summary': head + (f" — задач больше порога {limit}" if over else ""),
+                                    'total': total, 'tasks': tasks, 'runs': runs, 'limit': limit,
+                                    'top': lines[:10]}}, context)
         return head
 
     snapshot = collect()
-    save_params() >> snapshot >> report(snapshot)
+    verdict = report(snapshot)
+    save_params() >> snapshot >> verdict
+    verdict >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_log_events()

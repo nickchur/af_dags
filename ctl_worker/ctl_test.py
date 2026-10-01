@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -15,6 +15,8 @@
 `POST /v4/api/wf/{wid}/loading`. Поэтому симулятор существует только на DEV, IFT и PSI, а
 на боевом и неизвестном контуре не регистрируется вовсе. Притворяться выполнение будет
 только там, где разрешён `test_mode` (см. `ctl_worker.py`) — это отдельный ключ.
+
+Подробно: [ctl_worker/readme.md — ctl_test](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_testpy--симулятор-нагрузки)
 """
 
 from airflow import DAG, Dataset
@@ -26,8 +28,8 @@ from airflow.exceptions import (AirflowFailException, AirflowSkipException,
                                 AirflowRescheduleException, DagRunAlreadyExists)
 # from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from plugins.utils import add_note, env_stand, on_callback, get_current_load, str2timedelta  # type: ignore
-from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
-from plugins.ctl_core import chk_any_conn  # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
+from ctl_worker.ctl_core import chk_any_conn  # type: ignore
 
 # Отбор запускаемых дагов идёт по метабазе: пауза и сериализация живут там, а не в CTL
 from airflow.models import DagModel
@@ -124,10 +126,12 @@ else:
         on_failure_callback=on_callback,
         # on_success_callback=on_callback,
         doc_md=__doc__,
+        description='Симулятор нагрузки CTL: события, Dataset-ы или запуски воркфлоу',
     ) as dag:
     
         @task(pool='ctl_pool')
         def test_events(**context): 
+            """Генерирует нагрузку в режиме `simulator` из `ctl_config`; выключен — skipped."""
         
             chk_any_conn('ctl')
         
@@ -297,6 +301,7 @@ else:
             map_index_template="{{ event }}"
         )
         def set_events(event, **context):
+            """Публикует Dataset-сигнал для одного сгенерированного события."""
 
             enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 
@@ -311,5 +316,5 @@ else:
     
         events = test_events()
         # chk_conn() >> 
-        events >> set_events.expand(event = events)
+        events >> set_events.override(doc_md=set_events.function.__doc__).expand(event = events)
 

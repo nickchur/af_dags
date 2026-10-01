@@ -1,63 +1,15 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-08-21 12:41 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
-сообщения) без какого-либо прикладного пайплайна:
+Два ручных DAG'а для проверки Kafka-связки (коннект, топик, формат сообщения) без
+прикладного пайплайна: 📤 `tools_test_kafka_snd` шлёт одно сообщение (по умолчанию —
+`TransferFileCephRq`, как в бою), 📥 `tools_test_kafka_rcv` показывает сообщения из топика.
 
-  📤 tools_test_kafka_snd — шлёт в топик одно произвольное сообщение; по умолчанию
-     в поле лежит готовый `TransferFileCephRq`, собранный тем же `build_message`,
-     каким тракт шлёт в бою.
-     ⚠️ При отправке в боевой топик ТФС идёт **мимо очереди** `export.er_sent_files`:
-     файл не попадёт в счётчики лимитов маршрута, а пул `tfs_<ScenarioId>` этот таск не берёт
-     (он живёт в `TOOLS_POOL`, а двух пулов у таска не бывает) — то есть возможна
-     отправка одновременно с `tfs_kafka_snd`. Для разовой проверки это допустимо,
-     для регулярной отправки нужен не этот даг, а очередь.
-  📥 tools_test_kafka_rcv — показывает сообщения из топика.
+⚠️ Отправка в боевой топик ТФС идёт мимо очереди `export.er_sent_files` и лимитов маршрута.
+⚠️ Режим `wait` читает в группе боевого `tfs_kafka_rcv` и может забрать квитанцию — только при
+остановленном `tfs_kafka_rcv`. По умолчанию `read_last`: свежая группа, ничего не перехватывает.
 
-Имена топиков TFS даны с его стороны, поэтому наши направления зеркальны:
-
-| Действие | conn_id | Топик |
-|---|---|---|
-| пишем | `tfs-kafka-in` | `TFS.HRPLT.IN` |
-| читаем | `tfs-kafka-out` | `TFS.HRPLT.OUT` |
-
-Дефолты параметров расставлены по этой таблице; на запуске переопределяются.
-
-⚠️ **Топики зависят от контура**: в таблице — сигма, на альфе маршрут ПКАП
-(`TFS.PKAPHR.IN` / `TFS.PKAPHR.OUT`). Из `KAFKA_SND_TOPICS` их сюда не подставить —
-этот даг выкладывается на оба контура, а `plugins/tfs_utils.py` живёт вместе с ЕР,
-и жёсткий импорт сломал бы даг там, где тракта нет. На альфе топик задаётся руками.
-
-Оба DAG-а параметризуются на запуске:
-
-| Параметр   | Описание |
-|---|---|
-| `conn_id`  | Airflow Kafka conn_id (kafka_config_id); выпадающий список — kafka-коннекты из Variable `local_connections`, её наполняет `tools_show_connections` |
-| `topic`    | Имя топика |
-| `message`  | Только write: текст сообщения, уходит как есть. Маркеры `{RqUID}` и `{RqTm}` заменяются при отправке; по умолчанию — `TransferFileCephRq` |
-| `mode`     | Только read: `read_last` / `wait` |
-| `timeout`  | Только read: сколько ждать сообщение, сек (окно read_last / poll_timeout) |
-| `max_messages` | Только read: сколько последних сообщений читать в `read_last` |
-
-Режимы приёма (`mode`):
-  • `read_last` (по умолчанию) — читает последние `max_messages` сообщений, **уже лежащих**
-    в топике (tail через seek к high_watermark−N), свежей consumer group без коммита offset.
-    Порядок запуска не важен, в боевую группу не входит — ничего ни у кого не перехватывает.
-  • `wait` — `ConsumeFromTopicOperator`: синхронно опрашивает топик на воркере, triggerer
-    не требуется. Ловит только сообщения, опубликованные ПОСЛЕ старта опроса (consumer group,
-    auto.offset.reset=latest), в пределах `timeout` секунд.
-    ⚠️ Работает в consumer group коннекта, а у `tfs-kafka-out` она общая с боевым дагом
-    `tfs_kafka_rcv` — единственным штатным потребителем этого топика. Сообщение,
-    доставшееся тесту, до него уже не дойдёт, а значит и до выгрузки, которая ждёт
-    квитанцию: топик `TFS.HRPLT.OUT` общий на все маршруты ТФС. Запускать здесь режим
-    `wait` можно только при остановленном `tfs_kafka_rcv`.
-    Прочитанные им квитанции лежат в `export.tfs_receipts` — обычно смотреть надо туда,
-    а не в топик.
-
-Запускать вручную (schedule=None). Для сквозной проверки: обоим DAG-ам поставить один топик
-(`TFS.HRPLT.IN` — туда пишем мы, чужих слушателей там нет), и в режиме `wait` сначала
-триггерить `tools_test_kafka_rcv`, а `tools_test_kafka_snd` — пока идёт опрос
-(`timeout` секунд). Для `read_last` порядок любой.
+Подробно: [tools/readme.md — test_kafka](../../_plugin_dag_docs/?doc=tools/readme.md#test_kafkapytest_kafkapy)
 """
 from __future__ import annotations
 
@@ -134,9 +86,9 @@ DEFAULT_MESSAGE = _default_message()
 def _kafka_conn_ids() -> list[str]:
     """conn_id всех kafka-соединений из Variable `local_connections` — для выпадающего списка.
 
-    Variable наполняет DAG `tools_show_connections`: {conn_type: [{conn_id, host, ...}]}.
-    Читаем на парсинге, как это делает test_connections._load_groups. Если Variable нет
-    (show_connections ещё не запускали) — остаются дефолты направлений, чтобы список не
+    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Читаем на парсинге. Если Variable нет
+    (test_connections ещё не запускали) — остаются дефолты направлений, чтобы список не
     оказался пустым; они же всегда в списке, иначе выпадашка откроется без своего значения.
     """
     conn_ids = {SND_CONN, RCV_CONN}
@@ -219,10 +171,12 @@ _DEF_ARGS = {
     "owner":               "DataLab (CI02420667)",
     "retries":             0,
     "pool":                TOOLS_POOL,
+    # Чтение ждёт сообщение параметром timeout (180 с по умолчанию)
+    "execution_timeout":   timedelta(minutes=15),
     "on_failure_callback": on_callback,
     "on_success_callback": on_callback,
 }
-_TAGS = ["DataLab", "tools", "kafka", "AutoQA"]
+_TAGS = ["DataTools", "tools", "AutoQA"]
 
 
 # ── DAG: tools_test_kafka_snd ───────────────────────────────────────────────
@@ -234,13 +188,17 @@ _TAGS = ["DataLab", "tools", "kafka", "AutoQA"]
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    dagrun_timeout=timedelta(minutes=30),
     render_template_as_native_obj=True,
     tags=_TAGS,
     default_args=_DEF_ARGS,
     doc_md=__doc__,
+    description='Kafka: отправить одно сообщение в топик',
     params={
-        "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
-        "topic":    Param(SND_TOPIC, type="string", title="Topic"),
+        "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS,
+                          description="Kafka-подключение; список — из Variable local_connections (наполняет tools_test_connections)"),
+        "topic":    Param(SND_TOPIC, type="string", title="Topic",
+                          description="Топик. По умолчанию сигма (TFS.HRPLT.IN); на альфе — TFS.PKAPHR.IN, задаётся руками. ⚠️ Мимо очереди и лимитов маршрута ТФС"),
         "message":  Param(
             DEFAULT_MESSAGE, type="string", format="multiline", title="Message",
             description="Уходит в топик как есть. Маркеры {RqUID} и {RqTm} заменяются "
@@ -271,13 +229,17 @@ tools_test_kafka_snd()
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
+    dagrun_timeout=timedelta(minutes=30),
     render_template_as_native_obj=True,
     tags=_TAGS,
     default_args=_DEF_ARGS,
     doc_md=__doc__,
+    description='Kafka: прочитать сообщение из топика',
     params={
-        "conn_id":  Param(RCV_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
-        "topic":    Param(RCV_TOPIC, type="string", title="Topic"),
+        "conn_id":  Param(RCV_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS,
+                          description="Kafka-подключение; список — из Variable local_connections (наполняет tools_test_connections)"),
+        "topic":    Param(RCV_TOPIC, type="string", title="Topic",
+                          description="Топик. По умолчанию сигма (TFS.HRPLT.OUT); на альфе — TFS.PKAPHR.OUT, задаётся руками"),
         "mode":     Param(
             "read_last",
             type="string",
@@ -291,12 +253,14 @@ tools_test_kafka_snd()
             180, type="integer", minimum=5, title="Timeout, sec",
             description="Сколько ждать сообщение: poll_timeout (wait), окно чтения (read_last).",
         ),
-        "max_messages": Param(1, type="integer", minimum=1, title="Max messages (read_last)"),
+        "max_messages": Param(1, type="integer", minimum=1, title="Max messages (read_last)",
+                              description="Сколько последних сообщений топика прочитать в режиме read_last"),
     },
 )
 def tools_test_kafka_rcv():
     @task.branch(task_id="pick")
     def pick(params=None):
+        """Выбирает ветку по `mode`: ждать новое сообщение или прочитать последние."""
         return {"wait": "wait", "read_last": "read_last"}[params["mode"]]
 
     # режим wait: синхронный опрос топика на воркере, triggerer не нужен.
@@ -319,6 +283,7 @@ def tools_test_kafka_rcv():
     # общая задача отображения: берёт сообщение из той ветки, что отработала
     @task(task_id="show", trigger_rule="none_failed_min_one_success")
     def show(**context):
+        """Показывает полученные сообщения в заметке рана."""
         ti = context["ti"]
         msg = (
             ti.xcom_pull(task_ids="read_last")                       # read_last: return list
@@ -337,6 +302,7 @@ def tools_test_kafka_rcv():
     # через свежую consumer group + seek к high_watermark-N. Backlog не реплеит, offset не двигает.
     @task(task_id="read_last")
     def read_last(**context):
+        """Читает последние `max_messages` сообщений топика свежей группой, без коммита смещений."""
         import time
         import uuid
 

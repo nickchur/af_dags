@@ -1,16 +1,7 @@
 """### 📦 DAG: Копирование между S3-бакетами
-*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Копирует объект из одного S3-бакета в другой с опциональным сжатием.
-
-| Параметр | Описание |
-|---|---|
-| `src_conn_id` | ID подключения источника |
-| `src_bucket` / `src_key` | Исходный бакет и ключ |
-| `dst_conn_id` | ID подключения приёмника |
-| `dst_bucket` / `dst_key` | Целевой бакет и ключ |
-| `dst_compression` | Сжатие: `` \| `gz` \| `zip` \| `tar.gz` |
-| `replace` | Перезаписать если существует *(default: `False`)* |
 
 > Если `dst_key` заканчивается на `/` или пуст — имя файла берётся из `src_key`.
 > Если расширение `src_key` совпадает с `dst_compression` — повторное сжатие не применяется.
@@ -47,6 +38,7 @@ s3_conns = get_conns_by_type(conn_type='aws')
 
 @dag(
     doc_md=__doc__,
+    description='Копировать объект между бакетами S3, по желанию со сжатием',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
@@ -62,13 +54,13 @@ s3_conns = get_conns_by_type(conn_type='aws')
     max_active_tasks=1,
     render_template_as_native_obj=True,
     params={
-        'src_conn_id': Param('s3', type='string', examples=s3_conns),
-        'src_bucket': Param('', type='string'),
-        'src_key': Param('', type='string'),
-        'replace': Param(False, type='boolean'),
-        'dst_conn_id': Param('s3', type='string', examples=s3_conns),
-        'dst_bucket': Param('', type='string'),
-        'dst_key': Param('', type=['string', 'null']),
+        'src_conn_id': Param('s3', type='string', examples=s3_conns, description='S3-подключение источника'),
+        'src_bucket': Param('', type='string', description='Бакет источника'),
+        'src_key': Param('', type='string', description='Ключ источника'),
+        'replace': Param(False, type='boolean', description='Перезаписать, если объект уже есть'),
+        'dst_conn_id': Param('s3', type='string', examples=s3_conns, description='S3-подключение приёмника'),
+        'dst_bucket': Param('', type='string', description='Бакет приёмника'),
+        'dst_key': Param('', type=['string', 'null'], description='Ключ приёмника; пусто или с / на конце — имя файла берётся из src_key'),
         'dst_compression': Param(
             '',
             type=['string', 'null'],

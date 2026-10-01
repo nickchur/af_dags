@@ -1,45 +1,14 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-04 10:25 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
-категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
-**блокировки** (`pg_blocking_pids()` не пуст). Против каждой находки подставляется таск,
-которому она принадлежит — по pid из `application_name` (`app-dataplatform-etl-worker_<pid>`)
-и колонке `task_instance.pid`.
+Каждые 10 минут снимает `pg_stat_activity` метабазы и разбирает находки: зависшие сессии
+(`idle in transaction`), долгие запросы, блокировки. Против находки — таск-владелец и жив ли
+он (`owner_alive`). По галке `terminate` снимает сессии без живого владельца. Снимки с
+находками — `pg_activity/<дата>/` в бакете логов. Плагин здоровья: при `alert` — ❌, иначе ⚠️.
 
-Владелец бывает трёх сортов, и это разные диагнозы:
+**Таски:** `params`; `collect` → `save` / `terminate` → `report` → `health_warn` / `health_errors`.
 
-| `owner_alive` | Что это | Что делать |
-|---|---|---|
-| `true` | таск идёт и бьётся (хартбит `job` свежее `zombie_after_sec`) | ничего: транзакция закроется вместе с таском. Висит сутками — вопрос к владельцам дага |
-| `false` | таск числится в работе, но хартбит протух, либо уже завершился | сессия брошена: процесса нет, соединение осталось |
-| `null` | владельца не опознали (чужой pid, не разобрался `application_name`) | то же, но без имени |
-
-Убиваем только тех, у кого `owner_alive` не `true`: прекратить сессию живого таска значит
-уронить чужую работу — он получит обрыв соединения с метабазой и умрёт зомби.
-
-| Параметр | Описание |
-|---|---|
-| `idle_tx_sec` | Порог для `idle in transaction`, сек *(default: `300`)* |
-| `long_query_sec` | Порог для активного запроса, сек *(default: `300`)* |
-| `lock_wait_sec` | Порог ожидания блокировки, сек *(default: `60`)* |
-| `zombie_after_sec` | Хартбит старше — владелец не жив, сек *(default: `300`, как у зомби-детектора Airflow)* |
-| `alert` | Краснеть при находках *(default: `True`)* |
-| `save_s3` | Писать снимки в S3 *(default: `True`)* |
-| `keep_days` | Сколько дней держим снимки, старше — удаляем *(default: `30`)* |
-| `dry_run` | При `terminate=True` только показать кандидатов *(default: `True`)* |
-| `save_to_var` | Записать значения формы в Variable `tools_pg_activity_cfg` *(default: `False`)* |
-| `terminate` | Убивать найденные сессии. **В Variable не сохраняется** *(default: `False`)* |
-
-**Таски:** `collect` → `save` / `terminate` → `report`, рядом `prune` — чистка снимков.
-
-Снимки лежат в бакете логов, в своей папке: `pg_activity/<YYYY-MM-DD>/<HHMMSS>.json`.
-Пустые снимки не пишутся — счётчики и так уходят в лог каждый запуск. Старые снимки
-даг убирает сам: наш S3-шлюз не принимает lifecycle-правило (`PutBucketLifecycleConfiguration`
-требует заголовок `Content-MD5`, которого boto3 больше не шлёт).
-
-> Пороги берутся из Variable `tools_pg_activity_cfg`, форма запуска ими предзаполняется.
-> Поменять порог для расписания — запуск с галкой «Сохранить настройки».
+Подробно: [tools/readme.md — pg_activity](../../_plugin_dag_docs/?doc=tools/readme.md#pg_activitypypg_activitypy)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -48,26 +17,32 @@ import logging
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
-from airflow.models import Param, Variable
+from airflow.models import Param
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, on_callback, health_tasks, push_health, saved_params,
+        saved_schedule, store_params_task,
+    )
 except ImportError:
-    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, on_callback, health_tasks, push_health, saved_params,
+        saved_schedule, store_params_task,
+    )
 
 logger = logging.getLogger("airflow.task")
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
 
-# Бакет и коннект — те же, что у логов задач (см. check/log_cleanup.py), но папка своя:
+# Бакет и коннект — те же, что у логов задач (см. tools/log_cleanup.py), но папка своя:
 # снимки не должны попасть под чистку логов и не должны мешаться с ними в выдаче.
 AWS_CONN_ID = conf.get("logging", "REMOTE_LOG_CONN_ID")
 BUCKET_NAME = conf.get("logging", "REMOTE_BASE_LOG_FOLDER").split("//")[-1].split("/")[0]
 PREFIX = "pg_activity/"
 
-CFG_VAR = "tools_pg_activity_cfg"
+PARAMS_VAR = "tools_pg_activity_cfg"
 
 # Значения по умолчанию. Всё, кроме terminate: убийство сессий не должно становиться
 # настройкой, живущей между запусками, — галку ставят руками на конкретный ран.
@@ -81,17 +56,21 @@ DEFAULTS = {
     "zombie_after_sec": 300,
     "alert": True,
     "save_s3": True,
-    "keep_days": 30,
     "dry_run": True,
 }
 
-# default_var={} обязателен: без него отсутствующая переменная роняет разбор файла
-# и вешает Broken DAG на весь даг, а не на один запуск.
-try:
-    _cfg = {**DEFAULTS, **(Variable.get(CFG_VAR, default_var={}, deserialize_json=True) or {})}
-except Exception:  # битый JSON в переменной не должен ломать разбор
-    logger.warning("Variable %s не разобрана, берём значения по умолчанию", CFG_VAR, exc_info=True)
-    _cfg = dict(DEFAULTS)
+DEFAULT_SCHEDULE = '*/10 * * * *'
+# Плагин здоровья (тег health): отчёт живёт четыре интервала — один-два пропущенных прогона
+# под нагрузкой не тревога, а 40 минут тишины сторожа метабазы уже она
+REPORT_TTL_SEC = 40 * 60
+# Навык агента, на который отчёт плагина отсылает толкование находок
+SKILL = 'tools-pg-activity'
+#: Разовая галочка: в переменную не сохраняется (см. выше)
+ONE_SHOT = ('terminate',)
+
+# Битая или недоступная переменная разбор не роняет: saved_params вернёт пусто
+SAVED = saved_params(PARAMS_VAR)
+_cfg = {**DEFAULTS, **SAVED}
 
 
 SQL_ACTIVITY = r"""
@@ -124,6 +103,15 @@ SELECT a.pid,
 # join к main.job: state='running' в task_instance ставится один раз и живёт до конца,
 # а бьётся LocalTaskJob, и только его latest_heartbeat говорит, жив ли владелец сейчас.
 # Окно в шесть часов — чтобы не читать всю таблицу ради недавних покойников.
+#
+# Две части, и обе по индексам: running — через ti_state, недавние — от свежих
+# LocalTaskJob (job_type_heart), к задаче через ti_job_id. Прежний фильтр
+# «state = 'running' OR end_date > now() - 6 ч» индекса не имел: у task_instance нет
+# индекса по end_date, и шёл Parallel Seq Scan всей таблицы. На ift (1,3 млн строк) он
+# с 01.09.2026 не укладывался в statement_timeout 30 с, и collect падал на каждом запуске.
+# Замер на стенде (AF 2.11, 98 тыс. строк): 0,5 с → 15 мс, результат совпал.
+# «Кончилась за 6 ч» теперь значит «её LocalTaskJob бился за 6 ч»: хартбит идёт до конца
+# задачи, разница — только у задачи, снятой как зомби через 6 ч после последнего удара.
 SQL_OWNERS = r"""
 SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
        round(extract(epoch FROM now() - ti.start_date))       AS age,
@@ -131,8 +119,16 @@ SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.s
        round(extract(epoch FROM now() - j.latest_heartbeat))  AS hb_age
   FROM main.task_instance ti
   LEFT JOIN main.job j ON j.id = ti.job_id
- WHERE ti.pid IS NOT NULL
-   AND (ti.state = 'running' OR ti.end_date > now() - interval '6 hours')
+ WHERE ti.state = 'running' AND ti.pid IS NOT NULL
+UNION
+SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
+       round(extract(epoch FROM now() - ti.start_date)),
+       j.state,
+       round(extract(epoch FROM now() - j.latest_heartbeat))
+  FROM main.job j
+  JOIN main.task_instance ti ON ti.job_id = j.id
+ WHERE j.job_type = 'LocalTaskJob' AND j.latest_heartbeat > now() - interval '6 hours'
+   AND ti.pid IS NOT NULL
 """
 
 
@@ -187,31 +183,6 @@ def _app_pid(application_name: str):
     return int(tail) if tail.isdigit() else None
 
 
-def _delete_keys(hook, keys: list) -> int:
-    """Удаляет ключи пачкой, а если шлюз пачку не принял — по одному.
-
-    Multi-object delete (POST ?delete) — из того же семейства запросов, что и
-    lifecycle: он требует Content-MD5, а boto3 вместо него давно шлёт контрольную
-    сумму, и шлюз может ответить отказом. У одиночного DELETE тела нет, спорить
-    не о чем — на нём и подстраховываемся.
-    """
-    try:
-        hook.delete_objects(bucket=BUCKET_NAME, keys=keys)
-        return len(keys)
-    except Exception as err:
-        logger.warning("удалить пачкой не вышло (%s), идём по одному", err)
-
-    conn = hook.get_conn()
-    deleted = 0
-    for key in keys:
-        try:
-            conn.delete_object(Bucket=BUCKET_NAME, Key=key)
-            deleted += 1
-        except Exception as err:
-            logger.warning("не удалён %s: %s", key, err)
-    return deleted
-
-
 def _fetch(sql: str) -> list:
     """Читает SQL в метабазе и отдаёт список словарей.
 
@@ -230,6 +201,7 @@ def _fetch(sql: str) -> list:
 
 @dag(
     doc_md=__doc__,
+    description='Сторож метабазы: зависшие сессии, долгие запросы, блокировки; по галке снимает сессии',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
@@ -250,11 +222,12 @@ def _fetch(sql: str) -> list:
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 8, 20, tzinfo=timezone.utc),
-    schedule_interval='*/10 * * * *',
+    schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
     # Тег tools важен: по нему ролевка ограничивает запуск (HRPDATALAB-15421)
-    tags=['DataLab', 'tools', 'check'],
+    tags=['DataTools', 'tools', 'health'],
     catchup=False,
-    is_paused_upon_creation=True,
+    # Плагин здоровья: на паузе core пишет «нет отчёта», поэтому включается сам
+    is_paused_upon_creation=False,
     max_active_runs=1,
     # Тридцать минут, а не девять. Наложиться на следующий прогон не даёт
     # max_active_runs=1, а dagrun_timeout нужен только чтобы расклинить зависший
@@ -278,12 +251,13 @@ def _fetch(sql: str) -> list:
                        description='Краснеть при находках'),
         'save_s3': Param(_cfg['save_s3'], type='boolean',
                          description='Писать снимки в S3'),
-        'keep_days': Param(_cfg['keep_days'], type='integer', minimum=1,
-                           description='Сколько дней держим снимки в S3, старше — удаляем'),
         'dry_run': Param(_cfg['dry_run'], type='boolean',
                          description='При «Убивать сессии» — только показать кандидатов'),
-        'save_to_var': Param(False, type='boolean',
-                             description=f'Сохранить настройки формы в Variable {CFG_VAR}'),
+        'schedule': Param(SAVED.get('schedule', DEFAULT_SCHEDULE), type=['string', 'null'],
+                          description='cron или пресет (@daily); пусто — только вручную. '
+                                      'Применяется со следующего разбора'),
+        'save_params': Param(False, type='boolean',
+                             description=f'Сохранить настройки формы в Variable {PARAMS_VAR}'),
         'terminate': Param(False, type='boolean',
                            description='Убивать найденные сессии (в Variable не сохраняется)'),
     },
@@ -294,12 +268,6 @@ def tools_pg_activity():
     def collect(**context) -> dict:
         """📸 Снимок pg_stat_activity, разбор находок и опознание владельцев."""
         p = context['params']
-
-        if p.get('save_to_var'):
-            saved = {k: p[k] for k in DEFAULTS}
-            Variable.set(CFG_VAR, saved, serialize_json=True)
-            logger.info("💾 Настройки сохранены в Variable %s: %s", CFG_VAR, saved)
-            add_note(f"💾 настройки сохранены в `{CFG_VAR}`: {saved}", level='task', context=context)
 
         rows = _fetch(SQL_ACTIVITY)
         owners_rows = _fetch(SQL_OWNERS)
@@ -389,7 +357,8 @@ def tools_pg_activity():
         now = datetime.now(timezone.utc)
         key = f"{PREFIX}{now:%Y-%m-%d}/{now:%H%M%S}.json"
         S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).load_string(
-            json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+            json.dumps({"platform": env_platform(), "stand": env_stand(), **snapshot},
+                       ensure_ascii=False, indent=2, default=str),
             key=key, bucket_name=BUCKET_NAME, replace=True,
         )
         logger.info("💾 снимок сохранён: s3://%s/%s", BUCKET_NAME, key)
@@ -450,56 +419,9 @@ def tools_pg_activity():
         add_note({'🔪 terminate': killed}, level='task', context=context)
         return killed
 
-    @task(task_id='prune', trigger_rule=TriggerRule.NONE_FAILED)
-    def prune(**context) -> str:
-        """🧹 Убирает снимки старше `keep_days`.
-
-        Сначала здесь стояло lifecycle-правило через `s3_set_ttl` — пусть чистит
-        хранилище. Не вышло: шлюз отвечает на PutBucketLifecycleConfiguration
-        "Missing required header for this request: Content-MD5", а boto3 этот
-        заголовок давно не шлёт, он заменён на контрольные суммы. Поэтому чистим
-        сами, благо ключ снимка начинается с даты и ходить за метаданными не нужно.
-        """
-        from airflow.exceptions import AirflowSkipException
-        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-
-        if not context['params']['save_s3']:
-            raise AirflowSkipException("save_s3=False — папку не трогаем")
-
-        days = context['params']['keep_days']
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).date()
-
-        hook = S3Hook(aws_conn_id=AWS_CONN_ID, verify=False)
-        keys = hook.list_keys(bucket_name=BUCKET_NAME, prefix=PREFIX) or []
-
-        stale, unknown = [], 0
-        for key in keys:
-            day = key[len(PREFIX):].split('/')[0]
-            try:
-                if datetime.strptime(day, '%Y-%m-%d').date() < cutoff:
-                    stale.append(key)
-            except ValueError:
-                # Не наш формат — руками положили или писал кто-то ещё. Чужое не удаляем.
-                unknown += 1
-
-        if not stale:
-            msg = f"снимков старше {days}д нет, всего в папке {len(keys)}"
-            logger.info("🧹 %s", msg)
-            return msg
-
-        deleted = _delete_keys(hook, stale)
-        msg = f"удалено {deleted} из {len(stale)} снимков старше {days}д (всего было {len(keys)})"
-        if unknown:
-            msg += f", пропущено чужих ключей: {unknown}"
-        logger.info("🧹 %s", msg)
-        add_note({'🧹 prune': msg}, level='task', context=context)
-        return msg
-
     @task(task_id='report', trigger_rule=TriggerRule.NONE_FAILED)
     def report(snapshot: dict, **context) -> str:
-        """🧾 Сводка в заметку и, если просили, красный таск с уведомлением."""
-        from airflow.exceptions import AirflowFailException
-
+        """🧾 Сводка в заметку и вердикт здоровья: находки — error при alert, иначе warn."""
         p = context['params']
         counts = snapshot['counts']
         totals = snapshot['totals']
@@ -508,6 +430,7 @@ def tools_pg_activity():
 
         if not snapshot['findings']:
             add_note(f"✅ чисто: {head}", level='task,dag', context=context, title='🩺 pg_activity')
+            push_health({'pg_activity': {'status': 'healthy', 'summary': head, **totals}}, context)
             return head
 
         # Заметка режется до 1000 символов, поэтому в неё идут счётчики и три самые
@@ -522,17 +445,23 @@ def tools_pg_activity():
         ]
         add_note({f"⚠️ {head} · {counts}": lines},
                  level='task,dag', context=context, title='🩺 pg_activity')
-
-        if p['alert']:
-            raise AirflowFailException(f"⚠️ {head} · {counts}\n" + "\n".join(lines))
+        # Находки — не падение снятия: alert задаёт уровень, итог подводит health_errors
+        push_health({'pg_activity': {'status': 'error' if p['alert'] else 'warn',
+                                     'summary': f"{head} · {counts}", 'top': lines, **totals}}, context)
         return head
 
-    snapshot = collect()
+    @task(task_id='params')
+    def save_params(**context) -> str:
+        """💾 Сохраняет форму (кроме terminate) в переменную как значения по умолчанию."""
+        # Сам по себе, без потомков: сорванное сохранение (битое расписание) краснит ран, но
+        # снимок и отчёт от него не зависят.
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
-    # prune не про находки: его дело — папка в S3. В цепочке до report он стоял зря,
-    # добавляя лишний прыжок через очередь к тому, ради чего даг и заводился.
-    snapshot >> prune()
-    [save(snapshot), terminate(snapshot)] >> report(snapshot)
+    save_params()
+    snapshot = collect()
+    verdict = report(snapshot)
+    [save(snapshot), terminate(snapshot)] >> verdict
+    verdict >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_pg_activity()
