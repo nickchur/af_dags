@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 18:18 MSK · v3.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 19:10 MSK · v3.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в сутки (23:00 MSK) ищет DAG'и, у которых сериализация переписывается на каждом разборе
 файла, и выясняет причину. Группа `check_serialized` ловит дрожание (ждёт следующего разбора,
@@ -625,6 +625,9 @@ def tools_test_dags():
         # переписал сериализацию) и на `duplicate_dag_id` (сменился fileloc: на один dag_id
         # претендуют два файла, и они затирают сериализацию друг друга). `no_parse` не падение:
         # за окно ожидания парсинга могло не случиться из-за очереди в dag-processor'е.
+        # `redeployed` тоже не падение: между снимками сменился сам исходник (выкладка ветки
+        # пришлась на окно ожидания), новый хэш законен. Так 01.10 на альфе прогон пометил
+        # unstable сам tools_test_dags — коммит доехал через три минуты после старта.
         #
         # Итог всегда уходит в XCom `recheck` (до возможного падения — иначе при падении
         # return-значения бы не осталось), оттуда его собирает report.
@@ -633,6 +636,7 @@ def tools_test_dags():
         from airflow.configuration import conf
         from airflow.exceptions import AirflowFailException, AirflowSkipException
         from airflow.models.dag import DagModel
+        from airflow.models.dagcode import DagCode
         from airflow.models.serialized_dag import SerializedDagModel
         from airflow.operators.python import get_current_context
         from airflow.utils.session import create_session
@@ -657,14 +661,20 @@ def tools_test_dags():
                    + conf.getint("core", "dag_file_processor_timeout", fallback=600))
 
         def snapshot() -> tuple:
-            """(dag_hash, data, last_parsed_time, fileloc); data берём через ORM — она распакует zlib."""
+            """(dag_hash, data, last_parsed_time, fileloc, source); data берём через ORM — она распакует zlib."""
             with create_session() as session:
                 sdm = session.query(SerializedDagModel).filter(SerializedDagModel.dag_id == dag_id).one_or_none()
                 parsed = session.query(DagModel.last_parsed_time).filter(DagModel.dag_id == dag_id).scalar()
+                if not sdm:
+                    return None, None, parsed, None, None
+                # Исходник сравниваем текстом, а не по dag_code.last_updated: тот следует за mtime
+                # файла, а синк может переложить файл, не меняя содержимого
+                source = session.query(DagCode.source_code).filter(
+                    DagCode.fileloc_hash == DagCode.dag_fileloc_hash(sdm.fileloc)).scalar()
                 # fileloc берём из колонки, а не из JSON: она есть и при compress_serialized_dags
-                return (sdm.dag_hash, sdm.data, parsed, sdm.fileloc) if sdm else (None, None, parsed, None)
+                return sdm.dag_hash, sdm.data, parsed, sdm.fileloc, source
 
-        hash0, data0, parsed0, loc0 = snapshot()
+        hash0, data0, parsed0, loc0, code0 = snapshot()
         if hash0 is None or parsed0 is None:
             msg = f"☮️ {dag_id}: нет в serialized_dag или в dag — сравнивать не с чем"
             add_note(msg, context, level="task", title=f"☮️ {dag_id}")
@@ -676,11 +686,11 @@ def tools_test_dags():
         logger.info("⏳ %s: ждём следующего парсинга, last_parsed_time=%s, таймаут %dс",
                     dag_id, parsed0, timeout)
 
-        hash1, data1, parsed1, loc1 = hash0, data0, parsed0, loc0
+        hash1, data1, parsed1, loc1, code1 = hash0, data0, parsed0, loc0, code0
         poll = 0
         while time.time() < deadline:
             time.sleep(poke)
-            hash1, data1, parsed1, loc1 = snapshot()
+            hash1, data1, parsed1, loc1, code1 = snapshot()
             poll += 1
             # Пишем на каждом опросе, а не только по факту: промежуточная выгрузка лога
             # в S3 (hrp_adapter/logging/handlers.py) дёргается из emit, то есть по записи,
@@ -707,6 +717,15 @@ def tools_test_dags():
             add_note(msg, context, level="task", title=f"✅ {dag_id}")
             logger.info(msg)
             result = {"dag_id": dag_id, "status": "stable", "waited": round(waited), "diffs": 0}
+            add_xcom("recheck", result, context)
+            return result
+
+        if loc0 == loc1 and code0 and code1 and code0 != code1:
+            msg = (f"🚚 {dag_id}: за {waited:.0f}с выложен новый исходник — новый dag_hash "
+                   f"`{hash1}` законен, стабильность проверит следующий прогон")
+            add_note(msg, context, level="task", title=f"🚚 {dag_id}")
+            logger.info(msg)
+            result = {"dag_id": dag_id, "status": "redeployed", "waited": round(waited), "diffs": 0}
             add_xcom("recheck", result, context)
             return result
 
@@ -1270,7 +1289,7 @@ def tools_test_dags():
         except ImportError:
             from CI06932748.tools.utils import add_note  # type: ignore
 
-        icon_by_status = {"stable": "✅", "no_parse": "⏱️",
+        icon_by_status = {"stable": "✅", "no_parse": "⏱️", "redeployed": "🚚",
                           "unstable": "❌", "duplicate_dag_id": "👯"}
         dag_run = context["dag_run"]
         ti = context["ti"]
