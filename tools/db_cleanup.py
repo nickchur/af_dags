@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-29 09:09 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 11:39 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -15,6 +15,7 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
+| 🩹 `drop_leftovers` | Разовая: удалить остатки прерванного REINDEX (`*_ccnew`/`*_ccold`), у которых исходный индекс есть и валиден; не сохраняется *(default: `False`)* |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 | ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 5 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
@@ -32,11 +33,32 @@
 новое подхватывается со следующего парсинга DAG-а. Негодное значение таск `params` не
 записывает (падает), а уже записанное битым — игнорируется на парсинге в пользу кода.
 
-**Таски:**
+**Таски:** `params` → `clean` → `vacuum` → `report`, параллельно `params` → `integrity` →
+`health_warn` / `health_errors`.
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
+- **integrity** (v2.0) — целостность метабазы по каталогу PG, без блокировок, секунды; находками
+  не падает, итог — `health_warn` / `health_errors`
+
+🩺 **Плагин здоровья с v2.0** (тег `health`): отчёт пишет `health_errors`, срок 26 ч. Повод —
+сигма dev 01.10.2026: прерванный несколько раз `REINDEX SCHEMA CONCURRENTLY main` оставил на
+`dag_run` 551 лишний индекс (4 ГБ), и каждая запись в `dag_run` обновляла их все.
+
+| Проверка | Что смотрит | ⚠️ warn | ❌ error |
+|---|---|---|---|
+| `indexes` | индексы схемы `main` | невалидный индекс, дубль (те же колонки, классы, выражения, условие) | остатки прерванного REINDEX `*_ccnew`/`*_ccold` — по таблицам, штук и размер |
+| `wraparound` | `age(datfrozenxid)` базы, три старейшие таблицы | > 1 млрд | > 1,5 млрд (PG встаёт у 2 млрд) |
+| `sequences` | доля израсходованного у последовательностей `main` (`job`, `log`, `celery_taskmeta` — int4) | > 70 % | > 90 % |
+| `vacuum` | мёртвые строки `dag_run`, `task_instance`, `job`, `log`, `xcom`, `celery_taskmeta` | > 20 % и > 100 тыс. | — |
+| `long_tx` | транзакции дольше часа (держат вакуум; чужие без `pg_read_all_stats` не видны) | есть | — |
+| `constraints` | ограничения `NOT VALID`, так и не проверенные | есть | — |
+
+Сам даг индексы **не перестраивает** (решение 21.09.2026). Остатки удаляет только разовая
+галка `drop_leftovers`: `DROP INDEX CONCURRENTLY` по одному под коннектом владельца
+(`get_af_conn`), и только тот остаток, у которого исходный индекс (имя без суффиксов) есть и
+валиден. Остальное — строкой в заметке. `amcheck` не используется: читает индексы целиком.
 
 > `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
 """
@@ -56,12 +78,12 @@ import logging
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
+        TOOLS_POOL, add_note, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
+        TOOLS_POOL, add_note, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 
@@ -329,6 +351,211 @@ def _fmt_ts(ts):
     return ts.strftime('%H:%M:%S') if ts else '—'
 
 
+# ── Целостность метабазы (таск integrity) ─────────────────────────────
+# Только чтение каталога и статистики PG: без блокировок таблиц, секунды. Повод — сигма dev
+# 01.10.2026: прерванный несколько раз REINDEX SCHEMA CONCURRENTLY оставил на dag_run 551 лишний
+# индекс на 4 ГБ, каждая запись в dag_run обновляла их все, и шедулер с карточкой Health стояли.
+# amcheck (bt_index_check) не берём: читает индексы целиком и требует CREATE EXTENSION.
+
+INTEGRITY_TIMEOUT_MS = 30_000
+# Остаток REINDEX CONCURRENTLY: _ccnew — недостроенная копия, _ccold — старый индекс после
+# подмены. Повторные REINDEX SCHEMA перестраивают и остатки, отсюда цепочки _ccold1_ccold_ccnew
+LEFTOVER_SQL = "c.relname ~ '_cc(new|old)[0-9]*$'"
+LEFTOVER_SUFFIX = r'(_cc(?:new|old)\d*)+$'
+# PG встаёт на защиту от переполнения счётчика транзакций у 2 млрд
+XID_WARN, XID_ERROR = 1_000_000_000, 1_500_000_000
+# job.id, log.id, celery_taskmeta.id в AF 2.11 — int4
+SEQ_WARN, SEQ_ERROR = 0.7, 0.9
+VACUUM_TABLES = ('dag_run', 'task_instance', 'job', 'log', 'xcom', 'celery_taskmeta')
+DEAD_SHARE, DEAD_MIN = 0.2, 100_000
+LONG_TX = '1 hour'
+CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
+
+
+def _catalog(sql, **bind):
+    """SELECT по каталогу метабазы с потолком на запрос."""
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        session.execute(text(f"SET LOCAL statement_timeout = {INTEGRITY_TIMEOUT_MS}"))
+        return [dict(r) for r in session.execute(text(sql), bind).mappings()]
+
+
+def _run_check(fn):
+    """Одна проверка; упала сама — error с причиной, таймаут метабазы — warn."""
+    ts = time.time()
+    try:
+        result = fn()
+    except Exception as exc:
+        logger.warning(f"{fn.__name__}: проверка упала", exc_info=True)
+        if type(getattr(exc, 'orig', None)).__name__ == 'QueryCanceled':
+            result = {'status': 'warn',
+                      'summary': f'метабаза не ответила за {INTEGRITY_TIMEOUT_MS // 1000} с'}
+        else:
+            result = {'status': 'error', 'summary': f'проверка упала: {type(exc).__name__}: {str(exc)[:200]}'}
+    result['sec'] = round(time.time() - ts, 2)
+    return result
+
+
+def check_indexes():
+    """Остатки прерванного REINDEX — error; невалидные и дубли — warn."""
+    rows = _catalog(f"""
+        SELECT t.relname AS tbl, c.relname AS idx, i.indisvalid AND i.indisready AS valid,
+               pg_relation_size(c.oid) AS bytes, {LEFTOVER_SQL} AS leftover
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main'
+    """)
+    leftovers, by_table = [r for r in rows if r['leftover']], {}
+    for r in leftovers:
+        cnt, size = by_table.get(r['tbl'], (0, 0))
+        by_table[r['tbl']] = (cnt + 1, size + r['bytes'])
+    invalid = [f"{r['tbl']}.{r['idx']}" for r in rows if not r['valid'] and not r['leftover']]
+    # Дубли — одинаковые колонки, классы операторов, выражения и условие; остатки не в счёт
+    dups = _catalog(f"""
+        SELECT t.relname AS tbl, string_agg(c.relname, ', ' ORDER BY c.relname) AS idx
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND NOT ({LEFTOVER_SQL})
+        GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text,
+                 coalesce(pg_get_expr(i.indexprs, i.indrelid), ''),
+                 coalesce(pg_get_expr(i.indpred, i.indrelid), '')
+        HAVING count(*) > 1
+    """)
+    parts = []
+    if by_table:
+        parts.append('остатки прерванного REINDEX: ' + ', '.join(
+            f'{t} {n} шт. ({readable_size(b)})' for t, (n, b) in sorted(by_table.items(), key=lambda x: -x[1][1])))
+    if invalid:
+        parts.append(f"невалидные: {', '.join(invalid[:10])}")
+    if dups:
+        parts.append('дубли: ' + '; '.join(f"{d['tbl']}: {d['idx']}" for d in dups[:10]))
+    status = 'error' if by_table else 'warn' if invalid or dups else 'healthy'
+    return {'status': status,
+            'summary': ' · '.join(parts) or f'{len(rows)} индексов, остатков, невалидных и дублей нет',
+            'leftovers': [r['idx'] for r in leftovers], 'invalid': invalid,
+            'duplicates': [d['idx'] for d in dups]}
+
+
+def check_wraparound():
+    """Возраст самой старой незамороженной транзакции базы и таблиц main."""
+    db_age = _catalog("SELECT age(datfrozenxid) AS age FROM pg_database WHERE datname = current_database()")[0]['age']
+    top = _catalog("""
+        SELECT c.relname AS tbl, age(c.relfrozenxid) AS age
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND c.relkind IN ('r', 't', 'm')
+        ORDER BY age(c.relfrozenxid) DESC LIMIT 3
+    """)
+    status = 'error' if db_age > XID_ERROR else 'warn' if db_age > XID_WARN else 'healthy'
+    return {'status': status,
+            'summary': f"возраст базы {db_age / 1e6:.0f} млн из 2000 млн; старше всех: "
+                       + ', '.join(f"{r['tbl']} {r['age'] / 1e6:.0f} млн" for r in top),
+            'age': db_age}
+
+
+def check_sequences():
+    """Доля израсходованного у последовательностей main: int4 кончается на 2,1 млрд."""
+    rows = _catalog("""
+        SELECT sequencename AS seq, last_value, max_value
+        FROM pg_sequences WHERE schemaname = 'main' AND last_value IS NOT NULL
+    """)
+    used = sorted(((r['last_value'] / r['max_value'], r['seq']) for r in rows), reverse=True)
+    worst = used[0][0] if used else 0
+    status = 'error' if worst > SEQ_ERROR else 'warn' if worst > SEQ_WARN else 'healthy'
+    return {'status': status,
+            'summary': (f"{len(rows)} последовательностей, больше всех: "
+                        + ', '.join(f'{s} {share:.1%}' for share, s in used[:3])) if used
+                       else 'последовательностей с last_value нет (или нет прав их видеть)'}
+
+
+def check_vacuum():
+    """Мёртвые строки ключевых таблиц: автовакуум не успевает."""
+    rows = _catalog("""
+        SELECT relname AS tbl, n_live_tup AS live, n_dead_tup AS dead,
+               greatest(last_vacuum, last_autovacuum) AS last_vac
+        FROM pg_stat_user_tables WHERE schemaname = 'main' AND relname = ANY(:t)
+    """, t=list(VACUUM_TABLES))
+    bad = [r for r in rows if r['dead'] > DEAD_MIN and r['dead'] > DEAD_SHARE * ((r['live'] or 0) + r['dead'])]
+    return {'status': 'warn' if bad else 'healthy',
+            'summary': ('мёртвых строк много: ' + ', '.join(
+                f"{r['tbl']} {readable_size(r['dead'], base=1000)} из "
+                f"{readable_size(r['live'] + r['dead'], base=1000)}, вакуум {r['last_vac'] or 'не было'}"
+                for r in bad)) if bad else f'{len(rows)} таблиц, автовакуум успевает'}
+
+
+def check_long_tx():
+    """Транзакции старше часа держат вакуум всей базы. Чужие сессии без pg_read_all_stats не видны."""
+    rows = _catalog(f"""
+        SELECT pid, usename, state, date_trunc('second', now() - xact_start) AS dur, left(query, 80) AS q
+        FROM pg_stat_activity
+        WHERE datname = current_database() AND backend_type = 'client backend'
+          AND xact_start < now() - interval '{LONG_TX}' AND pid <> pg_backend_pid()
+        ORDER BY xact_start LIMIT 5
+    """)
+    return {'status': 'warn' if rows else 'healthy',
+            'summary': ('транзакции дольше часа: ' + '; '.join(
+                f"pid {r['pid']} {r['usename']} {r['state']} {r['dur']}: {r['q']}" for r in rows))
+                       if rows else 'транзакций дольше часа нет'}
+
+
+def check_constraints():
+    """Ограничения, заведённые NOT VALID и не проверенные: данные могут их нарушать."""
+    rows = _catalog("""
+        SELECT conrelid::regclass::text AS tbl, conname
+        FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace
+        WHERE n.nspname = 'main' AND NOT c.convalidated
+    """)
+    return {'status': 'warn' if rows else 'healthy',
+            'summary': ('не проверены: ' + ', '.join(f"{r['tbl']}.{r['conname']}" for r in rows))
+                       if rows else 'все ограничения проверены'}
+
+
+INTEGRITY_CHECKS = (check_indexes, check_wraparound, check_sequences, check_vacuum, check_long_tx, check_constraints)
+
+
+def drop_leftovers(names):
+    """DROP INDEX CONCURRENTLY остатков REINDEX — только если исходный индекс есть и валиден.
+
+    Под коннектом владельца (get_af_conn): у штатного пользователя Airflow прав нет. По одному
+    и автокоммитом: CONCURRENTLY в транзакции не работает. Индекс, который держит ограничение,
+    PG удалить не даст — это строка в итоге, а не падение.
+    """
+    import re
+    from psycopg2 import sql as psql
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    valid = {r['idx'] for r in _catalog("""
+        SELECT c.relname AS idx FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND i.indisvalid AND i.indisready
+    """)}
+    done, kept = [], []
+    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '30s'")
+            cur.execute("SET statement_timeout = '10min'")
+            for name in names:
+                base = re.sub(LEFTOVER_SUFFIX, '', name)
+                if base == name or base not in valid:
+                    kept.append(f'{name}: исходного {base} нет или он невалиден')
+                    continue
+                try:
+                    cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS main.{}').format(psql.Identifier(name)))
+                    done.append(name)
+                except Exception as exc:
+                    kept.append(f'{name}: {str(exc).strip()[:120]}')
+    finally:
+        conn.close()
+    logger.info(f"🧹 остатков удалено {len(done)}, оставлено {len(kept)}")
+    return done, kept
+
+
 # Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
 # рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
 PARAMS_VAR = 'tools_db_cleanup_params'
@@ -343,6 +570,9 @@ def _param(key, default, **kwargs):
 # 05:00 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '0 2 * * *')
 DEFAULT_SCHEDULE = '0 5 * * *'
 MSK = timezone(timedelta(hours=3))
+ONE_SHOT = ('drop_leftovers',)
+# Плагин здоровья (тег health): сутки плюс два часа на опоздание ночного прогона
+REPORT_TTL_SEC = 26 * 3600
 
 
 
@@ -384,7 +614,13 @@ params = {
         type='string',
         description='Расписание: cron или пресет @daily; пусто — только вручную. Применяется со следующего парсинга',
     ),
-    # Разовое действие, а не настройка: в переменную не сохраняется и берётся всегда из кода
+    # Разовые действия, а не настройки: в переменную не сохраняются и берутся всегда из кода
+    'drop_leftovers': Param(
+        False,
+        type='boolean',
+        description='True — удалить остатки прерванного REINDEX (индексы *_ccnew/*_ccold), '
+                    'у которых исходный индекс есть и валиден',
+    ),
     'save_params': Param(
         False,
         type='boolean',
@@ -406,7 +642,8 @@ params = {
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2025, 8, 7, tzinfo=MSK),
-    tags=['DataTools', 'tools', 'clean'],
+    # Тег health — роль: таск integrity даёт вердикт, get_system_health читает отчёт
+    tags=['DataTools', 'tools', 'clean', 'health'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
@@ -420,7 +657,7 @@ def tools_db_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        return store_params_task(PARAMS_VAR, SAVED, context)
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку
@@ -815,6 +1052,33 @@ def tools_db_cleanup():
 
         return data
 
-    save_params() >> clean() >> vacuum() >> report()
+    @task(task_id='integrity', trigger_rule=TriggerRule.NONE_FAILED)
+    def integrity(**context):
+        """🩺 Целостность метабазы: индексы, wraparound, последовательности, вакуум, транзакции."""
+        checks = {fn.__name__.removeprefix('check_'): _run_check(fn) for fn in INTEGRITY_CHECKS}
+        lines = [f"{CHECK_ICON[c['status']]} **{name}** ({c['sec']} с) — {c['summary']}" for name, c in checks.items()]
+        leftovers = checks['indexes'].get('leftovers') or []
+        if leftovers and context['params'].get('drop_leftovers'):
+            try:
+                done, kept = drop_leftovers(leftovers)
+            except Exception as exc:  # нет коннекта владельца или метабаза отказала — вердикт важнее
+                logger.warning('drop_leftovers: не выполнено', exc_info=True)
+                done, kept = [], [f'не выполнено: {type(exc).__name__}: {str(exc)[:160]}']
+            lines.append(f'🧹 остатков удалено {len(done)}, оставлено {len(kept)}'
+                         + ''.join(f'\n- {k}' for k in kept[:20]))
+            checks['indexes'] = _run_check(check_indexes)
+            lines.append(f"{CHECK_ICON[checks['indexes']['status']]} **indexes** после удаления — "
+                         f"{checks['indexes']['summary']}")
+        elif leftovers:
+            lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` '
+                         '(исходные индексы проверяются перед удалением)')
+        add_note('\n\n'.join(lines), context=context, level='Task', title='🩺 integrity')
+        push_health({n: {k: v for k, v in c.items() if k in ('status', 'summary', 'sec')}
+                     for n, c in checks.items()}, context)
+        return {n: c['status'] for n, c in checks.items()}
+
+    params_done = save_params()
+    params_done >> clean() >> vacuum() >> report()
+    params_done >> integrity() >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill='tools-db-cleanup')
 
 tools_db_cleanup()

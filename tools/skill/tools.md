@@ -1,11 +1,11 @@
 ---
 name: tools
-description: Индекс служебных дагов Airflow (каталог tools/, на сигме CI06932748/tools) — какой даг отвечает на какой вопрос, общее устройство (пул, сохраняемые параметры, расписание), итог дагов-проверок в тасках health_warn / health_errors, теги-роли. Подробности по дагам — навыки tools-system-health, tools-pg-activity, tools-log-events, tools-test-connections, tools-test-dags, tools-queue-analyze, tools-paused-runs. Используй, когда спрашивают про любой tools_*, «tools_* красный», «health_errors / health_warn», «plugins: нет отчёта», «как поменять расписание служебного дага», «где сохраняются параметры», «нет навыка на MCP / нет текста в DAG Docs», «метабаза растёт».
+description: Индекс служебных дагов Airflow (каталог tools/, на сигме CI06932748/tools) — какой даг отвечает на какой вопрос, общее устройство (пул, сохраняемые параметры, расписание), итог дагов-проверок в тасках health_warn / health_errors, теги-роли. Подробности по дагам — навыки tools-system-health, tools-pg-activity, tools-log-events, tools-test-connections, tools-test-dags, tools-queue-analyze, tools-paused-runs, tools-db-cleanup. Используй, когда спрашивают про любой tools_*, «tools_* красный», «health_errors / health_warn», «plugins: нет отчёта», «как поменять расписание служебного дага», «где сохраняются параметры», «нет навыка на MCP / нет текста в DAG Docs», «метабаза растёт», «целостность метабазы», «остатки REINDEX».
 ---
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-10-01 09:32 MSK · v2.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 11:39 MSK · v2.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
 `tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
@@ -63,7 +63,7 @@ description: Индекс служебных дагов Airflow (каталог 
   вручную). Новое применяется **со следующего разбора файла**. Негодное значение таск `params`
   не записывает и падает ❌; уже записанное битым игнорируется в пользу кода.
 - **Разовые галочки не сохраняются никогда**: `purge` (`queue_analyze`), `terminate`
-  (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение —
+  (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`), `drop_leftovers` (`db_cleanup`). Исключение —
   `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
 - **Создаются на паузе**: `db_cleanup`, `log_cleanup`, `paused_runs_cleanup`, ручные
   `test_kafka_*`. Плагины здоровья, `dummy`, `mcp_skills`,
@@ -83,7 +83,7 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
 | `tools_queue_analyze` | `10 * * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
-| `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
+| `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180); целостность метабазы (`integrity`, плагин здоровья с v2.0) | **удаляет**; `dry_run=False` по умолчанию; индексы — только при `drop_leftovers` |
 | `tools_log_cleanup` | `17 8 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
