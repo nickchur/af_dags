@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 14:32 MSK · v3.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v3.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -492,6 +492,7 @@ def check_dag_size() -> dict:
 
 @dag(
     doc_md=__doc__,
+    description='DAG-и, чья сериализация переписывается на каждом разборе, и причина',
     default_args={
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,

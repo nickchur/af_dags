@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-09-28 10:36 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Находит раны в `running` / `queued` у дагов на паузе и, если попросили, закрывает их —
 как кнопка **Mark failed** в UI.
@@ -137,6 +137,7 @@ def classify(runs, tis, now, older_than_hours):
 
 @dag(
     doc_md=__doc__,
+    description='Зависшие раны запаузенных дагов: отчёт и, по галке, Mark failed',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

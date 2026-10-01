@@ -1,6 +1,6 @@
 """
 ### 🫀 DAG: задачи выполняются
-*2026-09-28 10:45 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час два таска подряд:
 - `dummy_task` (`EmptyOperator`) — шедулер отмечает его успешным сам, до воркера он не
@@ -36,6 +36,7 @@ def _sec(a, b):
 @dag(
     dag_id='tools_dummy',
     doc_md=__doc__,
+    description='Пульс: жив ли шедулер и доходит ли задача до воркера, сколько ждёт в очереди',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-09-28 10:36 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Считает по таблице `log` метабазы события, которыми планировщик сообщает, что задача не
 доехала до воркера или не доработала:
@@ -245,6 +245,7 @@ SELECT event, count(*) AS cnt
 
 @dag(
     doc_md=__doc__,
+    description='Отчёт по журналу метабазы: задачи, не доехавшие до воркера или не доработавшие',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

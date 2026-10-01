@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-10-01 14:44 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
 убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
@@ -240,6 +240,7 @@ params = {
 
 @dag(
     doc_md=__doc__,
+    description='Бакет логов: срок хранения, удаление старого, статистика по папкам',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

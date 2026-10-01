@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-09-29 15:22 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -241,6 +241,7 @@ _TAGS = ["DataTools", "tools", "AutoQA"]
     tags=_TAGS,
     default_args=_DEF_ARGS,
     doc_md=__doc__,
+    description='Kafka: отправить одно сообщение в топик',
     params={
         "conn_id":  Param(SND_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
         "topic":    Param(SND_TOPIC, type="string", title="Topic"),
@@ -279,6 +280,7 @@ tools_test_kafka_snd()
     tags=_TAGS,
     default_args=_DEF_ARGS,
     doc_md=__doc__,
+    description='Kafka: прочитать сообщение из топика',
     params={
         "conn_id":  Param(RCV_CONN, type="string", title="Kafka conn_id", examples=KAFKA_CONN_IDS),
         "topic":    Param(RCV_TOPIC, type="string", title="Topic"),

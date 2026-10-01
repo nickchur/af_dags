@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-09-30 22:13 MSK · v3.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v3.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Почему задачи не идут: S3 логов, пулы, разбор файлов, раны и `scheduled`, плюс сторож
 отчётов остальных плагинов. Пишет итог в лог, XCom и заметку; сетка DAG'а — лента здоровья
@@ -1260,6 +1260,7 @@ def _finish(name: str, checks: dict, started: float, context) -> dict:
 
 @dag(
     doc_md=__doc__,
+    description='Здоровье контура раз в час: S3 логов, пулы, разбор файлов, раны, отчёты плагинов',
     owner_links=OWNER_LINKS,
     default_args=DEFAULT_ARGS,
     # Часовой пояс DAG-а берётся из start_date.tzinfo — расписание московское
@@ -1361,6 +1362,7 @@ PULSE_TTL_SEC = 15 * 60
 
 @dag(
     doc_md=PULSE_DOC,
+    description='Пульс контура раз в 5 минут: компоненты, celery, метабаза, доставка задач',
     owner_links=OWNER_LINKS,
     # Проверки пульса укладываются в секунды: брокер — два broadcast по 2 с и ping с петлёй
     # pub/sub до 12 с, метабаза — 5 с на запрос

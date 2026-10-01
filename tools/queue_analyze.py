@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-10-01 15:12 MSK · v3.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v3.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
@@ -681,6 +681,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
 
 @dag(
     doc_md=__doc__,
+    description='Почему задачи ждут в очереди: брокер, шедулер, ёмкость воркеров; по галке чистка брокера',
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
     default_args={
         "owner": "DataLab (CI02420667)",

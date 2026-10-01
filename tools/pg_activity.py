@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-30 15:39 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -236,6 +236,7 @@ def _fetch(sql: str) -> list:
 
 @dag(
     doc_md=__doc__,
+    description='Сторож метабазы: зависшие сессии, долгие запросы, блокировки; по галке снимает сессии',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

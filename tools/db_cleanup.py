@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 17:27 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -861,6 +861,7 @@ if ADMIN:
 
 @dag(
     doc_md=__doc__,
+    description='Чистка метабазы Airflow по сроку хранения; вакуум, переиндексация и проверки целостности по галкам',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

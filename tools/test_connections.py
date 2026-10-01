@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-30 09:50 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v3.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
@@ -262,6 +262,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 
 @dag(
     doc_md=__doc__,
+    description='Проверка всех подключений из secret backend: важные красят ран, остальные — предупреждение',
     default_args={
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,

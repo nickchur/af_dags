@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-09-29 18:36 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:33 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
@@ -370,6 +370,7 @@ def _ch_insert_sql(table: str) -> str:
         "run_cleanup": Param(default=True, type="boolean"),
     },
     doc_md=__doc__,
+    description='Регрессионный стенд операторов hrp_operators: pg, ch, s3',
 )
 def test_hrp_operators_dag():
 
