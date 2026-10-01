@@ -1,5 +1,5 @@
 """### 🛠️ Загрузка контента в S3
-*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает текстовый контент в S3 из параметров запуска DAG.
 
@@ -101,6 +101,7 @@ def tools_s3_from_content():
 
     @task
     def s3_from_content(**context):
+        """Записывает текст из параметров в объект S3, по желанию сжимает и ставит `.done`."""
         from airflow.models import Connection
         from airflow.exceptions import AirflowNotFoundException, AirflowSkipException, AirflowFailException
 

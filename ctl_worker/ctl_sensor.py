@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-10-01 17:35 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:45 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -525,7 +525,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
        
     add_get = ctl_add_get()
-    add_chk = ctl_add_chk.expand(jsn = add_get)
+    add_chk = ctl_add_chk.override(doc_md=ctl_add_chk.function.__doc__).expand(jsn = add_get)
     add_end = ctl_add_end(add_chk)
         
 

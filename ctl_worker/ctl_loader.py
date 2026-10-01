@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-10-01 17:35 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
@@ -145,6 +145,7 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
     
     @task(pool='ctl_pool')
     def chk_ctl():
+        """Проверяет, что CTL отвечает: без него остальные выгрузки не начинаются."""
         return chk_any_conn('ctl')
    
     
@@ -193,6 +194,7 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
 
     @task(pool='ctl_pool')
     def load_entities(**context):
+        """Выгружает сущности CTL и сохраняет поддерево корня `root_entity`."""
         # Полный список сущностей, а не поиск по дереву.
         #
         # Раньше здесь стоял `/v4/api/entity/tree?search=<корень>&offset=0&limit=<ctl_limit>`
@@ -426,6 +428,7 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         
     @task(pool='ctl_pool')
     def load_events(**context):
+        """Собирает события, которых ждут воркфлоу, и отмечает висячие ссылки на них."""
         
         wfs = ctl_obj_load('ctl_workflows') or {}
         if not wfs:
@@ -562,10 +565,6 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         # Сохраняем в S3
         load_obj_save('ctl_prf_events', data, var=False, skip=True)
 
-    @task(pool='ctl_pool')
-    def load_enames(**context):
-        pass
-        
     chk_ctl() >> [
         load_profile(),
         load_categories(),
@@ -580,6 +579,5 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
     # load_categories >> load_workflows 
     # load_categories >> load_ue_events
     # load_profile >> load_ctl_events
-    # load_workflows >> load_enames
 
     # chk_ctl() >> ctl_load() #>> EmptyOperator(task_id='end') 

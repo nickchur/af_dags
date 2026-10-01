@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-10-01 17:33 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два независимых DAG-а для изолированной проверки Kafka-связки (коннект, топик, формат
 сообщения) без какого-либо прикладного пайплайна:
@@ -303,6 +303,7 @@ tools_test_kafka_snd()
 def tools_test_kafka_rcv():
     @task.branch(task_id="pick")
     def pick(params=None):
+        """Выбирает ветку по `mode`: ждать новое сообщение или прочитать последние."""
         return {"wait": "wait", "read_last": "read_last"}[params["mode"]]
 
     # режим wait: синхронный опрос топика на воркере, triggerer не нужен.
@@ -325,6 +326,7 @@ def tools_test_kafka_rcv():
     # общая задача отображения: берёт сообщение из той ветки, что отработала
     @task(task_id="show", trigger_rule="none_failed_min_one_success")
     def show(**context):
+        """Показывает полученные сообщения в заметке рана."""
         ti = context["ti"]
         msg = (
             ti.xcom_pull(task_ids="read_last")                       # read_last: return list
@@ -343,6 +345,7 @@ def tools_test_kafka_rcv():
     # через свежую consumer group + seek к high_watermark-N. Backlog не реплеит, offset не двигает.
     @task(task_id="read_last")
     def read_last(**context):
+        """Читает последние `max_messages` сообщений топика свежей группой, без коммита смещений."""
         import time
         import uuid
 

@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-10-01 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -205,6 +205,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
 
     @task
     def get_yml(**context): 
+        """Выгружает категории, сущности и выбранные воркфлоу CTL в YAML на S3."""
         
         safe = context['params']['safe']
         

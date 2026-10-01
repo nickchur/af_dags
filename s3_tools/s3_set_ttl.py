@@ -1,5 +1,5 @@
 """### ⏱️ DAG: Управление TTL правилами S3
-*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Просматривает, устанавливает или удаляет правила жизненного цикла (TTL) объектов в S3-бакете.
 
@@ -61,6 +61,7 @@ def tools_s3_set_ttl():
 
     @task
     def set_ttl(**context):
+        """Показывает, выставляет или снимает правило TTL на префикс бакета."""
         p = context['params']
 
         drop = p.get('drop') or False

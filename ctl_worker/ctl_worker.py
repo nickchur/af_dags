@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-10-01 17:35 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -1055,6 +1055,7 @@ def build_worker_dag(w):
             # короткие служебные запросы, и занимать их публикацией датасета незачем.
             @task(outlets=[ DatasetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
             def run_out(wf, **context):
+                """Публикует Dataset `TFS/<профиль>/<wf_tfs_out>` для выгрузки в ТФС."""
                 pass
 
         outlets = [DatasetAlias(f"CTL/{profile}/{e}") for e in w_eids]
@@ -1062,6 +1063,7 @@ def build_worker_dag(w):
         # быстрее — пока run_end стоит в очереди ctl_pool, загрузка висит в RUNNING
         @task(outlets=outlets, priority_weight=900)
         def run_end(wf, **context):
+            """Закрывает загрузку в CTL по результату `run_exe` и публикует Dataset-ы сущностей."""
             ti = context['task_instance']
             chk_any_conn('ctl')
             wf_prm = get_params(context)

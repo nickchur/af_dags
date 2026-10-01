@@ -1,5 +1,5 @@
 """### 📦 Тестовый пакет для единого репликатора / TFS
-*2026-10-01 17:35 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает тестовые ZIP-пакеты в S3 с актуальными таймштампами.
 По умолчанию используются встроенные тестовые данные (3 части, 36/37/38 строк).
@@ -77,6 +77,7 @@ def tools_test_package():
 
     @task(task_id="upload")
     def upload(**context):
+        """Собирает тестовый ZIP-пакет из `parts` и `meta` и кладёт его в S3."""
         p = context["params"]
         prefix = p["prefix"]
         group = p["group"]

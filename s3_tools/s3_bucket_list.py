@@ -1,5 +1,5 @@
 """### 📋 DAG: Список бакетов S3
-*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Перечисляет все бакеты по всем S3-подключениям с размером, количеством объектов и TTL.
 """
@@ -42,6 +42,7 @@ def tools_s3_bucket_list():
 
     @task
     def chk_s3_conn(**context):
+        """Обходит все S3-подключения: бакеты, размер, число объектов, TTL."""
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         from pprint import pformat
         import json

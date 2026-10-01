@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-10-01 17:33 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт навыки агента из репозитория дагов (`*/skill/*.md`) в Airflow Variables, откуда
 MCP-эндпоинт вебсервера отдаёт их ресурсами `airflow://skill/<имя>`.
@@ -263,6 +263,7 @@ def tools_mcp_skills():
     # ALL_SUCCESS утянул бы в skip и публикацию
     @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish(**context):
+        """Кладёт изменившиеся навыки `*/skill/*.md` в Variables `mcp_skill__*` и обновляет оглавление."""
         from airflow.configuration import conf
         from airflow.models import Variable
 
@@ -304,6 +305,7 @@ def tools_mcp_skills():
 
     @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish_docs(**context):
+        """Кладёт документацию дагов в бакет логов и обновляет её оглавление."""
         from airflow.configuration import conf
         from airflow.models import Variable
 

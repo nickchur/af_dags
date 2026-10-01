@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 17:33 MSK · v3.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:45 MSK · v3.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
 причину. Выделен из `test_connections` (там остались проверки соединений).
@@ -1507,7 +1507,7 @@ def tools_test_dags():
     # за минуты. Внутри compare сравнение идёт последним — оно сличает две версии,
     # и вторую из них создаёт как раз snapshot_dags
     with TaskGroup(group_id=CHECK_GROUP, tooltip="Дрожание сериализации на парсинге") as tg_check:
-        recheck_serialized_dag.expand(target=check_serialized_dag())
+        recheck_serialized_dag.override(doc_md=recheck_serialized_dag.function.__doc__).expand(target=check_serialized_dag())
 
     with TaskGroup(group_id=COMPARE_GROUP, tooltip="Версии в S3 и что изменилось") as tg_compare:
         # expand раскрывается только по return_value: на кастомном ключе Airflow
@@ -1518,7 +1518,7 @@ def tools_test_dags():
         # список изменившихся через XCom упирался в лимит контура (см. COMPARE_LIMIT)
         pairs = snapshot_dags()
         find_changed() >> pairs
-        compare_changed.expand(target=pairs)
+        compare_changed.override(doc_md=compare_changed.function.__doc__).expand(target=pairs)
 
     # parse_time вне групп и ни от кого не зависит: он про разбор файлов, а не про
     # содержимое serialized_dag

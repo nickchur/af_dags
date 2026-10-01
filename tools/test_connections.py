@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-01 17:33 MSK · v3.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v3.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Автоматизированный аудит и тестирование всех подключений из secret backend.
 Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
@@ -389,12 +389,13 @@ def tools_test_connections():  # noqa: PLR0915
             raise AirflowSkipException(msg)
         return _run_test(item["conn_id"], item["conn_type"], **context)
 
-    checks = check.expand(item=collect())
+    checks = check.override(doc_md=check.function.__doc__).expand(item=collect())
 
 
     # --- Summary ---
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):  # noqa: PLR0915
+        """Сводка проверок: таблица по группам и причины падений."""
         from airflow.models import TaskInstance
         from airflow.utils.session import create_session
 

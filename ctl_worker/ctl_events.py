@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-10-01 17:35 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -79,6 +79,7 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
         retries=sensor_retries,
     )
     def get_events(**context): 
+        """Сенсор: сверяет события из Variables с последним statval в CTL, ждёт, пока какое-то изменится."""
 
         # TEST !!!
         # test_mode = '' if str(config.get('test_mode')).lower() in ['event'] else '--'
@@ -221,6 +222,7 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
         map_index_template="{{ event[0] }}"
     )
     def set_events(event, **context): 
+        """Публикует Dataset `CTL/<событие>` для одного изменившегося события."""
 
         # ds = Dataset(f'CTL/entity/{event[0]}')
         ds = Dataset(f'CTL/{event[0]}')
@@ -231,5 +233,5 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
     
     
     events = get_events()
-    task(task_id=f'chk_ctl')(chk_any_conn)(id='ctl') >> events >> set_events.expand(event = events)
+    task(task_id=f'chk_ctl')(chk_any_conn)(id='ctl') >> events >> set_events.override(doc_md=set_events.function.__doc__).expand(event = events)
 

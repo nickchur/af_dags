@@ -1,5 +1,5 @@
 """### 🔍 DAG: Копирование/перемещение файлов S3 → S3
-*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Находит файлы по маске и копирует (или перемещает) их в целевой бакет.
 
@@ -78,6 +78,7 @@ def tools_s3_to_s3_test():
 
     @task
     def s3_find(**context):
+        """Находит файлы по маске `src_path` и отдаёт список на копирование."""
         p = context['params']
         path = p.get('src_path', '')
         reverse = p.get('reverse', True)
@@ -103,6 +104,7 @@ def tools_s3_to_s3_test():
 
     @task(max_active_tis_per_dag=5, map_index_template="{{ path[0] }}")
     def s3_copy(path: str, **context):
+        """Копирует или перемещает один файл в целевой бакет (сжатие, распаковка, `.done`)."""
         p = context['params']
         ti = context['ti']
         src_path, src_info = path[0], path[1]
@@ -180,7 +182,7 @@ def tools_s3_to_s3_test():
         add_note(msg, context, level='TASK,DAG')
         return msg
 
-    s3_copy.partial().expand(path=s3_find())
+    s3_copy.override(doc_md=s3_copy.function.__doc__).expand(path=s3_find())
 
 
 tools_s3_to_s3_test()

@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-10-01 17:35 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:45 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -417,7 +417,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     path_list = tfs_wait()
 
     # Запускаем параллельно
-    tfs_copy.partial().expand(path=path_list)
+    tfs_copy.override(doc_md=tfs_copy.function.__doc__).expand(path=path_list)
 
 
 # ── Kafka-triggered DAG ──────────────────────────────────────────────────────
@@ -558,5 +558,5 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
 
     path_list = tfs_wait()
     kafka_wait() >> path_list
-    copies = tfs_copy.partial().expand(path=path_list)
+    copies = tfs_copy.override(doc_md=tfs_copy.function.__doc__).expand(path=path_list)
     copies >> send_receipt

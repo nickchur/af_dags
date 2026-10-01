@@ -1,5 +1,5 @@
 """### 👁️ DAG: Просмотр файлов S3
-*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список объектов по маске, сортирует и читает содержимое файлов (txt, gz, zip).
 
@@ -74,6 +74,7 @@ def tools_s3_check_logs():
 
     @task
     def list_s3_keys(**context):
+        """Перечисляет ключи по префиксу и маске, сортирует и режет до `max_items`."""
         from fnmatch import fnmatch
 
         p = context['params']
@@ -170,6 +171,7 @@ def tools_s3_check_logs():
 
     @task(trigger_rule='one_failed')
     def chk_s3_conn(**context):
+        """При сбое листинга проверяет подключение и показывает доступные бакеты."""
         from pprint import pformat
         import json
 
@@ -199,6 +201,7 @@ def tools_s3_check_logs():
 
     @task(max_active_tis_per_dag=5, map_index_template="{{ path }}")
     def chk_s3_keys(path: str, conn_id: str, rows: int, **context):
+        """Читает один файл (txt, gz, zip) и показывает первые строки в заметке."""
         import gzip
         import io
 
@@ -260,6 +263,7 @@ def tools_s3_check_logs():
 
     @task(trigger_rule='one_success')
     def end(**context):
+        """Отмечает успешное завершение одной из веток."""
         add_note("Done", context, level='TASK')
 
     list_keys = list_s3_keys()
@@ -268,7 +272,7 @@ def tools_s3_check_logs():
 
     list_keys >> chk_conn >> dag_end
 
-    chk_s3_keys.partial(
+    chk_s3_keys.override(doc_md=chk_s3_keys.function.__doc__).partial(
         conn_id='{{ params.aws_conn_id }}',
         rows='{{ params.rows }}',
     ).expand(path=list_keys) >> dag_end

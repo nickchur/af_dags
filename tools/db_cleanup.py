@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 17:33 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v2.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -900,6 +900,7 @@ def tools_db_cleanup():
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку
     @task(task_id='clean', trigger_rule=TriggerRule.NONE_FAILED)
     def clean(**context):
+        """Удаляет записи метабазы старше `retention_days` (при `dry_run` только считает); отдаёт список таблиц для vacuum."""
         from airflow.exceptions import AirflowFailException
         from airflow.utils.db_cleanup import config_dict as _cleanup_config
         from airflow.utils.session import create_session
@@ -1135,6 +1136,7 @@ def tools_db_cleanup():
 
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):
+        """VACUUM ANALYZE таблиц, которые чистил `clean`, под админской учёткой."""
         from airflow.exceptions import AirflowSkipException
 
         p = context['params']
@@ -1206,6 +1208,7 @@ def tools_db_cleanup():
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
+        """Сводка рана: сколько удалено по таблицам, сравнение с прошлым запуском."""
         from airflow.models import DagRun, XCom
         from airflow.utils.session import create_session
 

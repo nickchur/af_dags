@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-01 17:33 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:44 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
@@ -510,6 +510,7 @@ def test_hrp_operators_dag():
     # ───────────────────────── validation helpers ─────────────────────────────
     @task
     def validate_ch_count(table: str, expected: int = EXPECTED_ROWS, params=None):
+        """Сверяет число строк в таблице ClickHouse с ожидаемым."""
         ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
         cnt = ch.execute(f"SELECT count() FROM {CH_SCHEMA}.{table}")[0][0]
         if cnt != expected:
@@ -576,6 +577,7 @@ def test_hrp_operators_dag():
 
         @task.branch(task_id=gate_id)  # gate_id всегда с префиксом "gate_" (report их исключает)
         def _gate(params=None):
+            """Пропускает группу проверок, если её флаг в параметрах выключен."""
             return ids if cond(params) else []
 
         g = _gate()
@@ -797,6 +799,7 @@ def test_hrp_operators_dag():
 
         @task
         def validate_pg_ddl(**context):
+            """Проверяет, что `pg_ddl` вернул DDL с `CREATE TABLE`."""
             ddl = context["ti"].xcom_pull(task_ids="pg_ddl")
             if not ddl or "CREATE TABLE" not in ddl:
                 raise AirflowFailException(f"pg_ddl вернул некорректный DDL: {ddl!r}")
@@ -825,6 +828,7 @@ def test_hrp_operators_dag():
 
         @task
         def validate_list_keys(**context):
+            """Проверяет, что `s3_list_keys` нашёл ключи тестового префикса."""
             keys = context["ti"].xcom_pull(task_ids="s3_list_keys") or []
             names = [k.get("Key") if isinstance(k, dict) else k for k in keys]
             if not any(str(n).startswith(S3_PREFIX) for n in names):
