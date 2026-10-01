@@ -1,6 +1,6 @@
 # af3_dags — даги HR-платформы под Airflow 3
 
-*2026-10-01 22:26 MSK · v0.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 23:40 MSK · v0.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Перенос дагов из `af_dags` (Airflow 2) на Airflow 3.3.1 — этап 8 плана миграции
 `etl-core-3/openspec/changes/airflow-3-migration/tasks.md`. **Приватный**: сюда можно то, что
@@ -62,12 +62,26 @@ SQL привязан к схеме 3.3.1 и сверяется при обнов
 
 Проверка — только на стенде AF3 (`etl-core-3/docs/STAND.md`, раздел «Живой AF3»): даги
 кладутся в `/opt/aftest/home3/dags/`. Сквозной прогон CTL — эмулятор `testbed/ctl_worker` из
-`af_dags`; переменные `ctl_*` и подключения GP стенда — копией из метабазы AF2.
+`af_dags`; переменные `ctl_*` стенда — копией из метабазы AF2.
 
 **`tools_test_dags` не перенесён.** Он ловит нестабильную сериализацию по смене `dag_hash`;
 в AF3 такая смена заводит новую `dag_version`, и проверке нужно своё решение, а не замена SQL.
 
-**Стенд AF3 делит с AF2 эмулятор CTL и бакет логов.** Даги `CTL.*` ставятся незапаузенными —
-их сразу после разбора ставят на паузу (scheduler остановлен, пока не поставлены), иначе
-сенсор и монитор AF3 поведут загрузки эмулятора наравне с AF2. `tools_mcp_skills` пишет
-`docs/` в общий бакет: после прогона вернуть версии AF2 по оглавлению `af_docs` AF2.
+**У стенда AF3 свой эмулятор CTL и свои бакеты** (с 01.10.2026; до того общие с AF2, и сенсор,
+монитор и симулятор AF3 двигали загрузки AF2, а `tools_mcp_skills` переписывал его `docs/`):
+
+| Что | AF2 | AF3 |
+|---|---|---|
+| Эмулятор CTL | `ctl-mock`, порт 9080 | `ctl-mock3`, порт 9081 (`/opt/aftest/ctl-mock3`) |
+| База GP и состояние эмулятора | `gp_test` | `gp_test3` (копия `gp_test`) |
+| Подключение `ctl` | `/vault/secrets/application` | `/vault/secrets/application3` (`stand_af3_env.sh`) |
+| `alpha-adb_dev_comm-read` / `-write` | → `gp_test` | → `gp_test3` (метабаза AF3) |
+| Бакеты `ctl_config` | `edpetl-ctl`, `edpetl-files` | `edpetl-ctl3`, `edpetl-files3` |
+| Бакет логов | `hrplt-test` | `hrplt-test3` (`stand_af3_env.sh`) |
+
+Общими остались MinIO, ClickHouse и Kafka стенда. Прогон: загрузку создаёт
+`POST :9081/v4/api/wf/<wf_id>/loading`, затем START в RUNNING переводит
+`PUT :9081/v4/api/loading/<lid>/status` с `{"status": "RUNNING", "log": ""}` — в бою это делает
+движок CTL, эмулятор сам статус не двигает. Лог обязательно пустой: RUNNING с логом сенсор
+пропускает как «already run». Монитор START тоже перезапускает, но только через `new_grace`
+(час).
