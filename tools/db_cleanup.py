@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 12:56 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 13:09 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -51,7 +51,8 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
 - **clean** — подсчёт и удаление по каждой таблице; заметка дописывается **сверху** строкой на таблицу
   (в долгой таблице — строка хода не чаще раза в 5 мин), итоговая таблица ложится сверху в конце (v2.2;
-  до того заметка переписывалась целиком на каждой порции)
+  до того заметка переписывалась целиком на каждой порции). Так же с v2.3 и остальные: `vacuum` —
+  строка на таблицу, `reindex` — на индекс, `integrity` — на проверку; итоговые таблицы — сверху в конце
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
 - **reindex** — перестройка индексов по одному (только по галке `reindex`)
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
@@ -572,7 +573,7 @@ REINDEX_BUDGET_SEC = 3 * 3600  # execution_timeout 4 ч: после бюджет
 REINDEX_STATEMENT_TIMEOUT = '1h'
 
 
-def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC):
+def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
     """REINDEX INDEX CONCURRENTLY по каждому индексу main, кроме остатков.
 
     Returns: (done, failed, left) или строка — причина не начинать (нет прав).
@@ -629,6 +630,8 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC):
                     cur.execute(size_sql, (r['idx'],))
                     after = dict(cur.fetchall()).get(r['idx'])
                     done.append({**r, 'after': after, 'sec': round(time.monotonic() - ts, 1)})
+                    if on_step:
+                        on_step(done[-1], None)
                 except Exception as exc:
                     # Своя недостроенная копия: <idx>_ccnew[N]. ponytail: имя длиннее 63 символов
                     # PG усекает — такую копию не узнаем, её найдёт integrity
@@ -639,6 +642,8 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC):
                                    'dropped': [n for n in mine if n not in kept]})
                     blocked.add(r['tbl'])
                     logger.warning(f"❌ {r['idx']}: {exc}")
+                    if on_step:
+                        on_step(failed[-1], failed[-1]['error'])
             # Копию, которую не дал удалить тот же блокирующий (стенд: DROP CONCURRENTLY ждёт ту же
             # транзакцию и падает по lock_timeout), пробуем ещё раз в конце — блокировка могла уйти
             for r in failed:
@@ -1071,21 +1076,24 @@ def tools_db_cleanup():
         conn_id = get_af_conn()
 
         results, skipped = [], []
-        for tbl in tables:
+        n = len(tables)
+        # Как у clean: строка на таблицу сверху — ход виден, пока идёт вакуум (до 15 мин на
+        # таблицу); итоговая таблица с мёртвыми строками до/после ложится сверху в конце
+        for i, tbl in enumerate(tables, 1):
             _ts = time.time()
+            icon, why = '✅', ''
             try:
                 db_vacuum(tbl, conn_id, full=False, timeout=timeout)
             except AirflowSkipException as e:
                 logger.warning(f"☮️ {tbl}: {e}")
-                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'☮️ {str(e)[:60]}'})
-                continue
+                icon, why = '☮️', str(e)[:60]
             except Exception as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
-                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'❌ {str(e)[:60]}'})
-                continue
-            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
+                icon, why = '❌', str(e)[:60]
+            row = {'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': f'{icon} {why}'.strip()}
+            (results if icon == '✅' else skipped).append(row)
+            add_note(f"{icon} {tbl} ({i}/{n}): {row['duration']} с" + (f" — {why}" if why else ''),
+                     context=context, level='Task')
 
         if not results and not skipped:
             add_note('нет таблиц для вакуума', context=context, level='DAG,Task', title='🧹 vacuum')
@@ -1104,15 +1112,14 @@ def tools_db_cleanup():
             r['last_vacuum'] = _fmt_ts(last_vac)
             logger.info(f"🔎 {r['table']}: мёртвых {r['dead']} | last_vacuum={last_vac}")
 
-        lines = [
-            '| Таблица | Время, с | Мёртвых | last_vacuum | Статус |',
-            '|---------|---------|---------|-------------|--------|',
-        ] + [
-            f"| `{r['table']}` | {r['duration']} | {r['dead']} | {r['last_vacuum']} | {r['status']} |"
-            for r in results + skipped
+        # Узко: заметка в AF 2 — 1000 символов (колонка метабазы), широкая таблица вытесняла
+        # строки по таблицам. Причины пропусков — строками под таблицей
+        lines = ['|Таблица|с|Мёртвых||', '|-|-|-|-|'] + [
+            f"|{r['table']}|{r['duration']}|{r['dead']}|{r['status'][:2].strip()}|" for r in results + skipped
         ]
         total = round(sum(r['duration'] for r in results + skipped), 2)
-        lines.append(f"| **Итого** | **{total} с** | | | **{len(results)}/{len(tables)}** |")
+        lines.append(f"|**Итого**|**{total}**||**{len(results)}/{len(tables)}**|")
+        lines += [f"\n{r['status'][:2].strip()} {r['table']}: {r['status'][2:].strip()}" for r in skipped]
         add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
         add_note(f'{len(results)}/{len(tables)} таблиц за {total} с'
                  + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
@@ -1212,8 +1219,18 @@ def tools_db_cleanup():
     @task(task_id='integrity', trigger_rule=TriggerRule.ALL_DONE)
     def integrity(**context):
         """🩺 Целостность метабазы: индексы, wraparound, последовательности, вакуум, транзакции."""
-        checks = {fn.__name__.removeprefix('check_'): _run_check(fn) for fn in INTEGRITY_CHECKS}
-        lines = [f"{CHECK_ICON[c['status']]} **{name}** ({c['sec']} с) — {c['summary']}" for name, c in checks.items()]
+        def line(name, c, suffix=''):
+            add_note(f"{CHECK_ICON[c['status']]} **{name}**{suffix} ({c['sec']} с) — {c['summary']}",
+                     context=context, level='Task')
+
+        # Как у clean и vacuum: строка на проверку сверху, по мере выполнения. Идём с конца,
+        # чтобы главная — indexes — оказалась наверху
+        checks = {}
+        for fn in reversed(INTEGRITY_CHECKS):
+            name = fn.__name__.removeprefix('check_')
+            checks[name] = _run_check(fn)
+            line(name, checks[name])
+        lines = []
         leftovers = checks['indexes'].get('leftovers') or []
         if leftovers and context['params'].get('drop_leftovers'):
             try:
@@ -1224,14 +1241,16 @@ def tools_db_cleanup():
             lines.append(f'🧹 остатков удалено {len(done)}, оставлено {len(kept)}'
                          + ''.join(f'\n- {k}' for k in kept[:20]))
             checks['indexes'] = _run_check(check_indexes)
-            lines.append(f"{CHECK_ICON[checks['indexes']['status']]} **indexes** после удаления — "
-                         f"{checks['indexes']['summary']}")
+            add_note('\n'.join(lines), context=context, level='Task')
+            lines = []
+            line('indexes', checks['indexes'], ' после удаления')
         elif leftovers:
             lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` '
                          '(исходные индексы проверяются перед удалением)' if ADMIN else
                          'Удалить остатки — вручную `DROP INDEX CONCURRENTLY`: админской учётки '
                          'метабазы в Vault нет, галки `drop_leftovers` в форме нет')
-        add_note('\n\n'.join(lines), context=context, level='Task', title='🩺 integrity')
+        if lines:
+            add_note('\n'.join(lines), context=context, level='Task')
         push_health({n: {k: v for k, v in c.items() if k in ('status', 'summary', 'sec')}
                      for n, c in checks.items()}, context)
         return {n: c['status'] for n, c in checks.items()}
@@ -1246,7 +1265,17 @@ def tools_db_cleanup():
             raise AirflowSkipException('галка reindex не стоит')
         if p.get('dry_run'):
             raise AirflowSkipException('dry_run — индексы не перестраиваем')
-        res = reindex_one_by_one()
+        total = {'n': 0}
+
+        def step(r, error):
+            # Как у clean и vacuum: строка на индекс сверху, итоговая таблица — в конце
+            total['n'] += 1
+            add_note(f"{'❌' if error else '✅'} {r['idx']} ({r['tbl']}, {total['n']}): "
+                     + (error[:100] if error else f"{readable_size(r['bytes'])} → "
+                        f"{readable_size(r['after']) if r['after'] is not None else '—'}, {r['sec']} с"),
+                     context=context, level='Task')
+
+        res = reindex_one_by_one(on_step=step)
         if isinstance(res, str):
             add_note(res, context=context, level='DAG,Task', title='🔁 reindex ☮️')
             raise AirflowSkipException(res)

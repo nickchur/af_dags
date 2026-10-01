@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-01 12:41 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 13:09 MSK · v1.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -269,9 +269,12 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
                     continue
                     
-                # Логика склейки заметки
+                # Логика склейки заметки. Однострочная заметка без заголовка — строка хода
+                # (db_cleanup: строка на таблицу) — отделяется от прошлой пустой строкой, а не
+                # чертой: иначе лента из десятка строк занимает втрое больше места
                 if add:
-                    new_note = f"{ new_note}\n\n---\n{obj.note if obj.note else '' }"
+                    sep = '\n\n' if not title and '\n' not in new_note else '\n\n---\n'
+                    new_note = f"{new_note}{sep}{obj.note}" if obj.note else new_note
                     
                 # Лимит длины
                 obj.note = new_note[:MAX_NOTE_LEN]
