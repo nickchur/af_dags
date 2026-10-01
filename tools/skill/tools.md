@@ -5,10 +5,10 @@ description: Индекс служебных дагов Airflow (каталог 
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-10-01 17:27 MSK · v2.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:01 MSK · v2.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
-`tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
+`tools/` репозитория `af_dags`: `tools/readme.md` (подробно) и шапка модуля (кратко); при расхождении
 прав код. На сигме каталог лежит как `CI06932748/tools/…`, общие функции — модуль
 `CI06932748.tools.utils` (в репозитории — `plugins/utils.py`). `s3_tools/` в навык не входит.
 

@@ -1,39 +1,21 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-01 17:44 MSK · v3.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:00 MSK · v3.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Автоматизированный аудит и тестирование всех подключений из secret backend.
-Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
-(и обновляет Variable `local_connections` для выпадающих списков kafka-подключений), дальше в
-mapped-таск `check` проверяет подключения этого списка — экземпляр на подключение, в сетке
-подписан «группа · `conn_id`». Состав проверок всегда свежий: парсинг файла
-Variable не читает. До 29.09.2026 список снимал отдельный даг `tools_show_connections`.
+Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
+(и обновляет Variable `local_connections`), mapped `check` — по экземпляру на подключение,
+`report` — таблица ✅/❌/☮️ в заметке. Упало важное (`critical`) — ❌, ран красный;
+вспомогательное — ⚠️, ран зелёный.
 
-| Группа | Условие (conn_id / type) | Описание проверки |
-|---|---|---|
-| **tfs** | `tfs` в ID **и** тип `aws` | Проверка S3-бакетов через `list_buckets()` |
-| **s3** | тип `aws` (без tfs) | Проверка прав доступа к объектному хранилищу |
-| **postgres** | тип `postgres` | `SELECT current_user, current_database()` |
-| **ctl** | тип `http`, `ctl*` или FQDN | Вызов `GET /v5/api/info` (Kerberos Auth) |
-| **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
-| **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
-| **trino** | тип `trino` | Валидация сессии через `TrinoHook`; нерезолвящийся хост → `☮️` |
-| **redis** | тип `redis` | Проверка доступности через `redis.Redis(...).ping()` |
-| **other** | прочие | Помечаются символом `☮️` (пропуск) |
+| Параметр | Описание |
+|---|---|
+| `critical` | Шаблоны `conn_id` (fnmatch) важных подключений *(`airflowdb`, `ctl`, `s3`, подключение логов)* |
+| `skip_<группа>` | Не проверять группу (`tfs`, `s3`, `postgres`, `ctl`, `clickhouse`, `kafka`, `trino`, `redis`) |
+| `schedule` | cron или пресет; пусто — только вручную *(`15 23 * * *`)* |
+| `save_params` | Сохранить параметры запуска в `tools_test_connections_params` |
 
-**Особенности:**
-- **Группы**: набор задан в коде (таблица выше). Флаги `skip_<группа>` (`skip_kafka`, …,
-  секция «Пропуск групп»): подключения группы не проверяются (☮️, не ошибка); сохраняются с
-  `save_params`.
-  Не снялся список (`collect` упал) — ❌ `health_errors`, проверять было нечего.
-- **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
-- **Отчетность**: таск `report` формирует Markdown-таблицу со всеми статусами (⭐ — важное) в заметке рана.
-- **Важные и вспомогательные**: параметр `critical` — шаблоны `conn_id` (fnmatch), по умолчанию
-  `airflowdb`, `ctl`, `s3` и подключение бакета логов; сохраняется с `save_params`. Упавшее
-  подключение роняет свой таск, но ран краснеет (❌ `health_errors`, уведомление) только из-за
-  важного; вспомогательное — ⚠️ `health_warn`, ран зелёный. Отчёт плагина здоровья пишет
-  `health_errors`.
-- **Проверка сериализации DAG'ов** вынесена в отдельный DAG `tools_test_dags`
-  (`tools/test_dags.py`) — она ждёт парсинга файлов и живёт по своим часам.
+**Таски:** `params` → `collect` → `check` (mapped) → `report` → `health_warn` / `health_errors`.
+
+Подробно: [tools/readme.md — test_connections](../../_plugin_dag_docs/?doc=tools/readme.md#test_connectionspytest_connectionspy)
 """
 
 from fnmatch import fnmatch

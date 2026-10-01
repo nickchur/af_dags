@@ -1,49 +1,26 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-10-01 17:33 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:00 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
-категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
-**блокировки** (`pg_blocking_pids()` не пуст). Против каждой находки подставляется таск,
-которому она принадлежит — по pid из `application_name` (`app-dataplatform-etl-worker_<pid>`)
-и колонке `task_instance.pid`.
-
-Владелец бывает трёх сортов, и это разные диагнозы:
-
-| `owner_alive` | Что это | Что делать |
-|---|---|---|
-| `true` | таск идёт и бьётся (хартбит `job` свежее `zombie_after_sec`) | ничего: транзакция закроется вместе с таском. Висит сутками — вопрос к владельцам дага |
-| `false` | таск числится в работе, но хартбит протух, либо уже завершился | сессия брошена: процесса нет, соединение осталось |
-| `null` | владельца не опознали (чужой pid, не разобрался `application_name`) | то же, но без имени |
-
-Убиваем только тех, у кого `owner_alive` не `true`: прекратить сессию живого таска значит
-уронить чужую работу — он получит обрыв соединения с метабазой и умрёт зомби.
+Каждые 10 минут снимает `pg_stat_activity` метабазы и разбирает находки: зависшие сессии
+(`idle in transaction`), долгие запросы, блокировки. Против находки — таск-владелец и жив ли
+он (`owner_alive`). По галке `terminate` снимает сессии без живого владельца. Снимки с
+находками — `pg_activity/<дата>/` в бакете логов. Плагин здоровья: при `alert` — ❌, иначе ⚠️.
 
 | Параметр | Описание |
 |---|---|
-| `idle_tx_sec` | Порог для `idle in transaction`, сек *(default: `300`)* |
-| `long_query_sec` | Порог для активного запроса, сек *(default: `300`)* |
-| `lock_wait_sec` | Порог ожидания блокировки, сек *(default: `60`)* |
-| `zombie_after_sec` | Хартбит старше — владелец не жив, сек *(default: `300`, как у зомби-детектора Airflow)* |
-| `alert` | Находки — `error` (ран красный через `health_errors`), иначе `warn` *(default: `True`)* |
-| `save_s3` | Писать снимки в S3 *(default: `True`)* |
-| `dry_run` | При `terminate=True` только показать кандидатов *(default: `True`)* |
-| `schedule` | Расписание: cron или пресет, пусто — только вручную *(default: `*/10 * * * *`)* |
-| `save_params` | Записать значения формы в Variable `tools_pg_activity_cfg` *(default: `False`)* |
-| `terminate` | Убивать найденные сессии. **В Variable не сохраняется** *(default: `False`)* |
+| `idle_tx_sec` / `long_query_sec` | Пороги `idle in transaction` и активного запроса, сек *(300)* |
+| `lock_wait_sec` | Порог ожидания блокировки, сек *(60)* |
+| `zombie_after_sec` | Хартбит старше — владелец не жив, сек *(300)* |
+| `alert` | Находки — ❌ (ран красный), иначе ⚠️ *(вкл.)* |
+| `save_s3` | Писать снимки в S3 *(вкл.)* |
+| `dry_run` | При `terminate` только показать кандидатов *(вкл.)* |
+| `schedule` | cron или пресет; пусто — только вручную *(`*/10 * * * *`)* |
+| `save_params` | Сохранить параметры запуска в `tools_pg_activity_cfg` |
+| `terminate` | Снять найденные сессии без живого владельца. Не сохраняется |
 
-**Таски:** `params` (сохранение формы); `collect` → `save` / `terminate` → `report` →
-`health_warn` / `health_errors`. Находки таски не роняют: при
-`alert` они дают ❌ `health_errors` (ран красный, уведомление), без него — ⚠️ `health_warn`.
-Красный `collect` — сломалось само снятие; отчёт плагина здоровья пишет `health_errors`.
+**Таски:** `params`; `collect` → `save` / `terminate` → `report` → `health_warn` / `health_errors`.
 
-Снимки лежат в бакете логов, в своей папке: `pg_activity/<YYYY-MM-DD>/<HHMMSS>.json`.
-Пустые снимки не пишутся — счётчики и так уходят в лог каждый запуск. Старые снимки
-убирает `tools_log_cleanup` общим сроком бакета.
-
-> Пороги и расписание берутся из Variable `tools_pg_activity_cfg`, форма запуска ими
-> предзаполняется. Поменять их для плановых запусков — запуск с галкой `save_params`
-> (общий механизм `saved_params` / `store_params` из `plugins/utils.py`; до v1.6 галка
-> называлась `save_to_var`, переменная та же). Расписание применяется со следующего разбора.
+Подробно: [tools/readme.md — pg_activity](../../_plugin_dag_docs/?doc=tools/readme.md#pg_activitypypg_activitypy)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -487,11 +464,9 @@ def tools_pg_activity():
 
     @task(task_id='params')
     def save_params(**context) -> str:
-        """💾 Сохраняет форму (кроме terminate) в переменную как значения по умолчанию.
-
-        Сам по себе, без потомков: сорванное сохранение (битое расписание) краснит ран, но
-        снимок и отчёт от него не зависят.
-        """
+        """💾 Сохраняет форму (кроме terminate) в переменную как значения по умолчанию."""
+        # Сам по себе, без потомков: сорванное сохранение (битое расписание) краснит ран, но
+        # снимок и отчёт от него не зависят.
         return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     save_params()
