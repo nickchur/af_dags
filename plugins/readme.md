@@ -1,5 +1,5 @@
 # 🛠️ Общие модули `plugins/`
-*2026-09-30 09:50 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 12:41 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модули, которыми пользуются даги нескольких каталогов: утилиты Airflow, S3, тракт ТФС.
 
@@ -78,6 +78,10 @@ raise_status(st, ld_sts)      # ctl_worker/ctl_core.py: skip → AirflowSkipExce
 - **`str2timedelta`** — Парсинг timedelta из строки
 - **`saved_params` / `store_params`** — Значения по умолчанию из Variable и сохранение
   параметров запуска как новых умолчаний (включая `schedule`); возвращает `(status, message)`
+- **`get_af_conn` / `af_admin_available`** — коннект `af_adm` к метабазе под админской учёткой
+  из Vault (`DB_ADM_USER_1_1`, `DB_USER_OWNER_1` или `DB_USER_1_2`; штатная `DB_USER_1_1` не
+  берётся) и проверка на разборе файла, есть ли такая учётка. Права владельца таблиц по ключам
+  не видны — их проверяет таск перед работой (`tools_db_cleanup`)
 - **`update_dag_pause`** — Переключение паузы DAG-а из кода
 - **`valid_schedule`** — Проверка cron-строки до записи: битое расписание уронило бы
   разбор файла и убрало из UI саму форму, через которую его чинят

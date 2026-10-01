@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-30 19:10 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 12:41 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -24,6 +24,7 @@
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
 | `env_platform()` | Платформа: `alpha`, `sigma` или пустая строка |
+| `get_af_conn()` / `af_admin_available()` | Коннект к метабазе под админской учёткой из Vault; есть ли она (на разборе файла) |
 | `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
@@ -822,6 +823,27 @@ _LIBPQ_OPTS = {
 }
 
 
+AF_ADMIN_USER_KEYS = ('DB_ADM_USER_1_1', 'DB_USER_OWNER_1', 'DB_USER_1_2')
+
+
+def af_admin_available() -> bool:
+    """Есть ли в Vault админская учётка метабазы, из которой get_af_conn() соберёт коннект.
+
+    Зовётся на разборе DAG-файла: без учётки задачи и параметры, которым она нужна (VACUUM,
+    REINDEX, удаление индексов), не создаются. Читает локальный файл, в сеть не ходит; любая
+    ошибка — False. Права самой учётки отсюда не видны — их проверяет таск перед работой.
+    """
+    import json
+
+    try:
+        with open('/vault/secrets/application') as f:
+            secrets = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(secrets.get('DB_HOST_1') and secrets.get('DB_NAME_1')
+                and any(secrets.get(k) for k in AF_ADMIN_USER_KEYS))
+
+
 def get_af_conn():
     """Регистрирует коннект к метабазе Airflow из Vault, возвращает conn_id.
 
@@ -872,7 +894,9 @@ def get_af_conn():
         'host':      host,
         'port':      port,
         # Приоритет: админская учётка (DB_ADM_*), затем владелец схемы (DB_*_OWNER_1),
-        # затем обычная (DB_*_1_2) — у последней прав на VACUUM/REINDEX чужих таблиц нет.
+        # затем DB_*_1_2 — тоже админская; штатная учётка Airflow — DB_*_1_1, её не берём.
+        # Есть ли у получившейся учётки права владельца, проверяет вызывающий
+        # (db_cleanup.af_owner_check) — по ключам это не видно.
         'login':     _b64(secrets.get('DB_ADM_USER_1_1', '')) or _b64(secrets.get('DB_USER_OWNER_1', '')) or _b64(secrets.get('DB_USER_1_2', '')),
         'password':  _b64(secrets.get('DB_ADM_PASS_1_1', '')) or _b64(secrets.get('DB_PASS_OWNER_1', '')) or _b64(secrets.get('DB_PASS_1_2', '')),
         # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;

@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 11:39 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 12:48 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -14,16 +14,28 @@
 |---------------------|--------------------------------------------------------------------------------------------|
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
-| 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| 🩹 `drop_leftovers` | Разовая: удалить остатки прерванного REINDEX (`*_ccnew`/`*_ccold`), у которых исходный индекс есть и валиден; не сохраняется *(default: `False`)* |
+| 🧹 `vacuum` ¹       | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
+| 🔁 `reindex` ¹      | Разовая: перестроить индексы `main` по одному, от меньших к большим; не при `dry_run`, не сохраняется *(default: `False`)* |
+| 🩹 `drop_leftovers` ¹ | Разовая: удалить остатки прерванного REINDEX (`*_ccnew`/`*_ccold`), у которых исходный индекс есть и валиден; не сохраняется *(default: `False`)* |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 | ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 5 * * *`)* |
 | 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
 
-🔁 **Переиндексации нет (v1.11).** `REINDEX` убран целиком — тяжёлая операция под админским
-коннектом, от которой отказались (решение 21.09.2026). Ключ `reindex`, если он остался в
-`tools_db_cleanup_params`, ничего не включает и уйдёт из переменной при следующей записи
-параметров (`save_params=True` с изменёнными значениями).
+¹ **Только при админской учётке метабазы в Vault** (`af_admin_available`: `DB_ADM_USER_1_1`,
+`DB_USER_OWNER_1` или `DB_USER_1_2`). Без неё нет ни этих параметров, ни тасков `vacuum` и
+`reindex`: штатный пользователь Airflow таблицами не владеет, а не владельцу PG 16 и `VACUUM`,
+и `ANALYZE` молча пропускает (`WARNING … skipping it`, проверено на стенде 01.10.2026) —
+статистику тогда ведёт автовакуум. Учётка есть — её права всё равно проверяются перед первой
+командой (`owner_problem`): не владеет таблицами — таск ☮️ с её именем и списком таблиц.
+
+🔁 **Переиндексация по одному индексу (v2.1).** С v1.11 до v2.0 её не было: `REINDEX SCHEMA
+CONCURRENTLY` одной командой при обрыве оставлял копии всех индексов, а повторные запуски
+перестраивали и копии (сигма dev 01.10.2026: 551 остаток на `dag_run`). Теперь каждый индекс —
+своя команда `REINDEX INDEX CONCURRENTLY`, автокоммитом, от меньших к большим (за бюджет
+успевает больше, недоделанными остаются немногие крупные), `lock_timeout` 30 с, до часа на
+индекс, бюджет 3 ч. Отказ индекса: его копия `*_ccnew` удаляется сразу (не вышло — ещё раз в
+конце прогона), остальные индексы той же таблицы не начинаются, таск красный. Галка разовая
+и берётся из кода: ключ `reindex` в `tools_db_cleanup_params` от v1.10 её не включит.
 
 Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
 иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
@@ -33,11 +45,13 @@
 новое подхватывается со следующего парсинга DAG-а. Негодное значение таск `params` не
 записывает (падает), а уже записанное битым — игнорируется на парсинге в пользу кода.
 
-**Таски:** `params` → `clean` → `vacuum` → `report`, параллельно `params` → `integrity` →
-`health_warn` / `health_errors`.
+**Таски:** `params` → `clean` → `vacuum` → `reindex` → `report` и `integrity` →
+`health_warn` / `health_errors`; без админской учётки — `params` → `clean` → `report` и `integrity`.
+`integrity` идёт последним, чтобы не принять копию идущей перестройки за остаток.
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
 - **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
+- **reindex** — перестройка индексов по одному (только по галке `reindex`)
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
 - **integrity** (v2.0) — целостность метабазы по каталогу PG, без блокировок, секунды; находками
   не падает, итог — `health_warn` / `health_errors`
@@ -55,8 +69,7 @@
 | `long_tx` | транзакции дольше часа (держат вакуум; чужие без `pg_read_all_stats` не видны) | есть | — |
 | `constraints` | ограничения `NOT VALID`, так и не проверенные | есть | — |
 
-Сам даг индексы **не перестраивает** (решение 21.09.2026). Остатки удаляет только разовая
-галка `drop_leftovers`: `DROP INDEX CONCURRENTLY` по одному под коннектом владельца
+Остатки удаляет только разовая галка `drop_leftovers`: `DROP INDEX CONCURRENTLY` по одному под коннектом владельца
 (`get_af_conn`), и только тот остаток, у которого исходный индекс (имя без суффиксов) есть и
 валиден. Остальное — строкой в заметке. `amcheck` не используется: читает индексы целиком.
 
@@ -78,12 +91,12 @@ import logging
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
+        TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
+        TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 
@@ -517,6 +530,126 @@ def check_constraints():
 INTEGRITY_CHECKS = (check_indexes, check_wraparound, check_sequences, check_vacuum, check_long_tx, check_constraints)
 
 
+def owner_problem(cur, tables=None):
+    """Чего не хватает учётке коннекта для работы с таблицами main; None — всё в порядке.
+
+    Ключи в Vault не говорят о правах: VACUUM, ANALYZE и REINDEX не владельца PG 16
+    пропускает с WARNING «permission denied … skipping it» без ошибки (проверено на стенде
+    01.10.2026 временной ролью), поэтому права проверяются до первой команды.
+    """
+    cur.execute("""
+        SELECT current_user, coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false),
+               coalesce(array_agg(c.relname ORDER BY c.relname)
+                        FILTER (WHERE NOT pg_has_role(current_user, c.relowner, 'MEMBER')), '{}')
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND c.relkind = 'r' AND (%(t)s::text[] IS NULL OR c.relname = ANY(%(t)s))
+    """, {'t': list(tables) if tables else None})
+    user, superuser, foreign = cur.fetchone()
+    if superuser or not foreign:
+        return None
+    return f"учётка {user} не владеет таблицами: {', '.join(foreign[:10])}" + (' и другими' if len(foreign) > 10 else '')
+
+
+def af_owner_problem(tables=None):
+    """owner_problem() на коннекте get_af_conn() — том, под которым пойдёт работа."""
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    try:
+        with conn.cursor() as cur:
+            return owner_problem(cur, tables)
+    finally:
+        conn.close()
+
+
+# Переиндексация: каждый индекс своей командой, от меньших к большим. Обрыв посреди
+# REINDEX SCHEMA CONCURRENTLY на сигме dev (01.10.2026) оставил 551 остаток на dag_run; по
+# одному индексу обрыв оставляет одну копию, и её убираем сразу. Порядок по размеру: за
+# бюджет успевает больше индексов, а недоделанными остаются немногие крупные — их видно
+REINDEX_BUDGET_SEC = 3 * 3600  # execution_timeout 4 ч: после бюджета новые не начинаем
+REINDEX_STATEMENT_TIMEOUT = '1h'
+
+
+def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC):
+    """REINDEX INDEX CONCURRENTLY по каждому индексу main, кроме остатков.
+
+    Returns: (done, failed, left) или строка — причина не начинать (нет прав).
+    Отказ индекса убирает его недостроенную копию (*_ccnew) сразу же, а не вышло — ещё раз в
+    конце; остальные индексы той же таблицы после отказа не начинаются (в left).
+    """
+    import re
+    from psycopg2 import sql as psql
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    rows = _catalog(f"""
+        SELECT t.relname AS tbl, c.relname AS idx, pg_relation_size(c.oid) AS bytes
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND NOT ({LEFTOVER_SQL})
+        ORDER BY pg_relation_size(c.oid), c.relname
+    """)
+    size_sql = ("SELECT c.relname, pg_relation_size(c.oid) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'main' AND c.relkind = 'i' AND c.relname LIKE %s")
+    done, failed, left = [], [], []
+    started = time.monotonic()
+
+    def drop(cur, names):
+        """Удалить копии; вернуть те, что удалить не вышло."""
+        kept = []
+        for name in names:
+            try:
+                cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS main.{}').format(psql.Identifier(name)))
+            except Exception as exc:
+                logger.warning(f"{name}: копию пока не удалить: {exc}")
+                kept.append(name)
+        return kept
+
+    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            problem = owner_problem(cur, sorted({r['tbl'] for r in rows}))
+            if problem:
+                return problem
+            cur.execute("SET lock_timeout = '30s'")
+            cur.execute(f"SET statement_timeout = '{REINDEX_STATEMENT_TIMEOUT}'")
+            blocked = set()  # таблицы с отказом: следующий индекс там оставил бы ещё одну копию
+            for r in rows:
+                if time.monotonic() - started > budget_sec or r['tbl'] in blocked:
+                    left.append(r)
+                    continue
+                ts = time.monotonic()
+                try:
+                    cur.execute(psql.SQL('REINDEX INDEX CONCURRENTLY main.{}').format(psql.Identifier(r['idx'])))
+                    cur.execute(size_sql, (r['idx'],))
+                    after = dict(cur.fetchall()).get(r['idx'])
+                    done.append({**r, 'after': after, 'sec': round(time.monotonic() - ts, 1)})
+                except Exception as exc:
+                    # Своя недостроенная копия: <idx>_ccnew[N]. ponytail: имя длиннее 63 символов
+                    # PG усекает — такую копию не узнаем, её найдёт integrity
+                    cur.execute(size_sql, (r['idx'] + '\\_ccnew%',))
+                    mine = [n for n, _ in cur.fetchall() if re.fullmatch(re.escape(r['idx']) + r'_ccnew\d*', n)]
+                    kept = drop(cur, mine)
+                    failed.append({**r, 'error': str(exc).strip()[:160], 'kept': kept,
+                                   'dropped': [n for n in mine if n not in kept]})
+                    blocked.add(r['tbl'])
+                    logger.warning(f"❌ {r['idx']}: {exc}")
+            # Копию, которую не дал удалить тот же блокирующий (стенд: DROP CONCURRENTLY ждёт ту же
+            # транзакцию и падает по lock_timeout), пробуем ещё раз в конце — блокировка могла уйти
+            for r in failed:
+                if r['kept']:
+                    still = drop(cur, r['kept'])
+                    r['dropped'] += [n for n in r['kept'] if n not in still]
+                    r['kept'] = still
+    finally:
+        conn.close()
+    logger.info(f"🔁 переиндексировано {len(done)}, отказов {len(failed)}, не успели {len(left)}")
+    return done, failed, left
+
+
 def drop_leftovers(names):
     """DROP INDEX CONCURRENTLY остатков REINDEX — только если исходный индекс есть и валиден.
 
@@ -538,6 +671,9 @@ def drop_leftovers(names):
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
+            problem = owner_problem(cur)
+            if problem:
+                return [], [f'не выполнено: {problem}']
             cur.execute("SET lock_timeout = '30s'")
             cur.execute("SET statement_timeout = '10min'")
             for name in names:
@@ -570,7 +706,11 @@ def _param(key, default, **kwargs):
 # 05:00 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '0 2 * * *')
 DEFAULT_SCHEDULE = '0 5 * * *'
 MSK = timezone(timedelta(hours=3))
-ONE_SHOT = ('drop_leftovers',)
+ONE_SHOT = ('drop_leftovers', 'reindex')
+# Админская учётка метабазы в Vault (get_af_conn). Без неё VACUUM, REINDEX и удаление индексов
+# невозможны — ни задач, ни параметров для них не создаём: спрашивать о том, что даг сделать
+# не может, незачем. Права самой учётки проверяет таск перед работой (owner_problem)
+ADMIN = af_admin_available()
 # Плагин здоровья (тег health): сутки плюс два часа на опоздание ночного прогона
 REPORT_TTL_SEC = 26 * 3600
 
@@ -587,11 +727,6 @@ params = {
         'dry_run', False,
         type='boolean',
         description='True — только подсчёт, False — реальное удаление',
-    ),
-    'vacuum': _param(
-        'vacuum', True,
-        type='boolean',
-        description='True — VACUUM ANALYZE, False — пропустить',
     ),
     'custom': _param(
         'custom', False,
@@ -614,19 +749,35 @@ params = {
         type='string',
         description='Расписание: cron или пресет @daily; пусто — только вручную. Применяется со следующего парсинга',
     ),
-    # Разовые действия, а не настройки: в переменную не сохраняются и берутся всегда из кода
-    'drop_leftovers': Param(
-        False,
-        type='boolean',
-        description='True — удалить остатки прерванного REINDEX (индексы *_ccnew/*_ccold), '
-                    'у которых исходный индекс есть и валиден',
-    ),
+    # Разовое действие, а не настройка: в переменную не сохраняется и берётся всегда из кода
     'save_params': Param(
         False,
         type='boolean',
         description='True — сохранить параметры этого запуска как значения по умолчанию',
     ),
 }
+if ADMIN:
+    params.update({
+        'vacuum': _param(
+            'vacuum', True,
+            type='boolean',
+            description='True — VACUUM ANALYZE, False — пропустить',
+        ),
+        # Разовые: из кода, не из SAVED, и в ONE_SHOT — ключ reindex: true, оставшийся в
+        # Variable от v1.10, их не включит (так 18.09.2026 «выключенный» реиндекс запускался)
+        'reindex': Param(
+            False,
+            type='boolean',
+            description='True — перестроить индексы main по одному (REINDEX INDEX CONCURRENTLY), '
+                        'от меньших к большим; не при dry_run',
+        ),
+        'drop_leftovers': Param(
+            False,
+            type='boolean',
+            description='True — удалить остатки прерванного REINDEX (индексы *_ccnew/*_ccold), '
+                        'у которых исходный индекс есть и валиден',
+        ),
+    })
 
 
 @dag(
@@ -911,9 +1062,13 @@ def tools_db_cleanup():
         tables = context['ti'].xcom_pull(task_ids='clean') or []
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
-        before = db_stats(tables)
         # Штатный пользователь Airflow не владеет таблицами main и VACUUM их молча
-        # пропускает — идём админским коннектом из Vault.
+        # пропускает — идём админским коннектом из Vault, проверив его права заранее
+        problem = af_owner_problem(tables)
+        if problem:
+            add_note(problem, context=context, level='DAG,Task', title='🧹 vacuum ☮️')
+            raise AirflowSkipException(problem)
+        before = db_stats(tables)
         conn_id = get_af_conn()
 
         results, skipped = [], []
@@ -1048,11 +1203,14 @@ def tools_db_cleanup():
             f" | {readable_size(total_live, base=1000)}"
             f" | {readable_size(total_dead, base=1000)} |"
         )
+        if not ADMIN:
+            summary += ('\n\n☮️ Админской учётки метабазы в Vault нет: вакуум, переиндексация и '
+                        'удаление остатков не создаются — статистику ведёт автовакуум')
         add_note(summary, context=context, level='DAG', title='📊 Схема main')
 
         return data
 
-    @task(task_id='integrity', trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id='integrity', trigger_rule=TriggerRule.ALL_DONE)
     def integrity(**context):
         """🩺 Целостность метабазы: индексы, wraparound, последовательности, вакуум, транзакции."""
         checks = {fn.__name__.removeprefix('check_'): _run_check(fn) for fn in INTEGRITY_CHECKS}
@@ -1071,14 +1229,57 @@ def tools_db_cleanup():
                          f"{checks['indexes']['summary']}")
         elif leftovers:
             lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` '
-                         '(исходные индексы проверяются перед удалением)')
+                         '(исходные индексы проверяются перед удалением)' if ADMIN else
+                         'Удалить остатки — вручную `DROP INDEX CONCURRENTLY`: админской учётки '
+                         'метабазы в Vault нет, галки `drop_leftovers` в форме нет')
         add_note('\n\n'.join(lines), context=context, level='Task', title='🩺 integrity')
         push_health({n: {k: v for k, v in c.items() if k in ('status', 'summary', 'sec')}
                      for n, c in checks.items()}, context)
         return {n: c['status'] for n, c in checks.items()}
 
+    @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
+    def reindex(**context):
+        """🔁 Переиндексация по одному индексу — только по разовой галке и не при dry_run."""
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+        p = context['params']
+        if not p.get('reindex'):
+            raise AirflowSkipException('галка reindex не стоит')
+        if p.get('dry_run'):
+            raise AirflowSkipException('dry_run — индексы не перестраиваем')
+        res = reindex_one_by_one()
+        if isinstance(res, str):
+            add_note(res, context=context, level='DAG,Task', title='🔁 reindex ☮️')
+            raise AirflowSkipException(res)
+        done, failed, left = res
+        lines = ['| Индекс | Таблица | Было | Стало | с |', '|---|---|---|---|---|'] + [
+            f"| `{r['idx']}` | {r['tbl']} | {readable_size(r['bytes'])} | "
+            f"{readable_size(r['after']) if r['after'] is not None else '—'} | {r['sec']} |" for r in done]
+        lines += [f"\n❌ `{r['idx']}` ({r['tbl']}): {r['error']}"
+                  + (f"; копия удалена: {', '.join(r['dropped'])}" if r['dropped'] else '')
+                  + (f"; **копия осталась: {', '.join(r['kept'])}**" if r['kept'] else '') for r in failed]
+        if left:
+            lines.append(f"\n⏱️ не начаты (бюджет {REINDEX_BUDGET_SEC // 3600} ч или отказ на таблице): {len(left)}, крупнейшие — "
+                         + ', '.join(f"{r['idx']} ({readable_size(r['bytes'])})" for r in left[-5:]))
+        add_note('\n'.join(lines), context=context, level='Task', title='🔁 reindex')
+        saved = sum(r['bytes'] - (r['after'] or r['bytes']) for r in done)
+        summary = (f"перестроено {len(done)}, освобождено {readable_size(max(saved, 0))}"
+                   + (f", отказов {len(failed)}" if failed else '') + (f", не начаты {len(left)}" if left else ''))
+        add_note(summary, context=context, level='DAG', title='🔁 reindex')
+        if failed:
+            raise AirflowFailException(f"отказов {len(failed)}: " + ', '.join(r['idx'] for r in failed))
+        return summary
+
     params_done = save_params()
-    params_done >> clean() >> vacuum() >> report()
-    params_done >> integrity() >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill='tools-db-cleanup')
+    tail = clean()
+    params_done >> tail
+    if ADMIN:
+        # integrity — после переиндексации: иначе приняла бы копию идущей перестройки за
+        # остаток, а копию от убитой по таймауту — поймает
+        vacuumed, reindexed = vacuum(), reindex()
+        tail >> vacuumed >> reindexed
+        tail = reindexed
+    tail >> report()
+    tail >> integrity() >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill='tools-db-cleanup')
 
 tools_db_cleanup()
