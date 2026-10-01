@@ -1,24 +1,16 @@
 """### 🔍 DAG: Проверка API CTL
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск HTTP-запроса к CTL API для диагностики и отладки.
 
-| Параметр | Описание |
-|---|---|
-| `url` | Шаблон URL (`/v4/api/entity/{eid}/child`, `/v4/api/loading/{lid}` …) |
-| `method` | HTTP-метод: `GET`, `POST`, `PUT`, `DELETE` |
-| `eid` | ID сущности (автозаполнение из `ctl_entities`) |
-| `wid` | ID workflow (автозаполнение из `ctl_workflows`) |
-| `lid` | ID загрузки |
-| `limit` | Лимит результатов |
-| `data` | JSON-тело для POST/PUT |
+Подробно: [ctl_worker/readme.md — ctl_checker](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_checkerpy--диагностика-ctl-api)
 """
 
 from airflow.sdk import DAG, Param, task
 from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import  on_callback # type: ignore
-from plugins.ctl_utils import ctl_obj_load, ctl_api # type: ignore
+from ctl_worker.ctl_utils import ctl_obj_load, ctl_api # type: ignore
 
 from  logging import getLogger
 from datetime import datetime, timezone
@@ -33,6 +25,7 @@ params={
     # "conn_id": Param('ctl', type="string", title="ID подключение" ), 
     "url": Param("/v5/api/info", type="string",
         title = "API URL",
+        description="Шаблон URL; {eid}, {wid}, {lid}, {limit} подставляются из полей ниже",
         examples=[
             "/v5/api/info",
             "/v4/api/permission",
@@ -51,6 +44,7 @@ params={
         'GET', type="string", 
         examples=["GET", "POST", "PUT", "DELETE"],
         title="Метод API",
+        description="HTTP-метод",
         # values_display={c: f"{c.lower()}" for c in methods},
         
     ),
@@ -58,6 +52,7 @@ params={
         enum=list(ent_dict.keys()), 
         values_display={c : f"{c} {ent_dict[c]['name'].replace('DATAMART#','').lower()}" for c in list(ent_dict.keys())}, 
         title="Entity",
+        description="Сущность для {eid} (список — из ctl_entities)",
         section="Options",
     ),
     "wid": Param(
@@ -75,14 +70,16 @@ params={
             for c in (wfs_dict.keys() if wfs_dict else [])
         }, 
         title="WorkFlow",
+        description="Воркфлоу для {wid} (список — из ctl_workflows)",
         section="Options",
     ),
-    "lid": Param(0, type=["integer","null"], title="loading_id", min=0, section="Options",),
+    "lid": Param(0, type=["integer","null"], title="loading_id", min=0, section="Options",
+                 description="Загрузка для {lid}"),
     # "a_simple_list": ["",],
     
     # "offset": Param(0, const=0, type="integer", min=1),
-    "limit": Param(100, const=100, type="integer", min=1, max=1000),
-    "data": Param({}, section="Options",),
+    "limit": Param(100, const=100, type="integer", min=1, max=1000, description="Значение {limit} в URL"),
+    "data": Param({}, section="Options", description="JSON-тело для POST / PUT"),
     # "data": Param("{\n}", type="string", format="multiline",),
 }
 
@@ -90,7 +87,7 @@ params={
 # Основная логика DAG
 with DAG(
     dag_id="tools_ctl_check_api",
-    description="Tools: CTL Check API",
+    description="Ручной запрос к CTL API для диагностики",
     default_args={
         "owner": "EDP.ETL", 
         "retries": 0,
@@ -111,31 +108,29 @@ with DAG(
 
     @task
     def chk_ctl_api(**context):
-        """### 🔍 Проверка API CTL
-
-    Выполняет HTTP-запрос к API CTL с параметрами из `context['params']`.
-
-    **Функционал:**
-    - Подставляет значения в шаблон URL (`{lid}`, `{wid}`, `{eid}`, `{limit}`).
-    - Парсит тело запроса (`data`) как Python-объект.
-    - Отправляет запрос через `ctl_api`.
-    - Логирует:
-      - URL, метод, данные.
-      - Ответ в формате `pprint` (читаемый JSON).
-    - Возвращает сырой ответ.
-
-    **Использование:**
-    - Для отладки новых интеграций.
-    - Проверка доступности сущностей, workflow'ов, загрузок.
-    - Тестирование прав доступа и параметров.
-
-    **Примеры URL:**
-    - `/v5/api/info`
-    - `/v4/api/permission`
-    - `/v4/api/wf/{wid}/loading`
-
-    **XCom Output:** полный ответ API (dict/list).
-    """
+        """🔍 Проверка API CTL"""
+        # Выполняет HTTP-запрос к API CTL с параметрами из `context['params']`.
+        #
+        # **Функционал:**
+        # - Подставляет значения в шаблон URL (`{lid}`, `{wid}`, `{eid}`, `{limit}`).
+        # - Парсит тело запроса (`data`) как Python-объект.
+        # - Отправляет запрос через `ctl_api`.
+        # - Логирует:
+        #   - URL, метод, данные.
+        #   - Ответ в формате `pprint` (читаемый JSON).
+        # - Возвращает сырой ответ.
+        #
+        # **Использование:**
+        # - Для отладки новых интеграций.
+        # - Проверка доступности сущностей, workflow'ов, загрузок.
+        # - Тестирование прав доступа и параметров.
+        #
+        # **Примеры URL:**
+        # - `/v5/api/info`
+        # - `/v4/api/permission`
+        # - `/v4/api/wf/{wid}/loading`
+        #
+        # **XCom Output:** полный ответ API (dict/list).
         # from pprint import pformat
         import json
         

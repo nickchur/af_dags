@@ -1,5 +1,5 @@
-"""### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
+*2026-09-30 09:26 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -13,7 +13,7 @@
 | `ctl_obj_load/save()` | JSON/YAML объекты в S3 + Airflow Variables |
 | `add_note()` | Заметки в UI Airflow (DAG run / task instance) |
 | `eval_delta()` | Временные смещения (`+1 hour`, `weekday=1`) |
-| `rate_limit()` | Ограничение частоты вызовов API (≤100/сек) |
+| `rate_limit()` | Ограничение частоты вызовов API (`ctl_rps` из `ctl_config`, по умолчанию 10/сек) |
 | `category_recursive()` | Иерархия задач по категориям CTL |
 
 > Импортируйте `get_config`, а не `config` напрямую.
@@ -47,8 +47,14 @@ from plugins.utils import query_to_dict, add_note, readable_size, pool_size # ty
 from plugins import af_meta  # type: ignore
 from plugins.s3_utils import s3_IterStream  # type: ignore
 
-from logging import getLogger
+from logging import getLogger, WARNING
 logger = getLogger("airflow.task")
+
+# ctl_api и gp_exe берут подключение на каждый вызов, и хуки отмечают это строкой INFO
+# («Retrieving connection», principal Kerberos). В логе монитора это две трети объёма: стенд
+# 29.09.2026, 14,7 тыс. строк из 22 тыс. за четыре пробы. Имя подключения есть и в тексте ошибки.
+for _name in ('airflow.hooks.base', 'airflow.task.hooks.hrp_operators.utils.kerberos_http.KerberosHttpHook'):
+    getLogger(_name).setLevel(WARNING)
 
 
 CTL_API_CALS = 100 #в секунду
@@ -177,8 +183,17 @@ import threading
 _last_call_time = {}
 _lock = threading.Lock()
 
-def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
+#: Запросов к CTL в секунду из одного процесса, если в ctl_config нет ctl_rps
+CTL_RPS_DEFAULT = 10
+
+
+def rate_limit(pool_name='ctl_pool', ctl_api_calls=None):
     """Thread-safe throttle: не более ctl_api_calls вызовов в секунду на pool_name — в этом процессе.
+
+    Порог — `ctl_rps` в `ctl_config` (по умолчанию 10; до 26.09.2026 был зашит 100). Общего
+    для всех задач счётчика нет: суммарно тракт может превысить порог в число одновременных
+    задач `ctl_pool`. Это ловит эмулятор CTL на стенде — он считает все запросы и отвечает 429
+    сверх `CTL_MOCK_RPS` (testbed/ctl_worker/ctl_mock.py).
 
     При необходимости блокирует поток на недостающий интервал (sleep). Словарь
     _last_call_time живёт в процессе, а у каждой задачи Airflow свой процесс, поэтому между
@@ -189,7 +204,14 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
     
     # Интервал между запросами (например, 1/100 = 0.01 сек)
     # Если нужно учитывать кол-во слотов, можно оставить вашу логику
-    min_interval = 1.0 / ctl_api_calls 
+    if ctl_api_calls is None:
+        try:
+            ctl_api_calls = float(get_config().get('ctl_rps') or CTL_RPS_DEFAULT)
+        except (TypeError, ValueError):
+            ctl_api_calls = CTL_RPS_DEFAULT
+    if ctl_api_calls <= 0:   # ноль или минус — не «без ограничения», а ошибка конфигурации
+        ctl_api_calls = CTL_RPS_DEFAULT
+    min_interval = 1.0 / ctl_api_calls
 
     with _lock:
         current_time = time.time()
@@ -200,26 +222,37 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=100):
             wait_time = min_interval - elapsed
             logger.debug(f"🕒 Throttling {pool_name}: ждем {wait_time:.3f} сек")
             time.sleep(wait_time)
-            # Обновляем время после сна
-            _last_call_time[pool_name] = current_time
+            # Отметка — после сна: иначе следующий вызов считал бы интервал от начала ожидания
+            _last_call_time[pool_name] = time.time()
         else:
             _last_call_time[pool_name] = current_time
     
 
+class CtlTooManyRequests(Exception):
+    """CTL ответил 429: запрос не выполнен, его можно повторить после паузы."""
+
+
 @retry(
-    stop=stop_after_attempt(3), # Максимум 3 попытки
-    wait=wait_exponential(multiplier=1, min=1, max=5), # Паузы 1с, 2с, 4с
+    stop=stop_after_attempt(3), # 3 попытки: первая + 2 повтора
+    wait=wait_exponential(multiplier=1, min=1, max=5), # Две паузы, 1–5 с
     # retry=retry_if_exception_type(Exception), # Ре траим на любые ошибки, кроме AirflowFailException
-    retry=retry_if_exception_type((ReadTimeout, ConnectTimeout, ConnectionError)),
+    # 429 — тоже повтор, а не отказ: окно лимита CTL — секунда, две паузы по 1–5 с его переживают.
+    # Повтор безопасен и для POST: отвергнутый по лимиту запрос CTL не выполнял.
+    # До 26.09.2026 429 шёл в общую ветку 4xx → AirflowSkipException: на стенде run_end
+    # отчёта ушёл в skipped посреди отправки фрагментов (11 запросов/с при лимите 10),
+    # итог в CTL не попал, загрузка осталась висеть
+    retry=retry_if_exception_type((ReadTimeout, ConnectTimeout, ConnectionError, CtlTooManyRequests)),
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True):
+def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True,
+            gp_log=True):
     """HTTP-клиент к CTL API через KerberosHttpHook с rate-limiting и retry.
 
     4xx → AirflowSkipException (skip=True) или AirflowFailException (skip=False).
-    5xx / таймаут → retry tenacity (до 3 раз, пауза 1–5 сек).
-    GET-запросы (кроме /statval, /tmpl) логируются в Greenplum через pr_log_ctl.
+    429 (лимит частоты), 5xx / таймаут → retry tenacity (3 попытки, паузы 1–5 сек).
+    GET-запросы (кроме /statval, /tmpl) логируются в Greenplum через pr_log_ctl; gp_log=False —
+    не логировать (монитор читает wf на каждую загрузку, изменения потоков в GP несёт лоадер).
     Возвращает распарсенный JSON или текст ответа.
     """
     
@@ -247,11 +280,15 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         
         # Логируем ошибку с деталями
         error_msg = f"{resp_text[:200]} ❌ Error: {status_code} HTTP {method} {url}"
+        if status_code == 429:
+            logger.warning(error_msg)
+            raise CtlTooManyRequests(error_msg) from e
         logger.error(error_msg)
         
         # Если это ошибка клиента (4xx, кроме таймаутов 408/429), повторы не помогут
-        # status_code пуст у таймаута и обрыва связи: сравнение с None падало TypeError-ом
-        # вместо повтора (дефект с Airflow 2, всплыл на таймаутах эмулятора CTL 21.09.2026)
+        # status_code пуст у таймаута и обрыва связи: сравнение с None падало TypeError-ом, и
+        # вместо повтора tenacity задача падала сразу (найдено 21.09.2026 на таймаутах
+        # эмулятора CTL при переносе на Airflow 3)
         if resp_text.startswith('4') or (status_code is not None and 300 <= status_code < 500):
             add_note(error_msg, level='Task,DAG', title='Ошибка API')
             if skip:
@@ -271,7 +308,7 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         # Журнал в GP — когда GP доступен (gp_pool открыт). С первого коммита (054ff46) здесь
         # стояло «not pool_slots(...)», то есть журнал писался только при закрытом GP и падал в
         # except; к тому же pool_slots пишет в slot_pool, а здесь нужно только прочитать
-        if 'tmpl' not in url and 'statval' not in url and pool_size('gp_pool') > 0:
+        if gp_log and 'tmpl' not in url and 'statval' not in url and pool_size('gp_pool') > 0:
             
             ts = time.time()
             url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
@@ -351,8 +388,8 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
         raise
 
 
-def gp_backend_busy(pid: int, timeout: int = 15) -> bool:
-    """Занят ли backend Greenplum с этим pid запуском загрузки.
+def gp_backend_busy(lid: int, timeout: int = 15) -> list:
+    """pid серверных процессов Greenplum, которые сейчас выполняют запуск загрузки `lid`.
 
     Нужна, чтобы отличить «работа ещё идёт» от «работы не было». По журналу это не
     различить: пока транзакция не закоммичена, её записи не видны другим сессиям. А
@@ -360,18 +397,26 @@ def gp_backend_busy(pid: int, timeout: int = 15) -> bool:
     (проверено на боевом кластере), поэтому после падения воркера ETL продолжает работать
     и закоммитится сам.
 
-    Смотрим `pg_stat_activity` на мастере: pid оттуда же, откуда его берёт `gp_exe`
-    (`pg_backend_pid()`). Отдельно сверяем текст запроса — pid переиспользуются, и без
-    этого чужая сессия сошла бы за нашу.
+    Ищем по номеру загрузки в тексте запроса, а не по pid прошлой попытки: pid жил в XCom,
+    а Airflow 2.11 стирает XCom задачи в начале каждой попытки (taskinstance.py:3127,
+    `clear_xcom_data`) — на повторе, ради которого pid и сохраняли, его уже не было.
+    `run_exe` ставит `lid` первым полем JSON, так что `track_activity_query_size` его не
+    обрежет; ищем регуляркой `"lid"\\s*:\\s*<номер>[^0-9]`. Свой процесс исключаем: в
+    тексте этого запроса тот же образец.
     """
     sql = """
-        select count(*)
+        select string_agg(pid::text, ',')
           from pg_stat_activity
-         where pid = %s
-           and query ilike '%%pr_swf_start_ctl%%'
+         where query ilike '%%pr_swf_start_ctl%%'
+           and query ~ %s
+           and pid <> pg_backend_pid()
     """
+    # Регулярка, а не like: пробелы вокруг двоеточия зависят от сериализатора, а промах
+    # здесь дорог — «запуска нет» отдаёт загрузку на повтор при идущем ETL. Граница после
+    # номера обязательна, иначе 1234 нашёлся бы в 12345
     ask = gp_exe.retry_with(stop=stop_after_attempt(2), wait=wait_fixed(2))
-    return bool(ask(sql=sql, val=(int(pid),), timeout=timeout))
+    res = ask(sql=sql, val=(f'"lid"\\s*:\\s*{int(lid)}[^0-9]',), timeout=timeout)
+    return [int(p) for p in res.split(',')] if res else []
 
 
 def gp_loading_result(lid: int, timeout: int = 30) -> dict | None:
@@ -521,6 +566,18 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
         raise AirflowFailException(msg)
 
 
+#: Папка снимков CTL в корне бакета логов. Своей настройки S3 у CTL нет с 25.09.2026: снимки —
+#: те же логи, живут по сроку бакета логов, а всё нужное дагам лежит в Variables
+CTL_S3_ROOT = 'ctl'
+
+
+def _ctl_s3():
+    """(conn_id, bucket, prefix) снимков CTL: соединение и бакет логов, папка `ctl/` в корне."""
+    from airflow.configuration import conf
+    base = conf.get('logging', 'remote_base_log_folder')
+    return conf.get('logging', 'remote_log_conn_id'), base.split('://', 1)[1].split('/', 1)[0], CTL_S3_ROOT
+
+
 @retry(
     stop=stop_after_attempt(3), # Максимум 3 попытки
     wait=wait_exponential(multiplier=1, min=2, max=10), # Паузы 2с, 4с, 8с
@@ -528,7 +585,7 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_load(key, s3_id=None, bucket=None):
+def ctl_obj_load(key):
     """Загружает объект по ключу: сначала из Airflow Variable, затем из S3 (JSON).
 
     Возвращает dict или {} при отсутствии объекта.
@@ -544,10 +601,8 @@ def ctl_obj_load(key, s3_id=None, bucket=None):
         # new_md5 = hashlib.md5(content).hexdigest()
         return data #, new_md5
     
-    s3 = get_config().get('conns', {}).get('s3', {})
-    s3_id = s3_id or s3.get('conn_id', 's3')
-    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
-
+    s3_id, bucket, prefix = _ctl_s3()
+    key_ext = f'{prefix}/{key}.json'
     if bucket:
         hook = S3Hook(aws_conn_id=s3_id)
         try:
@@ -583,19 +638,15 @@ def ctl_obj_load(key, s3_id=None, bucket=None):
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_obj_etag(key, ext='json', s3_id=None, bucket=None):
+def ctl_obj_etag(key, ext='json'):
     """
     Возвращает только ETag (md5) объекта из S3 без загрузки тела файла.
     """
     from botocore.exceptions import ClientError
 
-    s3 = get_config().get('conns', {}).get('s3', {})
-    s3_id = s3_id or s3.get('conn_id', 's3')
-    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
-
+    s3_id, bucket, prefix = _ctl_s3()
     hook = S3Hook(aws_conn_id=s3_id)
-    # key_ext = f'{key}.json'
-    key_ext = f'{key}.{ext}'
+    key_ext = f'{prefix}/{key}.{ext}'
     try:
         # head_object возвращает только заголовки (метаданные)
         response = hook.get_conn().head_object(Bucket=bucket, Key=key_ext)
@@ -629,7 +680,7 @@ def _var_set(key, data, var):
     logger.info(f"Переменная {key} успешно обновлена в Airflow.")
 
 
-def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
+def ctl_obj_save(key, data, var=False, ext='json'):
     """
     Сохраняет объект в S3 и обновляет переменную Айрфлоу, если указано.
 
@@ -642,13 +693,10 @@ def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
     подменённой. Цена возврата — один `Variable.set` за круг на объект.
     """
 
-    s3 = get_config().get('conns', {}).get('s3', {})
-    s3_id = s3_id or s3.get('conn_id', 's3')
-    bucket = bucket or s3.get('bucket', 'edpetl-ctl')
-
+    s3_id, bucket, prefix = _ctl_s3()
+    key_ext = f'{prefix}/{key}.{ext}'
     if bucket:
         hook = S3Hook(aws_conn_id=s3_id)
-        key_ext = f'{key}.{ext}'
             
         # 1. Готовим контент в памяти
         if ext in ['json','jsn']:
@@ -660,7 +708,7 @@ def ctl_obj_save(key, data, var=False, ext='json', s3_id=None, bucket=None):
         else:
             content = data
             
-        new_md5 = hashlib.md5(content).hexdigest()
+        new_md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
 
         # 2. Проверяем текущий ETag в S3 (boto3 хранит MD5 в ETag для обычных загрузок)
         if hook.check_for_key(key_ext, bucket_name=bucket):

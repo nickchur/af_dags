@@ -1,11 +1,8 @@
 """### 🪣 DAG: Просмотр бакетов S3
-*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список бакетов для выбранного S3-подключения.
 
-| Параметр | Описание |
-|---|---|
-| `aws_conn_id` | ID подключения к S3 |
 """
 
 from datetime import datetime, timedelta, timezone
@@ -21,6 +18,7 @@ from plugins.utils import get_conns_by_type  # type: ignore
 
 @dag(
     doc_md=__doc__,
+    description='Список бакетов выбранного S3-подключения',
     owner_links={
         'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab',
         'Korchagin Viacheslav': 'mailto:VYurKorchagin@sberbank.ru',
@@ -39,7 +37,7 @@ from plugins.utils import get_conns_by_type  # type: ignore
     max_active_tasks=1,
     render_template_as_native_obj=True,
     params={
-        'aws_conn_id': Param('s3', type='string', enum=get_conns_by_type(conn_type='aws'), title='ID подключения к S3'),
+        'aws_conn_id': Param('s3', type='string', enum=get_conns_by_type(conn_type='aws'), title='ID подключения к S3', description='S3-подключение, чьи бакеты показать'),
     },
 )
 def tools_s3_bucket_viewer():

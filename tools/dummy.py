@@ -1,61 +1,77 @@
 """
-# Тестовый DAG
-*2026-09-21 18:44 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+### 🫀 DAG: задачи выполняются
+*2026-10-01 17:33 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Используется для проверки отображения Markdown в Airflow UI.
+Раз в час два таска подряд:
+- `dummy_task` (`EmptyOperator`) — шедулер отмечает его успешным сам, до воркера он не
+  доходит: зелёный — шедулер жив и разбирает раны;
+- `ping` — настоящая задача на воркере. В заметке — под, сколько шедулер думал между
+  `dummy_task` и постановкой `ping` в очередь и сколько `ping` ждал воркера в очереди.
 
----
-
-| **Параметр** | *Значение* | Описание |
-| :--- | :---: | :--- |
-| `timeout` | 30 | Время ожидания |
-| `retries` | 0 | Количество попыток |
-| `retry_delay` | 30 | Время между попытками |
-
----
-
-> Данный DAG предназначен для тестирования и отладки.
-
-- один
-    - *один_один*
-- два
-- три
-
-🔗 [Открыть лог в Elastic](https://logs.company.com)
-
-```json
-{
-    "key": "value"
-}
-```
+Красный ран по `dagrun_timeout` — за 50 минут не выполнилось: не зелёный `dummy_task` —
+стоит шедулер, не зелёный `ping` — задачи не доходят до воркера. Разбор —
+`tools_system_health` и `tools_log_events` за это время. До 28.09.2026 — ручной даг для
+проверки Markdown в UI.
 """
 
-from datetime import datetime, timezone
-from airflow.providers.standard.operators.empty import EmptyOperator
-from airflow.sdk import dag
+from datetime import datetime, timedelta, timezone
 
-from plugins.utils import on_callback, default_args  # type: ignore
+from airflow.providers.standard.operators.empty import EmptyOperator
+from airflow.sdk import dag, task
+
+try:
+    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
+
+
+def _sec(a, b):
+    """Секунды от a до b; '?' если одной из отметок нет."""
+    return f"{(b - a).total_seconds():.0f} с" if a and b else '?'
 
 
 @dag(
+    dag_id='tools_dummy',
     doc_md=__doc__,
-    tags=['HR_Data', 'tools', 'dummy'],
-    owner_links={'HR_Data (CI02750757)': 'https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=1774392110'},
-    default_args=default_args,
+    description='Пульс: жив ли шедулер и доходит ли задача до воркера, сколько ждёт в очереди',
+    owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
+    default_args={
+        'owner': 'DataLab (CI02420667)',
+        'pool': TOOLS_POOL,
+        'retries': 0,
+        # Как у соседей по пулу: выше регрессии, ниже агента CTL (см. test_connections.py)
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
+        'execution_timeout': timedelta(minutes=5),
+        'on_failure_callback': on_callback,
+    },
     start_date=datetime(2026, 1, 22, tzinfo=timezone.utc),
-    schedule=None,
+    schedule='3 * * * *',
+    # Меньше часа: не выполнившийся ран краснеет до следующего, а не копится за ним
+    dagrun_timeout=timedelta(minutes=50),
+    tags=['DataTools', 'tools', 'AutoQA'],
     catchup=False,
-    is_paused_upon_creation=True,
+    is_paused_upon_creation=False,
+    max_active_runs=1,
     on_failure_callback=on_callback,
-    on_success_callback=on_callback,
 )
-def dummy_dag():
-    EmptyOperator(
-        task_id='dummy_task',
-        on_failure_callback=on_callback,
-        on_success_callback=on_callback,
-        doc_md=__doc__,
-    )
+def tools_dummy():
+
+    @task(task_id='ping')
+    def ping(**context):
+        """Отмечает, где выполнилась задача и сколько ждала шедулер и воркер."""
+        ti = context['ti']
+        empty = context['dag_run'].get_task_instance('dummy_task')
+        add_note(
+            f"✅ выполнено на {ti.hostname}: шедулер {_sec(empty and empty.end_date, ti.queued_dttm)}, "
+            f"очередь {_sec(ti.queued_dttm, ti.start_date)}",
+            context, level='task',
+        )
+
+    EmptyOperator(task_id='dummy_task') >> ping()
 
 
-dummy_dag()
+tools_dummy()

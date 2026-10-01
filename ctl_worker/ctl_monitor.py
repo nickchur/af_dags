@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -9,20 +9,29 @@
 | 🚫 `Aborted` | Остановка при исчерпании попыток |
 | ✅ `Completed` | Успешное завершение |
 | ⚠️ `reStarted` | Перезапуск зависшей задачи |
+| ▶️ `Started` | Новая загрузка потока UE, у которого сорвалось расписание |
 | 🚨 `SLA` | Нарушение времени выполнения |
 | 🛑 `Stopped` | Остановка вручную |
 | ☮️ `Skipped` | Пропуск без изменений |
+
+Две ветки. Свои потоки (профиль контура + оркестратор `dummy`) — логика Airflow и GP.
+Потоки `ue_category` на других профилях и оркестраторах — наши, но исполняет их не
+Airflow: пороги `ue_stale` / `ue_run_max` / `ue_grace`, вместо `reRunned` — `reStarted`,
+а поток на расписании без активной загрузки получает новую (`Started`).
+
+Подробно: [ctl_worker/readme.md — ctl_monitor](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_monitorpy--мониторинг)
 """
 
-from airflow.sdk import DAG, Param, PokeReturnValue, task, task_group
+from airflow.sdk import DAG, Param, PokeReturnValue, Variable, task, task_group
 from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until  # type: ignore
+from ctl_worker.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
+from ctl_worker.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN, ctl_wf_owner, ctl_subtree_names  # type: ignore
 from plugins import af_meta  # type: ignore
 
 import ast
+import json
 import re
 import sys
 from functools import partial
@@ -45,6 +54,7 @@ action_icons = {
     'New':'⏳' ,
     'Skipped': '☮️', 
     'SLA': '🚨',
+    'Started': '▶️',
 }
 
 # Сводка SLA делится по возрасту. Нарушение вчерашнее и нарушение полугодовой давности —
@@ -58,7 +68,88 @@ sla_dead_txt = f'{sla_dead.days} д' if sla_dead.days else f'{sla_dead.seconds /
 SLA_SHOW = 10
 
 monitor_interval = str2timedelta(get_config().get('monitor_interval','minutes=15'))
-timeout = timedelta(hours=24)
+# Пороги разбора загрузок — в конфиге, значения по умолчанию прежние (были зашиты в код).
+# Лестница, с которой они обязаны сходиться, — в ctl_worker/ctl_core.py.
+new_grace = get_config().get('new_grace', 'minutes=60')     # моложе — загрузка «новая»
+lock_stale = get_config().get('lock_stale', 'hours=5')      # LOCK / LOCK-WAIT → reStarted
+wait_grace = cfg_delta('wait_grace', 'minutes=15')          # просрочка TIME-WAIT → reStarted
+# Стандарт служебных сенсоров (22.09.2026): окно 6 ч, затем ран снимается (soft_fail → skipped)
+# и следующий начинается по расписанию: лог попытки копится за всё окно, а сенсор на 12–18 ч
+# в сводке здоровья выглядел как зависшая задача. Ретраи гасят разовые сбои CTL и гонку
+# «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
+# Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
+# не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
+# Потоки ue_category исполняет не Airflow: соединения с GP, которое рвётся через 4 ч 30, у
+# них нет, и пороги свои — сутки на зависание и работу, полчаса на просрочку запуска.
+ue_stale = cfg_delta('ue_stale', 'hours=24')
+ue_run_max = cfg_delta('ue_run_max', 'hours=24')
+ue_grace = cfg_delta('ue_grace', 'minutes=30')
+# Потоки UE на расписании, у которых нет активной загрузки: {wf_id: когда заметили}.
+# Между проверками сенсор в reschedule теряет и память, и XCom — держим в Variable
+UE_LOST_VAR = 'ctl_ue_lost'
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
+sensor_retries = int(get_config().get('sensor_retries', 10))
+
+def time_wait_action(lid, log, wf, sdt, now, grace, context):
+    """Действие по загрузке в TIME-WAIT: reStarted, если срок старта прошёл больше `grace`.
+
+    Время старта достаём общим разбором: наш словарь, старый текст CTL 'Start scheduled
+    on …' либо расписание воркфлоу. Раньше здесь понимался ТОЛЬКО текст CTL, а всё
+    остальное считалось мусором и уходило в Aborted — то есть повтор, поставленный нами
+    же, монитор отменял. CTL этот текст больше не пишет, так что разбор идёт по остальным.
+    """
+    wait_to = ctl_wait_until(log)
+    if not wait_to:
+        # Лог молчит — смотрим условие запуска. Оно приходит ТОЛЬКО в полной загрузке
+        # (в списке /loading/extended его нет), поэтому дотягиваем её здесь, а не для
+        # каждой ожидающей. Спрашивать условие ДО расписания обязательно: при заданном
+        # startCondition CTL игнорирует wf_time_sched, и посчитанное по нему время было
+        # бы неправдой.
+        cond = (ctl_api(f'/v4/api/loading/{lid}') or {}).get('startCondition')
+        wait_to = ctl_wait_until(log, wf=wf, sdt=sdt, cond=cond)
+    if not wait_to:
+        # Время неизвестно НАМ, но известно CTL: он и разбудит загрузку. Пропускаем, а
+        # залипшую поймает проверка SLA и покажет человеку — лучше, чем отменить молча.
+        return 'Skipped'
+    if pendulum.parse(wait_to, tz=get_config()['tz']) + grace <= now:
+        add_note({'log': log, 'старт был назначен на': wait_to},
+                 context, level='Task', title=f'reStarted {lid}')
+        return 'reStarted'
+    return 'Skipped'
+
+
+def ue_action(lid, sts, log, sdt, now, wf, prm, context):
+    """Действие монитора по загрузке потока UE (исполняет не Airflow, мы — владельцы).
+
+    Действуем теми же вызовами CTL, что и для своих, но без предположений об Airflow и
+    GP: RUNNING у чужого исполнителя — это работа, а не оборванное соединение, поэтому
+    порог сутки (или `wf_timeout` воркфлоу), а вместо reRunned — reStarted: вернуть
+    загрузку в RUNNING умеет только наш сенсор.
+    """
+    since = pendulum.parse(sdt, tz=get_config()['tz'])
+    if sts == 'ERROR':
+        return 'Aborted' if wf.get('faultTolerance', {}).get('abortOnFailure', False) else 'Completed'
+    if sts == 'SUCCESS':
+        return 'Completed'
+    if sts == 'ABORTING':
+        act = (log or '').split(' ')[0].strip()
+        return act if act in action_icons else 'Aborted'
+    if sts == 'TIME-WAIT':
+        return time_wait_action(lid, log, wf, sdt, now, ue_grace, context)
+    if sts == 'EVENT-WAIT':
+        # ctl_events_mon сам даёт событию полчаса форы, прежде чем счесть его пропущенным
+        chk = ctl_events_mon(sdt, wf, now)
+        if not chk['chk']:
+            add_note(chk, context, level='Task', title=f'reStarted {lid}')
+            return 'reStarted'
+        return 'Skipped'
+    if sts == 'RUNNING':
+        raw = prm.get('wf_timeout') or wf['params'].get('wf_timeout')
+        limit = gp_timeout({'wf_timeout': raw})[0] if raw else ue_run_max
+        return 'reStarted' if since + limit <= now else 'Skipped'
+    # INIT, PREREQ, PARAM, START, LOCK, LOCK-WAIT, ERRORCHECK — стоять сутки им незачем
+    return 'reStarted' if since + ue_stale <= now else 'Skipped'
+
 
 with DAG(f'CTL.{get_config()["profile"]}.monitor',
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'logger'],
@@ -93,8 +184,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
     },
     on_failure_callback=partial(on_callback, level='DAG'),
     on_success_callback=partial(on_callback, level='DAG'),
-    # dagrun_timeout=timeout + str2timedelta(config.get('dagrun_timeout','minutes=10')),
+    # страховка от зависшего рана: окно сенсора плюс час на задачи после него
+    dagrun_timeout=sensor_timeout + timedelta(hours=1),
     doc_md=__doc__,
+    description='Мониторинг загрузок CTL: SLA, повторы, ABORTED, зависшие таски',
 ) as dag:
     
     
@@ -102,15 +195,14 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         mode='reschedule', 
         soft_fail=True,
         poke_interval=monitor_interval,
-        timeout=timeout,
+        timeout=sensor_timeout,
+        retries=sensor_retries,
     )
     def ctl_monitor(**context):
-        """Sensor: опрашивает активные загрузки категории и принимает решения по каждой.
-
-        Для каждой загрузки определяет action: reRunned / reStarted / Aborted / Completed / SLA / Skipped.
-        Возвращает PokeReturnValue(is_done=True, xcom_value={lid: r}) при наличии загрузок для обработки,
-        иначе is_done=False (продолжает опрос).
-        """
+        """Sensor: опрашивает активные загрузки категории и принимает решения по каждой."""
+        # Для каждой загрузки определяет action: reRunned / reStarted / Aborted / Completed / SLA / Skipped.
+        # Возвращает PokeReturnValue(is_done=True, xcom_value={lid: r}) при наличии загрузок для обработки,
+        # иначе is_done=False (продолжает опрос).
         chk_any_conn('ctl', **context)
         ti = context['ti']
 
@@ -133,17 +225,28 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         actions = {}
         stats = {}
 
-        for c in ctl_obj_load('ctl_categories').keys():
-            
-            data={
-                    'alive': '["ACTIVE"]', 
-                    'engines': '["dummy"]',
-                    # 'profile_ids': f'[{profile_id}]', 
-                    'category_ids': f'[{c}]'
-                    # 'category_ids': str(category_ids),
-                    # 'status': '["SUCCESS","ERROR","LOCK","RUNNING","TIME-WAIT","EVENT-WAIT"]',
-            }
+        # Две ветки. Свои (профиль контура + dummy) — во всём дереве, логика Airflow и GP.
+        # Потоки ue_category — любой профиль и оркестратор: исполняет не Airflow, пороги
+        # свои (ue_action). До 26.09.2026 фильтр был только по dummy: чужие оркестраторы
+        # монитор не видел вовсе, а dummy чужого профиля разбирал как свой.
+        prf = get_config()['profile']
+        profile_id = (ctl_obj_load('ctl_profile') or {}).get('id')
+        ue_names = ctl_subtree_names(get_config().get('ue_category'))
+        ue_active = set()      # воркфлоу UE, у которых есть активная загрузка
+        ue_complete = True     # ответ CTL по UE не обрезан лимитом — можно искать пропавших
+
+        # wf на пробу: у многих активных загрузок один поток, а проба на стенде шла 12–14 мин
+        # при интервале 15 — около 2000 обращений к CTL. В GP wf не пишем: изменения несёт лоадер
+        wf_cache = {}
+
+        for c, cat in ctl_obj_load('ctl_categories').items():
+            is_ue = cat.get('name') in ue_names
+            data = {'alive': '["ACTIVE"]', 'category_ids': f'[{c}]'}
+            if not is_ue:
+                data.update({'engines': '["dummy"]', 'profile_ids': f'[{profile_id}]'})
             tsk = ctl_loading_load(data, save=False)
+            if is_ue and get_config().get('ctl_limit', 0) and len(tsk) >= get_config()['ctl_limit']:
+                ue_complete = False
             
             for ld in sorted(tsk, key=lambda x: int(x['id'])):
                 
@@ -154,8 +257,13 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 prm = ld.get('params', {})
                 wfn = ld.get('wf_name','unknown')
                 # wf = wfs[wid]
-                wf = ctl_api(f'/v4/api/wf/{wid}')
-                wf = ctl_wf_norm(wf, None)
+                if wid not in wf_cache:
+                    wf_cache[wid] = ctl_wf_norm(ctl_api(f'/v4/api/wf/{wid}', gp_log=False), None)
+                wf = wf_cache[wid]
+                # double (свой профиль + dummy внутри ue_category) исполняет Airflow — ему своя логика
+                ue_ld = is_ue and ctl_wf_owner(wf, ue_names, prf) == 'ue'
+                if is_ue:
+                    ue_active.add(wid)
 
                 # ctl_obj_save(f"ctl_working/{lid}", jsn, var=False)
                 
@@ -194,9 +302,12 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 }
                 
                 # status "INIT", "TIME-WAIT", "EVENT-WAIT", "LOCK-WAIT", "PREREQ", "LOCK", "PARAM", "START", "RUNNING", "SUCCESS", "ERROR", "ERRORCHECK", "ABORTING"
-                tst = pendulum.parse(eval_delta(sdt, 'minutes=60'), tz=get_config()['tz'])
+                tst = pendulum.parse(eval_delta(sdt, new_grace), tz=get_config()['tz'])
                 
-                if tst <= now and not action:
+                if tst <= now and ue_ld:
+                    action = ue_action(lid, sts, log, sdt, now, wf, prm, context)
+                    r['ue'] = True
+                elif tst <= now and not action:
                     if sts == 'RUNNING' and not log:
                         action = 'Skipped'
 
@@ -216,12 +327,15 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                         action = 'Completed'
 
                     elif sts == 'ABORTING':
-                        action = log.split(' ').strip()
-                        action = action if status_icons.get(action) else 'Aborted'
+                        # Недоделанное действие монитора (лог '<действие> {…}') повторяем,
+                        # остальное закрываем. До 26.09.2026 ветка падала на list.strip(),
+                        # а сверка шла со статусами, а не с действиями
+                        action = (log or '').split(' ')[0].strip()
+                        action = action if action in action_icons else 'Aborted'
 
                     elif sts in ['LOCK-WAIT', 'LOCK']:
                         # if datetime.strptime(eval_delta(sdt, 'hours=5'), "%Y-%m-%d %H:%M:%S") <= now:
-                        if pendulum.parse(eval_delta(sdt, 'hours=5'), tz=get_config()['tz']) <= now:
+                        if pendulum.parse(eval_delta(sdt, lock_stale), tz=get_config()['tz']) <= now:
                             action = 'reStarted'
                         else:
                             action = 'Skipped'
@@ -230,44 +344,18 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                         action = 'reRunned'
 
                     elif sts == 'RUNNING' and log and log.startswith('RUN'):
-                        # if datetime.strptime(eval_delta(sdt, 'hours=5'), "%Y-%m-%d %H:%M:%S") <= now:
-                        if pendulum.parse(eval_delta(sdt, 'hours=6'), tz=get_config()['tz']) <= now:
+                        # Не раньше, чем мог кончиться сам запрос: у воркфлоу с wf_timeout
+                        # 600 мин прежние 6 ч перезапускали загрузку посреди работы GP.
+                        # wf_timeout — из параметров загрузки, иначе воркфлоу
+                        exe_to, _ = gp_timeout({'wf_timeout': prm.get('wf_timeout') or wf['params'].get('wf_timeout')})
+                        stale = max(cfg_delta('run_stale'), exe_to + EXE_MARGIN)
+                        if pendulum.parse(sdt, tz=get_config()['tz']) + stale <= now:
                             action = 'reRunned'
                         else:
                             action = 'Skipped'
 
                     elif sts == 'TIME-WAIT' and not running:
-                        # Время старта достаём общим разбором: наш словарь, старый текст
-                        # CTL 'Start scheduled on …' либо расписание воркфлоу. Раньше здесь
-                        # понимался ТОЛЬКО текст CTL, а всё остальное считалось мусором и
-                        # уходило в Aborted — то есть повтор, поставленный нами же, монитор
-                        # отменял. CTL этот текст больше не пишет, так что ветка else стала
-                        # основной.
-                        # Сначала только лог: наш словарь либо старый текст CTL.
-                        wait_to = ctl_wait_until(log)
-
-                        if not wait_to:
-                            # Лог молчит — смотрим условие запуска. Оно приходит ТОЛЬКО
-                            # в полной загрузке (в списке /loading/extended его нет),
-                            # поэтому дотягиваем её здесь, а не для каждой ожидающей.
-                            #
-                            # Спрашивать условие ДО расписания обязательно: при заданном
-                            # startCondition CTL игнорирует wf_time_sched, и посчитанное
-                            # по нему время было бы неправдой.
-                            cond = (ctl_api(f'/v4/api/loading/{lid}') or {}).get('startCondition')
-                            wait_to = ctl_wait_until(log, wf=wf, sdt=sdt, cond=cond)
-
-                        if not wait_to:
-                            # Время неизвестно НАМ, но известно CTL: он и разбудит загрузку.
-                            # Пропускаем, а залипшую поймает проверка SLA ниже и покажет
-                            # человеку — это лучше, чем отменить молча.
-                            action = 'Skipped'
-                        elif pendulum.parse(wait_to, tz=get_config()['tz']) + timedelta(minutes=15) <= now:
-                            add_note({'log': log, 'старт был назначен на': wait_to},
-                                     context, level='Task', title=f'reStarted {lid}')
-                            action = 'reStarted'
-                        else:
-                            action = 'Skipped'
+                        action = time_wait_action(lid, log, wf, sdt, now, wait_grace, context)
 
                     elif sts == 'EVENT-WAIT' and not running:
                         chk = ctl_events_mon(sdt, wf, now)
@@ -284,7 +372,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     action = 'notFound'
                     
                 if action in ['Skipped']:
-                    wf_interval = gp_exe(None, f"SELECT '{sla}'::interval") if sla else timedelta(days=1)
+                    # Интервал разбирает Greenplum: формат wf_interval — интервал PostgreSQL. До
+                    # 29.09.2026 SQL уходил вторым аргументом, а первым — None: «can't execute an
+                    # empty query», и сенсор с soft_fail молча пропускал весь прогон монитора
+                    wf_interval = gp_exe("SELECT %s::interval", (sla,)) if sla else timedelta(days=1)
                     # wf_interval = timedelta(hours=6)
                     tst = pendulum.parse(sdt, tz=get_config()['tz']) + wf_interval 
                     if tst <= now:
@@ -334,6 +425,43 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     else:
                         continue
             
+        # Поток UE на расписании без активной загрузки — расписание сорвалось: по нему CTL
+        # сам больше ничего не создаст. Не раньше ue_grace с момента, как заметили: между
+        # концом загрузки и созданием следующей CTL нужно время. Обрезанный лимитом ответ
+        # CTL не годится — недостающие загрузки выглядели бы пропавшими потоками.
+        if ue_complete:
+            tz = get_config()['tz']
+            try:
+                seen = json.loads(Variable.get(UE_LOST_VAR, default='{}'))
+            except Exception:
+                seen = {}
+            lost = {}
+            for wid, w in (ctl_obj_load('ctl_workflows') or {}).items():
+                wid = str(wid)
+                if w.get('deleted', False) or wid in ue_active or ctl_wf_owner(w, ue_names, prf) != 'ue':
+                    continue
+                if not w.get('scheduled'):
+                    # Не на расписании — CTL ждущую загрузку не держит, и её отсутствие
+                    # штатно. Пришедшее событие у потока на расписании ловит EVENT-WAIT
+                    # (ue_action); у снятого с расписания стартовать по событию нечему —
+                    # так решил владелец. Замер прода 26.09.2026: у всех 58 UE-потоков
+                    # CTL держит EVENT-WAIT и создаёт следующую за 0,2–0,6 с после конца.
+                    continue
+                lost[wid] = seen.get(wid) or now.to_datetime_string()
+                t = now - pendulum.parse(lost[wid], tz=tz)
+                if t >= ue_grace and len(res) < MAX_WFS:
+                    actions['Started'] = actions.get('Started', 0) + 1
+                    res[f'wf:{wid}'] = {
+                        'time': (f'{t.days} d ' if t.days else '') + f'{t.hours:02}:{t.minutes:02}',
+                        'sdt': lost[wid], 'SLA': '', 'sch': True, 'sts': None, 'log': False,
+                        'act': 'Started', 'icon': action_icons['Started'],
+                        'wid': wid, 'wfn': w.get('name', ''), 'ue': True,
+                    }
+                    # следующая попытка — не раньше, чем через ue_grace
+                    lost[wid] = now.to_datetime_string()
+            if lost != seen:
+                Variable.set(UE_LOST_VAR, json.dumps(lost))
+
         actions = { f'{action_icons[a]}  {a}': v for a,v in actions.items()}
         add_note(actions, context, level='Task,DAG', title='Action', add=False)
         
@@ -393,14 +521,12 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
 
     @task(pool='ctl_pool')
     def ctl_action(res, **context):
-        """Выполняет действия над загрузками из res (XCom от ctl_monitor).
-
-        res — dict {lid: r}, где r содержит act/wid/sch. Для каждой загрузки:
-        - ABORTING статус → aborted/completed через API;
-        - reRunned → RUNNING статус;
-        - reStarted/Stopped → удаляет расписание, завершает, создаёт новую загрузку;
-        - scheduled → ставит в расписание.
-        """
+        """Выполняет действия над загрузками из res (XCom от ctl_monitor)."""
+        # res — dict {lid: r}, где r содержит act/wid/sch. Для каждой загрузки:
+        # - ABORTING статус → aborted/completed через API;
+        # - reRunned → RUNNING статус;
+        # - reStarted/Stopped → удаляет расписание, завершает, создаёт новую загрузку;
+        # - scheduled → ставит в расписание.
         chk_any_conn('ctl', **context)
         
         active = True
@@ -409,6 +535,23 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             raise AirflowSkipException('Notheng to do')
         
         for lid, r in res.items():
+            if r['act'] == 'Started':
+                # Загрузки нет — ключ wf:<id>. Перед созданием ещё раз спрашиваем CTL:
+                # решение принято по снимку воркфлоу, а загрузка могла появиться с тех пор
+                wid = r['wid']
+                add_note(r, context, level='Task', title=f"▶️ wf {wid} {r['wfn']}")
+                try:
+                    live = ctl_api('/v5/api/loading/extended', data={
+                        'alive': '["ACTIVE"]', 'wfNamesLike': json.dumps([r['wfn']])}) or []
+                    if any(str(x.get('wf_id')) == wid for x in live):
+                        continue
+                    # поток на расписании возвращаем в расписание, поток по событию — нет
+                    after = 'true' if r.get('sch') else 'false'
+                    if active: ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={after}", "post", json={})
+                except Exception as e:
+                    logger.error(f"ctl_action Started failed for wf={wid}: {e}")
+                continue
+
             lid = int(lid)
             wid = r['wid']
             action = r['act']
@@ -452,33 +595,32 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
     
     @task(pool='ctl_pool')
     def ctl_zombie(**context):
-        """🧟 Закрывает таски, зависшие в RUNNING с мёртвым heartbeat.
-
-        Зачем. Умерший воркер оставляет таск в состоянии RUNNING. Планировщик объявляет
-        его зомби и шлёт колбэк «пометить упавшим», но колбэк исполняется в контексте
-        файла дага — а даг к тому времени мог исчезнуть (воркфлоу выпал из ctl_workflows,
-        и фабрика его больше не строит). Тогда состояние не меняется никогда: те же таски
-        объявляются зомби каждые десять секунд годами. На alpha так накопилось 33 штуки,
-        самым старым — с апреля; они держали слоты ctl_pool, а каждое объявление дёргало
-        наш on_failure_callback (за пять минут — под тысячу вызовов и 33 МБ лога).
-
-        Что делает: помечает такие таски упавшими и закрывает осиротевшие раны. С
-        загрузкой CTL за раном (`sensor__<lid>_…`) поступает по-разному, и это главное
-        различие:
-
-        * ехать некуда (нет живых задач, даг выпал из сериализации) — загрузка
-          переводится в ABORTED: CTL иначе считает её активной, а идти ей действительно
-          некуда;
-        * ждёт снятия паузы — загрузка НЕ трогается. Снимут паузу — сенсор запустит её
-          заново; закрыть её значило бы потерять загрузку из-за плановых работ. Тот же
-          принцип, что у сенсора при `DagNotFound`: «вернётся даг — поедет и она».
-
-        Порог берётся из конфига (`zombie_after`, по умолчанию 6 часов) и обязан быть
-        БОЛЬШЕ exe_timeout: длинный run_exe не бьётся чаще, чем работает, и попасть под
-        нож не должен. Параметр формы `zombie_dry_run` показывает список, ничего не трогая.
-        """
+        """🧟 Закрывает таски, зависшие в RUNNING с мёртвым heartbeat."""
+        # Зачем. Умерший воркер оставляет таск в состоянии RUNNING. Планировщик объявляет
+        # его зомби и шлёт колбэк «пометить упавшим», но колбэк исполняется в контексте
+        # файла дага — а даг к тому времени мог исчезнуть (воркфлоу выпал из ctl_workflows,
+        # и фабрика его больше не строит). Тогда состояние не меняется никогда: те же таски
+        # объявляются зомби каждые десять секунд годами. На alpha так накопилось 33 штуки,
+        # самым старым — с апреля; они держали слоты ctl_pool, а каждое объявление дёргало
+        # наш on_failure_callback (за пять минут — под тысячу вызовов и 33 МБ лога).
+        #
+        # Что делает: помечает такие таски упавшими и закрывает осиротевшие раны. С
+        # загрузкой CTL за раном (`sensor__<lid>_…`) поступает по-разному, и это главное
+        # различие:
+        #
+        # * ехать некуда (нет живых задач, даг выпал из сериализации) — загрузка
+        #   переводится в ABORTED: CTL иначе считает её активной, а идти ей действительно
+        #   некуда;
+        # * ждёт снятия паузы — загрузка НЕ трогается. Снимут паузу — сенсор запустит её
+        #   заново; закрыть её значило бы потерять загрузку из-за плановых работ. Тот же
+        #   принцип, что у сенсора при `DagNotFound`: «вернётся даг — поедет и она».
+        #
+        # Порог берётся из конфига (`zombie_after`, по умолчанию 6 часов) и обязан быть
+        # больше потолка запроса в Greenplum (`gp_timeout` + 10 мин): лестница проверяется до
+        # любой уборки (`timeout_ladder`, ctl_worker/ctl_core.py). Параметр формы
+        # `zombie_dry_run` показывает список, ничего не трогая.
         dry = bool(context['params'].get('zombie_dry_run'))
-        after = str2timedelta(get_config().get('zombie_after', 'hours=6'))
+        after = cfg_delta('zombie_after')
         secs = int(after.total_seconds())
 
         # Порог — единственное, что отделяет уборку от бойни: при нуле под нож идёт всё,
@@ -488,6 +630,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             raise AirflowFailException(
                 f"🔥 zombie_after = {after} — меньше пяти минут; санитар с таким порогом "
                 "закрывает живые раны. Поправьте ctl_config.")
+        timeout_ladder()
 
         # Сколько ранов закрываем за один заход. Без потолка первый боевой прогон по
         # накопленному бэклогу закрыл бы всё разом и утащил бы за собой поштучный обход
@@ -564,19 +707,38 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         AGE = ("coalesce(dr.start_date, dr.queued_at, dr.run_after)"
                f" < now() - interval '{secs} seconds'")
 
+        PAUSED = "EXISTS (SELECT 1 FROM dag d WHERE d.dag_id = dr.dag_id AND d.is_paused)"
+        # Запаузенный даг из «нет живых задач» исключён: у его рана следующая задача так и
+        # остаётся без состояния (планировщик паузу не разбирает), и раньше такой ран уходил
+        # сюда — вместе с загрузкой в ABORTED. Пауза — не смерть: его забирает paused_where.
         dead_where = (
             f"dr.state IN ('running','queued') AND {AGE}"
             "   AND ("
-            "        (dr.state = 'running'"
+            f"        (dr.state = 'running' AND NOT {PAUSED}"
             "         AND NOT EXISTS (SELECT 1 FROM task_instance ti"
             "                          WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id"
             f"                            AND ti.state IN {LIVE_TASK}))"
             "     OR NOT EXISTS (SELECT 1 FROM serialized_dag sd WHERE sd.dag_id = dr.dag_id)"
             "       )"
         )
+        # Ран запаузенного дага: в очереди — по возрасту; в работе — если задач в running
+        # нет и ничего не заканчивалось дольше порога. dagrun_timeout такому рану не
+        # поможет: планировщик AF 2.11.2 запаузенные даги не разбирает вовсе
+        # (models/dagrun.py:412), а таймаут проверяет там же (scheduler_job_runner.py:1665).
+        # Задачу в running не трогаем при любом wf_timeout: запрос в GP доработает, и ран
+        # закроется на следующем круге. Отсчёт — от последнего движения, а не от старта
+        # рана: иначе ран, шедший пять часов и запаузенный сейчас, закрылся бы через час.
         paused_where = (
-            f"dr.state = 'queued' AND {AGE}"
-            "   AND EXISTS (SELECT 1 FROM dag d WHERE d.dag_id = dr.dag_id AND d.is_paused)"
+            f"{PAUSED} AND ("
+            f"    (dr.state = 'queued' AND {AGE})"
+            "  OR (dr.state = 'running'"
+            "      AND NOT EXISTS (SELECT 1 FROM task_instance ti"
+            "                       WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id"
+            "                         AND ti.state = 'running')"
+            "      AND coalesce((SELECT max(ti.end_date) FROM task_instance ti"
+            "                     WHERE ti.dag_id = dr.dag_id AND ti.run_id = dr.run_id),"
+            "                   dr.start_date, dr.queued_at)"
+            f"          < now() - interval '{secs} seconds'))"
         )
 
         def orphan_sql(action, where):
@@ -638,7 +800,28 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         # Порядок: сперва «ехать некуда» — иначе запаузенный ран пропавшего дага попал бы
         # во второй запрос и загрузка осталась бы висеть активной.
         runs = pg_exe(orphan_sql(upd, dead_where) + ret)
-        paused_runs = pg_exe(orphan_sql(upd, paused_where) + ret)
+        # Ран на паузе в работе закрываем так же, как сам Airflow по dagrun_timeout: ран —
+        # failed, незаконченные задачи — skipped (running среди них нет по отбору). was —
+        # прежнее состояние рана, для заметки: очередь и работа — разные истории.
+        paused_runs = pg_exe(
+            "WITH closed AS ("
+            "  UPDATE dag_run dr SET state = 'failed', end_date = now()"
+            "    FROM (SELECT dr.id, dr.state AS was FROM dag_run dr"
+            f"          WHERE {paused_where}"
+            "          ORDER BY coalesce(dr.start_date, dr.queued_at, dr.run_after)"
+            f"         LIMIT {LIMIT}) o"
+            "   WHERE dr.id = o.id"
+            "   RETURNING dr.dag_id, dr.run_id, o.was"
+            "), skipped AS ("
+            "  UPDATE task_instance ti SET state = 'skipped', end_date = now()"
+            "    FROM closed c"
+            "   WHERE ti.dag_id = c.dag_id AND ti.run_id = c.run_id AND c.was = 'running'"
+            "     AND (ti.state IS NULL OR ti.state IN ('scheduled','queued','up_for_retry',"
+            "                                           'up_for_reschedule','deferred','restarting'))"
+            "   RETURNING 1"
+            ")"
+            " SELECT c.dag_id, c.run_id, c.was, (SELECT count(*) FROM skipped) AS ti_skipped FROM closed c"
+        )
 
         # Загрузки берутся и с тасков, и с ранов: у рана-призрака живых тасков нет
         # вовсе, а загрузка за ним всё равно числится активной. Раны с паузы сюда НЕ
@@ -672,7 +855,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         add_note({'🧟 Закрыто зависших тасков': len(failed), 'таски': note,
                   'закрыто ранов': len(runs), 'загрузки ABORTED': closed,
                   'уже закрыты': skipped,
-                  '⏸️ закрыто ранов на паузе': len(paused_runs),
+                  '⏸️ закрыто ранов на паузе': {
+                      'в очереди': sum(r['was'] == 'queued' for r in paused_runs),
+                      'в работе': sum(r['was'] == 'running' for r in paused_runs),
+                      'задач → skipped': paused_runs[0]['ti_skipped'] if paused_runs else 0},
                   'их загрузки не тронуты': lids_of(paused_runs)},
                  context, level='Task,DAG')
         return {'stuck': len(failed), 'runs': len(runs), 'paused': len(paused_runs),

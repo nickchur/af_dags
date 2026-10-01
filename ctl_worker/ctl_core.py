@@ -1,5 +1,5 @@
-"""### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🛠️ Ядро логики CTL (`ctl_worker/ctl_core.py`)
+*2026-09-30 09:50 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -11,6 +11,7 @@
 | `ctl_chk_wait` / `ctl_chk_new` | Управление TIME-WAIT и готовностью к запуску |
 | `ctl_events_mon` / `ctl_chk_expire` | Мониторинг EVENT-WAIT (OR/AND), таймаут ожидания |
 | `ctl_wf_norm` / `ctl_get_eids` | Нормализация workflow, список участвующих сущностей |
+| `ctl_wf_owner` / `ctl_subtree_names` | Кто исполняет поток: Airflow, UE, оба или никто |
 | `ctl_send_html` | Потоковая отправка HTML-отчётов в CTL |
 | `chk_any_conn` | Проверка доступности Postgres / S3 / KerberosHttp |
 | `raise_status` | Превращает статус решателя (`ctl_chk_*`) в исключение Airflow |
@@ -30,8 +31,8 @@ import ast
 import time
 import json
 
-from plugins.utils import query_to_dict, pool_slots, on_callback, add_note # type: ignore
-from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
+from plugins.utils import chk_conn, pool_slots, on_callback, add_note, str2timedelta # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -126,26 +127,26 @@ def ctl_get_status(ld):
     }
 
 
-def ctl_exe_recover(lid, gp_pid=None, deadline=None, poll=30):
+def ctl_exe_recover(lid, deadline=None, poll=30):
     """🔎 Подбирает ответ по загрузке после обрыва: ждёт, если работа ещё идёт.
 
     Зовётся на повторной попытке `run_exe`. Отвечает на вопрос «что стало с прошлой
-    попыткой» и возвращает пару ``('ok', ответ)`` либо ``('fail', сообщение)`` —
-    решение принимает таск через `raise_status`.
+    попыткой» и возвращает пару:
 
-    Различать приходится три исхода, а не два:
+    - ``('ok', ответ)`` — **ответ в журнале есть**: работа выполнена и закоммичена;
+    - ожидание — **ответа нет, но Greenplum выполняет запуск этой загрузки**: обрыв
+      клиента запрос не останавливает, ETL продолжает работать. Ждём его: объявить работу
+      несостоявшейся значило бы отдать загрузку на повтор и получить второй ETL
+      параллельно первому;
+    - ``('lost', сообщение)`` — **ответа нет и запуска нет**: транзакция откачена, работы
+      не было. Исход достоверный, и загрузку можно сразу отдать CTL на повтор;
+    - ``('fail', сообщение)`` — запуск идёт дольше `deadline`: исход неизвестен.
 
-    - **ответ в журнале есть** — работа выполнена и закоммичена, отдаём его;
-    - **ответа нет, но backend занят нашей процедурой** — обрыв клиента запрос в Greenplum
-      не останавливает, значит ETL продолжает работать. Ждём его: упасть здесь значило бы
-      отдать загрузку на повтор в CTL и получить второй ETL параллельно первому;
-    - **ответа нет и backend свободен** — транзакция откачена, работы не было.
-
-    Без `gp_pid` (его пушит `gp_exe` в XCom) второй исход неотличим от третьего, и тогда
-    неизвестность трактуется в пользу «работа могла быть выполнена»: падаем, а не
-    запускаем ETL заново.
+    Запуск ищется по номеру загрузки (`gp_backend_busy`), а не по pid из XCom: Airflow
+    стирает XCom задачи в начале каждой попытки, и до 26.09.2026 повтор всегда заканчивался
+    «pid неизвестен». Недоступный Greenplum — исключение из справок, его разбирает таск.
     """
-    from plugins.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
+    from ctl_worker.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
 
     waited = 0
     while True:
@@ -153,17 +154,19 @@ def ctl_exe_recover(lid, gp_pid=None, deadline=None, poll=30):
         if done:
             return 'ok', done
 
-        pid = (gp_pid or {}).get('pid') if isinstance(gp_pid, dict) else gp_pid
-        if not pid:
-            return 'fail', (f"ответа по загрузке {lid} в журнале Greenplum нет, а pid прошлой "
-                            "попытки неизвестен — идёт ли работа, определить нечем")
-        if not gp_backend_busy(pid):
-            return 'fail', (f"ответа по загрузке {lid} в журнале Greenplum нет, backend {pid} "
-                            "свободен — транзакция откачена, работа не выполнялась")
+        pids = gp_backend_busy(lid)
+        if not pids:
+            # Между двумя справками запуск мог закоммититься: журнал спрашиваем ещё раз,
+            # иначе выполненную работу объявили бы несостоявшейся и повторили
+            done = gp_loading_result(lid)
+            if done:
+                return 'ok', done
+            return 'lost', (f"ответа по загрузке {lid} в журнале Greenplum нет и запуска "
+                            "с этим номером нет — прошлая попытка откачена, работа не выполнена")
 
         if deadline and waited >= deadline:
-            return 'fail', (f"загрузка {lid} всё ещё выполняется в Greenplum (backend {pid}), "
-                            f"ждали {waited} с и не дождались")
+            return 'fail', (f"загрузка {lid} всё ещё выполняется в Greenplum (backend "
+                            f"{', '.join(map(str, pids))}), ждали {waited} с и не дождались")
         time.sleep(poll)
         waited += poll
 
@@ -536,13 +539,16 @@ def ctl_send_html(html_content, lid, eid):
     Логика:
     - Если сообщение ≤ MAX_HTML — отправляется целиком.
     - Если > MAX_HTML и ≤ MAX_HTML * 10 — разбивается с сохранением <tr>.
-    - Очень длинные (> MAX_HTML * 10) — пропускаются.
+    - Очень длинные (> MAX_HTML * 10) — пропускаются: CTL режет статистику. Номера и длины
+      пропущенных возвращаются списком — вызывающий пишет заметку (полная копия отчёта лежит
+      в бакете логов, `ctl_reports/{lid}`).
     """
 
     max_len = get_config().get('max_html', MAX_HTML)
     max_total = max_len * 10
     profile = get_config()['profile']
     stat_id = 12
+    skipped = []
 
     try:
         # Приводим к списку строк
@@ -596,13 +602,17 @@ def ctl_send_html(html_content, lid, eid):
                     hd = '</td></tr>' if ft else ''
                     pos += cut_pos
 
-            # Сообщения длиннее max_total — пропускаем
+            # Сообщения длиннее max_total — пропускаем, но не молча
             else:
+                logger.warning("ctl_send_html: раздел %s длиной %s длиннее %s — в CTL не отправлен",
+                               n, length, max_total)
+                skipped.append((n, length))
                 continue
 
     except Exception as err:
         logger.error(f"[ERROR] Failed to send HTML to statval: {err}")
         raise
+    return skipped
 
 
 def ctl_loading_norm(wf_name, data):
@@ -691,7 +701,7 @@ def _fixed_slots(id, value) -> int:
 
 
 def chk_any_conn(id, data=None, manage_pool=False, **context):
-    """Проверяет доступность соединения id (Postgres / S3 / KerberosHttp).
+    """Проверяет доступность подключения id из конфига CTL — сама проверка в `plugins.utils.chk_conn`.
 
     data — dict с type/conn_id/pool_slots; при отсутствии берётся из get_config()['conns'][id].
     Успех — заметка в Airflow, сбой — заметка и AirflowFailException.
@@ -702,86 +712,52 @@ def chk_any_conn(id, data=None, manage_pool=False, **context):
     сидит в default_pool, который никто не обнуляет. Раньше писали все, и три проверки CTL
     сидели в самом ctl_pool: при сбое CTL обнуляли его и сами больше туда не попадали.
     """
-    
     data = data if data else get_config().get('conns', {}).get(id, {})
-    context = context if context else get_current_context()
-
-    ti = context['ti']
-    try_number = ti.try_number
-    sdt = ti.start_date.astimezone(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S %Z')
-    ts = time.time()
+    pool = manage_pool and data.get('pool_slots')
     try:
-        if data['type'] == 'Postgres':
-            if data.get('default'):
-                # Метабаза: в Airflow 3 не create_session, а af_meta (тот же conns.pg)
-                from plugins import af_meta  # type: ignore
-                result = af_meta.sql('SELECT current_user, current_database(), inet_server_addr()',
-                                     timeout=15)[0]
-            else:
-                from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
-                hook = PostgresHook(postgres_conn_id=data['conn_id'])
-                result = query_to_dict(hook, 'SELECT current_user, current_database(), inet_server_addr()', timeout=15)[0]
-            
-        elif data['type'] == 'S3':
-            from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
-            from botocore.config import Config # type: ignore
-            
-            # Явно извлекаем verify из экстра для надежности
-            extra = S3Hook.get_connection(data['conn_id']).extra_dejson
-            verify = extra.get('verify', True)
-            if isinstance(verify, str): verify = verify.lower() == 'true'
-
-            # config_kwargs соединения нельзя терять: явно переданный config подменяет их
-            # целиком (connection_wrapper.py: `if not self.botocore_config and config_kwargs`),
-            # а секрет-бэкенд кладёт туда signature_version, payload_signing_enabled и
-            # request_checksum_calculation — без них шлюз отвергает запросы.
-            # merge накладывает таймауты поверх, не затирая остального.
-            config = Config(**extra.get('config_kwargs', {})).merge(Config(connect_timeout=15, read_timeout=15))
-
-            hook = S3Hook(aws_conn_id=data['conn_id'], verify=verify, config=config)
-            result = hook.get_conn().list_buckets()['Buckets']
-            
-        elif data['type'] == 'KerberosHttp':
-            from plugins.ctl_utils import KerberosHttpHook # type: ignore  # там же и запасной путь
-            hook = KerberosHttpHook(method='GET', http_conn_id=data['conn_id'])
-            
-            # HttpHook.run принимает параметры requests через extra_options
-            verify = hook.get_connection(data['conn_id']).extra_dejson.get('verify', True)
-            if isinstance(verify, str): verify = verify.lower() == 'true'
-
-            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'}, extra_options={'timeout': 15, 'verify': verify})
-            response.raise_for_status()
-            result = response.json()
-        else:
-            result = None
-        
-        if manage_pool and data.get('pool_slots'):
-            pool_slots(f'{id}_pool', slots=_fixed_slots(id, data['pool_slots']))
-        
-        logger.info(f"🔍 {result}")       
-        msg = f"✅ {time.time()-ts:.2f} sec chk_{id}_conn"
-        add_note({'try':try_number, 'sdt':sdt}, context, title=msg)
-        
-    except AirflowSkipException:
-        raise
-
-    except ImportError as err:
-        msg = f"☮️ {id}: провайдер не установлен — {err}"
-        add_note(msg, context, level='task', title=f"☮️ {id}")
-        logger.warning(msg)
-        raise AirflowSkipException(msg) from err
-        
-    except Exception as err:
-        if manage_pool and data.get('pool_slots') and not data.get('default', False):
+        chk_conn(data['type'], data.get('conn_id'), context or None, name=id,
+                 tz=get_config()['tz'], default=data.get('default', False))
+    except AirflowFailException:
+        if pool and not data.get('default', False):
             pool_slots(f'{id}_pool', slots=0)
-        
-        response = getattr(err, 'response', None)
-        logger.error(response)      
-        msg = f"❌ {time.time()-ts:.2f} sec chk_{id}_conn ERROR Try {try_number} {sdt}"
-        add_note(err, context, level='Task,DAG', title=msg)
-        raise AirflowFailException(f"{msg}: {err}") from err
+        raise
+    if pool:
+        pool_slots(f'{id}_pool', slots=_fixed_slots(id, data['pool_slots']))
 
-        
+
+# Кто исполняет наши потоки (всё дерево root_category). Airflow — только профиль контура
+# с оркестратором dummy; потоки на других профилях и оркестраторах — наши же, но их
+# исполняет не Airflow: они лежат в ue_category, и за ними следит монитор (ветка UE).
+AF_ENGINE = 'dummy'
+
+
+def ctl_subtree_names(root_name, categories=None) -> set:
+    """Имена категории `root_name` и всех её потомков по дереву `ctl_categories`."""
+    cats = {str(k): c for k, c in (categories if categories is not None
+                                   else ctl_obj_load('ctl_categories') or {}).items()}
+    ids = {k for k, c in cats.items() if c.get('name') == root_name}
+    while True:
+        more = {k for k, c in cats.items() if str(c.get('parentId')) in ids} - ids
+        if not more:
+            return {cats[k]['name'] for k in ids}
+        ids |= more
+
+
+def ctl_wf_owner(wf, ue_names, profile) -> str:
+    """Кто отвечает за воркфлоу: `af`, `ue`, `double` (оба) или `orphan` (никто).
+
+    `af` — профиль контура и оркестратор dummy: даг строит фабрика, загрузки ведёт монитор
+    по своей логике. `ue` — лежит в `ue_category`: исполняет не Airflow, монитор только
+    следит. `double` — оба признака сразу: Airflow исполняет, ветка UE его не трогает.
+    `orphan` — ни то ни другое: дага нет, монитор не смотрит, поток потерян.
+    """
+    af = wf.get('profile') == profile and wf.get('engine') == AF_ENGINE
+    ue = wf.get('category') in ue_names
+    if af:
+        return 'double' if ue else 'af'
+    return 'ue' if ue else 'orphan'
+
+
 def ctl_wf_norm(wf, connectedEntities=None):
     """Нормализует workflow dict из API: разворачивает param→params, statusNotifications, wf_event_sched.
 
@@ -971,3 +947,76 @@ def ctl_get_eids(wid, wf_prm, connected=None):
     #     wfs[wid]['entity'] = ','.join(map(str, sorted(eids)))
     return eids
 
+
+
+# ─── Лестница таймаутов (ревизия 22.09.2026, openspec ctl-timeouts-revision) ───────────────
+#
+#   GP сервер          4 ч 30     обрывает запрос вместе с соединением — молча, без логов
+#   gp_timeout         4 ч 25     statement_timeout по умолчанию: на 5 мин ниже сервера, чтобы
+#                                 query_canceled поймал обработчик pr_swf_start_ctl (res = -2)
+#   run_exe            потолок + 10 мин   execution_timeout: страховка от зависшего соединения
+#   zombie_after       6 ч        санитар; обязан быть больше gp_timeout + 10 мин
+#   run_stale          6 ч        монитор: RUNNING → reRunned; не меньше zombie_after
+#
+# Раньше statement_timeout по умолчанию был 3 ч — ровно серверный лимит, гонка «кто первый».
+# Лимит сервера — правило GPCC «Query Time 4,5H (GLOBAL)»: pg_terminate_backend, у клиента AdminShutdown
+# и «SSL connection has been closed unexpectedly» (замер pg_sleep 22.09.2026). До 24.09.2026
+# здесь стояли 3 ч: загрузки резались на полтора часа раньше, чем мог бы сервер.
+TIMEOUT_DEFAULTS = {
+    'gp_server_limit': 'minutes=270',
+    'gp_timeout': 'minutes=265',
+    'zombie_after': 'hours=6',
+    'run_stale': 'hours=6',
+}
+#: Зазор задачи над своим запросом: доехать ответу и записаться заметке
+EXE_MARGIN = timedelta(minutes=10)
+
+
+def cfg_delta(key, default=None):
+    """Интервал из ctl_config строкой `hours=6`; нет ключа — значение по умолчанию."""
+    return str2timedelta(str(get_config().get(key) or default or TIMEOUT_DEFAULTS[key]))
+
+
+def gp_timeout(params=None):
+    """Потолок запроса загрузки в Greenplum: (timedelta, предупреждение или None).
+
+    `wf_timeout` воркфлоу — минуты числом (`15`, `600`) либо интервал (`minutes=1`); нет его —
+    `gp_timeout` конфига. `wf_timeout` не урезается: раз задан, значит нужен (решение
+    22.09.2026). Но если он не ниже серверного лимита, сервер оборвёт запрос раньше и
+    молча — об этом предупреждение. Одна функция на воркер и монитор: монитор по ней же
+    решает, не рано ли перезапускать загрузку.
+    """
+    raw = (params or {}).get('wf_timeout')
+    if raw in (None, ''):
+        return cfg_delta('gp_timeout'), None
+    try:
+        to = timedelta(minutes=int(raw))
+    except (ValueError, TypeError):
+        to = str2timedelta(str(raw))
+    if not to:
+        # непонятное значение — не ноль (statement_timeout = 0 значит «без предела»)
+        return cfg_delta('gp_timeout'), f"⚠️ wf_timeout = {raw!r} не разобран — взят gp_timeout"
+    limit = cfg_delta('gp_server_limit')
+    if to >= limit:
+        return to, (f"⚠️ wf_timeout = {to} не ниже серверного лимита Greenplum {limit}: "
+                    "сервер оборвёт запрос раньше и молча, без res = -2 и лога ошибки")
+    return to, None
+
+
+def timeout_ladder():
+    """Глобальные ключи лестницы; несогласованные — AirflowFailException с объяснением.
+
+    Зовёт санитар до любой уборки: при перепутанных порогах он закрыл бы живые раны.
+    `wf_timeout` отдельных воркфлоу сюда не входит — их учитывает монитор поштучно.
+    """
+    lad = {k: cfg_delta(k) for k in TIMEOUT_DEFAULTS}
+    errors = []
+    if lad['gp_timeout'] >= lad['gp_server_limit']:
+        errors.append(f"gp_timeout {lad['gp_timeout']} не ниже серверного лимита {lad['gp_server_limit']}")
+    if lad['zombie_after'] <= lad['gp_timeout'] + EXE_MARGIN:
+        errors.append(f"zombie_after {lad['zombie_after']} не больше gp_timeout + {EXE_MARGIN}")
+    if lad['run_stale'] < lad['zombie_after']:
+        errors.append(f"run_stale {lad['run_stale']} меньше zombie_after {lad['zombie_after']}")
+    if errors:
+        raise AirflowFailException("🔥 Лестница таймаутов нарушена, поправьте ctl_config: " + "; ".join(errors))
+    return lad

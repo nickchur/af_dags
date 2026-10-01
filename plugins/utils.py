@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-21 18:44 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 19:13 MSK · v1.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -23,8 +23,12 @@ Airflow 3 (v2.0): ORM-доступа к метабазе у задачи нет 
 | `safe_eval()` | Безопасное вычисление математических выражений |
 | `get_conns_by_type()` / `get_conn()` | Получение соединений по типу |
 | `query_to_dict()` | SQL → список словарей (Greenplum) |
+| `chk_conn()` | Проверка доступности подключения Postgres / S3 / KerberosHttp |
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
+| `env_platform()` | Платформа: `alpha`, `sigma` или пустая строка |
+| `get_af_conn()` / `af_admin_available()` | Коннект к метабазе под админской учёткой из Vault; есть ли она (на разборе файла) |
+| `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
 from airflow.sdk import Variable, get_current_context
@@ -74,18 +78,32 @@ def env_stand() -> str:
     """Контур, на котором мы работаем: `DEV`, `IFT`, `PSI`, `PROM` или пустая строка.
 
     Сначала `ENV_STAND` — её читают платформенные операторы и `tools/`, — при отсутствии
-    `ENVIRONMENT`: там, где выставлена только она (`check/`), поведение не должно
+    `ENVIRONMENT`: там, где выставлена только она (`tools/`), поведение не должно
     отличаться. Обе не выставлены — контур неизвестен, и вызывающий обязан считать это
     самым строгим случаем, а не стендом: переменная есть на всех контурах, включая
     тестовый (`/opt/aftest/airflow.env`).
     """
     return (os.getenv('ENV_STAND') or os.getenv('ENVIRONMENT') or '').strip().upper()
 
+def env_platform() -> str:
+    """Платформа: `alpha`, `sigma` или пустая строка, если не опознана.
+
+    `ENV_SPACE` не годится — в образе альфы он тоже `sigma`. У альфы один образ на все роли,
+    и роль выбирает переменная `ENTRYPOINT` (`worker`, `scheduler`, ...); на сигме у каждого
+    компонента свой образ с `APPLICATION_NAME=app-dataplatform-etl-<компонент>`, а
+    `ENTRYPOINT` — директива Dockerfile, не переменная (под сигмы dev, 30.09.2026).
+    """
+    if os.getenv('ENTRYPOINT'):
+        return 'alpha'
+    if os.getenv('APPLICATION_NAME', '').startswith('app-dataplatform-'):
+        return 'sigma'
+    return ''
+
 def sign(x):
     return (x > 0) - (x < 0)
 
 def md5_hash(data):
-    return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8'), usedforsecurity=False).hexdigest()
 
 def pool_slots(pool_name, slots):
     """Задаёт размер пула; если пула нет — создаёт. Пишет в slot_pool.
@@ -156,6 +174,24 @@ def get_current_load(pool_name, pool=True):
 
     return res
     
+def _hard_breaks(text):
+    """Одиночный перенос строки → жёсткий (два пробела в конце строки).
+
+    Заметку UI рендерит markdown'ом, а там одиночный перенос — пробел: лента из строк
+    сливалась в один абзац (db_cleanup clean, альфа 01.10.2026). Внутри ``` не трогаем;
+    таблицам и заголовкам хвостовые пробелы безразличны.
+    """
+    out, fence = [], False
+    lines = text.split('\n')
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith('```'):
+            fence = not fence
+        elif not fence and ln.strip() and i + 1 < len(lines) and lines[i + 1].strip():
+            ln = ln.rstrip() + '  '
+        out.append(ln)
+    return '\n'.join(out)
+
+
 def add_note(msg, context=None, level='task', add=True, title='', compact=False):
 
     if not context:
@@ -172,6 +208,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
         # compact=False — каждое значение на новой строке
         msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
         msg = '```\n' + msg + '\n```'
+    msg = _hard_breaks(msg)
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
 
@@ -187,8 +224,13 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
     def change(old):
         if old and old.startswith(new_note[:MAX_NOTE_LEN]):
             return None
-        # Логика склейки заметки и лимит длины
-        return (f"{new_note}\n\n---\n{old or ''}" if add else new_note)[:MAX_NOTE_LEN]
+        # Логика склейки заметки и лимит длины. Однострочная заметка без заголовка — строка хода
+        # (db_cleanup: строка на таблицу) — отделяется от прошлой пустой строкой, а не чертой:
+        # иначе лента из десятка строк занимает втрое больше места
+        if not (add and old):
+            return new_note[:MAX_NOTE_LEN]
+        sep = '\n\n' if not title and '\n' not in new_note else '\n\n---\n'
+        return f"{new_note}{sep}{old}"[:MAX_NOTE_LEN]
 
     # Airflow 3: Execution API заметки из задачи не принимает, пишем SQL-ом в dag_run_note /
     # task_instance_note (af_meta.update_note — там же блокировка «прочитал — склеил —
@@ -317,8 +359,6 @@ def _on_callback(context, level=None):
         logger.error(message)
         if level != 'DAG':
             add_note(message, context, level='DAG', add=True)
-        if level != 'DAG':
-            add_note(message, context, level='DAG', add=True)
     else:
         logger.warning(message)
 
@@ -331,6 +371,96 @@ def query_to_dict(gp_hook, sql, timeout=300):
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
     return [dict(zip(cols, row)) for row in rows]
+
+def chk_conn(conn_type, conn_id, context=None, name=None, tz=None, default=False):
+    """Проверяет доступность подключения `conn_id` типа `Postgres`, `S3` или `KerberosHttp`.
+
+    Одна проверка на все даги: сторож подключений CTL (`ctl_worker.ctl_core.chk_any_conn`
+    — обёртка с конфигом и пулами) и `tools_test_connections`. До 30.09.2026 у второго была
+    своя копия, и правки двух копий расходились.
+
+    name — подпись в заметке (по умолчанию `conn_id`); tz — пояс времени старта в заметке;
+    default=True у Postgres — метабаза Airflow через её сессию, `conn_id` не нужен.
+    Успех — заметка и результат запроса; провайдер не установлен — ☮️ и AirflowSkipException;
+    сбой — заметка и AirflowFailException.
+    """
+    import time
+    from zoneinfo import ZoneInfo
+    from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+
+    context = context or get_current_context()
+    name = name or conn_id
+    ti = context['ti']
+    try_number = ti.try_number
+    sdt = ti.start_date.astimezone(ZoneInfo(tz) if tz else None).strftime('%Y-%m-%d %H:%M:%S %Z')
+    ts = time.time()
+    try:
+        if conn_type == 'Postgres':
+            sql = 'SELECT current_user, current_database(), inet_server_addr()'
+            if default:
+                # Метабаза: в Airflow 3 не create_session, а af_meta (тот же conns.pg)
+                result = af_meta.sql(sql, timeout=15)[0]
+            else:
+                from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+                result = query_to_dict(PostgresHook(postgres_conn_id=conn_id), sql, timeout=15)[0]
+
+        elif conn_type == 'S3':
+            from airflow.providers.amazon.aws.hooks.s3 import S3Hook  # type: ignore
+            from botocore.config import Config  # type: ignore
+
+            extra = S3Hook.get_connection(conn_id).extra_dejson
+            verify = extra.get('verify', True)
+            if isinstance(verify, str):
+                verify = verify.lower() == 'true'
+            # config_kwargs соединения нельзя терять: явно переданный config подменяет их
+            # целиком (connection_wrapper.py: `if not self.botocore_config and config_kwargs`),
+            # а секрет-бэкенд кладёт туда signature_version, payload_signing_enabled и
+            # request_checksum_calculation — без них шлюз отвергает запросы.
+            # merge накладывает таймауты поверх, не затирая остального.
+            config = Config(**extra.get('config_kwargs', {})).merge(Config(connect_timeout=15, read_timeout=15))
+            result = S3Hook(aws_conn_id=conn_id, verify=verify, config=config).get_conn().list_buckets()['Buckets']
+
+        elif conn_type == 'KerberosHttp':
+            try:
+                from hrp_operators.utils.kerberos_http import KerberosHttpHook  # type: ignore
+            except ImportError:  # hrp_operators верхнего уровня — только на контурах
+                from sber_app_dataplatform_etl_core.hrp_operators.utils.kerberos_http import KerberosHttpHook  # type: ignore
+
+            hook = KerberosHttpHook(method='GET', http_conn_id=conn_id)
+            verify = hook.get_connection(conn_id).extra_dejson.get('verify', True)
+            if isinstance(verify, str):
+                verify = verify.lower() == 'true'
+            # HttpHook.run принимает параметры requests через extra_options
+            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'},
+                                extra_options={'timeout': 15, 'verify': verify})
+            response.raise_for_status()
+            result = response.json()
+        else:
+            result = None
+
+        logger.info(f"🔍 {result}")
+        add_note({'try': try_number, 'sdt': sdt}, context, title=f"✅ {time.time()-ts:.2f} sec chk_{name}_conn")
+        return result
+
+    except AirflowSkipException:
+        raise
+
+    except ImportError as err:
+        msg = f"☮️ {name}: провайдер не установлен — {err}"
+        add_note(msg, context, level='task', title=f"☮️ {name}")
+        logger.warning(msg)
+        raise AirflowSkipException(msg) from err
+
+    except Exception as err:
+        logger.error(f"❌ {name}: {err}", exc_info=True)
+        # is not None обязательно: у requests.Response __bool__ == False на 4xx/5xx,
+        # то есть проверка на истинность отбросила бы ровно те ответы, ради которых всё и логируется
+        response = getattr(err, 'response', None)
+        if response is not None:
+            logger.error(f"HTTP {getattr(response, 'status_code', '?')}: {str(getattr(response, 'text', ''))[:500]}")
+        msg = f"❌ {time.time()-ts:.2f} sec chk_{name}_conn ERROR Try {try_number} {sdt}"
+        add_note(err, context, level='Task,DAG', title=msg)
+        raise AirflowFailException(f"{msg}: {err}") from err
 
 def get_dict_from_ch(ch_hook, sql):
     """Выполняет SQL в ClickHouse и возвращает результат списком словарей {колонка: значение}.
@@ -402,7 +532,8 @@ def readable_size(size_bytes, base=1024):
     if i >= len(units): i = len(units) - 1
     if i < 0: i = 0
 
-    size_value = round(size_bytes / (base ** i), 2)
+    # Без дробной части у единиц: «3 строк», а не «3.0»
+    size_value = size_bytes if i == 0 else round(size_bytes / (base ** i), 2)
     
     return f"{sign}{size_value} {units[i]}".rstrip()
 
@@ -472,6 +603,54 @@ def valid_schedule(value) -> bool:
         logger.warning(f"⚠️ расписание {value!r}: {e}")
         return False
     return True
+
+
+def saved_schedule(saved, default, var_name=''):
+    """⏰ Расписание DAG-а из сохранённых параметров: годное — оно, битое — из кода.
+
+    Пара к valid_schedule(). Зовётся на парсинге в ``schedule=``: битое значение в
+    переменной не должно ронять разбор файла, иначе из UI пропадёт сама форма, через которую
+    расписание и чинят. Пусто или ``None`` — даг без расписания, только ручной запуск.
+
+    Args:
+        saved: Словарь из saved_params().
+        default: Расписание из кода — запасной вариант и значение по умолчанию.
+        var_name: Имя переменной — только для текста предупреждения.
+    """
+    value = saved.get('schedule', default)
+    if not valid_schedule(value):
+        logger.warning(f"⚠️ {var_name}: расписание '{value}' не разобрано — беру {default}")
+        return default
+    return None if value in (None, '', 'None') else str(value).strip()
+
+
+def store_params_task(var_name, saved, context=None, one_shot=(), flag='save_params'):
+    """💾 Тело таска ``params``: store_params() и решение по его статусу.
+
+    ``skip`` → AirflowSkipException, ``fail`` → AirflowFailException, ``ok`` → сообщение.
+    Следующие таски обязаны стоять на ``trigger_rule=NONE_FAILED`` (или таск ``params`` —
+    без потомков), иначе штатный пропуск утянет в skip всю цепочку.
+
+    Args:
+        var_name: Имя переменной Airflow с параметрами.
+        saved: Что лежало в переменной на парсинге.
+        context: Контекст таска; по умолчанию текущий.
+        one_shot: Разовые галочки формы (удалить, закрыть, убить) — в переменную не пишутся.
+        flag: Галочка «сохранить».
+    """
+    from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+
+    context = context or get_current_context()
+    if one_shot:
+        context = dict(context)
+        context['params'] = {k: v for k, v in context['params'].items() if k not in one_shot}
+    status, msg = store_params(var_name, saved, context, flag)
+    if status == 'skip':
+        raise AirflowSkipException(msg)
+    if status == 'fail':
+        raise AirflowFailException(msg)
+    add_note(msg, context, level='task')
+    return msg
 
 
 def saved_params(var_name) -> dict:
@@ -602,6 +781,27 @@ _LIBPQ_OPTS = {
 }
 
 
+AF_ADMIN_USER_KEYS = ('DB_ADM_USER_1_1', 'DB_USER_OWNER_1', 'DB_USER_1_2')
+
+
+def af_admin_available() -> bool:
+    """Есть ли в Vault админская учётка метабазы, из которой get_af_conn() соберёт коннект.
+
+    Зовётся на разборе DAG-файла: без учётки задачи и параметры, которым она нужна (VACUUM,
+    REINDEX, удаление индексов), не создаются. Читает локальный файл, в сеть не ходит; любая
+    ошибка — False. Права самой учётки отсюда не видны — их проверяет таск перед работой.
+    """
+    import json
+
+    try:
+        with open('/vault/secrets/application') as f:
+            secrets = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(secrets.get('DB_HOST_1') and secrets.get('DB_NAME_1')
+                and any(secrets.get(k) for k in AF_ADMIN_USER_KEYS))
+
+
 def get_af_conn():
     """Регистрирует коннект к метабазе Airflow из Vault, возвращает conn_id.
 
@@ -662,7 +862,9 @@ def get_af_conn():
         'host':      host,
         'port':      port,
         # Приоритет: админская учётка (DB_ADM_*), затем владелец схемы (DB_*_OWNER_1),
-        # затем обычная (DB_*_1_2) — у последней прав на VACUUM/REINDEX чужих таблиц нет.
+        # затем DB_*_1_2 — тоже админская; штатная учётка Airflow — DB_*_1_1, её не берём.
+        # Есть ли у получившейся учётки права владельца, проверяет вызывающий
+        # (db_cleanup.af_owner_check) — по ключам это не видно.
         'login':     _b64(secrets.get('DB_ADM_USER_1_1', '')) or _b64(secrets.get('DB_USER_OWNER_1', '')) or _b64(secrets.get('DB_USER_1_2', '')),
         'password':  _b64(secrets.get('DB_ADM_PASS_1_1', '')) or _b64(secrets.get('DB_PASS_OWNER_1', '')) or _b64(secrets.get('DB_PASS_1_2', '')),
         # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;
@@ -686,8 +888,159 @@ def get_af_conn():
     pwd = conn_json['password']
     logger.info(
         f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
-        f"/{conn_json['schema']} | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
+        f"/{conn_json['schema']} | пароль: {len(pwd)} симв."
         f" | {', '.join(f'{k}={v}' for k, v in sorted(conn_json['extra'].items()))}"
     )
 
     return AF_ID
+
+
+#: Отчёт дага-плагина здоровья: контракт с etl-core (``mcp_health``, раздел ``plugins``
+#: сводки ``get_system_health``), меняются только вместе. Плагин — даг с тегом ``health``
+HEALTH_PREFIX = 'system_health/checks/'
+HEALTH_SCHEMA = 1
+#: Больше core не читает
+HEALTH_MAX_BYTES = 256 * 1024
+
+
+def report_health(checks, context=None, ttl_sec=7200):
+    """Пишет отчёт проверок дага в бакет логов, откуда его читает ``get_system_health``.
+
+    ``checks`` — ``{имя: {'status', 'summary', 'skill'?, ...}}``, статус из ``healthy``/``warn``/
+    ``error``/``unknown``; остальные поля проверки уходят в ``data``. ``ttl_sec`` — через сколько
+    отчёт считать просроченным: больше интервала расписания, иначе каждый поздний прогон —
+    тревога. Файл один на даг и перезаписывается целиком.
+
+    Сбой записи задачу не роняет: проверки уже в логе и заметке, а молчание плагина core
+    покажет сам — «последний отчёт N назад». Возвращает ключ или None.
+    """
+    import re
+    from airflow.configuration import conf
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+    context = context or get_current_context()
+    dag = context['dag']
+    key = f"{HEALTH_PREFIX}{dag.dag_id}.json"
+    version = re.search(r'· (v[\d.]+) ·', dag.doc_md or '')
+    report = {
+        'schema': HEALTH_SCHEMA,
+        'source': dag.dag_id,
+        'platform': env_platform(),
+        'stand': env_stand(),
+        'run_id': context['run_id'],
+        'version': version.group(1) if version else None,
+        'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),
+        'ttl_sec': int(ttl_sec),
+        'checks': {
+            name: {
+                'status': c.get('status', 'unknown'),
+                'summary': c.get('summary', ''),
+                **({'skill': c['skill']} if c.get('skill') else {}),
+                'data': {k: v for k, v in c.items() if k not in ('status', 'summary', 'skill')},
+            }
+            for name, c in checks.items()
+        },
+    }
+    text = json.dumps(report, ensure_ascii=False, default=str)
+    if len(text.encode()) > HEALTH_MAX_BYTES:
+        # Статусы и строки важнее подробностей: без data отчёт core ещё прочтёт
+        for c in report['checks'].values():
+            c['data'] = {'dropped': 'отчёт больше 256 КБ'}
+        text = json.dumps(report, ensure_ascii=False, default=str)
+    try:
+        bucket = conf.get('logging', 'remote_base_log_folder').split('://', 1)[1].split('/', 1)[0]
+        S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')).load_string(
+            text, key, bucket_name=bucket, replace=True,
+            encrypt=conf.getboolean('logging', 'encrypt_s3_logs', fallback=False))
+    except Exception:
+        logger.warning("report_health: отчёт %s не записан", key, exc_info=True)
+        return None
+    logger.info("report_health: %s", key)
+    return key
+
+
+HEALTH_XCOM_KEY = 'health'
+# Упавший проверочный таск — тоже ошибка: проверка, которая не выполнилась, не значит «здорово»
+HEALTH_FAILED_STATES = ('failed', 'upstream_failed')
+
+
+def push_health(checks, context=None):
+    """Кладёт вердикты проверочного таска в XCom ``health``.
+
+    ``checks`` — ``{имя: {'status', 'summary', ...}}``, формат ``report_health``. Итог подводят
+    ``health_warn`` / ``health_errors`` из ``health_tasks``: сам проверочный таск находками не падает.
+    """
+    context = context or get_current_context()
+    context['ti'].xcom_push(key=HEALTH_XCOM_KEY, value=checks)
+    return checks
+
+
+def _gather_health(context) -> dict:
+    """Вердикты прямых upstream-тасков плюс упавшие без вердикта — как ``error``."""
+    ti, task, dag_run = context['ti'], context['task'], context['dag_run']
+    upstream = sorted(task.upstream_task_ids)
+    if not upstream:
+        return {}
+    # Все предки — чтобы у upstream_failed назвать виновника, а не того, кто за ним не пошёл
+    ancestors = sorted(task.get_flat_relative_ids(upstream=True))
+    # Airflow 3: ORM из задачи запрещён — SQL через af_meta
+    states = [(r['task_id'], r['map_index'], r['state']) for r in af_meta.sql(
+        "SELECT task_id, map_index, state FROM task_instance"
+        " WHERE dag_id = %(dag)s AND run_id = %(run)s AND task_id = ANY(%(ids)s)"
+        " ORDER BY task_id, map_index",
+        {'dag': dag_run.dag_id, 'run': dag_run.run_id, 'ids': ancestors})]
+    rows = [r for r in states if r[0] in upstream]
+    culprits = sorted({t for t, _, st in states if st == 'failed' and t not in upstream})
+    checks = {}
+    for task_id, map_index, state in rows:
+        label = task_id if map_index < 0 else f'{task_id}[{map_index}]'
+        got = ti.xcom_pull(task_ids=task_id, key=HEALTH_XCOM_KEY,
+                           map_indexes=map_index if map_index >= 0 else None)
+        if isinstance(got, dict) and got:
+            for name, check in got.items():
+                checks[name if name not in checks else f'{name}[{map_index}]'] = dict(check)
+        elif state in HEALTH_FAILED_STATES:
+            why = f": упал {', '.join(culprits[:5])}" if state == 'upstream_failed' and culprits else ''
+            checks[label] = {'status': 'error', 'summary': f'таск {label} не выполнился ({state}){why}'}
+    return checks
+
+
+def health_tasks(ttl_sec, skill='tools'):
+    """Два итоговых таска дага-проверки: ``health_warn`` и ``health_errors``.
+
+    Ставятся прямыми потомками проверочных тасков, запускаются при любом их исходе
+    (``ALL_DONE``). ``health_warn``: есть ``warn`` — заметка ⚠️ и успех, нет — skip.
+    ``health_errors``: пишет отчёт плагина (``report_health``, единственное место записи) и
+    при ``error`` падает с заметкой ❌ — ран красный, уведомление штатным колбэком; нет — skip.
+    ``skill`` — навык агента этого дага, уходит в отчёт каждой проверки.
+    """
+    from airflow.sdk import TriggerRule, task
+
+    def lines(checks, icon):
+        return "\n\n".join(f"{icon} **{name}** — {c.get('summary', '')}" for name, c in checks.items())
+
+    @task(task_id='health_warn', trigger_rule=TriggerRule.ALL_DONE)
+    def health_warn(**context):
+        """⚠️ Предупреждения проверок; нет их — skip."""
+        from airflow.sdk.exceptions import AirflowSkipException
+
+        warns = {n: c for n, c in _gather_health(context).items() if c.get('status') == 'warn'}
+        if not warns:
+            raise AirflowSkipException('предупреждений нет')
+        add_note(lines(warns, '⚠️'), context, level='task,DAG', title=f'⚠️ предупреждений {len(warns)}')
+        return {n: c.get('summary', '') for n, c in warns.items()}
+
+    @task(task_id='health_errors', trigger_rule=TriggerRule.ALL_DONE)
+    def health_errors(**context):
+        """❌ Ошибки проверок и отчёт плагина здоровья; ошибок нет — skip."""
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+
+        checks = _gather_health(context)
+        report_health({n: {**c, 'skill': skill} for n, c in checks.items()}, context, ttl_sec=ttl_sec)
+        errors = {n: c for n, c in checks.items() if c.get('status') == 'error'}
+        if not errors:
+            raise AirflowSkipException('ошибок нет')
+        add_note(lines(errors, '❌'), context, level='task,DAG', title=f'❌ ошибок {len(errors)}')
+        raise AirflowFailException('; '.join(f"{n}: {c.get('summary', '')}" for n, c in errors.items()))
+
+    return [health_warn(), health_errors()]

@@ -1,66 +1,12 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-09-19 00:26 MSK · v2.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 19:05 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-**Airflow 3.** Порт `af_dags/check/test_hrp_operators.py` v1.1 (Airflow 2). Отличия:
-импорты из `airflow.sdk`; сводка берёт состояния задач через Task SDK (`get_task_states`),
-а не из метабазы — у задач AF3 доступа к ней нет; по той же причине нет заметок
-(`add_note`, `on_callback`) и пула `tools_pool` (`ensure_pool` писал в метабазу при разборе):
-итог — в логе и XCom таска `summary`. Добавлены группы `click_to_click` и `lineage`.
+Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
+S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
+содержимого → сводка ✅/❌/☮️ в заметке → cleanup. Запуск вручную (`@once`), параллельные
+прогоны не поддержаны.
 
-Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
-Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
-Airflow / библиотек-зависимостей (встраивается в пайплайн dpm).
-
-**Что покрывается** (по группам)
-
-- `to_s3` — `PostgresToS3(List)`, `Clickhouse{Table,Query}ToS3`, `ClickNativeToS3(List)`:
-  все сжатия (`gzip`/`zip`/`tar.gz`/`None`), `xstream_sanitize`, массивы, NULL, спецсимволы.
-  Каждый оператор с `post_file_check=True` сам перечитывает файл и сверяет хэш.
-- `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count.
-- `db_to_db` — `PostgresToPostgres`, `ClickhouseToPostgres`, `PostgresToClickhouse`,
-  `*Incarnation*`: прямые переливки, сверка count и содержимого.
-- `s3_utils` — `S3ToS3`, `S3Archive`, `CheckS3FileHash`, `PostgresDDL`: перепаковка сжатий,
-  ZIP-архив, сверка MD5, генерация DDL.
-- `viewers` — `S3ListKeys`, `S3FileRead`, `S3BucketViewer`: листинг ключей/бакетов, чтение строк.
-- `cluster` — `ClickHouseClusterOperator`: DDL на ноды кластера (за флагом `run_known_broken`).
-- `click_to_click` — `ClickhouseToClickhouse`: стриминг CH→CH по HTTP (`clickhouse_connect`).
-- `lineage` — `utils.lineage.extract_lineage_from_sql`: inlets/outlets из SQL как `Asset`.
-
-**Не покрыты** — нужен внешний сервис, которого на стенде нет: `clickhouse_to_idp`,
-`clickhouse_to_datacatalog`, `openmetadata_data_quality`, `llm_processor`,
-`compute_embeddings`; `S3ToPostgres2` (инкарнации + собственный TSV) — отдельной проверкой.
-
-**Инфраструктура**
-- Postgres: таблицы в `airflowdb` (схема `public`); на таблицу и каждую колонку ставится
-  `COMMENT` (требование Quality Gate).
-- ClickHouse: таблицы в схеме `technical`, имена по имени теста.
-- S3: connection `s3-archive`, бакет `test_operators`, префикс `hrp_tests/`.
-
-**Методология**
-1. **Setup** — DROP/CREATE источников и таргетов (PG + CH) с данными (NULL, спецсимволы, массивы);
-   `setup_s3` проверяет соединение/бакет и чистит S3-префикс (идемпотентность). Каждый setup
-   скипается при выключенном флаге своей системы (`setup_pg`→`test_pg` и т.д.) ИЛИ при
-   недоступности системы: ошибка соединения гасит флаг (проверки уходят в ☮️, а не ❌ каскадом).
-2. **Execution** — операторы под тестом во всех поддерживаемых сжатиях.
-3. **Validation** — сверка row count и (где формат детерминирован) содержимого.
-4. **Summary** — markdown-таблица статусов `✅/❌/☮️` в логе и XCom таска `summary`.
-5. **Cleanup** — гарантированное удаление таблиц и S3-ключей (`trigger_rule=ALL_DONE`).
-
-**Флаги выбора проверок**
-- `test_pg` / `test_ch` / `test_s3` (по умолчанию `True`) — включают проверки по системам.
-  Каждая проверка гейтуется по всем задействованным ею системам (**AND**): `pg→s3` идёт только
-  при `test_pg И test_s3`, `s3→ch` — при `test_s3 И test_ch`, `ch→pg` — при `test_ch И test_pg`.
-  Выключение системы уводит все её проверки (в т.ч. кросс-системные) в ☮️ skipped.
-- `run_known_broken` (по умолчанию `False`) — «карантин» поверх системных флагов для проверок,
-  пока не проходящих на текущей сборке пакета / требующих кластера `datalab`: `pg_to_s3_list`,
-  `ch_native_list`, `ch_table_query_s3`, `s3_to_ch_tsv`, `pg_incarnation`, `cluster`.
-- `run_cleanup` (по умолчанию `True`) — операционный флаг: `False` оставляет таблицы/S3-ключи
-  для отладки упавшего прогона.
-
-Примечание: `max_active_runs=1` — имена таблиц фиксированы, параллельные прогоны не поддержаны.
-`ClickhouseTableToS3`/`ClickhouseQueryToS3` считают строки через `clusterAllReplicas(datalab,
-system.query_log)` — в окружении без кластера `datalab` они не работают, поэтому держатся за
-`run_known_broken`.
+Подробно: [tools/readme.md — test_hrp_operators](../../_plugin_dag_docs/?doc=tools/readme.md#test_hrp_operatorspytest_hrp_operatorspy)
 """
 
 # ruff: noqa: E402  — операторные импорты идут после sys.path-бутстрапа для локальной разработки.
@@ -77,9 +23,14 @@ for _env_var in ("HRP_ETL_CORE_PATH", "HRP_OPERATORS_SRC_PATH"):
     if _path:
         sys.path.insert(0, _path)
 
+from airflow.decorators import dag, task
+from airflow.exceptions import AirflowFailException, AirflowSkipException
+from airflow.models import TaskInstance
+from airflow.models.param import Param
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.sdk import Param, TaskGroup, TriggerRule, dag, task
-from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+from airflow.utils.session import create_session
+from airflow.utils.task_group import TaskGroup
+from airflow.utils.trigger_rule import TriggerRule
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_cluster_operator import HrpClickHouseClusterOperator
@@ -89,7 +40,6 @@ from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_postgres import 
     HrpClickhouseToPostgresIncarnationOperator,
     HrpClickhouseToPostgresOperator,
 )
-from sber_app_dataplatform_etl_core.hrp_operators.click_to_click import HrpClickhouseToClickhouseOperator
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_s3 import (
     HrpClickhouseQueryToS3Operator,
     HrpClickhouseTableToS3Operator,
@@ -116,7 +66,15 @@ from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
     HrpS3ListKeysOperator,
 )
 
+try:
+    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback  # type: ignore
+except ImportError:
+    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback  # type: ignore
+
 logger = getLogger("airflow.task")
+
+# Пул заводим при парсинге: к планированию первого таска он уже есть
+ensure_pool(TOOLS_POOL)
 
 # ───────────────────────────────── Настройки ──────────────────────────────────
 DEFAULT_PG_CONN = "airflowdb"
@@ -128,10 +86,11 @@ S3_PREFIX = "hrp_tests/"
 PG_SCHEMA = "main"
 CH_SCHEMA = "technical"
 
-# Стенд из env ENVIRONMENT. Только на DEV стенд владеет схемой и управляет DDL
+# Стенд — env_stand(): ENV_STAND, при её отсутствии ENVIRONMENT, как во всём tools/ (до
+# 29.09.2026 читалась одна ENVIRONMENT). Только на DEV стенд владеет схемой и управляет DDL
 # (DROP+CREATE в setup, DROP в cleanup). На прочих стендах таблицы предсозданы
 # вручную — setup лишь TRUNCATE+наполняет, cleanup лишь TRUNCATE (не удаляет).
-ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
+ENV_STAND = env_stand()
 IS_DEV = ENV_STAND == "DEV"
 
 # Имена объектов (фиксированы; max_active_runs=1, cleanup гарантирует отсутствие мусора)
@@ -143,7 +102,6 @@ T_S3_TO_CH = "hrp_s3_to_ch"      # landing PG→S3→CH (CSV, all-String)
 T_S3_TO_CH_LIST = "hrp_s3_to_ch_list"  # landing PG→S3List→CH (TSV, all-String)
 T_PG_INC = "hrp_pg_inc"          # таргет PostgresIncarnationInsert (_0/_1 + seq)
 T_CH_TO_PG_INC = "hrp_ch_to_pg_inc"    # таргет ClickhouseToPostgresIncarnation (_0/_1 + seq)
-T_CH_TO_CH = "hrp_ch_to_ch"      # таргет ClickhouseToClickhouse (id, name, s_special)
 PROBE = "hrp_setup_probe"        # временный объект setup-пробы прав (create/write/drop)
 
 # Сжатия и их расширения / метки для task_id
@@ -183,13 +141,12 @@ def _s3_purge_prefix(s3_hook, bucket: str) -> int:
 
 
 def _skip_setup(system: str, reason: str, context):
-    """Пишет причину недоступности/нехватки прав в лог и скипает систему.
+    """Пишет причину недоступности/нехватки прав в заметку таска (add_note) и скипает систему.
 
-    Флаг test_* гаснет через AirflowSkipException (setup → ☮️, зависимые проверки → ☮️).
-    В AF3 заметку таска из самого таска не записать (Execution API её не принимает),
-    поэтому причина — в логе, а строка «Системы» в summary называет систему недоступной.
+    Флаг test_* гаснет через AirflowSkipException (setup → ☮️, зависимые проверки → ☮️),
+    но причина остаётся видимой в UI таска, а не только в логах.
     """
-    logger.warning("⚠️ %s: setup пропущен — %s", system, reason)
+    add_note(reason, context, level="task", title=f"⚠️ {system}: setup пропущен")
     raise AirflowSkipException(reason)
 
 
@@ -200,9 +157,8 @@ def _skip_or_retry(system: str, reason: str, exc: Exception, context):
     Так транзиентный сетевой сбой не гасит систему преждевременно, а устойчивая
     недоступность/нехватка прав всё равно уводит проверки в ☮️ (а не в ❌ каскадом).
     """
-    # У RuntimeTaskInstance (Task SDK) нет is_eligible_to_retry(): считаем сами
     ti = context["ti"]
-    if ti.try_number <= ti.max_tries:
+    if ti.is_eligible_to_retry():
         raise exc
     _skip_setup(system, reason, context)
 
@@ -328,25 +284,37 @@ def _ch_insert_sql(table: str) -> str:
     catchup=False,
     is_paused_upon_creation=False,
     max_active_runs=1,
-    tags=["DataLab", "tools", "operators", "AutoQA"],
+    dagrun_timeout=dt.timedelta(hours=2),
+    # pg_export — политика etl-core 1.2.5 (task_policy): даг с ClickHouse → Postgres без тега не импортируется
+    tags=["DataTools", "tools", "AutoQA", "pg_export"],
     # retries — переживаем transient «Connection reset by peer» от общего ClickHouse/S3
     default_args={
         "owner": "DataLab (CI02420667)",
+        "pool": TOOLS_POOL,
         "retries": 2,
         "retry_delay": dt.timedelta(seconds=30),
+        # Тестовые таблицы — десятки строк: потолок ловит зависание, а не объём
+        "execution_timeout": dt.timedelta(minutes=30),
+        # Единый вывод исхода в заметку КАЖДОГО таска (успех/скип-причина/ошибка-причина).
+        # on_callback пишет add_note со state (✅/❌/SKIPPED) и текстом context['exception'].
+        # on_skipped_callback (Airflow ≥2.9) срабатывает на AirflowSkipException — так причина
+        # скипа setup_* (флаг/недоступность) попадает в заметку и без явного add_note.
+        "on_success_callback": on_callback,
+        "on_failure_callback": on_callback,
+        "on_skipped_callback": on_callback,
     },
     params={
-        "pg_conn_id": Param(DEFAULT_PG_CONN, type="string"),
-        "ch_conn_id": Param(DEFAULT_CH_CONN, type="string"),
-        "s3_conn_id": Param(DEFAULT_S3_CONN, type="string"),
-        "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string"),
+        "pg_conn_id": Param(DEFAULT_PG_CONN, type="string", description="Postgres для тестовых таблиц (схема public)"),
+        "ch_conn_id": Param(DEFAULT_CH_CONN, type="string", description="ClickHouse для тестовых таблиц (схема technical)"),
+        "s3_conn_id": Param(DEFAULT_S3_CONN, type="string", description="S3-подключение для тестовых файлов"),
+        "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string", description="Бакет для тестовых файлов (префикс hrp_tests/)"),
         # Флаги систем: каждая проверка гейтуется по системам, которые она задействует (AND).
         # Кросс-системные проверки идут только при включённых ОБЕИХ системах: pg→s3 требует
         # test_pg И test_s3, s3→ch — test_s3 И test_ch, ch→pg — test_ch И test_pg и т.д.
         # Выключение системы уводит все её проверки (в т.ч. кросс) в ☮️ skipped.
-        "test_pg": Param(default=True, type="boolean"),
-        "test_ch": Param(default=True, type="boolean"),
-        "test_s3": Param(default=True, type="boolean"),
+        "test_pg": Param(default=True, type="boolean", description="Проверки с Postgres; кросс-системные идут, только если включены обе системы"),
+        "test_ch": Param(default=True, type="boolean", description="Проверки с ClickHouse"),
+        "test_s3": Param(default=True, type="boolean", description="Проверки с S3"),
         # Отдельный «карантин» поверх системных флагов: проверки, пока не проходящие на текущей
         # сборке пакета / требующие кластера datalab. По умолчанию False (☮️ skipped):
         #   pg_to_s3_list     — баг prepare_row в HrpPostgresToS3ListOperator (до пересборки пакета);
@@ -355,12 +323,13 @@ def _ch_insert_sql(table: str) -> str:
         #   pg_incarnation    — баг insert_incarnation (sql.Literal вместо sql.SQL) (до пересборки);
         #   ch_table_query_s3 — требует clusterAllReplicas(datalab, system.query_log);
         #   cluster           — требует system.clusters('datalab').
-        "run_known_broken": Param(default=False, type="boolean"),
+        "run_known_broken": Param(default=False, type="boolean", description="Карантин: проверки, не проходящие на текущей сборке или требующие кластера datalab"),
         # На время отладки: False оставляет все PG/CH таблицы и S3-ключи, чтобы можно было
         # переразобрать/перезапустить отдельный упавший таск (иначе cleanup сносит всё).
-        "run_cleanup": Param(default=True, type="boolean"),
+        "run_cleanup": Param(default=True, type="boolean", description="Удалить тестовые таблицы и ключи S3 после прогона; выкл. — оставить для отладки"),
     },
     doc_md=__doc__,
+    description='Регрессионный стенд операторов hrp_operators: pg, ch, s3',
 )
 def test_hrp_operators_dag():
 
@@ -377,13 +346,11 @@ def test_hrp_operators_dag():
     # ─────────────────────────────── setup ────────────────────────────────────
     @task
     def setup_pg(params=None, **context):
-        """Создаёт PG-источник и все PG-таргеты (с комментами) + наполняет источник.
-
-        Скипается при test_pg=False, либо если PG недоступен / нет прав на create/write (проба
-        гасит test_pg, причина пишется в лог; проверки уходят в ☮️
-        вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
-        реальный fail (сигнал регрессии не маскируется).
-        """
+        """Создаёт PG-источник и все PG-таргеты (с комментами) + наполняет источник."""
+        # Скипается при test_pg=False, либо если PG недоступен / нет прав на create/write (проба
+        # гасит test_pg, причина пишется в заметку таска через add_note; проверки уходят в ☮️
+        # вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
+        # реальный fail (сигнал регрессии не маскируется).
         if not params.get("test_pg"):
             raise AirflowSkipException("test_pg=False — PG-проверки отключены, setup_pg пропущен")
         pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
@@ -428,13 +395,11 @@ def test_hrp_operators_dag():
 
     @task
     def setup_ch(params=None, **context):
-        """Создаёт CH-источник (typed) и landing-таблицы (all-String) + наполняет источник.
-
-        Скипается при test_ch=False, либо если CH недоступен / нет прав на create/write (проба
-        гасит test_ch, причина пишется в лог; проверки уходят в ☮️
-        вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
-        реальный fail (сигнал регрессии не маскируется).
-        """
+        """Создаёт CH-источник (typed) и landing-таблицы (all-String) + наполняет источник."""
+        # Скипается при test_ch=False, либо если CH недоступен / нет прав на create/write (проба
+        # гасит test_ch, причина пишется в заметку таска через add_note; проверки уходят в ☮️
+        # вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
+        # реальный fail (сигнал регрессии не маскируется).
         if not params.get("test_ch"):
             raise AirflowSkipException("test_ch=False — CH-проверки отключены, setup_ch пропущен")
         ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
@@ -461,25 +426,17 @@ def test_hrp_operators_dag():
             for stmt in _ch_create_sql(table, typed=False).split(";"):
                 if stmt.strip():
                     ch.execute(stmt)
-        if IS_DEV:
-            ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{T_CH_TO_CH}")
-            ch.execute(f"CREATE TABLE {CH_SCHEMA}.{T_CH_TO_CH} (id Int32, name String, s_special String) "
-                       "ENGINE = MergeTree() ORDER BY id")
-        else:
-            ch.execute(f"TRUNCATE TABLE {CH_SCHEMA}.{T_CH_TO_CH}")
         ch.execute(_ch_insert_sql(SRC))
         logger.info("ClickHouse setup complete: %d rows in %s.%s", EXPECTED_ROWS, CH_SCHEMA, SRC)
 
     @task
     def setup_s3(params=None, **context):
-        """Проверяет S3-соединение и существование бакета + чистит префикс от прошлых прогонов.
-
-        Аналог DROP→CREATE у setup_pg/setup_ch: делает S3 идемпотентным, чтобы стейл-ключи
-        (например после прогона с run_cleanup=False) не искажали s3_list_keys/bucket_viewer.
-        Скипается при test_s3=False, либо если S3 недоступен / нет бакета / нет прав на запись
-        (проба гасит test_s3, причина пишется в лог; проверки уходят
-        в ☮️ вместо каскада падений).
-        """
+        """Проверяет S3-соединение и существование бакета + чистит префикс от прошлых прогонов."""
+        # Аналог DROP→CREATE у setup_pg/setup_ch: делает S3 идемпотентным, чтобы стейл-ключи
+        # (например после прогона с run_cleanup=False) не искажали s3_list_keys/bucket_viewer.
+        # Скипается при test_s3=False, либо если S3 недоступен / нет бакета / нет прав на запись
+        # (проба гасит test_s3, причина пишется в заметку таска через add_note; проверки уходят
+        # в ☮️ вместо каскада падений).
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("test_s3"):
             raise AirflowSkipException("test_s3=False — S3-проверки отключены, setup_s3 пропущен")
@@ -506,6 +463,7 @@ def test_hrp_operators_dag():
     # ───────────────────────── validation helpers ─────────────────────────────
     @task
     def validate_ch_count(table: str, expected: int = EXPECTED_ROWS, params=None):
+        """Сверяет число строк в таблице ClickHouse с ожидаемым."""
         ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
         cnt = ch.execute(f"SELECT count() FROM {CH_SCHEMA}.{table}")[0][0]
         if cnt != expected:
@@ -547,7 +505,7 @@ def test_hrp_operators_dag():
         logger.info("OK: %s активная инкарнация %s = %d строк", table, active, cnt)
 
     # TaskGroup'ы используем с prefix_group_id=False: task_id остаются прежними (их
-    # используют XCom-pull'ы, ветки-гейты и summary), меняется лишь группировка в UI.
+    # используют XCom-pull'ы, ветки-гейты и report), меняется лишь группировка в UI.
 
     # ─────────────────────────────── setup ────────────────────────────────────
     with TaskGroup(group_id="setup", prefix_group_id=False):
@@ -560,7 +518,7 @@ def test_hrp_operators_dag():
     # Гейты групп: на каждую группу — branch по условию над системными флагами params.
     # Условие = все задействованные оператором системы включены (AND); битые проверки
     # дополнительно требуют run_known_broken. При False вся группа (ops + каскадом их
-    # валидаторы) скипается. Собираем гейты для summary/all_tasks.
+    # валидаторы) скипается. Собираем гейты для report/all_tasks.
     gates = []
 
     def gate_cond(*flags):
@@ -570,8 +528,9 @@ def test_hrp_operators_dag():
     def make_gate(cond, ops, gate_id, upstream=None):
         ids = [o.task_id for o in ops]
 
-        @task.branch(task_id=gate_id)  # gate_id всегда с префиксом "gate_" (summary их исключает)
+        @task.branch(task_id=gate_id)  # gate_id всегда с префиксом "gate_" (report их исключает)
         def _gate(params=None):
+            """Пропускает группу проверок, если её флаг в параметрах выключен."""
             return ids if cond(params) else []
 
         g = _gate()
@@ -793,6 +752,7 @@ def test_hrp_operators_dag():
 
         @task
         def validate_pg_ddl(**context):
+            """Проверяет, что `pg_ddl` вернул DDL с `CREATE TABLE`."""
             ddl = context["ti"].xcom_pull(task_ids="pg_ddl")
             if not ddl or "CREATE TABLE" not in ddl:
                 raise AirflowFailException(f"pg_ddl вернул некорректный DDL: {ddl!r}")
@@ -821,6 +781,7 @@ def test_hrp_operators_dag():
 
         @task
         def validate_list_keys(**context):
+            """Проверяет, что `s3_list_keys` нашёл ключи тестового префикса."""
             keys = context["ti"].xcom_pull(task_ids="s3_list_keys") or []
             names = [k.get("Key") if isinstance(k, dict) else k for k in keys]
             if not any(str(n).startswith(S3_PREFIX) for n in names):
@@ -853,78 +814,41 @@ def test_hrp_operators_dag():
         make_gate(gate_cond("run_known_broken", "test_ch"), [cluster_op],
                   "gate_cluster", upstream=setup_ch_t)
 
-    # ─────────────────────────── click_to_click ───────────────────────────────
-    # Стриминг CH→CH через clickhouse_connect (HTTP, порт по умолчанию 8123 — у conn берётся
-    # только host). Таргет — три колонки: JSONEachRow отдаёт даты строками, а типизированную
-    # вставку дат clickhouse_connect не делает — здесь проверяется сам поток, а не приведения.
-    with TaskGroup(group_id="click_to_click", prefix_group_id=False):
-        ch_to_ch = HrpClickhouseToClickhouseOperator(
-            task_id="ch_to_ch",
-            clickhouse_source_conn_id=CH_CONN, clickhouse_target_conn_id=CH_CONN,
-            source_sql=f"SELECT id, name, s_special FROM {CH_SCHEMA}.{SRC}",
-            target_table=f"{CH_SCHEMA}.{T_CH_TO_CH}", truncate_target=True, batch_size=2,
-        )
-
-        @task
-        def validate_ch_to_ch(params=None):
-            """count, sum(id) и строка со спецсимволами — байт в байт как в источнике."""
-            ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
-            cnt, sid = ch.execute(f"SELECT count(), sum(id) FROM {CH_SCHEMA}.{T_CH_TO_CH}")[0]
-            special = ch.execute(f"SELECT s_special FROM {CH_SCHEMA}.{T_CH_TO_CH} WHERE id = 2")[0][0]
-            if cnt != EXPECTED_ROWS or sid != 6 or special != _SPECIAL:
-                raise AirflowFailException(f"ch_to_ch: count={cnt}, sum(id)={sid}, s_special={special!r}")
-            logger.info("OK: ch_to_ch count=%d sum(id)=%d, спецсимволы целы", cnt, sid)
-
-        v_ch_to_ch = validate_ch_to_ch()
-        setup_ch_t >> ch_to_ch >> v_ch_to_ch
-        make_gate(gate_cond("test_ch"), [ch_to_ch], "gate_ch_to_ch")
-
-    # ──────────────────────────────── lineage ─────────────────────────────────
-    # Не оператор, а утилита пакета: в AF3 Dataset стал Asset (airflow.sdk). Систем не трогает.
-    with TaskGroup(group_id="lineage", prefix_group_id=False):
-
-        @task
-        def lineage_from_sql():
-            from airflow.sdk import Asset
-
-            from sber_app_dataplatform_etl_core.hrp_operators.utils.lineage import extract_lineage_from_sql
-            inlets, outlets = extract_lineage_from_sql(
-                f"INSERT INTO {CH_SCHEMA}.{T_CH_TO_CH} SELECT id, name, s_special FROM {CH_SCHEMA}.{SRC}", CH_CONN)
-            got = ([a.uri for a in inlets], [a.uri for a in outlets])
-            want = ([f"table://{CH_CONN}/{CH_SCHEMA}/{SRC}"], [f"table://{CH_CONN}/{CH_SCHEMA}/{T_CH_TO_CH}"])
-            if got != want or not all(isinstance(a, Asset) for a in inlets + outlets):
-                raise AirflowFailException(f"lineage: получено {got}, ожидалось {want}")
-            logger.info("OK: lineage inlets=%s outlets=%s", *got)
-
-        lineage_t = lineage_from_sql()
-
-    # ──────────────────────────── summary ─────────────────────────────────────
-    @task(task_id="summary", trigger_rule=TriggerRule.ALL_DONE)
-    def summary(**context):
-        """Собирает статусы всех тасков прогона в markdown-таблицу: в лог и в XCom (return_value).
-
-        Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
-        недоступна (setup пропущен по ошибке соединения) или активна.
-        """
-        # В AF3 у задачи нет сессии метабазы: состояния соседей — через Execution API
-        # (RuntimeTaskInstance.get_task_states → {run_id: {task_id: state}}).
-        ti, dag_run = context["ti"], context["dag_run"]
-        states = ti.get_task_states(dag_id=dag_run.dag_id, run_ids=[dag_run.run_id]).get(dag_run.run_id, {})
-        states = {k: (v or "no_status") for k, v in states.items()}
-        rows, ok, fail, skip = [], 0, 0, 0
-        for task_id in sorted(states):
-            # служебные таски не относятся к покрытию операторов: summary/cleanup
-            # и гейты-ветки (все с префиксом gate_) — их скип это норма
-            if task_id in ("summary", "cleanup") or task_id.startswith("gate_"):
-                continue
-            state = states[task_id]
-            if state == "success":
-                icon, ok = "✅", ok + 1
-            elif state in ("skipped", "upstream_failed", "removed"):
-                icon, skip = "☮️", skip + 1
-            else:
-                icon, fail = "❌", fail + 1
-            rows.append(f"| {icon} | `{task_id}` | {state} |")
+    # ──────────────────────────── report ──────────────────────────────────────
+    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
+    def report(**context):
+        """Собирает статусы всех тасков прогона в markdown-таблицу (как в test_connections)."""
+        # Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
+        # недоступна (setup пропущен по ошибке соединения) или активна.
+        dag_run = context["dag_run"]
+        with create_session() as session:
+            tis = (
+                session.query(TaskInstance)
+                .filter(TaskInstance.dag_id == dag_run.dag_id, TaskInstance.run_id == dag_run.run_id)
+                .order_by(TaskInstance.task_id)
+                .all()
+            )
+            states = {ti.task_id: (ti.state or "no_status") for ti in tis}
+            rows, ok, fail, skip = [], 0, 0, 0
+            for ti in tis:
+                # служебные таски не относятся к покрытию операторов: report/cleanup
+                # и гейты-ветки (все с префиксом gate_) — их скип это норма
+                if ti.task_id in ("report", "cleanup") or ti.task_id.startswith("gate_"):
+                    continue
+                state = ti.state or "no_status"
+                if state == "success":
+                    icon, ok = "✅", ok + 1
+                elif state in ("skipped", "upstream_failed", "removed"):
+                    icon, skip = "☮️", skip + 1
+                    # on_skipped_callback ловит только явный AirflowSkipException; скипы по
+                    # гейту/upstream он НЕ триггерит — до-записываем заметку здесь (ti в сессии,
+                    # note закоммитит create_session). Заметки setup_* с причиной не перетираем.
+                    if not ti.note:
+                        ti.note = f"☮️ SKIPPED — {state} (отключено флагом системы или зависимостью)"
+                else:
+                    icon, fail = "❌", fail + 1
+                rows.append(f"| {icon} | `{ti.task_id}` | {state} |")
+            session.commit()  # фиксируем до-записанные заметки скипнутых тасков
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
         params = context["params"]
@@ -945,18 +869,15 @@ def test_hrp_operators_dag():
 
         headline = f"🧪 HRP operators: ✅ {ok} / ❌ {fail} / ☮️ {skip}"
         table = "| Статус | Таск | State |\n|---|---|---|\n" + "\n".join(rows)
-        report = f"{headline}\n\n{sys_line}\n\n{table}"
-        logger.info("%s", report)
-        return report
+        add_note(sys_line + "\n\n" + table, context, level="DAG", title=headline)
+        logger.info("%s | %s", headline, " · ".join(sys_status))
 
     # ──────────────────────────── cleanup ─────────────────────────────────────
     @task(task_id="cleanup", trigger_rule=TriggerRule.ALL_DONE)
     def cleanup(params=None):
-        """Очищает PG/CH таблицы и S3-ключи (отрабатывает при любом исходе).
-
-        DEV — DROP таблиц/последовательностей (стенд владеет схемой);
-        прочие стенды — только TRUNCATE (таблицы предсозданы, не удаляем).
-        """
+        """Очищает PG/CH таблицы и S3-ключи (отрабатывает при любом исходе)."""
+        # DEV — DROP таблиц/последовательностей (стенд владеет схемой);
+        # прочие стенды — только TRUNCATE (таблицы предсозданы, не удаляем).
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("run_cleanup", True):
             logger.info("run_cleanup=False — пропускаем удаление (отладка: таблицы/ключи оставлены)")
@@ -979,7 +900,7 @@ def test_hrp_operators_dag():
             pg.run("\n".join(truncs))
 
         ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
-        for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, T_CH_TO_CH, "hrp_cluster_probe"):
+        for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, "hrp_cluster_probe"):
             if IS_DEV:
                 ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{t}")
             else:
@@ -989,9 +910,9 @@ def test_hrp_operators_dag():
         _s3_purge_prefix(s3, params["s3_bucket"])
         logger.info("Cleanup complete")
 
-    # Все рабочие таски → summary → cleanup (оба ALL_DONE). Включаем КАЖДЫЙ таск как прямой
-    # upstream summary, чтобы ALL_DONE дождался всех валидаций (Airflow дедуплицирует рёбра).
-    summary_t = summary()
+    # Все рабочие таски → report → cleanup (оба ALL_DONE). Включаем КАЖДЫЙ таск как прямой
+    # upstream report, чтобы ALL_DONE дождался всех валидаций (Airflow дедуплицирует рёбра).
+    report_t = report()
     cleanup_t = cleanup()
     all_tasks = [
         setup_pg_t, setup_ch_t, setup_s3_t,
@@ -1001,12 +922,12 @@ def test_hrp_operators_dag():
         pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc,
         s3_archive, check_hash, pg_ddl, v_pg_ddl,
         list_keys, v_list_keys, file_read, bucket_viewer,
-        cluster_op, ch_to_ch, v_ch_to_ch, lineage_t,
+        cluster_op,
     ]
-    # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream summary — branch
+    # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream report — branch
     # принудительно скипает все прямые downstream вне своего списка, перебивая
-    # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому summary всё дожидается.
-    all_tasks >> summary_t >> cleanup_t
+    # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому report всё дожидается.
+    all_tasks >> report_t >> cleanup_t
 
 
 test_hrp_operators_dag()

@@ -1,19 +1,9 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
-| Параметр | Описание |
-|---|---|
-| `profile` / `root_category` / `root_entity` / `ue_category` | Профиль и иерархия CTL |
-| `gp_conn_id` / `gp_schema` / `gp_timeout` / `gp_task_timeout` | Подключение Greenplum |
-| `s3_conn_id` / `ctl_bucket` / `ctl_ttl` | S3-хранилище |
-| `ctl_conn_id` / `ctl_url` / `ctl_timeout` | CTL API |
-| `conns.<id>.pool_slots` / `ctl_limit` / `ctl_days` | Размер пула подключения (`ctl` — 20, `gp`, `files`) и лимиты CTL. Пул задаёт только `test_conn`; после смены — перезапустить этот DAG |
-| `tz` / `expire` | Часовой пояс и таймаут ожидания |
-| `orchestrator` / `pause_new_dags` | Кто владеет расписаниями (`ctl`/`mixed`/`af`) и пауза при создании дага |
-| `simulator` / `test_mode` / `test_sleep` | Отладочные режимы: генератор нагрузки и фиктивное выполнение. Действуют не на всех контурах — см. `ctl_test.py` и `ctl_worker.py` |
-| `CTL_PIN` | PIN подтверждения (скрыто) |
+Подробно: [ctl_worker/readme.md — ctl_config](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_configpy--управление-конфигурацией)
 """
 
 from airflow.sdk import DAG, Param, Variable, task
@@ -74,12 +64,8 @@ conns = {
         'type': 'Postgres',
         'default': True,
     },
-    's3': {
-        'type': 'S3',
-        'conn_id': 's3',
-        "bucket": "edpetl-ctl",
-        "ttl": 7, # days
-    },
+    # Своего S3 у CTL нет с 25.09.2026: снимки (ctl_obj_save) лежат в папке ctl/ бакета логов
+    # и живут по его сроку (ctl_worker/ctl_utils.py, _ctl_s3)
     'files': {
         'type': 'S3',
         'conn_id': 's3-archive',
@@ -115,9 +101,26 @@ config = {
     'ue_category': "p1080.sdpue",
     "archive_category": "p1080.ARCHIVE",
     "event_expire": "time=0:00",
-    'task_timeout': 'hours=1', 
-    'exe_timeout': 'hours=4',
-    'sla_time': 'hours=1', 
+    # Лестница таймаутов (ctl_worker/ctl_core.py): сервер GP рвёт запрос через 4 ч 30 (правило
+    # GPCC «Query Time 4,5H (GLOBAL)»), наш statement_timeout на 5 мин ниже. exe_timeout и
+    # sla_time убраны 22.09.2026: первый потолком не был, второй (Airflow-SLA) не срабатывал
+    'gp_server_limit': 'minutes=270',
+    'gp_timeout': 'minutes=265',   # statement_timeout, если у воркфлоу нет wf_timeout
+    'task_timeout': 'hours=1',     # execution_timeout задач воркера, кроме run_exe/run_tfs
+    'zombie_after': 'hours=6',     # санитар: > gp_timeout + 10 мин
+    'run_stale': 'hours=6',        # монитор: RUNNING → reRunned, >= zombie_after
+    'lock_stale': 'hours=5',       # монитор: LOCK / LOCK-WAIT → reStarted
+    'new_grace': 'minutes=60',     # монитор: моложе — загрузка «новая»
+    'wait_grace': 'minutes=15',    # монитор: просрочка TIME-WAIT → reStarted
+    # Потоки ue_category (исполняет не Airflow, GP соединение не рвёт — пороги свои)
+    'ue_stale': 'hours=24',        # монитор UE: статус не меняется дольше → reStarted
+    'ue_run_max': 'hours=24',      # монитор UE: RUNNING дольше (или wf_timeout) → reStarted
+    'ue_grace': 'minutes=30',      # монитор UE: просрочка расписания/события → reStarted/Started
+    # Час, а не 6 ч (30.09.2026): лог сенсора с reschedule копит все пробы окна и целиком
+    # перезаливается в S3 на каждой — у events (раз в минуту) было до 346 проб в файле
+    'sensor_timeout': 'hours=1',   # служебные сенсоры: events, monitor, tfs_sensor
+    'sensor_retries': 10,
+    'ctl_rps': 10,      # запросов к CTL в секунду из одного процесса (rate_limit); эмулятор держит тот же порог
     'ctl_limit': 1000,  #сколько записей запросить из CTL
     'ctl_days': 5, #сколько дней назад запросить из CTL
     # 'ctl_task_timeout': 'hours=+5',
@@ -126,6 +129,9 @@ config = {
     'simulator': 'off',        # генератор нагрузки, ctl_test.py: off/event/dataset/trigger
     'test_mode': 'off',        # фиктивное выполнение, ctl_worker.py: off/ok/ok-no/ok-no-error
     'test_sleep': 'minutes=45',# верхняя граница ожидания вместо процедуры воркфлоу
+    # Потоки с этими префиксами имени и в тестовом режиме выполняются по-настоящему: отчёты
+    # строятся поверх журнала, который наполняют тестовые прогоны остальных потоков
+    'test_real': ['pc1080.mail_', 'pc1080.check_'],
     'tz': 'Europe/Moscow',
     'conns': conns,
     **conf,
@@ -135,6 +141,45 @@ if not conf:
     ctl = get_conn('ctl')
     config['conns']['ctl']['url'] = f"{ctl.get('schema', 'https')}://{ctl.get('host')}:{ctl.get('port','9080')}"
     Variable.set('ctl_config', config, serialize_json=True, description=str(pendulum.now(config['tz']))[:19])
+
+# Подписи полей формы: что за ключ и где о нём подробно (ctl_worker/readme.md).
+# Ключ без подписи — пережиток Variable от прошлых версий, код его не читает.
+CONFIG_DESCR = {
+    'profile': 'Имя профиля CTL',
+    'root_entity': 'Корневая сущность нашего поддерева CTL',
+    'root_category': 'Корневая категория наших воркфлоу',
+    'ue_category': 'Наши потоки, которые исполняет не Airflow (монитор действует, пороги ue_*)',
+    'archive_category': 'Категория архивных воркфлоу: их даги не создаются',
+    'event_expire': 'Срок ожидания события по умолчанию (time=Ч:ММ), если у воркфлоу нет wf_expire',
+    'expire': 'Прежнее имя event_expire — читается, если event_expire не задан',
+    'gp_server_limit': 'Серверный лимит запроса в Greenplum (факт, не рычаг): 4 ч 30',
+    'gp_timeout': 'statement_timeout загрузки, если у воркфлоу нет wf_timeout; на 5 мин ниже серверного',
+    'task_timeout': 'execution_timeout задач воркера, кроме run_exe и run_tfs',
+    'zombie_after': 'Санитар: таск RUNNING с мёртвым хартбитом старше — закрыть (> gp_timeout + 10 мин)',
+    'run_stale': 'Монитор: загрузка RUNNING дольше — reRunned (не меньше zombie_after)',
+    'lock_stale': 'Монитор: LOCK / LOCK-WAIT дольше — reStarted',
+    'new_grace': 'Монитор: загрузка моложе — «новая», не трогаем',
+    'wait_grace': 'Монитор: просрочка TIME-WAIT больше — reStarted',
+    'ue_stale': 'Монитор UE: статус не меняется дольше — reStarted',
+    'ue_run_max': 'Монитор UE: RUNNING дольше (или wf_timeout) — reStarted',
+    'ue_grace': 'Монитор UE: просрочка расписания или события больше — reStarted / Started',
+    'sensor_timeout': 'Окно служебных сенсоров (events, monitor, tfs_sensor)',
+    'sensor_retries': 'Ретраи служебных сенсоров',
+    'ctl_rps': 'Запросов к CTL в секунду из одного процесса',
+    'ctl_limit': 'Сколько записей запрашивать из CTL за раз',
+    'ctl_days': 'Глубина выгрузки событий из CTL, дней',
+    'test_sleep': 'Фиктивное выполнение: верхняя граница ожидания вместо процедуры',
+    'test_real': 'Префиксы имён потоков, которые и в тестовом режиме выполняются по-настоящему',
+    'tz': 'Часовой пояс расписаний и заметок',
+    'conns': 'Подключения: ctl (url, timeout, pool_slots), gp, files. Пулы задаёт test_conn — после смены перезапустить его',
+    'loader_interval': 'Интервал CTL.<профиль>.loader',
+    'events_interval': 'Интервал CTL.<профиль>.events',
+    'monitor_interval': 'Интервал CTL.<профиль>.monitor',
+    'tfs_interval': 'Интервал CTL.<профиль>.tfs_sensor',
+    'simulator_interval': 'Интервал симулятора нагрузки',
+    'dagrun_timeout': 'dagrun_timeout этого дага и служебных',
+}
+
 
 with DAG(f'CTL.{config["profile"]}.config',
     tags=['CTL', 'CTL_agent', 'tools'],
@@ -151,51 +196,54 @@ with DAG(f'CTL.{config["profile"]}.config',
     on_success_callback=on_callback,
     dagrun_timeout=str2timedelta(config.get('dagrun_timeout','minutes=10')),
     params={
-        **config,
+        **{k: Param(v, description=CONFIG_DESCR.get(k)) for k, v in config.items()},
         # Списком, а не руками: значения разбираются кодом, опечатка молча выключает режим.
         # В сам config кладутся простые строки — он же уходит в Variable, а Param не
         # сериализуется.
         'orchestrator': Param(enum_default(config.get('orchestrator'), ORCHESTRATOR_MODES, 'mixed'),
                               type='string', enum=ORCHESTRATOR_MODES,
-                              title='Кто владеет расписаниями (переключение перестроит все даги)'),
+                              title='Кто владеет расписаниями (переключение перестроит все даги)',
+                              description='ctl / mixed / af — этапы переноса оркестрации (openspec/project.md)'),
         'pause_new_dags': Param(enum_default(config.get('pause_new_dags'), PAUSE_NEW_MODES, 'auto'),
                                 type='string', enum=PAUSE_NEW_MODES,
-                                title='Новый даг создаётся запаузенным'),
+                                title='Новый даг создаётся запаузенным',
+                              description='auto — по режиму orchestrator, yes/no перебивают режим'),
         'simulator': Param(enum_default(config.get('simulator'), SIMULATOR_MODES), type='string',
                            enum=SIMULATOR_MODES,
-                           title='Симулятор нагрузки (event — только DEV)'),
+                           title='Симулятор нагрузки (event — только DEV)',
+                              description='Генератор нагрузки ctl_test.py: off / event / dataset / trigger'),
         'test_mode': Param(enum_default(config.get('test_mode'), TEST_MODES), type='string',
                            enum=TEST_MODES,
-                           title='Фиктивное выполнение (только DEV и IFT)'),
-        "CTL_PIN": '',
+                           title='Фиктивное выполнение (только DEV и IFT)',
+                              description='ctl_worker.py: off / ok / ok-no / ok-no-error'),
+        "CTL_PIN": Param('', description='PIN подтверждения; сравнивается с AIRFLOW__CTL_PIN из vault'),
     },
     doc_md=__doc__,
+    description='Конфигурация CTL: параметры в Variable ctl_config, ручной запуск по PIN',
 ) as dag:
     
     @task
     def config_save(**context):
-        """### Сохранение конфигурации CTL
-
-        Выполняет:
-        - Проверку PIN-кода (`CTL_PIN == AIRFLOW__CTL_PIN`).
-        - Сохранение параметров в Airflow Variable `ctl_config`.
-        - Настройку срока хранения (TTL) для S3-бакета.
-
-        **Логика:**
-        - Если PIN не совпадает — сохранение отменяется.
-        - После успешного сохранения — обновляется TTL в S3.
-
-        **XCom Output:** полный словарь конфигурации.
-
-        **Использование:**
-        - Только для администраторов.
-        - Требуется ручной запуск с подтверждением.
-        """
+        """Сохранение конфигурации CTL"""
+        # Выполняет:
+        # - Проверку PIN-кода (`CTL_PIN == AIRFLOW__CTL_PIN`).
+        # - Сохранение параметров в Airflow Variable `ctl_config`.
+        # - Настройку срока хранения (TTL) для S3-бакета.
+        #
+        # **Логика:**
+        # - Если PIN не совпадает — сохранение отменяется.
+        # - После успешного сохранения — обновляется TTL в S3.
+        #
+        # **XCom Output:** полный словарь конфигурации.
+        #
+        # **Использование:**
+        # - Только для администраторов.
+        # - Требуется ручной запуск с подтверждением.
         
         config = context["params"]
         pin = config.pop('CTL_PIN')
         if pin == get_scrt("AIRFLOW__CTL_PIN"):
-            from plugins.ctl_utils import ctl_obj_save # type: ignore
+            from ctl_worker.ctl_utils import ctl_obj_save # type: ignore
             # Save config to Variable
             ctl_obj_save('ctl_config', config, var=True)
             
@@ -214,8 +262,7 @@ with DAG(f'CTL.{config["profile"]}.config',
         # загрузкам некуда писать, и об этом надо знать сразу. А вот lifecycle-правило
         # к моменту вызова уже ничего не решает — конфигурация сохранена выше, и ронять
         # из-за него таск незачем: красный таск после успешного сохранения сбивает с толку.
-        for name, bucket_key, ttl_key in (('s3', 'ctl_bucket', 'ctl_ttl'),
-                                          ('files', 'files_bucket', 'files_ttl')):
+        for name, bucket_key, ttl_key in (('files', 'files_bucket', 'files_ttl'),):
             s3_id = config.get('conns',{}).get(name,{}).get('conn_id')
             bucket = config.get(bucket_key)
             ttl = config.get(ttl_key)

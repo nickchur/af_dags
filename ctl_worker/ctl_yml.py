@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -7,12 +7,14 @@
 |---|---|
 | `categories.yml` | Категории и сущности |
 | `workflows.yml` | Workflow'ы с параметрами и расписанием |
+
+Подробно: [ctl_worker/readme.md — ctl_yml](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_ymlpy--экспорт-в-yaml)
 """
 
-from airflow.sdk import DAG, task
+from airflow.sdk import DAG, Param, task
 
 from plugins.utils import add_note, default_args # type: ignore
-from plugins.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
 
 import json
 import pendulum
@@ -38,15 +40,15 @@ profiles = {
 
 with DAG(f"CTL_{get_config()['profile']}.yml", 
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tools'],
-    description='CTL',
+    description='Экспорт конфигурации CTL в YAML на S3, ручной запуск',
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc), 
     schedule=None, 
     catchup=False, 
     default_args=default_args,
     params={
-        'wfs': wfs,
-        'profiles': profiles,
-        'safe': True,
+        'wfs': Param(wfs, description='Префиксы имён воркфлоу для экспорта'),
+        'profiles': Param(profiles, description='Профили CTL, заменяемые переменными шаблона (справочно: код берёт их из модуля)'),
+        'safe': Param(True, type='boolean', description='Без расписаний и событий чужих сущностей (не 9410…)'),
     },
     doc_md=__doc__
 ) as dag:
@@ -204,6 +206,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
 
     @task
     def get_yml(**context): 
+        """Выгружает категории, сущности и выбранные воркфлоу CTL в YAML на S3."""
         
         safe = context['params']['safe']
         

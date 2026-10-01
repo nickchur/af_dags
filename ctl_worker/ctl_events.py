@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Asset
-*2026-09-21 16:08 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Asset'ы для оркестрации DAG'ов.
 
@@ -8,14 +8,16 @@
 | `CTL/wf/{wid}/{wf_name}` | Событие workflow |
 | `CTL/entity/{eid}/{ename}` | Событие сущности |
 | `CTL/{profile}/entities` | Алиас всех сущностей профиля |
+
+Подробно: [ctl_worker/readme.md — ctl_events](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_eventspy--обработка-событий)
 """
 
 from airflow.sdk import DAG, Asset, AssetAlias, PokeReturnValue, task
 # from airflow.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import add_note, on_callback, str2timedelta  # type: ignore
-from plugins.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
-from plugins.ctl_core import chk_any_conn  # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
+from ctl_worker.ctl_core import chk_any_conn  # type: ignore
 
 from datetime import timedelta, datetime, timezone
 import json
@@ -32,6 +34,14 @@ enames = {int(k):v for k,v in ctl_obj_load('ctl_enames').items()}
 
 events_interval = str2timedelta(get_config().get('events_interval','minutes=1'))
 events_alias = AssetAlias("CTL/events")
+# Стандарт служебных сенсоров (22.09.2026): окно 6 ч, затем ран снимается (soft_fail → skipped)
+# и следующий начинается по расписанию: лог попытки копится за всё окно, а сенсор на 12–18 ч
+# в сводке здоровья выглядел как зависшая задача. Ретраи гасят разовые сбои CTL и гонку
+# «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
+# Таймаут считается от первой попытки рана (в AF 2.11 — sensors/base.py:260), так что ретраи окно
+# не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
+sensor_retries = int(get_config().get('sensor_retries', 10))
 
 with DAG(f'CTL.{get_config()["profile"]}.events',
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc),
@@ -52,20 +62,24 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
     catchup=False,
     tags=['CTL', 'CTL_agent', 'events'],
     max_active_runs=1,
-    # dagrun_timeout=str2timedelta(config.get('dagrun_timeout','minutes=10')),
+    # страховка от зависшего рана: окно сенсора плюс час на задачи после него
+    dagrun_timeout=sensor_timeout + timedelta(hours=1),
     is_paused_upon_creation=False,
     on_failure_callback=on_callback,
     # on_success_callback=on_callback,
     doc_md=__doc__,
+    description='События CTL раз в 5 минут → Asset-ы для запуска воркфлоу',
 ) as dag:
     
     @task.sensor(
         mode='reschedule', 
         soft_fail=True,
         poke_interval=events_interval,
-        timeout=pendulum.duration(hours=24),
+        timeout=sensor_timeout,
+        retries=sensor_retries,
     )
     def get_events(**context): 
+        """Сенсор: сверяет события из Variables с последним statval в CTL, ждёт, пока какое-то изменится."""
 
         # TEST !!!
         # test_mode = '' if str(config.get('test_mode')).lower() in ['event'] else '--'
@@ -208,6 +222,7 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
         map_index_template="{{ event[0] }}"
     )
     def set_events(event, **context): 
+        """Публикует Asset `CTL/<событие>` для одного изменившегося события."""
 
         # ds = Asset(f'CTL/entity/{event[0]}')
         ds = Asset(f'CTL/{event[0]}')
@@ -218,5 +233,5 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
     
     
     events = get_events()
-    task(task_id=f'chk_ctl')(chk_any_conn)(id='ctl') >> events >> set_events.expand(event = events)
+    task(task_id='chk_ctl', doc_md='Проверяет, что CTL отвечает.')(chk_any_conn)(id='ctl') >> events >> set_events.override(doc_md=set_events.function.__doc__).expand(event = events)
 
