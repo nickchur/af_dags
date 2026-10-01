@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-10-01 18:18 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 30 минут публикует для вебсервера то, чего у него нет: навыки агента
 (`*/skill/*.md`) — в Variables `mcp_skill__<имя>` для MCP-ресурсов `airflow://skill/<имя>`,
@@ -255,13 +255,12 @@ def tools_mcp_skills():
             Variable.set(SKILL_INDEX, new_index, serialize_json=True,
                          description="Оглавление навыков агента для MCP: имя → sha256, путь, размер")
 
-        rows = ["| Навык | Файл | Байт | |", "|---|---|---:|---|"]
-        for name, meta in sorted(new_index.items()):
-            mark = '✏️ записан' if name in to_write else '✅ без изменений'
-            rows.append(f"| `{name}` | `{meta['path']}` | {meta['bytes']} | {mark} |")
-        rows += [f"| `{name}` | — | — | 🗑️ снят |" for name in to_delete]
-        rows += [f"| ❌ {s} | | | пропущен |" for s in skipped]
-        rows += [f"| ⚠️ {d} | | | то же имя |" for d in dups]
+        # Сначала то, что требует внимания; без изменений — одной строкой
+        rows = [f"❌ пропущен: {s}" for s in skipped] + [f"⚠️ то же имя: {d}" for d in dups]
+        rows += [f"✏️ `{name}` ← `{new_index[name]['path']}`, {new_index[name]['bytes']} байт" for name in sorted(to_write)]
+        rows += [f"🗑️ `{name}` снят" for name in to_delete]
+        same = sorted(set(new_index) - set(to_write))
+        rows += [f"✅ без изменений ({len(same)}): " + ", ".join(f"`{x}`" for x in same)] if same else []
         title = f"Навыки MCP: {len(new_index)}, записано {len(to_write)}, снято {len(to_delete)}"
         add_note("\n".join(rows), context, level='DAG,task', title=title)
         if skipped:

@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 19:13 MSK · v2.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v2.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
@@ -32,12 +32,12 @@ import logging
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
+        TOOLS_POOL, Feed, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
+        TOOLS_POOL, Feed, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 
@@ -334,50 +334,6 @@ REINDEX_NOTE_MIN = 1024 ** 2
 # пока потребитель стоит. ponytail: порог в ГБ без знания размера диска; поднять, если шумит
 LOGICAL_WAL_WARN_GB, LOGICAL_WAL_ERROR_GB = 5, 20
 CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
-# Заметка в AF 2 — 1000 символов (колонка метабазы); запас на заголовок
-NOTE_BUDGET = 900
-
-
-class Feed:
-    """Заметка таска одним проходом: строки хода сверху вниз, в конце итог — строкой над ними.
-
-    Таблиц нет: в 1000 символов заметки широкая таблица вытесняла строки (сигма dev 01.10.2026 —
-    reindex на 116 индексов обрывался на десятом). Не влезает — в ходе видны последние строки,
-    в итоге — те, что передал done(keep=…), и «ещё N».
-    """
-
-    def __init__(self, context, title):
-        self.context, self.title, self.lines = context, title, []
-
-    def line(self, text, replace_last=False):
-        if replace_last and self.lines:
-            self.lines[-1] = text
-        else:
-            self.lines.append(text)
-        self._write('', self.lines, tail=True)
-
-    def done(self, summary, keep=None, rest=''):
-        self._write(summary, self.lines if keep is None else keep, tail=False, rest=rest)
-
-    def _write(self, head, lines, tail, rest=''):
-        budget = NOTE_BUDGET - len(self.title) - len(head) - len(rest) - 40
-        picked, size = [], 0
-        for ln in (reversed(lines) if tail else lines):
-            # +3: перенос и два пробела жёсткого переноса от add_note
-            if size + len(ln) + 3 > budget:
-                break
-            picked.append(ln)
-            size += len(ln) + 3
-        if tail:
-            picked.reverse()
-        cut = len(lines) - len(picked)
-        more = f'… ещё {cut}' if cut else ''
-        body = [head] if head else []
-        body += ([more] if tail and more else []) + picked + ([more] if not tail and more else [])
-        body += [rest] if rest else []
-        add_note('\n'.join(body), context=self.context, level='Task', add=False, title=self.title)
-
-
 def _catalog(sql, **bind):
     """SELECT по каталогу метабазы с потолком на запрос."""
     from airflow.utils.session import create_session

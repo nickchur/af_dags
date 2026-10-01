@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 19:10 MSK · v3.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:00 MSK) ищет DAG'и, у которых сериализация переписывается на каждом разборе
 файла, и выясняет причину. Группа `check_serialized` ловит дрожание (ждёт следующего разбора,
@@ -113,13 +113,13 @@ COMPARE_LIMIT = 100
 
 
 def _short(value, limit: int = 60) -> str:
-    """Однострочное представление значения для ячейки таблицы diff'а."""
-    text = str(value).replace("|", "\\|").replace("\n", " ")
+    """Однострочное представление значения для строки diff'а в заметке."""
+    text = str(value).replace("\n", " ")
     return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def _diff_pair(before, after, limit: int = 110) -> tuple[str, str]:
-    """Пара ячеек для таблицы: у длинных строк показывает место расхождения, а не начало.
+    """Пара «было → стало» для заметки: у длинных строк показывает место расхождения, а не начало.
 
     Обрезка с начала бесполезна там, где строки различаются в середине или в конце:
     у `doc_md` первые полсотни символов совпадают, и в отчёт попадали два одинаковых
@@ -376,21 +376,18 @@ def dag_size_verdict(rows: list[dict]) -> dict:
 
 
 def dag_size_note(result: dict) -> str:
-    """Заметка dag_size: вердикт строкой, классы и крупные DAG'и таблицами."""
+    """Заметка dag_size: вердикт, классы одной строкой, крупные DAG'и — строкой на каждый."""
     icon = {"healthy": "✅", "warn": "⚠️"}.get(result["status"], "❌")
     if "classes" not in result:
         return f"{icon} {result['summary']}"
-    lines = [f"{icon} DAG'ов {result['dags']}, больше {TASKS_ALERT} тасков: {result['over_alert']}", "",
-             "| Тасков | DAG'ов |", "|---|---|"]
-    lines += [f"| {c} | {n} |" for c, n in result["classes"].items() if n]
-    if result["unknown"]:
-        lines.append(f"| без данных | {result['unknown']} |")
-    if result["top"]:
-        lines += ["", "| DAG | в DAG'е | в ране | |", "|---|---|---|---|"]
-        lines += [f"| `{d}` | {v['tasks'] if v['tasks'] is not None else '?'} | {v['max_ti']} | "
-                  f"{'⏸' if v['paused'] else ''} |" for d, v in result["top"].items()]
-        if result["over_alert"] > len(result["top"]):
-            lines.append(f"\nи ещё {result['over_alert'] - len(result['top'])}")
+    classes = [f"{c}: {n}" for c, n in result["classes"].items() if n]
+    classes += [f"без данных: {result['unknown']}"] if result["unknown"] else []
+    lines = [f"{icon} DAG'ов {result['dags']}, больше {TASKS_ALERT} тасков: {result['over_alert']}",
+             "по числу тасков — " + " · ".join(classes)]
+    lines += [f"`{d}`: {v['tasks'] if v['tasks'] is not None else '?'} в DAG'е, {v['max_ti']} в ране"
+              + (" ⏸" if v['paused'] else "") for d, v in result["top"].items()]
+    if result["over_alert"] > len(result["top"]):
+        lines.append(f"… ещё {result['over_alert'] - len(result['top'])}")
     return "\n".join(lines)
 
 
@@ -571,11 +568,9 @@ def tools_test_dags():
         def share(cnt: int) -> str:
             return f"{cnt * 100 / total:.0f}%" if total else "—"
 
-        stats = "\n".join(
-            ["| Изменялись | DAG'ов | Доля |", "|---|---:|---:|", f"| **всего** | **{total}** | 100% |"]
-            + [f"| {name} | {counts[name]} | {share(counts[name])} |" for name, _ in SERIALIZED_PERIODS]
-            + [f"| **{LAST_PARSE_ROW}** | **{at_parse}** | {share(at_parse)} |"]
-        )
+        stats = (f"DAG'ов {total}, изменялись: "
+                 + " · ".join(f"{name} {counts[name]} ({share(counts[name])})" for name, _ in SERIALIZED_PERIODS)
+                 + f" · **{LAST_PARSE_ROW} {at_parse}** ({share(at_parse)})")
         result = {"total": total, **{name: counts[name] for name, _ in SERIALIZED_PERIODS},
                   LAST_PARSE_ROW: at_parse}
 
@@ -597,9 +592,7 @@ def tools_test_dags():
         # last_parsed_time и dag_hash в заметке не нужны: первый по условию отбора и так
         # совпадает с last_updated с точностью до парсинга, второй ни с чем не сравнить.
         # Оба остаются в XCom `serialized_dag` — там их можно смотреть построчно
-        table = "| last_updated | dag_id |\n|---|---|\n" + "\n".join(
-            f"| {r['last_updated']} | `{r['dag_id']}` |" for r in data[:note_rows]
-        )
+        table = "\n".join(f"`{r['dag_id']}` — {r['last_updated'][:19]}" for r in data[:note_rows])
         if at_parse > note_rows:
             table += (f"\n\nПоказаны первые {min(note_rows, len(data))} из {at_parse}, "
                       f"полный список — в XCom `serialized_dag`.")
@@ -749,8 +742,7 @@ def tools_test_dags():
         for path, was, became in diffs:
             logger.warning("  %s: %s → %s", path, was, became)
         if diffs:
-            table = ("| Путь | Было | Стало |\n|---|---|---|\n"
-                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:NOTE_DIFFS]))
+            table = "\n".join(f"`{p}`: {a} → {b}" for p, a, b in diffs[:NOTE_DIFFS])
         else:
             # data пустая при compress_serialized_dags, либо расхождение вне JSON
             table = "Расхождений в JSON не нашлось, хотя dag_hash разный"
@@ -817,9 +809,8 @@ def tools_test_dags():
                         c["dag_id"], snaps[c["dag_id"]]["version"], c["last_updated"])
 
         if changed:
-            table = "| DAG | Версия | Изменён |\n|---|---:|---|\n" + "\n".join(
-                f"| `{c['dag_id']}` | {snaps[c['dag_id']]['version']:05d} | {c['last_updated']} |"
-                for c in changed[:note_rows])
+            table = "\n".join(f"`{c['dag_id']}` v{snaps[c['dag_id']]['version']:05d} — {c['last_updated']}"
+                              for c in changed[:note_rows])
             if len(changed) > note_rows:
                 table += f"\n\nПоказаны первые {note_rows} из {len(changed)}."
         else:
@@ -964,22 +955,22 @@ def tools_test_dags():
         elapsed = time.time() - ts
 
         rows = [
-            f"| новых версий | {written} |",
-            f"| из них первых | {first} |",
-            f"| на сравнение | {len(pairs)} |",
-            *([f"| без сравнения (лимит {COMPARE_LIMIT}) | {len(not_compared)} |"] if not_compared else []),
-            f"| без изменений | {unchanged} (освежено {refreshed}) |",
-            f"| объём выгрузки | {readable_size(total_bytes)} |",
-            f"| покрытие | {covered} из {len(all_dags)} ({covered * 100 / total:.0f}%) |",
-            f"| версий в хранилище | {versions} |",
-            f"| удалённых DAG'ов | {len(deleted)}{f' (версии стёрты: {len(deleted_keys)})' if deleted and cleanup else ''} |",
-            f"| самая старая копия | {oldest or '—'} |",
+            f"новых версий: {written}",
+            f"из них первых: {first}",
+            f"на сравнение: {len(pairs)}",
+            *([f"без сравнения (лимит {COMPARE_LIMIT}): {len(not_compared)}"] if not_compared else []),
+            f"без изменений: {unchanged} (освежено {refreshed})",
+            f"объём выгрузки: {readable_size(total_bytes)}",
+            f"покрытие: {covered} из {len(all_dags)} ({covered * 100 / total:.0f}%)",
+            f"версий в хранилище: {versions}",
+            f"удалённых DAG'ов: {len(deleted)}{f' (версии стёрты: {len(deleted_keys)})' if deleted and cleanup else ''}",
+            f"самая старая копия: {oldest or '—'}",
         ]
         if limit and covered < len(all_dags):
             days = -(-(len(all_dags) - covered) // limit)  # ceil
-            rows.append(f"| полное покрытие через | ~{days} сут |")
+            rows.append(f"полное покрытие через: ~{days} сут")
 
-        add_note("| | |\n|---|---:|\n" + "\n".join(rows), context, level="task",
+        add_note("\n".join(rows), context, level="task",
                  title=f"📦 {elapsed:.2f} sec snapshot_dags: +{written} версий")
         logger.info("📦 новых версий %d (%s), без изменений %d, покрытие %d/%d, на сравнение %d",
                     written, readable_size(total_bytes), unchanged, covered, len(all_dags), len(pairs))
@@ -1064,8 +1055,7 @@ def tools_test_dags():
         for path, was, became in diffs:
             logger.info("  %s: %s → %s", path, was, became)
         if diffs:
-            table = ("| Путь | Было | Стало |\n|---|---|---|\n"
-                     + "\n".join(f"| `{p}` | {a} | {b} |" for p, a, b in diffs[:NOTE_DIFFS]))
+            table = "\n".join(f"`{p}`: {a} → {b}" for p, a, b in diffs[:NOTE_DIFFS])
             if len(diffs) > NOTE_DIFFS:
                 table += f"\n\nПоказаны {NOTE_DIFFS} из {len(diffs)}, остальные — в логе."
         else:
@@ -1213,18 +1203,10 @@ def tools_test_dags():
             logger.warning("Сверка с serialized_dag не вышла: %s: %s", type(e).__name__, e)
 
         shown = outliers or rows[:note_rows]  # dagbag_stats уже отсортирован по убыванию
-        table = "| Файл | Сек | DAG'ов | Тасков |\n|---|---:|---:|---:|\n" + "\n".join(
-            f"| `{_short(r['file'], 70)}` | {r['sec']:.2f} | {r['dags']} | {r['tasks']} |"
-            for r in shown[:note_rows])
-        stats_block = "\n".join([
-            "| | |", "|---|---:|",
-            f"| файлов | {len(rows)} |",
-            f"| суммарно | {sum(secs):.1f}с |",
-            f"| среднее | {mean:.2f}с |",
-            f"| σ | {sigma:.2f}с |",
-            f"| порог (среднее + {SIGMAS}σ) | {threshold:.2f}с |",
-            f"| выбросов | {len(outliers) if enough else '—'} |",
-        ])
+        table = "\n".join(f"`{_short(r['file'], 70)}` — {r['sec']:.2f}с, DAG'ов {r['dags']}, тасков {r['tasks']}"
+                          for r in shown[:note_rows])
+        stats_block = (f"файлов {len(rows)}, суммарно {sum(secs):.1f}с, среднее {mean:.2f}с, σ {sigma:.2f}с, "
+                       f"порог (среднее + {SIGMAS}σ) {threshold:.2f}с, выбросов {len(outliers) if enough else '—'}")
         head = (f"🐢 Медленнее порога: {len(outliers)}" if outliers else
                 "Выбросов нет" if enough else
                 f"Файлов {len(rows)} — для {SIGMAS}σ мало, показаны самые медленные")
@@ -1237,12 +1219,10 @@ def tools_test_dags():
 
         gap_block = ""
         if gap_rows:
-            gap_block = ("\n\n**Нет в serialized_dag:**\n\n"
-                         "| Файл | Построено | Не записано | Позиции | Хвост |\n"
-                         "|---|---:|---:|---|---|\n"
+            gap_block = ("\n\n**Нет в serialized_dag:**\n"
                          + "\n".join(
-                             f"| `{_short(r['file'], 50)}` | {r['built']} | {r['missing']} "
-                             f"| {r['positions']} | {'да' if r['tail'] else 'нет'} |"
+                             f"`{_short(r['file'], 50)}`: построено {r['built']}, не записано {r['missing']}, "
+                             f"позиции {r['positions']}" + (", хвост файла" if r['tail'] else "")
                              for r in gap_rows[:note_rows])
                          + "\n\nНапример: " + ", ".join(f"`{d}`" for d in gap_ids))
             if any(r["tail"] for r in gap_rows):
@@ -1250,9 +1230,8 @@ def tools_test_dags():
                               "полпути. Смотреть в сторону `dag_file_processor_timeout` и "
                               "времени разбора файла, а не отдельных DAG'ов.")
             if gap_state or gap_no_row:
-                gap_block += (f"\n\n**Они же в таблице `dag`** (файл разобран {gap_fresh}):\n\n"
-                              "| DAG | is_active | last_parsed_time |\n|---|---|---|\n"
-                              + "\n".join(f"| `{s['dag_id']}` | {s['active']} | {s['parsed']} |"
+                gap_block += (f"\n\n**Они же в таблице `dag`** (файл разобран {gap_fresh}):\n"
+                              + "\n".join(f"`{s['dag_id']}`: is_active {s['active']}, разобран {s['parsed']}"
                                           for s in gap_state))
                 if gap_no_row:
                     gap_block += ("\n\nБез строки в `dag` вовсе: "
@@ -1362,22 +1341,20 @@ def tools_test_dags():
 
         parts = []
         if stats:
-            parts.append("| Изменялись | DAG'ов |\n|---|---:|\n" + "\n".join(
-                f"| {k} | {v} |" for k, v in stats.items()))
+            parts.append("изменялись: " + " · ".join(f"{k} {v}" for k, v in stats.items()))
         if rechecks:
-            parts.append("| DAG | Вердикт | Ждали | Расхождений |\n|---|---|---:|---:|\n" + "\n".join(
-                f"| `{r['dag_id']}` | {icon_by_status.get(r['status'], '❔')} {r['status']} "
-                f"| {r.get('waited', 0)}s | {r.get('diffs', 0)} |"
-                for r in rechecks
-            ))
+            parts.append("\n".join(
+                f"{icon_by_status.get(r['status'], '❔')} `{r['dag_id']}` — {r['status']}, ждали {r.get('waited', 0)}с"
+                + (f", расхождений {r['diffs']}" if r.get('diffs') else "")
+                for r in rechecks))
         if compares:
             parts.append(f"С прошлого прогона изменилось {found.get('changed')} "
-                         f"из {found.get('total')} DAG'ов:\n\n"
-                         + "| DAG | Версии | Вердикт | Расхождений |\n|---|---|---|---:|\n"
+                         f"из {found.get('total')} DAG'ов:\n"
                          + "\n".join(
-                             f"| `{r['dag_id']}` | {r.get('prev_version', 0):05d} → "
-                             f"{r.get('new_version', 0):05d} | {r['status']} | {r['diffs']} |"
-                             for r in compares))
+                             f"`{r['dag_id']}` v{r.get('prev_version', 0):05d} → v{r.get('new_version', 0):05d} — "
+                             f"{r['status']}" + (f", расхождений {r['diffs']}" if r['diffs'] else "")
+                             # changed — норма; snapshot_broken, duplicate_dag_id — наверх
+                             for r in sorted(compares, key=lambda r: r["status"] == "changed")))
         elif found and not cmp_silent:
             parts.append(f"С прошлого прогона не менялся ни один из {found.get('total')} DAG'ов")
         if snapshot.get("not_compared"):
