@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 12:48 MSK · v2.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 12:56 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -49,7 +49,9 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 `health_warn` / `health_errors`; без админской учётки — `params` → `clean` → `report` и `integrity`.
 `integrity` идёт последним, чтобы не принять копию идущей перестройки за остаток.
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
-- **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
+- **clean** — подсчёт и удаление по каждой таблице; заметка дописывается **сверху** строкой на таблицу
+  (в долгой таблице — строка хода не чаще раза в 5 мин), итоговая таблица ложится сверху в конце (v2.2;
+  до того заметка переписывалась целиком на каждой порции)
 - **vacuum** — VACUUM ANALYZE по очищенным таблицам
 - **reindex** — перестройка индексов по одному (только по галке `reindex`)
 - **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
@@ -986,19 +988,23 @@ def tools_db_cleanup():
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()
+        n = len(table_names)
+        # Заметка дописывается сверху строкой на таблицу, а не переписывается таблицей целиком:
+        # свежее — наверху, ход чистки виден, итоговая таблица ложится сверху в конце.
+        # Внутри долгой таблицы — строка не чаще раза в NOTE_EVERY_SEC: порций бывают сотни,
+        # а заметка ограничена MAX_NOTE_LEN
+        NOTE_EVERY_SEC = 300
+        last_note = {'at': time.time()}
 
         for i, tbl in enumerate(table_names, 1):
             _ts = time.time()
 
             def _on_batch(done, total, count, min_date, idx, _tbl=tbl, _i=i):
-                elapsed = round(time.time() - _ts_total, 2)
-                cur = {'count': count, 'min_date': min_date, 'idx': idx,
-                       'duration': f'{done}/{total}'}
-                subtotal = sum(r['count'] for r in results.values()) + count
-                prog = f"|*{_i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
-                add_note('\n'.join(HDR + _note_rows(results) + _note_rows({_tbl: cur}) + [prog]),
-                         context=context, level='Task',
-                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+                if time.time() - last_note['at'] < NOTE_EVERY_SEC:
+                    return
+                last_note['at'] = time.time()
+                add_note(f"⏳ {_tbl} ({_i}/{n}): порция {done}/{total}, {readable_size(count, base=1000)} строк, "
+                         f"{round(time.time() - _ts, 1)} с", context=context, level='Task')
 
             try:
                 with create_session() as session:
@@ -1007,12 +1013,8 @@ def tools_db_cleanup():
                 logger.warning(f"⚠️ {tbl}: {e}")
                 results[tbl] = {'count': 0, 'min_date': None, 'idx': '⚠️',
                                  'duration': str(e)[:40], 'batches': 0}
-                elapsed = round(time.time() - _ts_total, 2)
-                subtotal = sum(r['count'] for r in results.values())
-                prog = f"|*{i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
-                add_note('\n'.join(HDR + _note_rows(results) + [prog]),
-                         context=context, level='Task',
-                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+                add_note(f"⚠️ {tbl} ({i}/{n}): {str(e)[:120]}", context=context, level='Task')
+                last_note['at'] = time.time()
                 continue
             info['duration'] = round(time.time() - _ts, 2)
             results[tbl] = info
@@ -1022,12 +1024,9 @@ def tools_db_cleanup():
                 f"idx={info['idx']} batches={info['batches']} {info['duration']}s"
             )
 
-            subtotal = sum(r['count'] for r in results.values())
-            elapsed = round(time.time() - _ts_total, 2)
-            progress = f"|*{i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
-            add_note('\n'.join(HDR + _note_rows(results) + [progress]),
-                     context=context, level='Task',
-                     title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+            add_note(f"✅ {tbl} ({i}/{n}): {readable_size(info['count'], base=1000)} строк, {info['duration']} с",
+                     context=context, level='Task')
+            last_note['at'] = time.time()
 
         duration = round(time.time() - _ts_total, 2)
 
@@ -1036,7 +1035,7 @@ def tools_db_cleanup():
             footer = f"|**Итого**|**{readable_size(total, base=1000)}**|||**{duration}**|"
             lines = HDR + _note_rows(results) + [footer]
             add_note('\n'.join(lines), context=context, level='Task',
-                     title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+                     title=f'🗑️ clean ({mode}, {retention_days}d)')
             add_note(
                 f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}'
                 f' ⏱ {duration}s',
