@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-26 21:38 MSK · v3.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 09:50 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -106,7 +106,7 @@ Airflow (загрузчик покажет его «вне присмотра»,
 | `ctl_done/{lid}_{try}` | **итог попытки** после финализации: статус, лог результата, признак завершения, время пробуждения при TIME-WAIT. Номер — `try` из `wfp_retry` (счёт с 1; `0` — повторы у воркфлоу не настроены) | `run_end` |
 | `ctl_loadings/{profile}/{id}` | снимки из списка сенсора (`/v5/api/loading/extended`) | `ctl_loading_load` |
 
-Раскладка задана в одном месте — `ctl_loading_snapshot` (`plugins/ctl_core.py`). Итог
+Раскладка задана в одном месте — `ctl_loading_snapshot` (`ctl_worker/ctl_core.py`). Итог
 берётся из ответа финализирующего вызова, лишнего запроса к CTL нет; ответ непохожей формы
 приводит к перечитыванию полной загрузки. Неудача сохранения исход не меняет: загрузка уже
 финализирована в CTL, и красный таск после этого противоречил бы её статусу.
@@ -707,9 +707,9 @@ retry = {
 | прочие задачи воркера | `task_timeout` | 1 ч | `execution_timeout`; у `run_tfs` его нет — файлов в заходе сколько угодно |
 | монитор, `RUNNING` | `run_stale` | 6 ч | `reRunned`, но не раньше `wf_timeout` + 10 мин |
 | санитар | `zombie_after` | 6 ч | зависшие задачи, осиротевшие раны, раны на паузе |
-| служебные сенсоры | `sensor_timeout` | 6 ч | окно `events`, `monitor`, `tfs_sensor`; ретраев — `sensor_retries` (10) |
+| служебные сенсоры | `sensor_timeout` | 1 ч | окно `events`, `monitor`, `tfs_sensor`; ретраев — `sensor_retries` (10). Больше не ставить: при reschedule лог копит все пробы окна и целиком перезаливается в S3 на каждой |
 
-Проверки (`timeout_ladder`, `plugins/ctl_core.py`) — санитар падает, ничего не закрыв:
+Проверки (`timeout_ladder`, `ctl_worker/ctl_core.py`) — санитар падает, ничего не закрыв:
 `gp_timeout < gp_server_limit`, `zombie_after > gp_timeout + 10 мин`, `run_stale ≥ zombie_after`.
 
 `wf_timeout` воркфлоу не урезается: раз задан, он зачем-то нужен. Если он не ниже серверного
@@ -739,7 +739,7 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 | `task_timeout` | `execution_timeout` задач воркера, кроме `run_exe` и `run_tfs` | `hours=1` |
 | `zombie_after` / `run_stale` / `lock_stale` / `new_grace` / `wait_grace` | Пороги санитара и монитора | см. «Таймауты» |
 | `ue_stale` / `ue_run_max` / `ue_grace` | Пороги монитора для потоков UE | `hours=24` / `hours=24` / `minutes=30` |
-| `sensor_timeout` / `sensor_retries` | Окно и ретраи служебных сенсоров | `hours=6` / `10` |
+| `sensor_timeout` / `sensor_retries` | Окно и ретраи служебных сенсоров | `hours=1` / `10` |
 | `ctl_conn_id` | Подключение к API CTL | `ctl` |
 | `conns.ctl.timeout` | Таймаут запроса к API (сек) | `30` |
 | `conns.ctl.pool_slots` | Размер пула `ctl_pool` (задаёт `test_conn`) | `20` |
@@ -763,17 +763,172 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 
 ---
 
-## 🔌 Интеграция с plugins
+## 🧩 Модули `ctl_core` и `ctl_utils`
 
-Все DAG'и импортируют конфигурацию через `get_config()` из `plugins.ctl_utils`:
+Лежат здесь, рядом с дагами, а не в `plugins/`: кроме дагов CTL их никто не импортирует.
+Импорт — от корня папки дагов, одним путём и без запасного варианта:
 
 ```python
-from plugins.ctl_utils import get_config, ctl_api, ...
+from ctl_worker.ctl_utils import get_config, ctl_api, ...
+from ctl_worker.ctl_core import chk_any_conn, ...
 
 profile = get_config()['profile']   # ленивая загрузка при первом обращении
 ```
 
+`from ctl_utils import …` и `from .ctl_utils import …` не работают: в `sys.path` у Airflow корень
+папки дагов и plugins_folder, а не папка DAG-файла, и сам DAG-файл загружается модулем со
+служебным именем. Путь везде должен быть один и тот же: `plugins.ctl_utils` рядом с
+`ctl_worker.ctl_utils` дали бы в процессе две копии модуля — со своим `rate_limit` и кэшем
+конфигурации. От разбора как DAG-файлов оба модуля спрятаны в `.airflowignore`.
+
 `get_config()` — единственная точка входа к Airflow Variable `ctl_config`. Прямой импорт `config` не используется.
+
+### ctl_core.py — Ядро логики CTL
+
+Содержит основные функции для управления процессами загрузки данных:
+
+- **retry-логика** (`ctl_get_retry`): Получение и восстановление конфигурации повторов
+- **Проверка времени** (`ctl_chk_wait`, `ctl_chk_new`): Управление TIME-WAIT состояниями
+- **Проверка событий** (`ctl_chk_event`, `ctl_events_mon`): Мониторинг событий с поддержкой стратегий AND/OR
+- **Отправка HTML** (`ctl_send_html`): Отправка HTML-содержимого в CTL как статистики
+- **Нормализация данных** (`ctl_loading_norm`, `ctl_wf_norm`): Преобразование сырых данных в удобный формат
+- **Проверка соединений** (`chk_any_conn`): подключение из конфига CTL и размер его пула; сама проверка (Postgres, S3, HTTP) — общая `chk_conn` из `plugins/utils.py`
+- **Управление статусами** (`ctl_get_status`, `ctl_chk_status`): Проверка и отображение статусов загрузок
+- **Подбор ответа после обрыва** (`ctl_exe_recover`): что стало с прошлой попыткой `run_exe`
+  — см. ниже «Обрыв не останавливает работу в Greenplum»
+- **Лестница таймаутов** (`gp_timeout`, `timeout_ladder`, `cfg_delta`): потолок запроса в GP из `wf_timeout` или `gp_timeout` с предупреждением выше серверного лимита — один разбор для воркера и монитора; проверка согласованности порогов для санитара. Сама лестница — в разделе «Таймауты» выше
+
+Константы:
+- `MAX_HTML = 5000` — Максимальная длина фрагмента HTML для отправки
+- `conns` — Конфигурация соединений (ctl, gp, pg, s3, s3_files)
+
+
+### ctl_utils.py — Утилиты
+
+Содержит вспомогательные функции:
+
+- **`get_config()`** — Ленивая загрузка конфигурации из Airflow Variable `ctl_config`. Результат кешируется. **Импортируйте `get_config`, а не `config`.**
+- **`eval_delta`** — Расчёт времени с использованием delta-выражений
+- **`logging`** — Централизованное логирование с эмодзи-кодированием
+- **`ctl_api`** — Обёртка для API вызовов CTL с retry-логикой и rate limiting
+- **`gp_exe`** — Выполнение SQL в Greenplum с retry-логикой
+- **`gp_loading_result`** — ответ по загрузке из журнала движка (`vw_swf_ctl_log`) или `None`
+- **`gp_backend_busy`** — pid серверных процессов, выполняющих запуск загрузки с этим номером
+  (`pg_stat_activity`); pid берётся из XCom, куда его кладёт `gp_exe`
+- **`pg_exe`** — Выполнение SQL в PostgreSQL с retry-логикой
+- **`ctl_obj_load`/`ctl_obj_save`** — Загрузка и сохранение объектов в S3 (папка `ctl/` бакета логов) или Airflow Variables.
+  Читатель берёт сначала Variable и идёт в S3 только при её отсутствии, поэтому переменная
+  пишется **всегда**, даже когда тело в S3 не изменилось: раньше совпадение MD5 выходило из
+  функции раньше записи, и отставшая однажды переменная не догоняла никогда. Возвращаемый
+  признак по-прежнему про S3 — «записи не было»
+- **`ctl_obj_etag`** — Получение ETag (MD5-хеша) объекта из S3
+- **`gp_upload_s3_csv`** — потоковая загрузка CSV/ZIP/GZ из S3 в Greenplum. Усечение таблицы
+  (`truncate=True`) идёт **один раз на объект S3**: внутри архива каждый файл грузится своей
+  транзакцией, и усечение на каждом оставляло в таблице только последний файл
+- **`eval_delta`** — временные смещения. Неразобранный кусок дельты поднимает `ValueError` с
+  его текстом и всей дельтой: из дельты считается время следующей попытки, и молчаливый
+  пропуск давал неверное время без следа. Пустое значение (`hours=`, лишняя запятая)
+  пропускается
+
+Функции retry используют:
+- `tenacity` для автоматических повторов
+- `log_retry_attempt` для логирования попыток
+
+
+### Обрыв не останавливает работу в Greenplum
+
+Проверено на боевом кластере: если клиент отвалился, запрос **продолжает выполняться** и
+коммитится сам. Отсюда устройство `ctl_exe_recover`, которого иначе не понять.
+
+`pr_swf_start_ctl` атомарна — коммита внутри функции в Greenplum нет, — и свой ответ она
+кладёт в журнал той же транзакцией. Значит ответ в журнале означает «работа выполнена и
+закоммичена». Но **отсутствие ответа не означает «работы не было»**: пока транзакция идёт,
+её записи не видны другим сессиям, а идти она может ещё час после того, как воркер умер.
+
+Поэтому состояний три, и различает их `pg_stat_activity` — по номеру загрузки в тексте
+запроса (`gp_backend_busy(lid)`). Не по pid прошлой попытки: он лежал в XCom, а Airflow
+стирает XCom задачи в начале каждой попытки, и до 26.09.2026 повтор всегда кончался «pid
+неизвестен».
+
+| Журнал | Запуск в Greenplum | Что делает `ctl_exe_recover` |
+|---|---|---|
+| ответ есть | — | отдаёт его: `('ok', ответ)` |
+| ответа нет | идёт | ждёт завершения, потом отдаёт ответ; не дождался — `('fail', …)` |
+| ответа нет | нет | ещё раз спрашивает журнал; пусто — `('lost', …)`: транзакция откачена |
+
+`lost` — исход достоверный: `run_exe` отдаёт `res = -9`, и `run_end` сразу применяет повторы
+воркфлоу. `fail` и недоступный Greenplum — неизвестность: таск падает, ETL заново не
+запускается, загрузку разбирает монитор. Объявить работу несостоявшейся, пока она идёт,
+значит отдать загрузку на повтор и получить второй ETL параллельно первому. По той же
+причине сам вызов `pr_swf_start_ctl` идёт одной попыткой, без повторов `gp_exe` на
+`OperationalError`.
+
+
+### Настройки CTL
+
+Конфигурация хранится в Airflow Variable `ctl_config` (JSON):
+
+```json
+{
+  "tz": "Europe/Moscow",
+  "ctl_timeout": [10, 30],
+  "ctl_limit": 0,
+  "expire": "days=-1",
+  "gp_conn_id": "greenplum"
+}
+```
+
+
+### Примеры
+
+#### Проверка событий
+
+```python
+from ctl_worker.ctl_core import ctl_events_mon
+import pendulum
+
+wf = {
+    'name': 'my_workflow',
+    'eventAwaitStrategy': 'and',
+    'wf_event_sched': {
+        'profile1/entity1/stat1': True,
+        'profile2/entity2/stat2': True
+    },
+    'start_dttm': '2024-01-01 10:00:00'
+}
+
+result = ctl_events_mon(wf['start_dttm'], wf, pendulum.now())
+if result['chk']:
+    # Нужно продолжать ожидание
+    raise AirflowSkipException("Waiting for events")
+else:
+    # События наступили, можно продолжать
+    pass
+```
+
+#### Отправка HTML-отчета
+
+```python
+from ctl_worker.ctl_core import ctl_send_html
+
+html_content = [
+    "<table><tr><th>Col1</th><th>Col2</th></tr><tr><td>Val1</td><td>Val2</td></tr></table>"
+]
+
+ctl_send_html(html_content, loading_id=123, entity_id=456)
+```
+
+#### Управление retry
+
+```python
+from ctl_worker.ctl_core import ctl_get_retry
+
+retry = ctl_get_retry(
+    params={'wf_retry_on': 'error', 'wf_retry_cnt': 3},
+    wf={'faultTolerance': {'numAttempts': 3, 'retryDelayMs': 5000}}
+)
+# retry = {'try': 1, 'left': 2, 'delay': None, 'add': None}
+```
 
 ---
 

@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-09-28 12:18 MSK · v2.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 15:39 MSK · v2.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы Airflow и разбирает находки по трём
 категориям: **зависшие сессии** (`idle in transaction`), **долгие запросы** (`active`) и
@@ -57,11 +57,13 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, on_callback, health_tasks, push_health, saved_params,
+        saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, on_callback, health_tasks, push_health, saved_params,
+        saved_schedule, store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -389,7 +391,8 @@ def tools_pg_activity():
         now = datetime.now(timezone.utc)
         key = f"{PREFIX}{now:%Y-%m-%d}/{now:%H%M%S}.json"
         S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).load_string(
-            json.dumps(snapshot, ensure_ascii=False, indent=2, default=str),
+            json.dumps({"platform": env_platform(), "stand": env_stand(), **snapshot},
+                       ensure_ascii=False, indent=2, default=str),
             key=key, bucket_name=BUCKET_NAME, replace=True,
         )
         logger.info("💾 снимок сохранён: s3://%s/%s", BUCKET_NAME, key)

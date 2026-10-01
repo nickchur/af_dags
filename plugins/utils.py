@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-27 17:05 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 19:10 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -20,14 +20,18 @@
 | `safe_eval()` | Безопасное вычисление математических выражений |
 | `get_conns_by_type()` / `get_conn()` | Получение соединений по типу |
 | `query_to_dict()` | SQL → список словарей (Greenplum) |
+| `chk_conn()` | Проверка доступности подключения Postgres / S3 / KerberosHttp |
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
+| `env_platform()` | Платформа: `alpha`, `sigma` или пустая строка |
 | `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
+from airflow import settings
 from airflow.models import DagModel, TaskInstance, Pool
 from airflow.utils.session import provide_session, create_session
 from airflow.utils.state import State
+from sqlalchemy import text
 from airflow.operators.python import get_current_context
 
 from pprint import PrettyPrinter
@@ -77,11 +81,25 @@ def env_stand() -> str:
     """
     return (os.getenv('ENV_STAND') or os.getenv('ENVIRONMENT') or '').strip().upper()
 
+def env_platform() -> str:
+    """Платформа: `alpha`, `sigma` или пустая строка, если не опознана.
+
+    `ENV_SPACE` не годится — в образе альфы он тоже `sigma`. У альфы один образ на все роли,
+    и роль выбирает переменная `ENTRYPOINT` (`worker`, `scheduler`, ...); на сигме у каждого
+    компонента свой образ с `APPLICATION_NAME=app-dataplatform-etl-<компонент>`, а
+    `ENTRYPOINT` — директива Dockerfile, не переменная (под сигмы dev, 30.09.2026).
+    """
+    if os.getenv('ENTRYPOINT'):
+        return 'alpha'
+    if os.getenv('APPLICATION_NAME', '').startswith('app-dataplatform-'):
+        return 'sigma'
+    return ''
+
 def sign(x):
     return (x > 0) - (x < 0)
 
 def md5_hash(data):
-    return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8')).hexdigest()
+    return hashlib.md5(json.dumps(data, sort_keys=True, default=str).encode('utf-8'), usedforsecurity=False).hexdigest()
 
 @provide_session
 def pool_slots(pool_name, slots, session=None):
@@ -200,9 +218,16 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
     
-    # Используем новый контекстный менеджер для чистой сессии
+    # Своя сессия, не create_session(): тот отдаёт scoped-сессию потока — ту же, где вызывающий
+    # держит несохранённые изменения (autoflush у Airflow выключен). refresh ниже перечитывал
+    # его объект и затирал их: handle_failure ставит FAILED в памяти, зовёт on_callback, и
+    # callback зомби оставлял задачу running навсегда (альфа 30.09.2026, три run_prm по 5 ч).
+    # lock_timeout — чтобы не ждать строку, которую держит транзакция вызывающего
     try:
-        with create_session() as session:
+        session = settings.Session.session_factory()
+        try:
+            if session.bind.dialect.name == 'postgresql':
+                session.execute(text("SET LOCAL lock_timeout = '5s'"))
             # sorted, а не set: порядок блокировок должен быть одинаковым у всех тасков.
             # Общая строка тут одна (ран), свои task_instance у каждого свои, так что
             # взаимной блокировки не выходит, но полагаться на порядок set нельзя.
@@ -220,8 +245,13 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 # Транзакция короткая (чтение и запись одной строки), планировщик ждёт
                 # миллисекунды. Не получилось перечитать под блокировкой — работаем как
                 # раньше: потерянная строка заметки лучше упавшей задачи.
+                # OF — только своя таблица: у task_instance в запрос входит dag_run, и без OF
+                # блокировалась строка рана, которую держит планировщик (сигма dev 30.09: lock
+                # timeout). SAVEPOINT — чтобы сорвавшаяся блокировка не оставила транзакцию
+                # в ошибке: иначе и запись без блокировки падала с InFailedSqlTransaction.
                 try:
-                    session.refresh(obj, with_for_update=True)
+                    with session.begin_nested():
+                        session.refresh(obj, with_for_update={'of': type(obj)})
                 except Exception as e:
                     logger.warning(f"note: строка не заблокирована ({e}), пишем без блокировки")
                     session.expire(obj)
@@ -245,7 +275,9 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 # Лимит длины
                 obj.note = new_note[:MAX_NOTE_LEN]
             
-            session.commit() # Явный коммит внутри контекста
+            session.commit()
+        finally:
+            session.close()
     except Exception as e:
         logger.warning(f"Failed to update note: {e}")
 
@@ -367,8 +399,6 @@ def _on_callback(context, level=None):
         logger.error(message)
         if level != 'DAG':
             add_note(message, context, level='DAG', add=True)
-        if level != 'DAG':
-            add_note(message, context, level='DAG', add=True)
     else:
         logger.warning(message)
 
@@ -381,6 +411,93 @@ def query_to_dict(gp_hook, sql, timeout=300):
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
     return [dict(zip(cols, row)) for row in rows]
+
+def chk_conn(conn_type, conn_id, context=None, name=None, tz=None, default=False):
+    """Проверяет доступность подключения `conn_id` типа `Postgres`, `S3` или `KerberosHttp`.
+
+    Одна проверка на все даги: сторож подключений CTL (`ctl_worker.ctl_core.chk_any_conn`
+    — обёртка с конфигом и пулами) и `tools_test_connections`. До 30.09.2026 у второго была
+    своя копия, и правки двух копий расходились.
+
+    name — подпись в заметке (по умолчанию `conn_id`); tz — пояс времени старта в заметке;
+    default=True у Postgres — метабаза Airflow через её сессию, `conn_id` не нужен.
+    Успех — заметка и результат запроса; провайдер не установлен — ☮️ и AirflowSkipException;
+    сбой — заметка и AirflowFailException.
+    """
+    import time
+    from zoneinfo import ZoneInfo
+    from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+    context = context or get_current_context()
+    name = name or conn_id
+    ti = context['ti']
+    try_number = ti.try_number
+    sdt = ti.start_date.astimezone(ZoneInfo(tz) if tz else None).strftime('%Y-%m-%d %H:%M:%S %Z')
+    ts = time.time()
+    try:
+        if conn_type == 'Postgres':
+            sql = 'SELECT current_user, current_database(), inet_server_addr()'
+            if default:
+                with create_session() as session:
+                    result = dict(session.execute(text(sql)).fetchone())
+            else:
+                from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+                result = query_to_dict(PostgresHook(postgres_conn_id=conn_id), sql, timeout=15)[0]
+
+        elif conn_type == 'S3':
+            from airflow.providers.amazon.aws.hooks.s3 import S3Hook  # type: ignore
+            from botocore.config import Config  # type: ignore
+
+            extra = S3Hook.get_connection(conn_id).extra_dejson
+            verify = extra.get('verify', True)
+            if isinstance(verify, str):
+                verify = verify.lower() == 'true'
+            # config_kwargs соединения нельзя терять: явно переданный config подменяет их
+            # целиком (connection_wrapper.py: `if not self.botocore_config and config_kwargs`),
+            # а секрет-бэкенд кладёт туда signature_version, payload_signing_enabled и
+            # request_checksum_calculation — без них шлюз отвергает запросы.
+            # merge накладывает таймауты поверх, не затирая остального.
+            config = Config(**extra.get('config_kwargs', {})).merge(Config(connect_timeout=15, read_timeout=15))
+            result = S3Hook(aws_conn_id=conn_id, verify=verify, config=config).get_conn().list_buckets()['Buckets']
+
+        elif conn_type == 'KerberosHttp':
+            from hrp_operators.utils.kerberos_http import KerberosHttpHook  # type: ignore
+
+            hook = KerberosHttpHook(method='GET', http_conn_id=conn_id)
+            verify = hook.get_connection(conn_id).extra_dejson.get('verify', True)
+            if isinstance(verify, str):
+                verify = verify.lower() == 'true'
+            # HttpHook.run принимает параметры requests через extra_options
+            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'},
+                                extra_options={'timeout': 15, 'verify': verify})
+            response.raise_for_status()
+            result = response.json()
+        else:
+            result = None
+
+        logger.info(f"🔍 {result}")
+        add_note({'try': try_number, 'sdt': sdt}, context, title=f"✅ {time.time()-ts:.2f} sec chk_{name}_conn")
+        return result
+
+    except AirflowSkipException:
+        raise
+
+    except ImportError as err:
+        msg = f"☮️ {name}: провайдер не установлен — {err}"
+        add_note(msg, context, level='task', title=f"☮️ {name}")
+        logger.warning(msg)
+        raise AirflowSkipException(msg) from err
+
+    except Exception as err:
+        logger.error(f"❌ {name}: {err}", exc_info=True)
+        # is not None обязательно: у requests.Response __bool__ == False на 4xx/5xx,
+        # то есть проверка на истинность отбросила бы ровно те ответы, ради которых всё и логируется
+        response = getattr(err, 'response', None)
+        if response is not None:
+            logger.error(f"HTTP {getattr(response, 'status_code', '?')}: {str(getattr(response, 'text', ''))[:500]}")
+        msg = f"❌ {time.time()-ts:.2f} sec chk_{name}_conn ERROR Try {try_number} {sdt}"
+        add_note(err, context, level='Task,DAG', title=msg)
+        raise AirflowFailException(f"{msg}: {err}") from err
 
 def get_dict_from_ch(ch_hook, sql):
     """Выполняет SQL в ClickHouse и возвращает результат списком словарей {колонка: значение}.
@@ -779,7 +896,7 @@ def get_af_conn():
     pwd = conn_json['password']
     logger.info(
         f"🔑 Коннект {AF_ID} зарегистрирован: {conn_json['login']}@{host}:{conn_json['port']}"
-        f"/{conn_json['schema']} | пароль: {len(pwd)} симв. {pwd[:2]}…{pwd[-2:]}"
+        f"/{conn_json['schema']} | пароль: {len(pwd)} симв."
         f" | {', '.join(f'{k}={v}' for k, v in sorted(conn_json['extra'].items()))}"
     )
 
@@ -816,6 +933,8 @@ def report_health(checks, context=None, ttl_sec=7200):
     report = {
         'schema': HEALTH_SCHEMA,
         'source': dag.dag_id,
+        'platform': env_platform(),
+        'stand': env_stand(),
         'run_id': context['run_id'],
         'version': version.group(1) if version else None,
         'at': datetime.now(timezone.utc).isoformat(timespec='seconds'),

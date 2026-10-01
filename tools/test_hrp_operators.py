@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-09-28 10:38 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-29 18:36 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Config-driven регрессионный стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`.
 Предназначен для прогона на **каждом релизе/хотфиксе** и при обновлении версии
@@ -109,9 +109,9 @@ from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
 )
 
 try:
-    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback  # type: ignore
 except ImportError:
-    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback  # type: ignore
 
 logger = getLogger("airflow.task")
 
@@ -128,10 +128,11 @@ S3_PREFIX = "hrp_tests/"
 PG_SCHEMA = "main"
 CH_SCHEMA = "technical"
 
-# Стенд из env ENVIRONMENT. Только на DEV стенд владеет схемой и управляет DDL
+# Стенд — env_stand(): ENV_STAND, при её отсутствии ENVIRONMENT, как во всём tools/ (до
+# 29.09.2026 читалась одна ENVIRONMENT). Только на DEV стенд владеет схемой и управляет DDL
 # (DROP+CREATE в setup, DROP в cleanup). На прочих стендах таблицы предсозданы
 # вручную — setup лишь TRUNCATE+наполняет, cleanup лишь TRUNCATE (не удаляет).
-ENV_STAND = os.getenv("ENVIRONMENT", "").strip().upper()
+ENV_STAND = env_stand()
 IS_DEV = ENV_STAND == "DEV"
 
 # Имена объектов (фиксированы; max_active_runs=1, cleanup гарантирует отсутствие мусора)

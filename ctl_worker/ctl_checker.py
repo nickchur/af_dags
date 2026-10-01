@@ -1,5 +1,5 @@
 """### 🔍 DAG: Проверка API CTL
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск HTTP-запроса к CTL API для диагностики и отладки.
 
@@ -20,7 +20,7 @@ from airflow.decorators import task
 from airflow.exceptions import AirflowFailException, AirflowSkipException
 
 from plugins.utils import  on_callback # type: ignore
-from plugins.ctl_utils import ctl_obj_load, ctl_api # type: ignore
+from ctl_worker.ctl_utils import ctl_obj_load, ctl_api # type: ignore
 
 from  logging import getLogger
 from datetime import datetime, timezone

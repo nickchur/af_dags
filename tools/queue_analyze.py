@@ -1,19 +1,19 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-09-29 09:06 MSK · v3.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 19:11 MSK · v3.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
 брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
 выясняли руками по логу шедулера и ответам health, — а чистка брокера стала одним таском
 по галочке `purge`.
 
-**Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`; `purge` (только при
-`purge`) ждёт `broker`; `report` — всех, при любом их исходе, → `health_warn` / `health_errors`.
+**Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`, `pidbox`; `purge`
+(только при `purge`) ждёт `broker`; `report` — всех, при любом их исходе, → `health_warn` / `health_errors`.
 Дампы убирает `tools_log_cleanup` общим сроком бакета.
 
 **Плагин здоровья** (тег `health`), раз в сутки в 09:10 MSK — в начале рабочего дня очередь
 занята, ночью разбирать нечего. Вердикт не выше ⚠️: очередь — не авария. Предупреждение —
 мусор в брокере не ниже `min_junk_share`, голодание по приоритету, раны, закрытые без старта,
-и не отработавший сборщик; остальные выводы — справка в заметке. Плановый прогон брокер не
+раздутый сет привязок ответных очередей и не отработавший сборщик; остальные выводы — справка в заметке. Плановый прогон брокер не
 чистит: `purge` разовая и не сохраняется. Отчёт для `get_system_health` пишет `health_errors`.
 
 | Таск | Что смотрит |
@@ -21,6 +21,7 @@
 | `broker` | Сообщения очередей celery: живые и мусор (задача уже в терминальном состоянии или её нет в метабазе). Дамп мусора — в бакет логов |
 | `scheduler` | Почему задачи ждут в `scheduled`: лимит дага (`max_active_tasks`), исчерпанный пул, приоритет; раны, закрытые без единого старта; раны запаузенных дагов |
 | `capacity` | `queued`+`running` против `parallelism` × живые шедулеры; слоты воркеров из отбивок (`health_beacon`), если они есть на контуре |
+| `pidbox` | Сет привязок ответных очередей control-канала (`_kombu.binding.reply.celery.pidbox`): сколько записей, пять для примера; при `purge_pidbox` — удаляет сет |
 | `purge` | Удаление размеченного мусора из брокера — с прежними предохранителями |
 | `report` | Заметка на ран: разделы и **вывод словами** |
 
@@ -35,6 +36,7 @@
 | `queued`+`running` ≥ `parallelism` × шедулеры | Слоты executor'а заняты: смотреть `slot_reconciler` в логе шедулера |
 | Мусора в брокере ≥ `min_junk_share` | Можно запускать с `purge` |
 | Раны запаузенных дагов в `queued` / `running` | Не поедут никогда — `tools_paused_runs_cleanup` |
+| Привязок ответных очередей ≥ `max_reply_bindings` | Каждый ответ воркера на ping/inspect читает сет целиком в главном цикле: задачи не берутся, ping молчит, liveness перезапускает поды (сигма dev 30.09.2026). Запуск с `purge_pidbox` |
 
 `parallelism` здесь — из конфига **воркера**, на котором идёт таск; у шедулера он может быть
 другим (vault перекрывает `airflow.cfg`). Значение шедулера даёт MCP `get_config_value` →
@@ -48,7 +50,9 @@
 | `max_delete` | Не удалять, если мусора больше этого числа *(default: `5000`)* |
 | `schedule` | Расписание; пусто — только вручную *(default: пусто)* |
 | `save_params` | Записать форму в Variable `tools_queue_analyze_params` *(default: `False`)* |
+| `max_reply_bindings` | Порог записей в сете привязок ответных очередей для вывода 📮 *(default: `1000`)* |
 | `purge` | Удалять размеченный мусор. **В Variable не сохраняется** *(default: `False`)* |
+| `purge_pidbox` | Удалить сет привязок ответных очередей. Задачи не теряются: в сете только адреса ответов на служебные команды, живые опрашивающие вернут свою запись при следующем опросе. **В Variable не сохраняется** *(default: `False`)* |
 
 Пороги прежнего дага (Variable `tools_queue_cleanup_cfg`) берутся значениями по умолчанию,
 пока не сохранена новая переменная. Дампы по-прежнему в `queue_cleanup/<YYYY-MM-DD>/`:
@@ -69,6 +73,8 @@ from datetime import datetime, timedelta, timezone
 import base64
 import json
 import logging
+import time
+import uuid
 
 from airflow.configuration import conf
 from airflow.decorators import dag, task
@@ -78,12 +84,12 @@ from airflow.utils.trigger_rule import TriggerRule
 try:
     from plugins.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
-        store_params_task,
+        env_platform, env_stand, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
-        store_params_task,
+        env_platform, env_stand, store_params_task,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -123,8 +129,11 @@ DEFAULTS = {
     # Раз в сутки в 09:10 MSK (cron в зоне start_date, как у соседних дагов; до 29.09.2026 —
     # UTC, «10 6 * * *»): в начале рабочего дня очередь занята, ночью разбирать нечего
     "schedule": "10 9 * * *",
+    # Привязок ответных очередей больше этого — вывод 📮 и ⚠️ плагина. Живых опрашивающих
+    # (маяки, liveness-пробы, пульс) — единицы на под, тысяча уже значит утечку
+    "max_reply_bindings": 1000,
 }
-ONE_SHOT = ("purge",)
+ONE_SHOT = ("purge", "purge_pidbox")
 MSK = timezone(timedelta(hours=3))
 # Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
 REPORT_TTL_SEC = 26 * 3600
@@ -132,7 +141,17 @@ REPORT_TTL_SEC = 26 * 3600
 SKILL = "tools-queue-analyze"
 # Выводы, которые дают ⚠️ (по значку в начале строки conclusions): мусор в брокере, голодание
 # по приоритету, раны без старта. Лимиты дагов и пулы — ограничения в коде дагов, справка
-WARN_MARKS = ("🗑️", "⚖️", "⏱️")
+WARN_MARKS = ("🗑️", "⚖️", "⏱️", "📮")
+# Сет привязок ответных очередей control-канала celery (kombu: keyprefix_queue % exchange).
+# Отвечая на ping/inspect, воркер читает его целиком (SMEMBERS в get_table) в главном цикле:
+# на раздутом сете он минутами не берёт задачи и молчит на ping — сигма dev 30.09.2026,
+# стек kill -USR1. Обычно kombu убирает свою запись сам после сбора ответов (стенд: сет пуст)
+REPLY_BINDINGS_KEY = "_kombu.binding.reply.celery.pidbox"
+# Сколько записей сета показать в заметке
+REPLY_SAMPLE = 5
+# Добор сета через SREM, если DEL его не удалил: записей за шаг и предел по времени
+PURGE_BATCH = 1000
+PURGE_SREM_SEC = 300
 
 SAVED = saved_params(PARAMS_VAR)
 _cfg = {**DEFAULTS, **{k: v for k, v in saved_params(OLD_VAR).items() if k in DEFAULTS}, **SAVED}
@@ -194,11 +213,15 @@ def _decode(raw) -> dict:
     # Протокол celery v2: тело — [args, kwargs, embed]. Команда Airflow лежит первым
     # позиционным аргументом execute_command. Разбираем тело, а не headers.argsrepr:
     # repr придётся парсить как питон, а тело — обычный JSON.
-    args = json.loads(body)[0] if body else []
+    # Чужое тело (не список, пустой список, args не список) — команды нет, id и task остаются.
+    # Первый элемент — через next(iter()), без индекса: пустой список даёт None, а не IndexError
+    payload = json.loads(body) if body else None
+    args = next(iter(payload), None) if isinstance(payload, list) else None
+    command = next(iter(args), None) if isinstance(args, list) else None
     return {
         "id": headers.get("id"),
         "task": headers.get("task"),
-        "command": args[0] if args and isinstance(args[0], list) else None,
+        "command": command if isinstance(command, list) else None,
     }
 
 
@@ -400,7 +423,148 @@ def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list,
             "median_dispatched": median, "dispatched_1h": len(dispatched)}
 
 
-def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
+def _count(res) -> int:
+    """Число из ответа Redis. Альфа dev 30.09: SREM ответил списком, а не числом, — похоже на
+    прокси перед брокером, который шлёт команду на несколько узлов и возвращает их ответы."""
+    if isinstance(res, (list, tuple)):
+        return sum(_count(r) for r in res)
+    return res if isinstance(res, int) else 0
+
+
+def _reply(res):
+    """Ответ как есть, если он не число: по нему видно, что вернул сервер."""
+    return res if isinstance(res, int) else repr(res)[:200]
+
+
+def _probe(client, full: str) -> dict:
+    """Какие удаления брокер выполняет на самом деле: на маленьком временном сете и на большом.
+
+    Альфа и сигма dev 30.09: DEL сета ответил 1, SREM — `[]`, а сет не изменился; на стенде те же
+    команды работают. kombu убирает привязку ответной очереди тем же SREM — если он на контуре
+    не работает, это и есть утечка. Временный ключ с тем же хэштегом (тот же узел), живёт минуту.
+    """
+    out = {}
+    tmp = full.split("}", 1)[0] + "}_tools_probe:" + uuid.uuid4().hex[:8] if full.startswith("{") \
+        else "_tools_probe:" + uuid.uuid4().hex[:8]
+    try:
+        out["tmp_sadd"] = _reply(client.sadd(tmp, "a", "b", "c"))
+        client.expire(tmp, 60)
+        out["tmp_srem"] = _reply(client.srem(tmp, "a"))
+        out["tmp_scard"] = _reply(client.scard(tmp))
+        # SMOVE во временный ключ + UNLINK — обход SREM, которым etl-core снимает привязку
+        moved = tmp + ":m"
+        out["smove"] = _reply(client.smove(tmp, moved, "b"))
+        client.expire(moved, 60)
+        out["smove_left"] = _reply(client.sismember(tmp, "b"))
+        out["smove_dst"] = _reply(client.scard(moved))
+        out["tmp_del"] = _reply(client.delete(tmp))
+        out["tmp_exists"] = _reply(client.exists(tmp))
+        out["tmp_ttl"] = _reply(client.ttl(tmp))
+        # Команды, которыми kombu подтверждает задачу (HDEL unacked, ZREM unacked_index) и снимает
+        # сообщение (LREM): не выполняются — подтверждённое вернётся в очередь по visibility_timeout
+        h, z, lst = tmp + ":h", tmp + ":z", tmp + ":l"
+        client.hset(h, "k", "v")
+        client.zadd(z, {"m": 1})
+        client.rpush(lst, "a")
+        for key in (h, z, lst):
+            client.expire(key, 60)
+        out["hdel"] = _reply(client.hdel(h, "k"))
+        out["hlen"] = _reply(client.hlen(h))
+        out["zrem"] = _reply(client.zrem(z, "m"))
+        out["zcard"] = _reply(client.zcard(z))
+        out["lrem"] = _reply(client.lrem(lst, 0, "a"))
+        out["llen"] = _reply(client.llen(lst))
+        out["unlink"] = _reply(client.unlink(tmp))
+        out["unlink_exists"] = _reply(client.exists(tmp))
+        member = client.srandmember(full)
+        if member is not None:
+            out["big_srem1"] = _reply(client.srem(full, member))
+            out["big_ismember"] = _reply(client.sismember(full, member))
+            before = client.scard(full)
+            out["big_spop"] = repr(client.spop(full))[:120]
+            out["big_spop_delta"] = before - client.scard(full)
+    except Exception as exc:  # noqa: BLE001 — проба, не повод падать
+        out["error"] = f"{type(exc).__name__}: {exc}"
+    return out
+
+
+def reply_bindings(purge: bool = False) -> dict:
+    """Размер сета привязок ответных очередей; purge — удалить сет целиком.
+
+    Удаление безопасно для задач: в сете только адреса ответов на служебные команды. Ответная
+    очередь kombu — auto_delete, её объявление не кэшируется, и живой опрашивающий вернёт
+    свою запись при следующем broadcast, потеряв не больше одного ответа.
+    """
+    from airflow.providers.celery.executors.celery_executor import app
+
+    import redis
+
+    with app.connection_for_write() as connection:
+        channel = connection.default_channel
+        # Все команды — по полному имени через клиент без префикса на том же пуле. Клиент канала
+        # префикс дописывает сам, но только части команд (kombu 5.6.2: DEL и SREM — да, SCARD и
+        # SSCAN — нет), и на альфе dev 30.09 DEL и SREM по короткому имени сет не тронули
+        # (124571 → 124598), хотя SCARD по полному имени его видел: чтение и удаление смотрели
+        # в разные ключи. Один клиент и одно имя — одна и та же запись
+        client = redis.Redis(connection_pool=channel.client.connection_pool)
+        full = (getattr(channel, "global_keyprefix", "") or "") + REPLY_BINDINGS_KEY
+        count = client.scard(full)
+        _, sample = client.sscan(full, 0, count=REPLY_SAMPLE)
+        # Запись — routing_key, шаблон и очередь через разделитель kombu; показываем очередь
+        sep = getattr(channel, "sep", "\x06\x16")
+        out = {"key": full, "count": count,
+               "sample": [(m.decode() if isinstance(m, bytes) else m).split(sep)[-1] for m in sample[:REPLY_SAMPLE]]}
+        if purge and count:
+            # Сервер — чтобы по отчёту было видно, кто отвечает: Redis или прокси перед ним
+            try:
+                info = client.info("server")
+                out["server"] = {k: info.get(k) for k in ("redis_version", "redis_mode", "server_name", "os")}
+            except Exception as exc:  # noqa: BLE001 — сведения, не повод падать
+                out["server"] = f"{type(exc).__name__}: {exc}"
+            out["probe"] = _probe(client, full)
+            out["del"] = _reply(client.delete(full))
+            left = client.scard(full)
+            if left:
+                # Альфа dev 30.09 (проба): DEL и SREM брокер не выполняет, UNLINK и SPOP — выполняет
+                out["unlink"] = _reply(client.unlink(full))
+                left = client.scard(full)
+            # DEL ответил, а сет на месте — добираем пачками SSCAN + SREM. Проход по сету, после
+            # которого он не уменьшился, — удаление не работает: крутить до предела бессмысленно
+            out["srem"] = 0
+            cursor, deadline, before = 0, time.monotonic() + PURGE_SREM_SEC, left
+            while left and time.monotonic() < deadline:
+                cursor, batch = client.sscan(full, cursor, count=PURGE_BATCH)
+                if batch:
+                    res = client.srem(full, *batch)
+                    out.setdefault("srem_raw", repr(res)[:200])
+                    out["srem"] += _count(res)
+                if not cursor:
+                    left = client.scard(full)
+                    if not batch or left >= before:
+                        break
+                    before = left
+            # Альфа dev 30.09: SREM и DEL брокер не выполняет вовсе (проба на временном ключе), SPOP
+            # — выполняет. SPOP снимает случайные записи, среди них может оказаться привязка живого
+            # опрашивающего: он не получит один ответ и заведёт привязку заново. Цена приемлема
+            if left and time.monotonic() < deadline:
+                out["spop"] = 0
+                while left and time.monotonic() < deadline:
+                    popped = client.spop(full, PURGE_BATCH)
+                    if not popped:
+                        break
+                    out["spop"] += len(popped) if isinstance(popped, (list, set)) else 1
+                    now_left = client.scard(full)
+                    if now_left >= left:
+                        break
+                    left = now_left
+            out["deleted"] = count - left
+            out["left"] = left
+            logger.warning("📮 сет %s: было %s, DEL=%s, UNLINK=%s, SREM=%s, SPOP=%s, осталось %s",
+                           full, count, out["del"], out.get("unlink"), out["srem"], out.get("spop"), left)
+    return out
+
+
+def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = None) -> list:
     """Вывод словами по правилам из шапки. Пустой список — очередь в норме."""
     out = []
     stale_min = p["stale_min"]
@@ -452,6 +616,12 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
         share = broker["junk"] / broker["total"]
         if share >= p["min_junk_share"]:
             out.append(f"🗑️ Мусора в брокере {broker['junk']} из {broker['total']} ({share:.0%}) — можно `purge`")
+    pidbox = pidbox or {}
+    n = pidbox.get("left", pidbox.get("count")) or 0
+    if n >= p["max_reply_bindings"]:
+        out.append(f"📮 Привязок ответных очередей в брокере {n} (порог {p['max_reply_bindings']}) — каждый ответ "
+                   "воркера на ping/inspect читает их все, и на тысячах главный цикл воркера стоит: задачи не "
+                   "берутся, ping молчит, liveness перезапускает поды. Запустить с `purge_pidbox`")
     return out
 
 
@@ -505,10 +675,18 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict) -> list:
             False, type="boolean",
             description=f"Записать значения формы (кроме purge) в Variable {PARAMS_VAR}",
         ),
+        "max_reply_bindings": Param(
+            _cfg["max_reply_bindings"], type="integer", minimum=1,
+            description="Привязок ответных очередей больше этого — вывод 📮 и ⚠️",
+        ),
         # Разовое действие, а не настройка: в переменную не пишется и берётся всегда из кода
         "purge": Param(
             False, type="boolean",
             description="Удалить размеченный мусор из брокера. В Variable не сохраняется",
+        ),
+        "purge_pidbox": Param(
+            False, type="boolean",
+            description="Удалить сет привязок ответных очередей control-канала. В Variable не сохраняется",
         ),
     },
 )
@@ -579,7 +757,8 @@ def tools_queue_analyze():
             for m in junk
         ]
         S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).load_string(
-            json.dumps(dump, ensure_ascii=False, indent=2),
+            json.dumps({"platform": env_platform(), "stand": env_stand(), "messages": dump},
+                       ensure_ascii=False, indent=2),
             key=dump_key, bucket_name=BUCKET_NAME, replace=True,
         )
         logger.info("💾 дамп мусора: s3://%s/%s (%s)", BUCKET_NAME, dump_key, len(dump))
@@ -807,9 +986,26 @@ def tools_queue_analyze():
         )
         return result
 
+    @task(task_id="pidbox", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
+    def pidbox(**context) -> dict:
+        """📮 Привязки ответных очередей control-канала: сколько их; при purge_pidbox — удалить."""
+        p = context["params"]
+        res = reply_bindings(purge=p["purge_pidbox"])
+        text = f"привязок ответных очередей: {res['count']}"
+        if "left" in res:
+            text += (f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}"
+                     + (f", UNLINK {res['unlink']}" if "unlink" in res else "") + f", SREM {res['srem']}"
+                     + (f", SPOP {res['spop']}" if "spop" in res else "") + ")")
+            text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "") \
+                + (f"\nпроба удалений: `{res['probe']}`" if res.get("probe") else "")
+        if res["sample"]:
+            text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
+        add_note(text, context=context, level="Task", title="📮 pidbox")
+        return res
+
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(snapshot: dict = None, sched: dict = None, cap: dict = None, purged: dict = None,
-               **context) -> str:
+               bindings: dict = None, **context) -> str:
         """📊 Выводы словами и сводка по разделам.
 
         Запускается при любом исходе (`ALL_DONE`), поэтому любого словаря может не быть:
@@ -824,7 +1020,7 @@ def tools_queue_analyze():
         def state(task_id):
             return getattr(dag_run.get_task_instance(task_id), "state", None)
 
-        found = conclusions(sched or {}, cap or {}, snapshot or {}, p)
+        found = conclusions(sched or {}, cap or {}, snapshot or {}, p, bindings or {})
         lines = ["**Выводы:**"] + [f"- {x}" for x in found] if found else ["**Выводы:** ✅ очередь в норме"]
 
         # Отказ порога отличается от выключенной галки: удаление запрашивали, и его не
@@ -864,6 +1060,13 @@ def tools_queue_analyze():
         else:
             s = state("broker")
             lines.append("| брокер | очередь пуста |" if s == "skipped" else f"| брокер | ❌ не отработал ({s}) |")
+        if bindings:
+            lines.append(f"| привязки ответов | {bindings['count']}"
+                         + (f", удалено {bindings['deleted']}, осталось {bindings['left']} (DEL {bindings.get('del')}, "
+                            f"SREM {bindings.get('srem')})" if "left" in bindings else "")
+                         + " |")
+        else:
+            lines.append(f"| привязки ответов | ❌ не прочитаны ({state('pidbox')}) |")
         if stop:
             lines += ["", f"> ⛔️ {stop}"]
         if snapshot and snapshot.get("reasons"):
@@ -877,9 +1080,9 @@ def tools_queue_analyze():
             now = datetime.now(timezone.utc)
             key = f"{PREFIX}{now:%Y-%m-%d}/{now:%H%M%S}_analyze.json"
             S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).load_string(
-                json.dumps({"conclusions": found, "scheduler": sched, "capacity": cap,
+                json.dumps({"platform": env_platform(), "stand": env_stand(), "conclusions": found, "scheduler": sched, "capacity": cap,
                             "broker": {k: v for k, v in (snapshot or {}).items() if k != "keys"},
-                            "purge": purged}, ensure_ascii=False, indent=2, default=str),
+                            "purge": purged, "pidbox": bindings}, ensure_ascii=False, indent=2, default=str),
                 key=key, bucket_name=BUCKET_NAME, replace=True,
             )
             lines.append(f"\nРазбор целиком: `s3://{BUCKET_NAME}/{key}`")
@@ -893,7 +1096,7 @@ def tools_queue_analyze():
 
         # Вердикт не выше warn: очередь — не авария. Не отработавший сборщик — тоже warn
         warns = [x for x in found if x.startswith(WARN_MARKS)]
-        warns += [f"{t} не отработал ({state(t)})" for t in ("broker", "scheduler", "capacity")
+        warns += [f"{t} не отработал ({state(t)})" for t in ("broker", "scheduler", "capacity", "pidbox")
                   if state(t) in ("failed", "upstream_failed")]
         push_health({"queue": {"status": "warn" if warns else "healthy",
                                "summary": "; ".join(warns) if warns else f"в норме, выводов {len(found)}",
@@ -901,10 +1104,10 @@ def tools_queue_analyze():
         return summary
 
     done = save_params()
-    snapshot, sched, cap = broker(), scheduler(), capacity()
-    done >> [snapshot, sched, cap]
+    snapshot, sched, cap, bindings = broker(), scheduler(), capacity(), pidbox()
+    done >> [snapshot, sched, cap, bindings]
     purged = purge(snapshot)
-    report(snapshot, sched, cap, purged) >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
+    report(snapshot, sched, cap, purged, bindings) >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_queue_analyze()

@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-14 11:34 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -26,8 +26,8 @@ from airflow.exceptions import (AirflowFailException, AirflowSkipException,
                                 AirflowRescheduleException, DagRunAlreadyExists)
 # from airflow.providers.common.sql.operators.sql import SQLExecuteQueryOperator
 from plugins.utils import add_note, env_stand, on_callback, get_current_load, str2timedelta  # type: ignore
-from plugins.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
-from plugins.ctl_core import chk_any_conn  # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_obj_load, ctl_api # type: ignore 
+from ctl_worker.ctl_core import chk_any_conn  # type: ignore
 
 # Отбор запускаемых дагов идёт по метабазе: пауза и сериализация живут там, а не в CTL
 from airflow.models import DagModel

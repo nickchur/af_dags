@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-09-26 14:20 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
@@ -20,8 +20,8 @@ from airflow.exceptions import AirflowFailException, AirflowSkipException, Airfl
 
 
 from plugins.utils import add_note, on_callback, readable_size, str2timedelta, md5_hash # type: ignore
-from plugins.ctl_utils import get_config,  ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
-from plugins.ctl_core import ctl_loading_load, ctl_wf_norm, chk_any_conn, ctl_wf_owner, ctl_subtree_names, AF_ENGINE # type: ignore
+from ctl_worker.ctl_utils import get_config,  ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
+from ctl_worker.ctl_core import ctl_loading_load, ctl_wf_norm, chk_any_conn, ctl_wf_owner, ctl_subtree_names, AF_ENGINE # type: ignore
 
 
 from functools import partial

@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-09-29 15:22 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -55,7 +55,7 @@ from airflow.utils.state import State
 
 from plugins.utils import readable_size, add_note, on_callback, str2timedelta  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_path_parse, s3_from_zip, s3_keys  # type: ignore
-from plugins.ctl_utils import get_config   # type: ignore
+from ctl_worker.ctl_utils import get_config   # type: ignore
 
 import xml.etree.ElementTree as ET
 import pendulum
@@ -114,7 +114,7 @@ tfs_interval = str2timedelta(get_config().get('tfs_interval','minutes=5'))
 # «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
 # Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
 # не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
-sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
 sensor_retries = int(get_config().get('sensor_retries', 10))
 
 

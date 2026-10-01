@@ -21,7 +21,7 @@ PostgreSQL. Поэтому здесь лежат и служебные объе�
 | Откуда | Вызов | Когда |
 |---|---|---|
 | `ctl_worker/ctl_worker.py:778`, таск `run_exe` | `select pr_swf_start_ctl('<json>'::json)` | На каждую загрузку CTL |
-| `plugins/ctl_utils.py:268` | `select pr_log_ctl('<url>', '<json>')` | На каждый GET к CTL API, кроме `/statval` и `/tmpl` |
+| `ctl_worker/ctl_utils.py:268` | `select pr_log_ctl('<url>', '<json>')` | На каждый GET к CTL API, кроме `/statval` и `/tmpl` |
 
 Всё остальное здесь — то, что дёргают эти две функции, и отчётность по тракту.
 
@@ -256,12 +256,12 @@ msg = coalesce(m_jsn->>'msg', m_jsn::text, translate(wf_ret, '"', ''''));
 | текст исключения PL/pgSQL | обработчик `when OTHERS`, туда же пишется `pr_log_error` | `-7` |
 | `Ошибка качества данных …` | `pr_chk_cnt_delta` | `-5` |
 
-`statement_timeout` ставит `gp_exe` (`plugins/ctl_utils.py:308`) на время сессии.
+`statement_timeout` ставит `gp_exe` (`ctl_worker/ctl_utils.py:308`) на время сессии.
 Значение приходит из `wf_timeout` воркфлоу, а при его отсутствии — из `gp_timeout` в
 `ctl_config` (по умолчанию 4 ч 25 мин при серверном лимите 4 ч 30 мин; до 24.09.2026 — 2 ч 55 и 3 ч). До 22.09.2026 здесь
 было написано «`exe_timeout`, 4 часа» — неправда: `exe_timeout` потолком не был, а
 `gp_timeout` по умолчанию стоял ровно на серверных 3 ч. Разбор — `gp_timeout()` в
-`plugins/ctl_core.py`, вся лестница — в [`ctl_worker/readme.md`](../ctl_worker/readme.md).
+`ctl_worker/ctl_core.py`, вся лестница — в [`ctl_worker/readme.md`](../ctl_worker/readme.md).
 
 **Наш таймаут намеренно короче серверного, примерно на пять минут.** Сервер Greenplum
 обрывает долгий запрос сам, но при его обрыве соединение рвётся вместе с сессией, и

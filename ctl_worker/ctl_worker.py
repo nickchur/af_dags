@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-29 10:21 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -51,9 +51,9 @@ from tenacity import stop_after_attempt
 
 
 from plugins.utils import add_note, env_stand, on_callback, str2timedelta, update_dag_pause, safe_eval, readable  # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_obj_save, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
+from ctl_worker.ctl_utils import get_config, gp_exe, ctl_obj_load, ctl_obj_save, ctl_api, eval_delta, gp_upload_s3_csv  # type: ignore
 from plugins.s3_utils import s3_move_s3, s3_keys, s3_delete  # type: ignore
-from plugins.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
+from ctl_worker.ctl_core import (ctl_send_html, ctl_get_retry, ctl_chk_expire, ctl_chk_status, status_icons, raise_status,  # type: ignore
                               ctl_get_eids, chk_any_conn, ctl_set_status, ctl_set_completed, ctl_loading_snapshot,
                               ctl_exe_recover, gp_timeout, cfg_delta, EXE_MARGIN, AF_ENGINE)
 
@@ -545,7 +545,7 @@ def build_worker_dag(w):
     # prm_task_to = task_time
     # tfs_task_to = (prm_task_to + task_time) if w.get('wf_tfs_in') else prm_task_to
     
-    # Потолок запроса в Greenplum и задачи вокруг него — лестница в plugins/ctl_core.py.
+    # Потолок запроса в Greenplum и задачи вокруг него — лестница в ctl_worker/ctl_core.py.
     # Airflow-SLA (sla=sla_time на run_exe) снят 22.09.2026: в AF2 он считается от следующего
     # ПО РАСПИСАНИЮ рана (dag_processing/processor.py:498) и у дагов без расписания Airflow не
     # срабатывает вовсе, callback и почта выключены, в AF3 его нет. Зависшие загрузки

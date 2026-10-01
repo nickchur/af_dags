@@ -1,5 +1,5 @@
-"""### 🛠️ Утилиты CTL (`plugins/ctl_utils.py`)
-*2026-09-26 22:31 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
+*2026-09-30 09:26 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -43,8 +43,14 @@ from sqlalchemy import text
 from plugins.utils import query_to_dict, add_note, readable_size, pool_size # type: ignore #, on_callback
 from plugins.s3_utils import s3_IterStream  # type: ignore
 
-from logging import getLogger
+from logging import getLogger, WARNING
 logger = getLogger("airflow.task")
+
+# ctl_api и gp_exe берут подключение на каждый вызов, и хуки отмечают это строкой INFO
+# («Retrieving connection», principal Kerberos). В логе монитора это две трети объёма: стенд
+# 29.09.2026, 14,7 тыс. строк из 22 тыс. за четыре пробы. Имя подключения есть и в тексте ошибки.
+for _name in ('airflow.hooks.base', 'airflow.task.hooks.hrp_operators.utils.kerberos_http.KerberosHttpHook'):
+    getLogger(_name).setLevel(WARNING)
 
 
 CTL_API_CALS = 100 #в секунду
@@ -245,12 +251,14 @@ class CtlTooManyRequests(Exception):
     before_sleep=log_retry_attempt,
     reraise=True
 )
-def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True):
+def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True,
+            gp_log=True):
     """HTTP-клиент к CTL API через KerberosHttpHook с rate-limiting и retry.
 
     4xx → AirflowSkipException (skip=True) или AirflowFailException (skip=False).
     429 (лимит частоты), 5xx / таймаут → retry tenacity (3 попытки, паузы 1–5 сек).
-    GET-запросы (кроме /statval, /tmpl) логируются в Greenplum через pr_log_ctl.
+    GET-запросы (кроме /statval, /tmpl) логируются в Greenplum через pr_log_ctl; gp_log=False —
+    не логировать (монитор читает wf на каждую загрузку, изменения потоков в GP несёт лоадер).
     Возвращает распарсенный JSON или текст ответа.
     """
     
@@ -306,7 +314,7 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         # Журнал в GP — когда GP доступен (gp_pool открыт). С первого коммита (054ff46) здесь
         # стояло «not pool_slots(...)», то есть журнал писался только при закрытом GP и падал в
         # except; к тому же pool_slots пишет в slot_pool, а здесь нужно только прочитать
-        if 'tmpl' not in url and 'statval' not in url and pool_size('gp_pool') > 0:
+        if gp_log and 'tmpl' not in url and 'statval' not in url and pool_size('gp_pool') > 0:
             
             ts = time.time()
             url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
@@ -704,7 +712,7 @@ def ctl_obj_save(key, data, var=False, ext='json'):
         else:
             content = data
             
-        new_md5 = hashlib.md5(content).hexdigest()
+        new_md5 = hashlib.md5(content, usedforsecurity=False).hexdigest()
 
         # 2. Проверяем текущий ETag в S3 (boto3 хранит MD5 в ETag для обычных загрузок)
         if hook.check_for_key(key_ext, bucket_name=bucket):

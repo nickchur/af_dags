@@ -8,8 +8,8 @@ Airflow) и папка `plugins/`, из которой остальные бер
 
 | Каталог | Что делает | Спецификация |
 | :--- | :--- | :--- |
-| `ctl_worker/` | Оркестрация загрузок через CTL API: генерация DAG'ов, сенсор, монитор, события | `specs/ctl-worker/` |
-| `plugins/` | Общие модули: конфигурация, обёртки API и БД, S3, утилиты Airflow, тракт ТФС | `specs/plugins/` |
+| `ctl_worker/` | Оркестрация загрузок через CTL API: генерация DAG'ов, сенсор, монитор, события; модули `ctl_core` и `ctl_utils` | `specs/ctl-worker/` |
+| `plugins/` | Общие модули: утилиты Airflow, S3, тракт ТФС | `specs/plugins/` |
 | `er_export/` | Выгрузка ЕР: ClickHouse → S3 → уведомление в ТФС | `specs/er-export/` |
 | `tfs_kafka/` | Тракт Kafka ↔ ТФС: отправка уведомлений и приём квитанций | `specs/tfs-kafka/` |
 | `xs_export/` | Выгрузки xStream, генерируемые из JSON-метаданных | `specs/xs-export/` |
@@ -143,14 +143,16 @@ TCP не посылая terminate, посмотреть, появилась ли
 - **Контракт `(status, payload)`.** Функции-решатели (`ctl_chk_*`, `pause_set`, `store_params`)
   возвращают пару, а не бросают исключение; разбирает её вызывающий таск (`raise_status`).
   На исключениях остаются только транспортные функции.
-- **Двойной импорт plugins.** DAG'и импортируют модули с fallback, потому что на боевых
-  контурах пакет лежит по другому пути:
+- **Двойной импорт plugins.** Модули `plugins/` едут и на сигму, где репозиторий лежит под
+  `CI06932748/tools/`, поэтому их импортируют с fallback:
   ```python
   try:
-      from plugins.ctl_core import chk_any_conn
+      from plugins.utils import add_note
   except ImportError:
-      from CI06932748.tools.utils import chk_any_conn
+      from CI06932748.tools.utils import add_note
   ```
+  Код CTL работает только на альфе и импортируется одним путём, от корня папки дагов:
+  `from ctl_worker.ctl_core import chk_any_conn`.
 - **Ленивая инициализация.** `get_config()` и список S3-бакетов читаются при первом
   обращении, а не на импорте: парсинг DAG'а не должен ходить в сеть и падать без Variable.
 

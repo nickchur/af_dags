@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-29 09:52 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -28,8 +28,8 @@ from airflow.utils.session import create_session
 from airflow.sensors.base import PokeReturnValue # type: ignore
 
 from plugins.utils import add_note, on_callback, str2timedelta, get_current_load # type: ignore
-from plugins.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
-from plugins.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN, ctl_wf_owner, ctl_subtree_names  # type: ignore
+from ctl_worker.ctl_utils import get_config, gp_exe, pg_exe, ctl_obj_load, eval_delta, ctl_api # type: ignore
+from ctl_worker.ctl_core import chk_any_conn, ctl_loading_load, status_icons, ctl_wf_norm, ctl_events_mon, ctl_set_status, ctl_set_completed, ctl_wait_until, gp_timeout, cfg_delta, timeout_ladder, EXE_MARGIN, ctl_wf_owner, ctl_subtree_names  # type: ignore
 
 import ast
 import json
@@ -70,7 +70,7 @@ SLA_SHOW = 10
 
 monitor_interval = str2timedelta(get_config().get('monitor_interval','minutes=15'))
 # Пороги разбора загрузок — в конфиге, значения по умолчанию прежние (были зашиты в код).
-# Лестница, с которой они обязаны сходиться, — в plugins/ctl_core.py.
+# Лестница, с которой они обязаны сходиться, — в ctl_worker/ctl_core.py.
 new_grace = get_config().get('new_grace', 'minutes=60')     # моложе — загрузка «новая»
 lock_stale = get_config().get('lock_stale', 'hours=5')      # LOCK / LOCK-WAIT → reStarted
 wait_grace = cfg_delta('wait_grace', 'minutes=15')          # просрочка TIME-WAIT → reStarted
@@ -88,7 +88,7 @@ ue_grace = cfg_delta('ue_grace', 'minutes=30')
 # Потоки UE на расписании, у которых нет активной загрузки: {wf_id: когда заметили}.
 # Между проверками сенсор в reschedule теряет и память, и XCom — держим в Variable
 UE_LOST_VAR = 'ctl_ue_lost'
-sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
 sensor_retries = int(get_config().get('sensor_retries', 10))
 
 def time_wait_action(lid, log, wf, sdt, now, grace, context):
@@ -237,6 +237,10 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         ue_active = set()      # воркфлоу UE, у которых есть активная загрузка
         ue_complete = True     # ответ CTL по UE не обрезан лимитом — можно искать пропавших
 
+        # wf на пробу: у многих активных загрузок один поток, а проба на стенде шла 12–14 мин
+        # при интервале 15 — около 2000 обращений к CTL. В GP wf не пишем: изменения несёт лоадер
+        wf_cache = {}
+
         for c, cat in ctl_obj_load('ctl_categories').items():
             is_ue = cat.get('name') in ue_names
             data = {'alive': '["ACTIVE"]', 'category_ids': f'[{c}]'}
@@ -255,8 +259,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 prm = ld.get('params', {})
                 wfn = ld.get('wf_name','unknown')
                 # wf = wfs[wid]
-                wf = ctl_api(f'/v4/api/wf/{wid}')
-                wf = ctl_wf_norm(wf, None)
+                if wid not in wf_cache:
+                    wf_cache[wid] = ctl_wf_norm(ctl_api(f'/v4/api/wf/{wid}', gp_log=False), None)
+                wf = wf_cache[wid]
                 # double (свой профиль + dummy внутри ue_category) исполняет Airflow — ему своя логика
                 ue_ld = is_ue and ctl_wf_owner(wf, ue_names, prf) == 'ue'
                 if is_ue:
@@ -620,7 +625,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
 
         Порог берётся из конфига (`zombie_after`, по умолчанию 6 часов) и обязан быть
         больше потолка запроса в Greenplum (`gp_timeout` + 10 мин): лестница проверяется до
-        любой уборки (`timeout_ladder`, plugins/ctl_core.py). Параметр формы
+        любой уборки (`timeout_ladder`, ctl_worker/ctl_core.py). Параметр формы
         `zombie_dry_run` показывает список, ничего не трогая.
         """
         dry = bool(context['params'].get('zombie_dry_run'))

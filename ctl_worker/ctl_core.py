@@ -1,5 +1,5 @@
-"""### 🛠️ Ядро логики CTL (`plugins/ctl_core.py`)
-*2026-09-26 21:26 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+"""### 🛠️ Ядро логики CTL (`ctl_worker/ctl_core.py`)
+*2026-09-30 09:50 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -24,7 +24,6 @@ payload)`, а решение принимает вызывающий таск �
 
 from airflow.exceptions import AirflowSkipException, AirflowFailException
 from airflow.decorators import task, task_group
-from airflow.operators.python import get_current_context
 
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
@@ -32,8 +31,8 @@ import ast
 import time
 import json
 
-from plugins.utils import query_to_dict, pool_slots, on_callback, add_note, str2timedelta # type: ignore
-from plugins.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
+from plugins.utils import chk_conn, pool_slots, on_callback, add_note, str2timedelta # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_api, ctl_obj_load, eval_delta, logging, ctl_obj_save # type: ignore
 
 from logging import getLogger
 logger = getLogger("airflow.task")
@@ -147,7 +146,7 @@ def ctl_exe_recover(lid, deadline=None, poll=30):
     стирает XCom задачи в начале каждой попытки, и до 26.09.2026 повтор всегда заканчивался
     «pid неизвестен». Недоступный Greenplum — исключение из справок, его разбирает таск.
     """
-    from plugins.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
+    from ctl_worker.ctl_utils import gp_backend_busy, gp_loading_result  # noqa: PLC0415
 
     waited = 0
     while True:
@@ -702,7 +701,7 @@ def _fixed_slots(id, value) -> int:
 
 
 def chk_any_conn(id, data=None, manage_pool=False, **context):
-    """Проверяет доступность соединения id (Postgres / S3 / KerberosHttp).
+    """Проверяет доступность подключения id из конфига CTL — сама проверка в `plugins.utils.chk_conn`.
 
     data — dict с type/conn_id/pool_slots; при отсутствии берётся из get_config()['conns'][id].
     Успех — заметка в Airflow, сбой — заметка и AirflowFailException.
@@ -713,88 +712,19 @@ def chk_any_conn(id, data=None, manage_pool=False, **context):
     сидит в default_pool, который никто не обнуляет. Раньше писали все, и три проверки CTL
     сидели в самом ctl_pool: при сбое CTL обнуляли его и сами больше туда не попадали.
     """
-    
     data = data if data else get_config().get('conns', {}).get(id, {})
-    context = context if context else get_current_context()
-
-    ti = context['ti']
-    try_number = ti.try_number
-    sdt = ti.start_date.astimezone(ZoneInfo(get_config()['tz'])).strftime('%Y-%m-%d %H:%M:%S %Z')
-    ts = time.time()
+    pool = manage_pool and data.get('pool_slots')
     try:
-        if data['type'] == 'Postgres':
-            if data.get('default'):
-                from airflow.utils.session import create_session
-                from sqlalchemy import text
-                with create_session() as session:
-                    result = dict(session.execute(text(
-                        'SELECT current_user, current_database(), inet_server_addr()'
-                    )).fetchone())
-            else:
-                from airflow.providers.postgres.hooks.postgres import PostgresHook # type: ignore
-                hook = PostgresHook(postgres_conn_id=data['conn_id'])
-                result = query_to_dict(hook, 'SELECT current_user, current_database(), inet_server_addr()', timeout=15)[0]
-            
-        elif data['type'] == 'S3':
-            from airflow.providers.amazon.aws.hooks.s3 import S3Hook # type: ignore
-            from botocore.config import Config # type: ignore
-            
-            # Явно извлекаем verify из экстра для надежности
-            extra = S3Hook.get_connection(data['conn_id']).extra_dejson
-            verify = extra.get('verify', True)
-            if isinstance(verify, str): verify = verify.lower() == 'true'
-
-            # config_kwargs соединения нельзя терять: явно переданный config подменяет их
-            # целиком (connection_wrapper.py: `if not self.botocore_config and config_kwargs`),
-            # а секрет-бэкенд кладёт туда signature_version, payload_signing_enabled и
-            # request_checksum_calculation — без них шлюз отвергает запросы.
-            # merge накладывает таймауты поверх, не затирая остального.
-            config = Config(**extra.get('config_kwargs', {})).merge(Config(connect_timeout=15, read_timeout=15))
-
-            hook = S3Hook(aws_conn_id=data['conn_id'], verify=verify, config=config)
-            result = hook.get_conn().list_buckets()['Buckets']
-            
-        elif data['type'] == 'KerberosHttp':
-            from hrp_operators.utils.kerberos_http import KerberosHttpHook # type: ignore
-            hook = KerberosHttpHook(method='GET', http_conn_id=data['conn_id'])
-            
-            # HttpHook.run принимает параметры requests через extra_options
-            verify = hook.get_connection(data['conn_id']).extra_dejson.get('verify', True)
-            if isinstance(verify, str): verify = verify.lower() == 'true'
-
-            response = hook.run('/v5/api/info', headers={'Accept': 'application/json'}, extra_options={'timeout': 15, 'verify': verify})
-            response.raise_for_status()
-            result = response.json()
-        else:
-            result = None
-        
-        if manage_pool and data.get('pool_slots'):
-            pool_slots(f'{id}_pool', slots=_fixed_slots(id, data['pool_slots']))
-        
-        logger.info(f"🔍 {result}")       
-        msg = f"✅ {time.time()-ts:.2f} sec chk_{id}_conn"
-        add_note({'try':try_number, 'sdt':sdt}, context, title=msg)
-        
-    except AirflowSkipException:
-        raise
-
-    except ImportError as err:
-        msg = f"☮️ {id}: провайдер не установлен — {err}"
-        add_note(msg, context, level='task', title=f"☮️ {id}")
-        logger.warning(msg)
-        raise AirflowSkipException(msg) from err
-        
-    except Exception as err:
-        if manage_pool and data.get('pool_slots') and not data.get('default', False):
+        chk_conn(data['type'], data.get('conn_id'), context or None, name=id,
+                 tz=get_config()['tz'], default=data.get('default', False))
+    except AirflowFailException:
+        if pool and not data.get('default', False):
             pool_slots(f'{id}_pool', slots=0)
-        
-        response = getattr(err, 'response', None)
-        logger.error(response)      
-        msg = f"❌ {time.time()-ts:.2f} sec chk_{id}_conn ERROR Try {try_number} {sdt}"
-        add_note(err, context, level='Task,DAG', title=msg)
-        raise AirflowFailException(f"{msg}: {err}") from err
+        raise
+    if pool:
+        pool_slots(f'{id}_pool', slots=_fixed_slots(id, data['pool_slots']))
 
-        
+
 # Кто исполняет наши потоки (всё дерево root_category). Airflow — только профиль контура
 # с оркестратором dummy; потоки на других профилях и оркестраторах — наши же, но их
 # исполняет не Airflow: они лежат в ue_category, и за ними следит монитор (ветка UE).

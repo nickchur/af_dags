@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-29 15:21 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-09-30 09:27 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -19,7 +19,9 @@ ctl_worker/          # DAG'и Airflow
 ├── ctl_yml.py       # 💾 Экспорт конфигурации CTL в YAML-файлы в S3 (бэкап / IaC)
 ├── ctl_tfs.py       # 📁 TFS → S3: по расписанию (tfs_sensor) и по Kafka-событию (tfs_kafka) с квитанцией
 ├── ctl_test.py      # 🧪 Симулятор: тестовые события / Dataset-сигналы / случайные триггеры
-└── ctl_test_conn.py # 🔌 Мониторинг подключений (CTL, GP, PG, S3) с backoff
+├── ctl_test_conn.py # 🔌 Мониторинг подключений (CTL, GP, PG, S3) с backoff
+├── ctl_core.py      # 🧠 Ядро: retry, события (AND/OR), TIME-WAIT, нормализация данных (не DAG)
+└── ctl_utils.py     # 🔧 API-обёртки, SQL, S3, конфигурация (get_config), логирование (не DAG)
 
 s3_tools/                # S3-инструменты альфы (ручной запуск) → s3_tools/readme.md
 ├── s3_from_content.py   # 📤 Загрузка текстового контента в S3
@@ -53,8 +55,7 @@ gp_exchange/                 # Приём универсального обме�
 └── tfs_exchange_common.py   # ⚙️ Конфигурация тракта ТФС (сценарий, бакет, топик) и сообщение TransferFileCephRq
 
 plugins/             # Переиспользуемые модули (импортируются DAG'ами)
-├── ctl_core.py      # 🧠 Ядро: retry, события (AND/OR), TIME-WAIT, нормализация данных
-├── ctl_utils.py     # 🔧 API-обёртки, SQL, S3, конфигурация (get_config), логирование
+├── tfs_utils.py     # 🚚 Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС
 ├── s3_utils.py      # ☁️ Расширенные S3-утилиты: TTL, копирование, ZIP-распаковка
 └── utils.py         # 🛠️ Общие хелперы Airflow: пулы, заметки, колбэки, timedelta
 

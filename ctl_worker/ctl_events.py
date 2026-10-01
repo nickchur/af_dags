@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-09-22 13:26 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-09-30 09:25 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -17,8 +17,8 @@ from airflow.decorators import task
 from airflow.sensors.base import PokeReturnValue
 
 from plugins.utils import add_note, on_callback, str2timedelta  # type: ignore
-from plugins.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
-from plugins.ctl_core import chk_any_conn  # type: ignore
+from ctl_worker.ctl_utils import get_config, ctl_api, pg_exe, ctl_obj_load # type: ignore 
+from ctl_worker.ctl_core import chk_any_conn  # type: ignore
 
 from datetime import timedelta, datetime, timezone
 import json
@@ -40,7 +40,7 @@ events_interval = str2timedelta(get_config().get('events_interval','minutes=1'))
 # «executor reported success, but TI state is queued», которые иначе роняли ран целиком.
 # Таймаут в AF 2.11 считается от первой попытки рана (sensors/base.py:260), так что ретраи окно
 # не растягивают. Ретраи — только у сенсора: у задач после него повтор = повторное действие.
-sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=6'))
+sensor_timeout = str2timedelta(get_config().get('sensor_timeout', 'hours=1'))
 sensor_retries = int(get_config().get('sensor_retries', 10))
 
 with DAG(f'CTL.{get_config()["profile"]}.events',
