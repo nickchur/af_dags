@@ -17,9 +17,7 @@ from logging import getLogger
 from typing import Optional
 
 from airflow.configuration import conf
-from airflow.decorators import dag, task
-from airflow.models.param import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 
 try:
     from plugins.utils import (  # type: ignore
@@ -126,7 +124,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     """
     import time
 
-    from airflow.exceptions import AirflowFailException, AirflowSkipException
+    from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
     try:
         from plugins.utils import add_note  # type: ignore
@@ -311,8 +309,8 @@ def tools_test_connections():  # noqa: PLR0915
         from collections import defaultdict
 
         from airflow.configuration import get_custom_secret_backend
-        from airflow.exceptions import AirflowFailException
-        from airflow.models import Variable
+        from airflow.sdk import Variable
+        from airflow.sdk.exceptions import AirflowFailException
 
         try:
             from plugins.utils import add_note  # type: ignore
@@ -348,9 +346,8 @@ def tools_test_connections():  # noqa: PLR0915
     def check(item: dict):
         """Проверка одного подключения; в сетке экземпляр подписан «группа · conn_id»."""
         # item, а не conn: conn — ключ контекста Airflow
-        from airflow.operators.python import get_current_context
-
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk import get_current_context
+        from airflow.sdk.exceptions import AirflowSkipException
 
         context = get_current_context()
         context["conn_label"] = f"{item['group']} · {item['conn_id']}"
@@ -371,12 +368,13 @@ def tools_test_connections():  # noqa: PLR0915
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):  # noqa: PLR0915
         """Сводка проверок: таблица по группам и причины падений."""
-        from airflow.models import TaskInstance
-        from airflow.utils.session import create_session
+        from types import SimpleNamespace
 
         try:
+            from plugins import af_meta  # type: ignore
             from plugins.utils import add_note  # type: ignore
         except ImportError:
+            from CI06932748.tools import af_meta  # type: ignore
             from CI06932748.tools.utils import add_note  # type: ignore
 
         dag_run = context["dag_run"]
@@ -384,31 +382,17 @@ def tools_test_connections():  # noqa: PLR0915
         # много, task_id у них общий, и словарь по одному task_id оставлял заметку
         # случайного индекса — в строке падения показывалась причина от соседнего,
         # успешного экземпляра
-        notes_map: dict[tuple[str, int], str] = {}
-
-        with create_session() as session:
-            tis = (
-                session.query(TaskInstance)
-                .filter(
-                    TaskInstance.dag_id == dag_run.dag_id,
-                    TaskInstance.run_id == dag_run.run_id,
-                )
-                .order_by(TaskInstance.task_id, TaskInstance.map_index)
-                .all()
-            )
-            try:
-                from airflow.models.taskinstance import TaskInstanceNote  # noqa: PLC0415
-                note_rows = (
-                    session.query(TaskInstanceNote)
-                    .filter(
-                        TaskInstanceNote.dag_id == dag_run.dag_id,
-                        TaskInstanceNote.run_id == dag_run.run_id,
-                    )
-                    .all()
-                )
-                notes_map = {(n.task_id, n.map_index): (n.content or "") for n in note_rows}
-            except Exception as e:
-                logger.warning("Could not load task notes: %s", e)
+        # Airflow 3: ORM у задачи нет — задачи рана и их заметки одним SQL. Заметка в AF3
+        # живёт в task_instance_note по ti_id, а не по (dag_id, run_id, task_id, map_index)
+        rows = af_meta.sql(
+            "SELECT ti.task_id, ti.map_index, ti.rendered_map_index, ti.state, ti.duration,"
+            "       n.content AS note"
+            "  FROM task_instance ti LEFT JOIN task_instance_note n ON n.ti_id = ti.id"
+            " WHERE ti.dag_id = %s AND ti.run_id = %s"
+            " ORDER BY ti.task_id, ti.map_index",
+            (dag_run.dag_id, dag_run.run_id))
+        tis = [SimpleNamespace(**r) for r in rows]
+        notes_map: dict[tuple[str, int], str] = {(r["task_id"], r["map_index"]): (r["note"] or "") for r in rows}
 
         critical = list(context["params"].get("critical") or [])
         # Номер экземпляра check → подключение: тот же список, по которому шёл expand

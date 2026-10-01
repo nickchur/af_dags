@@ -21,9 +21,7 @@
 # Param/TriggerRule для сигнатуры, datetime для start_date, cheap-stdlib.
 # Всё runtime-only (модели, exceptions, session, settings, config_dict, pprint,
 # unicodedata) импортируется внутри тасков/хелперов — грузится на воркере.
-from airflow.decorators import dag, task
-from airflow.models import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 from sqlalchemy import text
 
 from datetime import date, datetime, timedelta, timezone
@@ -40,6 +38,10 @@ except ImportError:
         TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -51,36 +53,41 @@ BATCH_SIZE = 50_000
 
 # Дополнительные условия: не трогать строки ранов моложе cutoff.
 # {p} — префикс таблицы: её имя ('task_instance.') или алиас 'base.'; пустым не бывает, см. _do_cleanup.
-# execution_date ≤ start_date всегда, поэтому start_date < cutoff ⟹ execution_date < cutoff
-# (безопасное добавление). Индекса по execution_date в AF 2.11 нет — только вторым полем
-# в (dag_id, execution_date), — поэтому EXISTS находит ран по уникальному (dag_id, run_id)
-# (у xcom — по dag_run.id), а дату проверяет у одной найденной строки.
+# Схема метабазы не зашита (main на контуре AF2, main_3 на альфе AF3, public на стенде):
+# таблицы — через search_path, каталог — по схеме, куда он разрешает dag_run.
+# Airflow 3: опора — run_after (индекс idx_dag_run_run_after). У logical_date бывает NULL
+# (ручной ран без даты), и условие по нему такие раны не удалило бы никогда; run_after есть
+# всегда и не позже start_date, поэтому start_date < cutoff ⟹ run_after < cutoff.
 _EXTRA_COND = {
-    'dag_run': '{p}execution_date < :cutoff',
+    'dag_run': '{p}run_after < :cutoff',
     'task_instance': (
-        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        'EXISTS (SELECT 1 FROM dag_run _dr'
         ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
-        ' AND _dr.execution_date < :cutoff)'
+        ' AND _dr.run_after < :cutoff)'
     ),
     'task_instance_history': (
-        'EXISTS (SELECT 1 FROM main.dag_run _dr'
+        'EXISTS (SELECT 1 FROM dag_run _dr'
         ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
-        ' AND _dr.execution_date < :cutoff)'
+        ' AND _dr.run_after < :cutoff)'
     ),
-    'task_fail': (
-        'EXISTS (SELECT 1 FROM main.dag_run _dr'
-        ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
-        ' AND _dr.execution_date < :cutoff)'
-    ),
+    # У task_reschedule в Airflow 3 нет dag_id/run_id — только ti_id (индекс
+    # idx_task_reschedule_ti_id_id_desc): к рану идём через задачу. start_date попытки
+    # не раньше run_after рана, так что условие лишь сужает, а не расширяет отбор
     'task_reschedule': (
-        'EXISTS (SELECT 1 FROM main.dag_run _dr'
-        ' WHERE _dr.dag_id = {p}dag_id AND _dr.run_id = {p}run_id'
-        ' AND _dr.execution_date < :cutoff)'
+        'EXISTS (SELECT 1 FROM task_instance _ti JOIN dag_run _dr'
+        ' ON _dr.dag_id = _ti.dag_id AND _dr.run_id = _ti.run_id'
+        ' WHERE _ti.id = {p}ti_id AND _dr.run_after < :cutoff)'
     ),
-    # dag_run_id — FK на dag_run.id; подзапрос идёт по первичному ключу dag_run
+    # dag_run_id — FK на dag_run.id
     'xcom': (
-        'EXISTS (SELECT 1 FROM main.dag_run _dr'
-        ' WHERE _dr.id = {p}dag_run_id AND _dr.execution_date < :cutoff)'
+        'EXISTS (SELECT 1 FROM dag_run _dr'
+        ' WHERE _dr.id = {p}dag_run_id AND _dr.run_after < :cutoff)'
+    ),
+    # task_instance.dag_version_id — FK RESTRICT (3.3.1): версия, на которую ещё смотрит
+    # задача (в том числе свежая — версия дага живёт месяцами), не удаляется. Без условия
+    # DELETE падал бы на первой такой строке целиком для таблицы.
+    'dag_version': (
+        'NOT EXISTS (SELECT 1 FROM task_instance _ti WHERE _ti.dag_version_id = {p}id)'
     ),
     # celery_taskmeta здесь нет намеренно: до v1.9 строка удалялась только при живом
     # task_instance с тем же external_executor_id. Колонка хранит id ТОЛЬКО последней
@@ -135,7 +142,7 @@ _BASE_WHERE = {
     # Проверено на стенде откатом: старые сироты удаляются, обе живые STARTED остаются.
     'celery_taskmeta': (
         '({col} < :cutoff OR ({col} IS NULL AND {p}id < '
-        '(SELECT MIN(id) FROM main.celery_taskmeta WHERE date_done >= :cutoff)))'
+        '(SELECT MIN(id) FROM celery_taskmeta WHERE date_done >= :cutoff)))'
     ),
 }
 
@@ -163,23 +170,25 @@ _PK_BATCH = {
     'job':                'id',
 }
 
-# Таблицы вне стандартного _cleanup_config с дополнительным safety-фильтром (opt-in через custom=True).
-_CUSTOM_TABLES = {
-    # Исходники DAG-файлов — нельзя трогать то, на что ссылается serialized_dag
-    'dag_code': {
-        'col': 'last_updated',
-        'safe_where': (
-            'NOT EXISTS (SELECT 1 FROM main.serialized_dag sd WHERE sd.fileloc_hash = dag_code.fileloc_hash)'
-        ),
-    },
-    # Устаревший pickle-формат — нельзя трогать то, на что ссылается dag.pickle_id
-    'dag_pickle': {
-        'col': 'created_dttm',
-        'safe_where': (
-            'NOT EXISTS (SELECT 1 FROM main.dag d WHERE d.pickle_id = dag_pickle.id)'
-        ),
-    },
-}
+# Airflow 3: пусто. dag_code привязан к dag_version (FK CASCADE) и уходит вместе с ней,
+# dag_pickle удалён миграцией 3.0 — прежние записи ссылались на колонки, которых больше нет.
+_CUSTOM_TABLES = {}
+
+# Отбор «последнего» для keep_last: те же фильтры, что у Airflow (keep_last_filters в
+# utils/db_cleanup.py 3.3.1). У dag_run это run_type != 'manual' — в Airflow 2 было
+# external_trigger = false, колонку удалили.
+_KEEP_LAST_FILTER = {'dag_run': "run_type <> 'manual'"}
+
+
+def _af_connect(conn_id):
+    """Сырой коннект psycopg2 с search_path метабазы на всю сессию (af_meta.search_path)."""
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT set_config('search_path', %s, false)", (af_meta.search_path(),))
+    conn.commit()
+    return conn
 
 
 def _order_children_first(names, session):
@@ -197,7 +206,7 @@ def _order_children_first(names, session):
         JOIN pg_class c ON c.oid = con.conrelid
         JOIN pg_class f ON f.oid = con.confrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE con.contype = 'f' AND n.nspname = 'main' AND c.relname <> f.relname
+        WHERE con.contype = 'f' AND n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND c.relname <> f.relname
     """)).fetchall()
 
     children = {}
@@ -253,15 +262,13 @@ def db_stats(tables):
     Статистика наполняется коллектором асинхронно (~500 мс), поэтому читать её
     сразу после VACUUM бессмысленно — снимок «после» снимаем с паузой.
     """
-    from airflow import settings
-
     sql = text("""
         SELECT relname, n_dead_tup, GREATEST(last_vacuum, last_autovacuum)
         FROM pg_stat_user_tables
-        WHERE schemaname = 'main' AND relname = ANY(:tbls)
+        WHERE schemaname = (SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = 'dag_run'::regclass) AND relname = ANY(:tbls)
     """)
-    with settings.engine.connect() as conn:
-        rows = conn.execute(sql, {'tbls': list(tables)}).fetchall()
+    with af_meta.meta_session() as session:
+        rows = session.execute(sql, {'tbls': list(tables)}).fetchall()
     return {r[0]: (r[1], r[2]) for r in rows}
 
 
@@ -273,14 +280,14 @@ def db_vacuum(table, conn_id, full=False, timeout=3600):
     Без прав владельца VACUUM не падает, а молча пропускает таблицу с warning'ом —
     его и ловим, чтобы пропуск был виден.
     """
-    from airflow.exceptions import AirflowSkipException
+    from airflow.sdk.exceptions import AirflowSkipException
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     ts = time.time()
     mode = 'FULL ANALYZE' if full else 'ANALYZE'
-    sql = f"VACUUM {mode} main.{table}"
+    sql = f"VACUUM {mode} {table}"
 
-    conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
+    conn = _af_connect(conn_id)
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -380,9 +387,7 @@ class Feed:
 
 def _catalog(sql, **bind):
     """SELECT по каталогу метабазы с потолком на запрос."""
-    from airflow.utils.session import create_session
-
-    with create_session() as session:
+    with af_meta.meta_session() as session:
         session.execute(text(f"SET LOCAL statement_timeout = {INTEGRITY_TIMEOUT_MS}"))
         return [dict(r) for r in session.execute(text(sql), bind).mappings()]
 
@@ -412,7 +417,7 @@ def check_indexes():
         JOIN pg_class c ON c.oid = i.indexrelid
         JOIN pg_class t ON t.oid = i.indrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main'
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass)
     """)
     leftovers, by_table = [r for r in rows if r['leftover']], {}
     for r in leftovers:
@@ -426,7 +431,7 @@ def check_indexes():
         JOIN pg_class c ON c.oid = i.indexrelid
         JOIN pg_class t ON t.oid = i.indrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main' AND NOT ({LEFTOVER_SQL})
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND NOT ({LEFTOVER_SQL})
         GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text,
                  coalesce(pg_get_expr(i.indexprs, i.indrelid), ''),
                  coalesce(pg_get_expr(i.indpred, i.indrelid), '')
@@ -448,12 +453,12 @@ def check_indexes():
 
 
 def check_wraparound():
-    """Возраст самой старой незамороженной транзакции базы и таблиц main."""
+    """Возраст самой старой незамороженной транзакции базы и таблиц метабазы."""
     db_age = _catalog("SELECT age(datfrozenxid) AS age FROM pg_database WHERE datname = current_database()")[0]['age']
     top = _catalog("""
         SELECT c.relname AS tbl, age(c.relfrozenxid) AS age
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main' AND c.relkind IN ('r', 't', 'm')
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND c.relkind IN ('r', 't', 'm')
         ORDER BY age(c.relfrozenxid) DESC LIMIT 3
     """)
     status = 'error' if db_age > XID_ERROR else 'warn' if db_age > XID_WARN else 'healthy'
@@ -467,7 +472,7 @@ def check_sequences():
     """Доля израсходованного у последовательностей main: int4 кончается на 2,1 млрд."""
     rows = _catalog("""
         SELECT sequencename AS seq, last_value, max_value
-        FROM pg_sequences WHERE schemaname = 'main' AND last_value IS NOT NULL
+        FROM pg_sequences WHERE schemaname = (SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = 'dag_run'::regclass) AND last_value IS NOT NULL
     """)
     used = sorted(((r['last_value'] / r['max_value'], r['seq']) for r in rows), reverse=True)
     worst = used[0][0] if used else 0
@@ -483,7 +488,7 @@ def check_vacuum():
     rows = _catalog("""
         SELECT relname AS tbl, n_live_tup AS live, n_dead_tup AS dead,
                greatest(last_vacuum, last_autovacuum) AS last_vac
-        FROM pg_stat_user_tables WHERE schemaname = 'main' AND relname = ANY(:t)
+        FROM pg_stat_user_tables WHERE schemaname = (SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = 'dag_run'::regclass) AND relname = ANY(:t)
     """, t=list(VACUUM_TABLES))
     bad = [r for r in rows if r['dead'] > DEAD_MIN and r['dead'] > DEAD_SHARE * ((r['live'] or 0) + r['dead'])]
     return {'status': 'warn' if bad else 'healthy',
@@ -558,7 +563,7 @@ def check_constraints():
     rows = _catalog("""
         SELECT conrelid::regclass::text AS tbl, conname
         FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace
-        WHERE n.nspname = 'main' AND NOT c.convalidated
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND NOT c.convalidated
     """)
     return {'status': 'warn' if rows else 'healthy',
             'summary': ('не проверены: ' + ', '.join(f"{r['tbl']}.{r['conname']}" for r in rows))
@@ -581,7 +586,7 @@ def owner_problem(cur, tables=None):
                coalesce(array_agg(c.relname ORDER BY c.relname)
                         FILTER (WHERE NOT pg_has_role(current_user, c.relowner, 'MEMBER')), '{}')
         FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main' AND c.relkind = 'r' AND (%(t)s::text[] IS NULL OR c.relname = ANY(%(t)s))
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND c.relkind = 'r' AND (%(t)s::text[] IS NULL OR c.relname = ANY(%(t)s))
     """, {'t': list(tables) if tables else None})
     user, superuser, foreign = cur.fetchone()
     if superuser or not foreign:
@@ -593,7 +598,7 @@ def af_owner_problem(tables=None):
     """owner_problem() на коннекте get_af_conn() — том, под которым пойдёт работа."""
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
-    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    conn = _af_connect(get_af_conn())
     try:
         with conn.cursor() as cur:
             return owner_problem(cur, tables)
@@ -626,12 +631,12 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
         JOIN pg_class c ON c.oid = i.indexrelid
         JOIN pg_class t ON t.oid = i.indrelid
         JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main' AND NOT ({LEFTOVER_SQL})
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND NOT ({LEFTOVER_SQL})
         ORDER BY pg_relation_size(c.oid), c.relname
     """)
     size_sql = ("SELECT c.relname, pg_relation_size(c.oid) FROM pg_class c "
                 "JOIN pg_namespace n ON n.oid = c.relnamespace "
-                "WHERE n.nspname = 'main' AND c.relkind = 'i' AND c.relname LIKE %s")
+                "WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND c.relkind = 'i' AND c.relname LIKE %s")
     done, failed, left = [], [], []
     started = time.monotonic()
 
@@ -640,13 +645,13 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
         kept = []
         for name in names:
             try:
-                cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS main.{}').format(psql.Identifier(name)))
+                cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS {}').format(psql.Identifier(name)))
             except Exception as exc:
                 logger.warning(f"{name}: копию пока не удалить: {exc}")
                 kept.append(name)
         return kept
 
-    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    conn = _af_connect(get_af_conn())
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -662,7 +667,7 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
                     continue
                 ts = time.monotonic()
                 try:
-                    cur.execute(psql.SQL('REINDEX INDEX CONCURRENTLY main.{}').format(psql.Identifier(r['idx'])))
+                    cur.execute(psql.SQL('REINDEX INDEX CONCURRENTLY {}').format(psql.Identifier(r['idx'])))
                     cur.execute(size_sql, (r['idx'],))
                     after = dict(cur.fetchall()).get(r['idx'])
                     done.append({**r, 'after': after, 'sec': round(time.monotonic() - ts, 1)})
@@ -716,7 +721,7 @@ def drop_leftovers(names):
     valid = {r['idx'] for r in _catalog("""
         SELECT c.relname AS idx FROM pg_index i
         JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'main' AND i.indisvalid AND i.indisready
+        WHERE n.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND i.indisvalid AND i.indisready
     """)}
     todo, done, kept = [], [], []
     for name in names:
@@ -727,7 +732,7 @@ def drop_leftovers(names):
             todo.append(name)
     if not todo:
         return done, kept
-    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    conn = _af_connect(get_af_conn())
     try:
         conn.autocommit = True
         with conn.cursor() as cur:
@@ -740,7 +745,7 @@ def drop_leftovers(names):
             def drop(batch):
                 """None — удалены; иначе причина. lock — не взяли блокировку ни разу."""
                 stmt = psql.SQL('DROP INDEX IF EXISTS {}').format(
-                    psql.SQL(', ').join(psql.Identifier('main', n) for n in batch))
+                    psql.SQL(', ').join(psql.Identifier(n) for n in batch))
                 for attempt in range(1, DROP_TRIES + 1):
                     try:
                         cur.execute(stmt)
@@ -815,7 +820,7 @@ params = {
     'custom': _param(
         'custom', False,
         type='boolean',
-        description='True — включить dag_code и dag_pickle, False — только стандартные таблицы',
+        description='В Airflow 3 не включает ничего: dag_code уходит каскадом с dag_version, dag_pickle удалён',
     ),
     'batch_size': _param(
         'batch_size', BATCH_SIZE,
@@ -906,9 +911,9 @@ def tools_db_cleanup():
     @task(task_id='clean', trigger_rule=TriggerRule.NONE_FAILED)
     def clean(**context):
         """Удаляет записи метабазы старше `retention_days` (при `dry_run` только считает); отдаёт список таблиц для vacuum."""
-        from airflow.exceptions import AirflowFailException
+        from airflow.sdk.exceptions import AirflowFailException
+        # Статическая конфигурация ядра — модели импортируются, но ORM не вызывается
         from airflow.utils.db_cleanup import config_dict as _cleanup_config
-        from airflow.utils.session import create_session
 
         p = context['params']
         retention_days = p['retention_days']
@@ -934,7 +939,7 @@ def tools_db_cleanup():
                     JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = i.indkey[0]
                     JOIN pg_class c ON c.oid = i.indrelid
                     JOIN pg_namespace ns ON ns.oid = c.relnamespace
-                    WHERE ns.nspname = 'main' AND c.relname = :tbl AND a.attname = :col
+                    WHERE ns.oid = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND c.relname = :tbl AND a.attname = :col
                 """), {'tbl': tbl, 'col': col}).scalar()
                 if n:
                     return '✅'
@@ -946,7 +951,7 @@ def tools_db_cleanup():
 
         def _do_cleanup(tbl, session, on_batch=None):
             session.execute(text(f"SET lock_timeout = '{lock_timeout}'"))
-            t = f'main.{tbl}'
+            t = tbl
             bind = {'cutoff': cutoff}
             logger.info(f"⚙️ Параметры очистки: retention_days={retention_days}, cutoff={cutoff}, dry_run={dry_run}, batch_size={batch_size}")
 
@@ -971,7 +976,7 @@ def tools_db_cleanup():
                     grp = cfg.keep_last_group_by[0]
                     keep_sub = (
                         f"SELECT {grp}, MAX({col}) AS _max FROM {t} "
-                        f"WHERE external_trigger = false GROUP BY {grp}"
+                        f"WHERE {_KEEP_LAST_FILTER.get(tbl, 'TRUE')} GROUP BY {grp}"
                     )
                     jc = f"base.{grp} = _l.{grp} AND base.{col} = _l._max"
                     base_where = f"base.{col} < :cutoff AND _l._max IS NULL"
@@ -1056,8 +1061,19 @@ def tools_db_cleanup():
 
         custom = p.get('custom', False)
         table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
+        # Таблицы, которых в базе нет, пропускаем явно: список Airflow общий для любой истории
+        # базы, а _xcom_archive, например, появляется только миграцией из Airflow 2 (на свежей
+        # базе её нет). Иначе такая таблица уходила в отчёт ⚠️ с UndefinedTable.
+        present = {r['relname'] for r in af_meta.sql(
+            "SELECT c.relname FROM pg_class c"
+            f" WHERE c.relnamespace = (SELECT relnamespace FROM pg_class WHERE oid = 'dag_run'::regclass) AND c.relkind IN ('r', 'p') AND c.relname = ANY(%s)",
+            (table_names,))}
+        missing = [t for t in table_names if t not in present]
+        if missing:
+            logger.info(f"📭 Нет в базе, пропускаю: {', '.join(missing)}")
+            table_names = [t for t in table_names if t in present]
         try:
-            with create_session() as session:
+            with af_meta.meta_session() as session:
                 table_names = _order_children_first(table_names, session)
             logger.info(f"📐 Порядок очистки (дети раньше родителей): {', '.join(table_names)}")
         except Exception as e:
@@ -1087,7 +1103,7 @@ def tools_db_cleanup():
                 last_note['progress'] = True
 
             try:
-                with create_session() as session:
+                with af_meta.meta_session() as session:
                     info = _do_cleanup(tbl, session, on_batch=_on_batch)
             except Exception as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
@@ -1132,7 +1148,7 @@ def tools_db_cleanup():
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):
         """VACUUM ANALYZE таблиц, которые чистил `clean`, под админской учёткой."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
 
         p = context['params']
         if not p.get('vacuum', True):
@@ -1199,38 +1215,31 @@ def tools_db_cleanup():
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
         """Сводка рана: сколько удалено по таблицам, сравнение с прошлым запуском."""
-        from airflow.models import DagRun, XCom
-        from airflow.utils.session import create_session
-
         dag_id = context['dag_run'].dag_id
         run_id = context['dag_run'].run_id
 
-        with create_session() as session:
-            prev_run = (
-                session.query(DagRun)
-                .filter(DagRun.dag_id == dag_id, DagRun.run_id != run_id)
-                .order_by(DagRun.execution_date.desc())
-                .first()
-            )
+        # Airflow 3: прошлый ран — SQL (порядок по run_after: logical_date бывает NULL),
+        # его XCom — штатный xcom_pull с run_id, чтобы значение прошло через XCom-бэкенд
+        prev = af_meta.sql(
+            "SELECT run_id FROM dag_run WHERE dag_id = %s AND run_id <> %s"
+            " ORDER BY run_after DESC LIMIT 1", (dag_id, run_id))
         prev_data = None
-        if prev_run:
-            prev_data = XCom.get_one(
-                run_id=prev_run.run_id, key='return_value',
-                task_id='report', dag_id=dag_id,
-            )
+        if prev:
+            prev_data = context['ti'].xcom_pull(
+                dag_id=dag_id, task_ids='report', key='return_value', run_id=prev[0]['run_id'])
         before = {r['table']: r['size_bytes'] for r in prev_data} if prev_data else {}
 
         sql = """
             SELECT
                 relname,
-                pg_total_relation_size('main.' || relname)  AS total_bytes,
+                pg_total_relation_size(relid)  AS total_bytes,
                 n_live_tup,
                 n_dead_tup
             FROM pg_stat_user_tables
-            WHERE schemaname = 'main'
+            WHERE schemaname = (SELECT relnamespace::regnamespace::text FROM pg_class WHERE oid = 'dag_run'::regclass)
             ORDER BY total_bytes DESC
         """
-        with create_session() as session:
+        with af_meta.meta_session() as session:
             rows = session.execute(text(sql)).fetchall()
 
         data = []
@@ -1305,7 +1314,7 @@ def tools_db_cleanup():
     @task(task_id='drop_leftovers', trigger_rule=TriggerRule.NONE_FAILED)
     def drop_leftovers_task(**context):
         """🩹 Остатки прерванного REINDEX — только по разовой галке, до тяжёлых тасков."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
 
         if not context['params'].get('drop_leftovers'):
             raise AirflowSkipException('галка drop_leftovers не стоит')
@@ -1322,7 +1331,7 @@ def tools_db_cleanup():
     @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
     def reindex(**context):
         """🔁 Переиндексация по одному индексу — только по разовой галке; dry_run её не отменяет."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
         p = context['params']
         if not p.get('reindex'):

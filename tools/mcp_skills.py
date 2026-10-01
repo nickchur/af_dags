@@ -13,10 +13,9 @@
 
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
+import os
 
-from airflow.decorators import dag, task
-from airflow.models.param import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 
 try:
     from plugins.utils import (  # type: ignore
@@ -27,7 +26,16 @@ except ImportError:
         TOOLS_POOL, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
     )
 
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
+
 logger = getLogger("airflow.task")
+
+# Корень дагов — от этого файла (tools/mcp_skills.py), а не [core] dags_folder: в Airflow 3
+# даги приходят бандлом (S3DagBundle), и dags_folder на контуре на них не указывает
+DAGS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 MSK = timezone(timedelta(hours=3))
 
@@ -229,16 +237,15 @@ def tools_mcp_skills():
     @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish(**context):
         """Кладёт изменившиеся навыки `*/skill/*.md` в Variables `mcp_skill__*` и обновляет оглавление."""
-        from airflow.configuration import conf
-        from airflow.models import Variable
+        from airflow.sdk import Variable
 
         try:
             from plugins.utils import add_note  # type: ignore
         except ImportError:
             from CI06932748.tools.utils import add_note  # type: ignore
 
-        root = conf.get('core', 'dags_folder')
-        index = Variable.get(SKILL_INDEX, default_var={}, deserialize_json=True) or {}
+        root = DAGS_ROOT
+        index = Variable.get(SKILL_INDEX, default={}, deserialize_json=True) or {}
         found, dups = find_skills(root, index)
         new_index, to_write, to_delete, skipped = plan(found, index, root)
 
@@ -271,17 +278,16 @@ def tools_mcp_skills():
     @task(trigger_rule=TriggerRule.NONE_FAILED)
     def publish_docs(**context):
         """Кладёт документацию дагов в бакет логов и обновляет её оглавление."""
-        from airflow.configuration import conf
-        from airflow.models import Variable
+        from airflow.sdk import Variable
 
         try:
             from plugins.utils import add_note  # type: ignore
         except ImportError:
             from CI06932748.tools.utils import add_note  # type: ignore
 
-        root = conf.get('core', 'dags_folder')
+        root = DAGS_ROOT
         purge = bool(context['params'].get('purge_docs'))
-        index = Variable.get(DOC_INDEX, default_var={}, deserialize_json=True) or {}
+        index = Variable.get(DOC_INDEX, default={}, deserialize_json=True) or {}
         new_index, to_write, to_delete, skipped = docs_plan(
             find_docs(root), index, root, datetime.now(timezone.utc))
 
@@ -308,14 +314,8 @@ def tools_mcp_skills():
 
     def _purge_docs():
         """Удаляет все Variables ``af_doc__*``. Возвращает, сколько удалено."""
-        from airflow.models import Variable
-        from airflow.utils.session import create_session
-
-        with create_session() as session:
-            rows = session.query(Variable).filter(Variable.key.like(f'{DOC_PREFIX}%')).all()
-            for row in rows:
-                session.delete(row)
-            return len(rows)
+        # Airflow 3: ORM у задачи нет, а Task SDK не умеет искать по маске — SQL через af_meta
+        return len(af_meta.sql("DELETE FROM variable WHERE key LIKE %s RETURNING key", (f'{DOC_PREFIX}%',)))
 
     params_done = save_params()
     params_done >> [publish(), publish_docs()]

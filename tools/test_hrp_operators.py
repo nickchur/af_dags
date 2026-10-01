@@ -23,19 +23,15 @@ for _env_var in ("HRP_ETL_CORE_PATH", "HRP_OPERATORS_SRC_PATH"):
     if _path:
         sys.path.insert(0, _path)
 
-from airflow.decorators import dag, task
-from airflow.exceptions import AirflowFailException, AirflowSkipException
-from airflow.models import TaskInstance
-from airflow.models.param import Param
 from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.utils.session import create_session
-from airflow.utils.task_group import TaskGroup
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TaskGroup, TriggerRule, dag, task
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_cluster_operator import HrpClickHouseClusterOperator
 
 # Операторы под тестом — импортируем из конкретных модулей (не через deprecated __getattr__).
+from sber_app_dataplatform_etl_core.hrp_operators.click_to_click import HrpClickhouseToClickhouseOperator
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_to_postgres import (
     HrpClickhouseToPostgresIncarnationOperator,
     HrpClickhouseToPostgresOperator,
@@ -100,6 +96,7 @@ T_CH_TO_PG = "hrp_ch_to_pg"      # таргет ClickhouseToPostgres
 T_PG_TO_CH = "hrp_pg_to_ch"      # таргет PostgresToClickhouse (all-String)
 T_S3_TO_CH = "hrp_s3_to_ch"      # landing PG→S3→CH (CSV, all-String)
 T_S3_TO_CH_LIST = "hrp_s3_to_ch_list"  # landing PG→S3List→CH (TSV, all-String)
+T_CH_TO_CH = "hrp_ch_to_ch"      # таргет ClickhouseToClickhouse (id, name, s_special)
 T_PG_INC = "hrp_pg_inc"          # таргет PostgresIncarnationInsert (_0/_1 + seq)
 T_CH_TO_PG_INC = "hrp_ch_to_pg_inc"    # таргет ClickhouseToPostgresIncarnation (_0/_1 + seq)
 PROBE = "hrp_setup_probe"        # временный объект setup-пробы прав (create/write/drop)
@@ -814,41 +811,77 @@ def test_hrp_operators_dag():
         make_gate(gate_cond("run_known_broken", "test_ch"), [cluster_op],
                   "gate_cluster", upstream=setup_ch_t)
 
+    # ─────────────────────────── click_to_click ───────────────────────────────
+    # Стриминг CH→CH через clickhouse_connect (HTTP, порт по умолчанию 8123 — у conn берётся
+    # только host). Таргет — три колонки: JSONEachRow отдаёт даты строками, а типизированную
+    # вставку дат clickhouse_connect не делает — здесь проверяется сам поток, а не приведения.
+    with TaskGroup(group_id="click_to_click", prefix_group_id=False):
+        ch_to_ch = HrpClickhouseToClickhouseOperator(
+            task_id="ch_to_ch",
+            clickhouse_source_conn_id=CH_CONN, clickhouse_target_conn_id=CH_CONN,
+            source_sql=f"SELECT id, name, s_special FROM {CH_SCHEMA}.{SRC}",
+            target_table=f"{CH_SCHEMA}.{T_CH_TO_CH}", truncate_target=True, batch_size=2,
+        )
+
+        @task
+        def validate_ch_to_ch(params=None):
+            """count, sum(id) и строка со спецсимволами — байт в байт как в источнике."""
+            ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
+            cnt, sid = ch.execute(f"SELECT count(), sum(id) FROM {CH_SCHEMA}.{T_CH_TO_CH}")[0]
+            special = ch.execute(f"SELECT s_special FROM {CH_SCHEMA}.{T_CH_TO_CH} WHERE id = 2")[0][0]
+            if cnt != EXPECTED_ROWS or sid != 6 or special != _SPECIAL:
+                raise AirflowFailException(f"ch_to_ch: count={cnt}, sum(id)={sid}, s_special={special!r}")
+            logger.info("OK: ch_to_ch count=%d sum(id)=%d, спецсимволы целы", cnt, sid)
+
+        v_ch_to_ch = validate_ch_to_ch()
+        setup_ch_t >> ch_to_ch >> v_ch_to_ch
+        make_gate(gate_cond("test_ch"), [ch_to_ch], "gate_ch_to_ch")
+
+    # ──────────────────────────────── lineage ─────────────────────────────────
+    # Не оператор, а утилита пакета: в AF3 Dataset стал Asset (airflow.sdk). Систем не трогает.
+    with TaskGroup(group_id="lineage", prefix_group_id=False):
+
+        @task
+        def lineage_from_sql():
+            from airflow.sdk import Asset
+
+            from sber_app_dataplatform_etl_core.hrp_operators.utils.lineage import extract_lineage_from_sql
+            inlets, outlets = extract_lineage_from_sql(
+                f"INSERT INTO {CH_SCHEMA}.{T_CH_TO_CH} SELECT id, name, s_special FROM {CH_SCHEMA}.{SRC}", CH_CONN)
+            got = ([a.uri for a in inlets], [a.uri for a in outlets])
+            want = ([f"table://{CH_CONN}/{CH_SCHEMA}/{SRC}"], [f"table://{CH_CONN}/{CH_SCHEMA}/{T_CH_TO_CH}"])
+            if got != want or not all(isinstance(a, Asset) for a in inlets + outlets):
+                raise AirflowFailException(f"lineage: получено {got}, ожидалось {want}")
+            logger.info("OK: lineage inlets=%s outlets=%s", *got)
+
+        lineage_t = lineage_from_sql()
+
     # ──────────────────────────── report ──────────────────────────────────────
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
         """Собирает статусы всех тасков прогона в markdown-таблицу (как в test_connections)."""
         # Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
         # недоступна (setup пропущен по ошибке соединения) или активна.
-        dag_run = context["dag_run"]
-        with create_session() as session:
-            tis = (
-                session.query(TaskInstance)
-                .filter(TaskInstance.dag_id == dag_run.dag_id, TaskInstance.run_id == dag_run.run_id)
-                .order_by(TaskInstance.task_id)
-                .all()
-            )
-            states = {ti.task_id: (ti.state or "no_status") for ti in tis}
-            rows, ok, fail, skip = [], 0, 0, 0
-            for ti in tis:
-                # служебные таски не относятся к покрытию операторов: report/cleanup
-                # и гейты-ветки (все с префиксом gate_) — их скип это норма
-                if ti.task_id in ("report", "cleanup") or ti.task_id.startswith("gate_"):
-                    continue
-                state = ti.state or "no_status"
-                if state == "success":
-                    icon, ok = "✅", ok + 1
-                elif state in ("skipped", "upstream_failed", "removed"):
-                    icon, skip = "☮️", skip + 1
-                    # on_skipped_callback ловит только явный AirflowSkipException; скипы по
-                    # гейту/upstream он НЕ триггерит — до-записываем заметку здесь (ti в сессии,
-                    # note закоммитит create_session). Заметки setup_* с причиной не перетираем.
-                    if not ti.note:
-                        ti.note = f"☮️ SKIPPED — {state} (отключено флагом системы или зависимостью)"
-                else:
-                    icon, fail = "❌", fail + 1
-                rows.append(f"| {icon} | `{ti.task_id}` | {state} |")
-            session.commit()  # фиксируем до-записанные заметки скипнутых тасков
+        # Airflow 3: у задачи нет сессии метабазы — состояния соседей через Execution API
+        # (RuntimeTaskInstance.get_task_states → {run_id: {task_id: state}}). Заметку скипнутым
+        # по гейту здесь не дописываем: она шла через ORM, а причина и так в строке отчёта.
+        ti, dag_run = context["ti"], context["dag_run"]
+        states = ti.get_task_states(dag_id=dag_run.dag_id, run_ids=[dag_run.run_id]).get(dag_run.run_id, {})
+        states = {k: (v or "no_status") for k, v in states.items()}
+        rows, ok, fail, skip = [], 0, 0, 0
+        for task_id in sorted(states):
+            # служебные таски не относятся к покрытию операторов: report/cleanup
+            # и гейты-ветки (все с префиксом gate_) — их скип это норма
+            if task_id in ("report", "cleanup") or task_id.startswith("gate_"):
+                continue
+            state = states[task_id]
+            if state == "success":
+                icon, ok = "✅", ok + 1
+            elif state in ("skipped", "upstream_failed", "removed"):
+                icon, skip = "☮️", skip + 1
+            else:
+                icon, fail = "❌", fail + 1
+            rows.append(f"| {icon} | `{task_id}` | {state} |")
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
         params = context["params"]
@@ -900,7 +933,7 @@ def test_hrp_operators_dag():
             pg.run("\n".join(truncs))
 
         ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
-        for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, "hrp_cluster_probe"):
+        for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, T_CH_TO_CH, "hrp_cluster_probe"):
             if IS_DEV:
                 ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{t}")
             else:
@@ -922,7 +955,7 @@ def test_hrp_operators_dag():
         pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc,
         s3_archive, check_hash, pg_ddl, v_pg_ddl,
         list_keys, v_list_keys, file_read, bucket_viewer,
-        cluster_op,
+        cluster_op, ch_to_ch, v_ch_to_ch, lineage_t,
     ]
     # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream report — branch
     # принудительно скипает все прямые downstream вне своего списка, перебивая

@@ -13,10 +13,9 @@
 
 from datetime import datetime, timedelta, timezone
 from logging import getLogger
+from types import SimpleNamespace
 
-from airflow.decorators import dag, task
-from airflow.models.param import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 
 try:
     from plugins.utils import (  # type: ignore
@@ -26,6 +25,11 @@ except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
         TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
     )
+
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = getLogger("airflow.task")
 
@@ -58,7 +62,7 @@ def classify(runs, tis, now, older_than_hours):
     """Решение по ранам без Airflow — чтобы проверялось тестом.
 
     Args:
-        runs: `[{dag_id, run_id, state, queued_at, start_date, execution_date, ...}]`.
+        runs: `[{dag_id, run_id, state, queued_at, start_date, run_after, ...}]`.
         tis: `{(dag_id, run_id): {'states': {state: n}, 'last_end': datetime|None}}`.
         now: Текущее время (aware).
         older_than_hours: Порог.
@@ -73,7 +77,7 @@ def classify(runs, tis, now, older_than_hours):
         info = tis.get((r['dag_id'], r['run_id'])) or {}
         states = info.get('states') or {}
         if r['state'] == 'queued':
-            since = r.get('queued_at') or r.get('execution_date')
+            since = r.get('queued_at') or r.get('run_after')
         else:
             since = info.get('last_end') or r.get('start_date') or r.get('queued_at')
         age = now - since if since else timedelta(0)
@@ -155,49 +159,47 @@ def tools_paused_runs_cleanup():
     @task(task_id='collect', trigger_rule=TriggerRule.NONE_FAILED)
     def collect(**context) -> list:
         """🔎 Раны запаузенных дагов в выбранных состояниях, с возрастом и задачами."""
-        from sqlalchemy import func, tuple_
-
-        from airflow.models import DagModel, DagRun, Log, TaskInstance
-        from airflow.utils import timezone as tz
-        from airflow.utils.session import create_session
-
         p = context['params']
         states = [s for s in (p.get('states') or []) if s in RUN_STATES]
         if not states:
             raise ValueError(f"states: нужно хотя бы одно из {RUN_STATES}")
-        now = tz.utcnow()
+        now = datetime.now(timezone.utc)
 
-        with create_session() as session:
-            q = (session.query(DagRun.dag_id, DagRun.run_id, DagRun.state, DagRun.run_type,
-                               DagRun.queued_at, DagRun.start_date, DagRun.execution_date)
-                 .join(DagModel, DagModel.dag_id == DagRun.dag_id)
-                 .filter(DagModel.is_paused.is_(True), DagRun.state.in_(states)))
-            if p.get('dag_id_like'):
-                q = q.filter(DagRun.dag_id.like(p['dag_id_like']))
-            runs = [r._asdict() for r in q.order_by(DagRun.execution_date).limit(FETCH_LIMIT)]
+        # Airflow 3: ORM у задачи нет — те же выборки SQL-ом через af_meta
+        runs = af_meta.sql(
+            "SELECT dr.dag_id, dr.run_id, dr.state, dr.run_type, dr.queued_at, dr.start_date, dr.run_after"
+            "  FROM dag_run dr JOIN dag d ON d.dag_id = dr.dag_id"
+            " WHERE d.is_paused AND dr.state = ANY(%(states)s)"
+            + (" AND dr.dag_id LIKE %(like)s" if p.get('dag_id_like') else "")
+            + " ORDER BY dr.run_after LIMIT %(lim)s",
+            {'states': states, 'like': p.get('dag_id_like'), 'lim': FETCH_LIMIT})
 
-            tis = {}
-            dag_ids = sorted({r['dag_id'] for r in runs})
-            if runs:
-                keys = {(r['dag_id'], r['run_id']) for r in runs}
-                # По парам (dag_id, run_id) — индекс ti_dag_run; по одному dag_id читалась
-                # вся история запаузенных дагов, а лишнее отбрасывалось уже здесь
-                agg = (session.query(TaskInstance.dag_id, TaskInstance.run_id, TaskInstance.state,
-                                     func.count(), func.max(TaskInstance.end_date))
-                       .filter(tuple_(TaskInstance.dag_id, TaskInstance.run_id).in_(sorted(keys)))
-                       .group_by(TaskInstance.dag_id, TaskInstance.run_id, TaskInstance.state))
-                for dag_id, run_id, state, n, last_end in agg:
-                    info = tis.setdefault((dag_id, run_id), {'states': {}, 'last_end': None})
-                    info['states'][state or 'none'] = n
-                    if last_end and (info['last_end'] is None or last_end > info['last_end']):
-                        info['last_end'] = last_end
+        tis = {}
+        dag_ids = sorted({r['dag_id'] for r in runs})
+        if runs:
+            # По парам (dag_id, run_id) — индекс ti_dag_run; по одному dag_id читалась
+            # вся история запаузенных дагов, а лишнее отбрасывалось уже здесь
+            agg = af_meta.sql(
+                "SELECT ti.dag_id, ti.run_id, ti.state, count(*) AS n, max(ti.end_date) AS last_end"
+                "  FROM task_instance ti"
+                "  JOIN unnest(%(dags)s::text[], %(runs)s::text[]) AS k(dag_id, run_id)"
+                "    ON ti.dag_id = k.dag_id AND ti.run_id = k.run_id"
+                " GROUP BY ti.dag_id, ti.run_id, ti.state",
+                {'dags': [r['dag_id'] for r in runs], 'runs': [r['run_id'] for r in runs]})
+            for row in agg:
+                info = tis.setdefault((row['dag_id'], row['run_id']), {'states': {}, 'last_end': None})
+                info['states'][row['state'] or 'none'] = row['n']
+                last_end = row['last_end']
+                if last_end and (info['last_end'] is None or last_end > info['last_end']):
+                    info['last_end'] = last_end
 
-            paused_by = {}
-            if dag_ids:
-                for row in (session.query(Log.dag_id, Log.dttm, Log.event, Log.owner)
-                            .filter(Log.dag_id.in_(dag_ids), Log.event.in_(PAUSE_EVENTS))
-                            .order_by(Log.dttm.desc())):
-                    paused_by.setdefault(row.dag_id, row)
+        paused_by = {}
+        if dag_ids:
+            for row in af_meta.sql(
+                    "SELECT dag_id, dttm, event, owner FROM log"
+                    " WHERE dag_id = ANY(%(dags)s) AND event = ANY(%(events)s) ORDER BY dttm DESC",
+                    {'dags': dag_ids, 'events': list(PAUSE_EVENTS)}):
+                paused_by.setdefault(row['dag_id'], SimpleNamespace(**row))
 
         rows = classify(runs, tis, now, p['older_than_hours'])
         todo = [r for r in rows if r['verdict'] == 'close']
@@ -237,7 +239,7 @@ def tools_paused_runs_cleanup():
     @task(task_id='close', trigger_rule=TriggerRule.NONE_FAILED)
     def close(found: list, **context) -> dict:
         """🧹 Помечает найденные раны failed. Только при close=True и не больше max_runs."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
         p = context['params']
         if not p.get('close'):
@@ -283,38 +285,45 @@ def _close_run(r, me):
     """
     import json
 
-    from sqlalchemy import or_
+    from sqlalchemy import text
 
-    from airflow.models import DagRun, Log, TaskInstance
-    from airflow.utils import timezone as af_tz
-    from airflow.utils.session import create_session
-    from airflow.utils.state import DagRunState, State, TaskInstanceState
+    # Airflow 3: ORM у задачи нет — то же одной транзакцией через af_meta. set_state рана
+    # (state = failed и end_date) повторён UPDATE-ом; заметка — в dag_run_note
+    with af_meta.meta_session() as session:
+        row = session.execute(text(
+            "SELECT id, state FROM dag_run WHERE dag_id = :d AND run_id = :r FOR UPDATE"),
+            {'d': r['dag_id'], 'r': r['run_id']}).mappings().first()
+        if row is None or row['state'] not in ('running', 'queued'):
+            return f"уже {row['state'] if row else 'удалён'}"
 
-    with create_session() as session:
-        dr = (session.query(DagRun)
-              .filter(DagRun.dag_id == r['dag_id'], DagRun.run_id == r['run_id']).one_or_none())
-        if dr is None or dr.state not in (DagRunState.RUNNING, DagRunState.QUEUED):
-            return f"уже {dr.state if dr else 'удалён'}"
-
-        ti = TaskInstance
-        mine = (ti.dag_id == r['dag_id'], ti.run_id == r['run_id'])
+        mine = {'d': r['dag_id'], 'r': r['run_id']}
         # Задача в running: collect такие раны не отдаёт, но она могла стартовать между collect и
         # close. Не трогаем — доработает, и ран закроется в следующий проход
-        if session.query(ti.task_id).filter(*mine, ti.state == TaskInstanceState.RUNNING).first():
+        if session.execute(text(
+                "SELECT 1 FROM task_instance WHERE dag_id = :d AND run_id = :r AND state = 'running' LIMIT 1"),
+                mine).first():
             return "оставлен: задача в running"
-        n = (session.query(ti)
-             .filter(*mine, or_(ti.state.is_(None), ti.state.notin_(list(State.finished))))
-             .update({ti.state: TaskInstanceState.SKIPPED, ti.end_date: af_tz.utcnow()},
-                     synchronize_session=False))
+        n = session.execute(text(
+            "UPDATE task_instance SET state = 'skipped', end_date = now(), updated_at = now()"
+            " WHERE dag_id = :d AND run_id = :r"
+            "   AND (state IS NULL OR state NOT IN ('success', 'failed', 'skipped', 'upstream_failed', 'removed'))"),
+            mine).rowcount
         how = f"skipped задач {n}"
-        dr.set_state(DagRunState.FAILED)  # и end_date рана
+        session.execute(text("UPDATE dag_run SET state = 'failed', end_date = now(), updated_at = now() WHERE id = :id"),
+                        {'id': row['id']})
 
         note = (f"Закрыт {me}: даг на паузе ({r['paused']}), ран висел в {r['state']} "
                 f"{r['age_h']} ч")
-        dr.note = f"{dr.note}\n\n{note}" if dr.note else note
-        session.add(Log(event=LOG_EVENT, owner=me, dag_id=r['dag_id'], run_id=r['run_id'],
-                        extra=json.dumps({'state': r['state'], 'age_h': r['age_h'], 'how': how},
-                                         ensure_ascii=False)))
+        session.execute(text(
+            "INSERT INTO dag_run_note (dag_run_id, content, created_at, updated_at)"
+            " VALUES (:id, :note, now(), now())"
+            " ON CONFLICT (dag_run_id) DO UPDATE"
+            "   SET content = coalesce(dag_run_note.content || E'\\n\\n', '') || :note, updated_at = now()"),
+            {'id': row['id'], 'note': note})
+        session.execute(text(
+            "INSERT INTO log (dttm, event, owner, dag_id, run_id, extra) VALUES (now(), :e, :o, :d, :r, :x)"),
+            {'e': LOG_EVENT, 'o': me, **mine,
+             'x': json.dumps({'state': r['state'], 'age_h': r['age_h'], 'how': how}, ensure_ascii=False)})
     return how
 
 

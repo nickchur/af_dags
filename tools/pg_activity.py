@@ -16,9 +16,7 @@ import json
 import logging
 
 from airflow.configuration import conf
-from airflow.decorators import dag, task
-from airflow.models import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 
 try:
     from plugins.utils import (  # type: ignore
@@ -30,6 +28,10 @@ except ImportError:
         TOOLS_POOL, add_note, ensure_pool, env_platform, env_stand, on_callback, health_tasks, push_health, saved_params,
         saved_schedule, store_params_task,
     )
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -99,35 +101,28 @@ SELECT a.pid,
 # application_name соединения (db_utils.failover_connect).
 #
 # Берём не только running: сессия переживает свою задачу — процесс умер, а соединение
-# осталось, — и такую находку нужно уметь отличать от долгой, но живой задачи. Отсюда же
-# join к main.job: state='running' в task_instance ставится один раз и живёт до конца,
-# а бьётся LocalTaskJob, и только его latest_heartbeat говорит, жив ли владелец сейчас.
+# осталось, — и такую находку нужно уметь отличать от долгой, но живой задачи.
+# state='running' в task_instance ставится один раз и живёт до конца, а жив ли владелец
+# сейчас, говорит пульс. Airflow 3: пульс — ti.last_heartbeat_at (его пишет Execution API,
+# task_instances.py:930, 3.3.1); job_id у задачи удалён, и join к job больше не к чему.
 # Окно в шесть часов — чтобы не читать всю таблицу ради недавних покойников.
 #
-# Две части, и обе по индексам: running — через ti_state, недавние — от свежих
-# LocalTaskJob (job_type_heart), к задаче через ti_job_id. Прежний фильтр
-# «state = 'running' OR end_date > now() - 6 ч» индекса не имел: у task_instance нет
-# индекса по end_date, и шёл Parallel Seq Scan всей таблицы. На ift (1,3 млн строк) он
-# с 01.09.2026 не укладывался в statement_timeout 30 с, и collect падал на каждом запуске.
-# Замер на стенде (AF 2.11, 98 тыс. строк): 0,5 с → 15 мс, результат совпал.
-# «Кончилась за 6 ч» теперь значит «её LocalTaskJob бился за 6 ч»: хартбит идёт до конца
-# задачи, разница — только у задачи, снятой как зомби через 6 ч после последнего удара.
+# Две части, и обе по индексам: running — через ti_state, недавние — через ti_heartbeat
+# (last_heartbeat_at). Фильтр «state = 'running' OR end_date > now() - 6 ч» индекса не
+# имел: по end_date его нет, и на ift (1,3 млн строк, AF2) Parallel Seq Scan с 01.09.2026 не
+# укладывался в statement_timeout 30 с. «Кончилась за 6 ч» значит «била пульс за 6 ч».
 SQL_OWNERS = r"""
 SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
-       round(extract(epoch FROM now() - ti.start_date))       AS age,
-       j.state                                                AS job_state,
-       round(extract(epoch FROM now() - j.latest_heartbeat))  AS hb_age
-  FROM main.task_instance ti
-  LEFT JOIN main.job j ON j.id = ti.job_id
+       round(extract(epoch FROM now() - ti.start_date))          AS age,
+       round(extract(epoch FROM now() - ti.last_heartbeat_at))   AS hb_age
+  FROM task_instance ti
  WHERE ti.state = 'running' AND ti.pid IS NOT NULL
 UNION
 SELECT ti.dag_id, ti.task_id, ti.run_id, ti.map_index, ti.hostname, ti.pid, ti.state,
        round(extract(epoch FROM now() - ti.start_date)),
-       j.state,
-       round(extract(epoch FROM now() - j.latest_heartbeat))
-  FROM main.job j
-  JOIN main.task_instance ti ON ti.job_id = j.id
- WHERE j.job_type = 'LocalTaskJob' AND j.latest_heartbeat > now() - interval '6 hours'
+       round(extract(epoch FROM now() - ti.last_heartbeat_at))
+  FROM task_instance ti
+ WHERE ti.last_heartbeat_at > now() - interval '6 hours'
    AND ti.pid IS NOT NULL
 """
 
@@ -151,7 +146,7 @@ def _human_age(seconds: int) -> str:
 def _owner(ti: dict, zombie_after_sec: int) -> dict:
     """Владелец сессии и вердикт «жив ли он».
 
-    Живой — тот, чья задача выполняется и чей LocalTaskJob бьётся не реже, чем ждёт
+    Живой — тот, чья задача выполняется и чей пульс (`last_heartbeat_at`) приходит не реже, чем ждёт
     зомби-детектор Airflow. Задача, которая формально `running`, но перестала биться,
     живой не считается: её сессия — то же брошенное соединение, только с записью в базе.
     """
@@ -186,13 +181,12 @@ def _app_pid(application_name: str):
 def _fetch(sql: str) -> list:
     """Читает SQL в метабазе и отдаёт список словарей.
 
-    create_session как контекст, а не своя долгоживущая сессия: сторож не должен
+    Короткая сессия af_meta на запрос, а не своя долгоживущая: сторож не должен
     попадать в собственный отчёт.
     """
-    from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
+    with af_meta.meta_session() as session:
         session.execute(text("SET LOCAL statement_timeout = '30s'"))
         result = session.execute(text(sql))
         cols = list(result.keys())
@@ -346,7 +340,7 @@ def tools_pg_activity():
     @task(task_id='save')
     def save(snapshot: dict, **context) -> str:
         """💾 Кладёт снимок в S3. Пустые снимки не пишем — их 144 в сутки и ноль пользы."""
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
         if not context['params']['save_s3']:
@@ -367,8 +361,7 @@ def tools_pg_activity():
     @task(task_id='terminate', trigger_rule=TriggerRule.NONE_FAILED)
     def terminate(snapshot: dict, **context) -> list:
         """🔪 Гасит найденные сессии. По умолчанию выключено, и даже включённое — dry-run."""
-        from airflow.exceptions import AirflowSkipException
-        from airflow.utils.session import create_session
+        from airflow.sdk.exceptions import AirflowSkipException
         from sqlalchemy import text
 
         p = context['params']
@@ -411,7 +404,9 @@ def tools_pg_activity():
                 logger.info("🧪 dry-run: %s", line)
                 killed.append(f"[dry-run] {line}")
                 continue
-            with create_session() as session:
+            # Та же учётка, что у Airflow (как create_session в Airflow 2): полномочий сторожу
+            # не прибавляем — гасить можно только то, что могла погасить и прежняя версия
+            with af_meta.meta_session() as session:
                 ok = session.execute(text(f"SELECT {fn}(:pid)"), {'pid': f['pid']}).scalar()
             logger.warning("🔪 %s → %s", line, ok)
             killed.append(f"{line} → {ok}")

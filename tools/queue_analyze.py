@@ -26,9 +26,7 @@ import time
 import uuid
 
 from airflow.configuration import conf
-from airflow.decorators import dag, task
-from airflow.models import Param
-from airflow.utils.trigger_rule import TriggerRule
+from airflow.sdk import Param, TriggerRule, dag, task
 
 try:
     from plugins.utils import (  # type: ignore
@@ -40,6 +38,10 @@ except ImportError:
         TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
         env_platform, env_stand, store_params_task,
     )
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -132,7 +134,7 @@ NOTE_ROWS = 30
 # Очереди, к которым задачи привязаны в метабазе. Смотрим не только queued: сообщение
 # переживает свою задачу, и очередь давно завершившейся задачи всё ещё нужно обойти.
 SQL_QUEUES = """
-SELECT DISTINCT queue FROM main.task_instance WHERE queue IS NOT NULL
+SELECT DISTINCT queue FROM task_instance WHERE queue IS NOT NULL
 """
 
 # Состояние задач, названных в сообщениях. Отбор по первичному ключу
@@ -145,7 +147,7 @@ SELECT DISTINCT queue FROM main.task_instance WHERE queue IS NOT NULL
 # удалить. Поэтому он здесь только для сверки в отчёте.
 SQL_TARGETS = """
 SELECT dag_id, task_id, run_id, map_index, state, external_executor_id
-  FROM main.task_instance
+  FROM task_instance
  WHERE (dag_id, task_id, run_id, map_index) IN :keys
 """
 
@@ -159,9 +161,11 @@ def _decode(raw) -> dict:
     body = msg.get("body")
     if props.get("body_encoding") == "base64":
         body = base64.b64decode(body)
-    # Протокол celery v2: тело — [args, kwargs, embed]. Команда Airflow лежит первым
-    # позиционным аргументом execute_command. Разбираем тело, а не headers.argsrepr:
-    # repr придётся парсить как питон, а тело — обычный JSON.
+    # Протокол celery v2: тело — [args, kwargs, embed]. Разбираем тело, а не headers.argsrepr:
+    # repr придётся парсить как питон, а тело — обычный JSON. Первый позиционный аргумент:
+    #   Airflow 2 — execute_command, список `airflow tasks run …`;
+    #   Airflow 3 — execute_workload, JSON-строка ExecuteTask с полем ti
+    #   (providers-celery, celery_executor_utils.py:436, 3.3.1).
     # Чужое тело (не список, пустой список, args не список) — команды нет, id и task остаются.
     # Первый элемент — через next(iter()), без индекса: пустой список даёт None, а не IndexError
     payload = json.loads(body) if body else None
@@ -170,7 +174,7 @@ def _decode(raw) -> dict:
     return {
         "id": headers.get("id"),
         "task": headers.get("task"),
-        "command": command if isinstance(command, list) else None,
+        "command": command if isinstance(command, (list, str)) else None,
     }
 
 
@@ -179,7 +183,17 @@ def _target(command) -> tuple | None:
 
     None — цель не читается: не `airflow tasks run`, укороченная команда, чужая задача
     celery. Такое сообщение остаётся в очереди.
+
+    Airflow 3: команда — JSON-строка ExecuteTask, цель в её `ti`.
     """
+    if isinstance(command, str):
+        try:
+            ti = (json.loads(command) or {}).get("ti") or {}
+        except (ValueError, AttributeError):
+            return None
+        if not all(ti.get(k) for k in ("dag_id", "task_id", "run_id")):
+            return None
+        return ti["dag_id"], ti["task_id"], ti["run_id"], int(ti.get("map_index", -1))
     if not command or command[:3] != ["airflow", "tasks", "run"] or len(command) < 6:
         return None
     map_index = -1
@@ -197,14 +211,14 @@ def _states(keys: list) -> dict:
     Порциями: список ключей приходит из очереди и на инциденте бывает в тысячи строк,
     а IN по кортежам с таким числом элементов планировщик разбирает заметно дольше.
     """
-    from airflow import settings
     from sqlalchemy import bindparam, text
 
     out = {}
     if not keys:
         return out
     sql = text(SQL_TARGETS).bindparams(bindparam("keys", expanding=True))
-    with settings.engine.connect() as conn:
+    # Airflow 3: settings.engine в задаче снят (block_orm_access) — сессия af_meta
+    with af_meta.meta_session() as conn:
         for i in range(0, len(keys), STATE_BATCH):
             rows = conn.execute(sql, {"keys": keys[i:i + STATE_BATCH]})
             for dag_id, task_id, run_id, map_index, state, eid in rows:
@@ -704,16 +718,15 @@ def tools_queue_analyze():
     @task(task_id="broker", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def broker(**context) -> dict:
         """📨 Обход очередей брокера, разметка по метабазе и дамп мусора в S3."""
-        from airflow.exceptions import AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-        from airflow import settings
+        from airflow.sdk.exceptions import AirflowSkipException
         from sqlalchemy import text
 
         p = context["params"]
         names = [n.strip() for n in (p["queues"] or "").split(",") if n.strip()]
         if not names:
             names = {conf.get("operators", "default_queue", fallback="default")}
-            with settings.engine.connect() as conn:
+            with af_meta.meta_session() as conn:
                 names.update(q for (q,) in conn.execute(text(SQL_QUEUES)) if q)
             names = sorted(names)
         logger.info("очереди: %s", ", ".join(names))
@@ -752,7 +765,10 @@ def tools_queue_analyze():
                 "queue": m["queue"],
                 "priority": m["priority"],
                 "celery_id": m["info"].get("id"),
-                "command": m["info"].get("command"),
+                # Airflow 3: команда — JSON ExecuteTask с токеном задачи; в поле кладём только
+                # цель, токен остаётся в одном месте — в payload, без него не вернуть сообщение
+                "command": (m["info"].get("command") if isinstance(m["info"].get("command"), list)
+                            else _target(m["info"].get("command"))),
                 "payload": m["raw"].decode() if isinstance(m["raw"], bytes) else m["raw"],
             }
             for m in junk
@@ -777,7 +793,7 @@ def tools_queue_analyze():
             "dump_key": dump_key,
             # Первые несколько мусорных — чтобы по отчёту было видно, что именно размечено
             "sample": [
-                {"celery_id": m["info"].get("id"), "command": (m["info"].get("command") or [])[3:6]}
+                {"celery_id": m["info"].get("id"), "command": _target(m["info"].get("command"))}
                 for m in junk[:5]
             ],
         }
@@ -793,62 +809,55 @@ def tools_queue_analyze():
     @task(task_id="scheduler", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def scheduler(**context) -> dict:
         """🗓️ Почему задачи ждут в scheduled: лимит дага, пул, приоритет; следы голодания."""
-        from sqlalchemy import and_, exists, func
-
-        from airflow.jobs.job import Job
-        from airflow.models import DagModel, DagRun, Pool, TaskInstance as TI
-        from airflow.utils import timezone as tz
-        from airflow.utils.session import create_session
-
+        # Airflow 3: ORM у задачи нет — те же выборки SQL-ом через af_meta
         p = context["params"]
-        now = tz.utcnow()
+        now = datetime.now(timezone.utc)
         # Себя не считаем: ран разбора на паузе (dags test, ручной запуск) дал бы «припаркованные»
         me = context["dag"].dag_id
-        with create_session() as session:
-            waiting = [r._asdict() for r in (
-                session.query(TI.dag_id, TI.pool, TI.priority_weight, TI.updated_at,
-                              DagModel.is_paused, DagModel.max_active_tasks, DagRun.state.label("run_state"),
-                              DagRun.execution_date.label("logical_date"))
-                .outerjoin(DagModel, DagModel.dag_id == TI.dag_id)
-                .outerjoin(DagRun, and_(DagRun.dag_id == TI.dag_id, DagRun.run_id == TI.run_id))
-                .filter(TI.state == "scheduled", TI.dag_id != me)
-                # В порядке шедулера: при обрезке по лимиту остаётся голова — окно
-                .order_by(TI.priority_weight.desc(), DagRun.execution_date)
-                .limit(SCHEDULED_LIMIT)
-            )]
-            active = dict(session.query(TI.dag_id, func.count())
-                          .filter(TI.state.in_(("queued", "running"))).group_by(TI.dag_id))
-            used = dict(session.query(TI.pool, func.sum(TI.pool_slots))
-                        .filter(TI.state.in_(("queued", "running"))).group_by(TI.pool))
-            pools = {name: {"slots": slots, "used": int(used.get(name) or 0)}
-                     for name, slots in session.query(Pool.pool, Pool.slots)}
-            # Через job, а не по start_date: индекса по start_date у task_instance нет, и отбор
-            # читал всю таблицу (стенд 27.09.2026: 74 мс на 102 тыс. строк). У задачи,
-            # стартовавшей за час, и хартбит её LocalTaskJob свежее часа — job_type_heart
-            hour_ago = now - timedelta(hours=1)
-            dispatched = [w for (w,) in session.query(TI.priority_weight)
-                          .join(Job, Job.id == TI.job_id)
-                          .filter(Job.job_type == "LocalTaskJob", Job.latest_heartbeat >= hour_ago,
-                                  TI.start_date >= hour_ago, TI.dag_id != me)]
+        waiting = af_meta.sql(
+            "SELECT ti.dag_id, ti.pool, ti.priority_weight, ti.updated_at, d.is_paused, d.max_active_tasks,"
+            "       dr.state AS run_state, coalesce(dr.logical_date, dr.run_after) AS logical_date"
+            "  FROM task_instance ti"
+            "  LEFT JOIN dag d ON d.dag_id = ti.dag_id"
+            "  LEFT JOIN dag_run dr ON dr.dag_id = ti.dag_id AND dr.run_id = ti.run_id"
+            " WHERE ti.state = 'scheduled' AND ti.dag_id <> %(me)s"
+            # В порядке шедулера: при обрезке по лимиту остаётся голова — окно
+            " ORDER BY ti.priority_weight DESC, coalesce(dr.logical_date, dr.run_after)"
+            " LIMIT %(lim)s", {"me": me, "lim": SCHEDULED_LIMIT})
+        active = {r["dag_id"]: r["n"] for r in af_meta.sql(
+            "SELECT dag_id, count(*) AS n FROM task_instance"
+            " WHERE state IN ('queued', 'running') GROUP BY dag_id")}
+        used = {r["pool"]: r["n"] for r in af_meta.sql(
+            "SELECT pool, sum(pool_slots) AS n FROM task_instance"
+            " WHERE state IN ('queued', 'running') GROUP BY pool")}
+        pools = {r["pool"]: {"slots": r["slots"], "used": int(used.get(r["pool"]) or 0)}
+                 for r in af_meta.sql("SELECT pool, slots FROM slot_pool")}
+        # По пульсу задачи, а не по start_date: индекса по start_date у task_instance нет, и отбор
+        # читал всю таблицу (стенд 27.09.2026: 74 мс на 102 тыс. строк). У задачи, стартовавшей
+        # за час, и пульс свежее часа — индекс ti_heartbeat (в AF2 был job.latest_heartbeat)
+        hour_ago = now - timedelta(hours=1)
+        dispatched = [r["priority_weight"] for r in af_meta.sql(
+            "SELECT priority_weight FROM task_instance"
+            " WHERE last_heartbeat_at >= %(h)s AND start_date >= %(h)s AND dag_id <> %(me)s",
+            {"h": hour_ago, "me": me})]
 
-            # След голодания: ран закрыт за сутки, ни одна задача не стартовала, есть skipped.
-            # Так выглядит dagrun_timeout, сработавший, пока задачи ждали в scheduled
-            started = exists().where(and_(TI.dag_id == DagRun.dag_id, TI.run_id == DagRun.run_id,
-                                          TI.start_date.isnot(None)))
-            skipped = exists().where(and_(TI.dag_id == DagRun.dag_id, TI.run_id == DagRun.run_id,
-                                          TI.state == "skipped"))
-            timeout_runs = [
-                {"dag_id": d, "run_id": r, "end": e.isoformat() if e else None}
-                for d, r, e in session.query(DagRun.dag_id, DagRun.run_id, DagRun.end_date)
-                .filter(DagRun.state == "failed", DagRun.end_date >= now - timedelta(hours=24),
-                        ~started, skipped)
-                .order_by(DagRun.end_date.desc()).limit(200)
-            ]
-            paused_runs = (session.query(func.count())
-                           .select_from(DagRun).join(DagModel, DagModel.dag_id == DagRun.dag_id)
-                           .filter(DagModel.is_paused.is_(True), DagRun.state.in_(("queued", "running")),
-                                   DagRun.dag_id != me)
-                           .scalar())
+        # След голодания: ран закрыт за сутки, ни одна задача не стартовала, есть skipped.
+        # Так выглядит dagrun_timeout, сработавший, пока задачи ждали в scheduled
+        timeout_runs = [
+            {"dag_id": r["dag_id"], "run_id": r["run_id"], "end": r["end_date"].isoformat() if r["end_date"] else None}
+            for r in af_meta.sql(
+                "SELECT dr.dag_id, dr.run_id, dr.end_date FROM dag_run dr"
+                " WHERE dr.state = 'failed' AND dr.end_date >= %(day)s"
+                "   AND NOT EXISTS (SELECT 1 FROM task_instance ti WHERE ti.dag_id = dr.dag_id"
+                "                   AND ti.run_id = dr.run_id AND ti.start_date IS NOT NULL)"
+                "   AND EXISTS (SELECT 1 FROM task_instance ti WHERE ti.dag_id = dr.dag_id"
+                "               AND ti.run_id = dr.run_id AND ti.state = 'skipped')"
+                " ORDER BY dr.end_date DESC LIMIT 200", {"day": now - timedelta(hours=24)})
+        ]
+        paused_runs = af_meta.sql(
+            "SELECT count(*) AS n FROM dag_run dr JOIN dag d ON d.dag_id = dr.dag_id"
+            " WHERE d.is_paused AND dr.state IN ('queued', 'running') AND dr.dag_id <> %(me)s",
+            {"me": me})[0]["n"]
 
         out = scheduler_causes(waiting, active, pools, dispatched, now, p["stale_min"], window=_scheduler_window())
         out.update(timeout_runs=timeout_runs, paused_runs=paused_runs, truncated=len(waiting) >= SCHEDULED_LIMIT,
@@ -868,23 +877,15 @@ def tools_queue_analyze():
     @task(task_id="capacity", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def capacity(**context) -> dict:
         """🔋 Ёмкость: parallelism × живые шедулеры против queued+running; слоты воркеров."""
-        from sqlalchemy import func
-
-        from airflow.jobs.job import Job
-        from airflow.models import TaskInstance as TI
-        from airflow.utils import timezone as tz
-        from airflow.utils.session import create_session
-
-        now = tz.utcnow()
+        now = datetime.now(timezone.utc)
         # Как считает сам Airflow: шедулер жив, пока хартбит свежее этого порога
         threshold = conf.getint("scheduler", "scheduler_health_check_threshold", fallback=30)
-        with create_session() as session:
-            counts = dict(session.query(TI.state, func.count())
-                          .filter(TI.state.in_(("queued", "running"))).group_by(TI.state))
-            schedulers = (session.query(func.count()).select_from(Job)
-                          .filter(Job.job_type == "SchedulerJob", Job.state == "running",
-                                  Job.latest_heartbeat >= now - timedelta(seconds=threshold))
-                          .scalar())
+        counts = {r["state"]: r["n"] for r in af_meta.sql(
+            "SELECT state, count(*) AS n FROM task_instance"
+            " WHERE state IN ('queued', 'running') GROUP BY state")}
+        schedulers = af_meta.sql(
+            "SELECT count(*) AS n FROM job WHERE job_type = 'SchedulerJob' AND state = 'running'"
+            " AND latest_heartbeat >= %(t)s", {"t": now - timedelta(seconds=threshold)})[0]["n"]
         parallelism = conf.getint("core", "parallelism")
         queued, running = counts.get("queued", 0), counts.get("running", 0)
         out = {"parallelism": parallelism, "schedulers": schedulers, "queued": queued, "running": running,
@@ -916,7 +917,7 @@ def tools_queue_analyze():
     @task(task_id="purge", trigger_rule=TriggerRule.NONE_FAILED)
     def purge(snapshot: dict = None, **context) -> dict:
         """🧹 Удаляет размеченный мусор. Только при purge=True."""
-        from airflow.exceptions import AirflowFailException, AirflowSkipException
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         from airflow.providers.celery.executors.celery_executor import app
 
@@ -1009,7 +1010,7 @@ def tools_queue_analyze():
         # Отдельным таском, а не флагом внутри `pidbox`: по сетке видно, запускалась ли чистка
         # и упала ли она отдельно от подсчёта (ИФТ 01.10.2026: `purge` упал, а чистку привязок,
         # прошедшую внутри `pidbox`, приняли за ту же неудачу).
-        from airflow.exceptions import AirflowSkipException
+        from airflow.sdk.exceptions import AirflowSkipException
 
         if not context["params"]["purge_pidbox"]:
             raise AirflowSkipException("purge_pidbox=False — привязки не трогаем")
@@ -1037,7 +1038,11 @@ def tools_queue_analyze():
         dag_run = context["dag_run"]
 
         def state(task_id):
-            return getattr(dag_run.get_task_instance(task_id), "state", None)
+            # Airflow 3: у DagRun в задаче нет get_task_instance — состояние соседа по рану
+            # спрашиваем у Task SDK: {run_id: {task_id: state}}
+            states = context["ti"].get_task_states(dag_id=dag_run.dag_id, task_ids=[task_id],
+                                                   run_ids=[dag_run.run_id])
+            return ((states or {}).get(dag_run.run_id) or {}).get(task_id)
 
         cleared = cleared or {}
         # Вывод 📮 — по тому, что осталось после чистки (left), а не по счёту до неё
