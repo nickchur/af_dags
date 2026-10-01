@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-09-30 19:10 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 19:13 MSK · v1.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -24,6 +24,7 @@
 | `update_dag_pause()` | Программная пауза/возобновление DAG'а |
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
 | `env_platform()` | Платформа: `alpha`, `sigma` или пустая строка |
+| `get_af_conn()` / `af_admin_available()` | Коннект к метабазе под админской учёткой из Vault; есть ли она (на разборе файла) |
 | `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
@@ -199,6 +200,24 @@ def get_current_load(pool_name, pool=True, session=None):
 
     return res
     
+def _hard_breaks(text):
+    """Одиночный перенос строки → жёсткий (два пробела в конце строки).
+
+    Заметку UI рендерит markdown'ом, а там одиночный перенос — пробел: лента из строк
+    сливалась в один абзац (db_cleanup clean, альфа 01.10.2026). Внутри ``` не трогаем;
+    таблицам и заголовкам хвостовые пробелы безразличны.
+    """
+    out, fence = [], False
+    lines = text.split('\n')
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith('```'):
+            fence = not fence
+        elif not fence and ln.strip() and i + 1 < len(lines) and lines[i + 1].strip():
+            ln = ln.rstrip() + '  '
+        out.append(ln)
+    return '\n'.join(out)
+
+
 def add_note(msg, context=None, level='task', add=True, title='', compact=False):
 
     if not context:
@@ -215,6 +234,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
         # compact=False — каждое значение на новой строке
         msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
         msg = '```\n' + msg + '\n```'
+    msg = _hard_breaks(msg)
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
     
@@ -268,9 +288,12 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
                 if obj.note and obj.note.startswith(new_note[:MAX_NOTE_LEN]):
                     continue
                     
-                # Логика склейки заметки
+                # Логика склейки заметки. Однострочная заметка без заголовка — строка хода
+                # (db_cleanup: строка на таблицу) — отделяется от прошлой пустой строкой, а не
+                # чертой: иначе лента из десятка строк занимает втрое больше места
                 if add:
-                    new_note = f"{ new_note}\n\n---\n{obj.note if obj.note else '' }"
+                    sep = '\n\n' if not title and '\n' not in new_note else '\n\n---\n'
+                    new_note = f"{new_note}{sep}{obj.note}" if obj.note else new_note
                     
                 # Лимит длины
                 obj.note = new_note[:MAX_NOTE_LEN]
@@ -571,7 +594,8 @@ def readable_size(size_bytes, base=1024):
     if i >= len(units): i = len(units) - 1
     if i < 0: i = 0
 
-    size_value = round(size_bytes / (base ** i), 2)
+    # Без дробной части у единиц: «3 строк», а не «3.0»
+    size_value = size_bytes if i == 0 else round(size_bytes / (base ** i), 2)
     
     return f"{sign}{size_value} {units[i]}".rstrip()
 
@@ -822,6 +846,27 @@ _LIBPQ_OPTS = {
 }
 
 
+AF_ADMIN_USER_KEYS = ('DB_ADM_USER_1_1', 'DB_USER_OWNER_1', 'DB_USER_1_2')
+
+
+def af_admin_available() -> bool:
+    """Есть ли в Vault админская учётка метабазы, из которой get_af_conn() соберёт коннект.
+
+    Зовётся на разборе DAG-файла: без учётки задачи и параметры, которым она нужна (VACUUM,
+    REINDEX, удаление индексов), не создаются. Читает локальный файл, в сеть не ходит; любая
+    ошибка — False. Права самой учётки отсюда не видны — их проверяет таск перед работой.
+    """
+    import json
+
+    try:
+        with open('/vault/secrets/application') as f:
+            secrets = json.load(f)
+    except (OSError, ValueError):
+        return False
+    return bool(secrets.get('DB_HOST_1') and secrets.get('DB_NAME_1')
+                and any(secrets.get(k) for k in AF_ADMIN_USER_KEYS))
+
+
 def get_af_conn():
     """Регистрирует коннект к метабазе Airflow из Vault, возвращает conn_id.
 
@@ -872,7 +917,9 @@ def get_af_conn():
         'host':      host,
         'port':      port,
         # Приоритет: админская учётка (DB_ADM_*), затем владелец схемы (DB_*_OWNER_1),
-        # затем обычная (DB_*_1_2) — у последней прав на VACUUM/REINDEX чужих таблиц нет.
+        # затем DB_*_1_2 — тоже админская; штатная учётка Airflow — DB_*_1_1, её не берём.
+        # Есть ли у получившейся учётки права владельца, проверяет вызывающий
+        # (db_cleanup.af_owner_check) — по ключам это не видно.
         'login':     _b64(secrets.get('DB_ADM_USER_1_1', '')) or _b64(secrets.get('DB_USER_OWNER_1', '')) or _b64(secrets.get('DB_USER_1_2', '')),
         'password':  _b64(secrets.get('DB_ADM_PASS_1_1', '')) or _b64(secrets.get('DB_PASS_OWNER_1', '')) or _b64(secrets.get('DB_PASS_1_2', '')),
         # schema в postgres-коннекте Airflow — это имя БД (dbname), а не SQL-схема;

@@ -1,20 +1,8 @@
 """### 🔍 DAG: Копирование/перемещение файлов S3 → S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Находит файлы по маске и копирует (или перемещает) их в целевой бакет.
 
-| Параметр | Описание |
-|---|---|
-| `src_path` | `conn_id://bucket/prefix/mask` |
-| `dst_path` | `conn_id://bucket/prefix/` |
-| `compress` | Сжать при копировании |
-| `unzip` | Распаковать ZIP перед копированием |
-| `done` | Создать `.done`-файл в dst после копирования |
-| `timestamp` | Добавить метку времени к имени файла |
-| `copy` | Копировать файл *(default: `True`)* |
-| `delete` | Удалить источник после копирования |
-| `max_items` | Макс. количество файлов (default: `25`) |
-| `reverse` | Сортировка от новых к старым |
 """
 
 from datetime import datetime, timedelta, timezone
@@ -44,6 +32,7 @@ for conn in get_conns_by_type(conn_type='aws'):
 
 @dag(
     doc_md=__doc__,
+    description='Копировать или переместить файлы S3 по маске в другой бакет',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
@@ -61,15 +50,15 @@ for conn in get_conns_by_type(conn_type='aws'):
     render_template_as_native_obj=True,
     on_failure_callback=on_callback,
     params={
-        'src_path': Param('', type='string', examples=[s + ('*.*' if not s.endswith('//') else '') for s in s3_list]),
-        'dst_path': Param('', type='string', examples=s3_list),
+        'src_path': Param('', type='string', examples=[s + ('*.*' if not s.endswith('//') else '') for s in s3_list], description='conn_id://bucket/prefix/mask'),
+        'dst_path': Param('', type='string', examples=s3_list, description='conn_id://bucket/prefix/'),
         'compress': Param(False, type='boolean', description='Сжать при копировании'),
         'unzip': Param(False, type='boolean', description='Распаковать ZIP перед копированием'),
         'done': Param(False, type='boolean', description='Создать .done-файл после копирования'),
         'timestamp': Param(False, type='boolean', description='Добавить метку времени к имени файла'),
         'copy': Param(True, type='boolean', description='Копировать файл'),
         'delete': Param(False, type='boolean', description='Удалить источник после копирования'),
-        'max_items': Param(MAX_ITEMS, type='integer', minimum=1, maximum=1000),
+        'max_items': Param(MAX_ITEMS, type='integer', minimum=1, maximum=1000, description='Сколько файлов взять, не больше'),
         'reverse': Param(True, type='boolean', description='Сортировка от новых к старым'),
     },
 )
@@ -77,6 +66,7 @@ def tools_s3_to_s3_test():
 
     @task
     def s3_find(**context):
+        """Находит файлы по маске `src_path` и отдаёт список на копирование."""
         p = context['params']
         path = p.get('src_path', '')
         reverse = p.get('reverse', True)
@@ -102,6 +92,7 @@ def tools_s3_to_s3_test():
 
     @task(max_active_tis_per_dag=5, map_index_template="{{ path[0] }}")
     def s3_copy(path: str, **context):
+        """Копирует или перемещает один файл в целевой бакет (сжатие, распаковка, `.done`)."""
         p = context['params']
         ti = context['ti']
         src_path, src_info = path[0], path[1]
@@ -179,7 +170,7 @@ def tools_s3_to_s3_test():
         add_note(msg, context, level='TASK,DAG')
         return msg
 
-    s3_copy.partial().expand(path=s3_find())
+    s3_copy.override(doc_md=s3_copy.function.__doc__).expand(path=s3_find())
 
 
 tools_s3_to_s3_test()

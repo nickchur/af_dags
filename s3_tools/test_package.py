@@ -1,20 +1,10 @@
 """### 📦 Тестовый пакет для единого репликатора / TFS
-*2026-09-28 10:36 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает тестовые ZIP-пакеты в S3 с актуальными таймштампами.
 По умолчанию используются встроенные тестовые данные (3 части, 36/37/38 строк).
 Содержимое и схему можно переопределить через параметры `parts` и `meta`.
 
-| Параметр       | Описание                                                                          |
-|----------------|-----------------------------------------------------------------------------------|
-| `prefix`       | Префикс имени файла — базовая реплика *(default: `hrplatform_datalab`)*           |
-| `group`        | Суффикс группы поставок, в архиве стоит за таймштампом *(default: `0`)*           |
-| `table_name`   | Таблица в формате `schema__table` *(default: `learning__lc_items_opened`)*        |
-| `s3_prefix`    | Папка в бакете, без слэша в конце *(default: пусто — корень бакета)*              |
-| `bucket`       | S3 бакет *(зависит от стенда)*                                                    |
-| `conn_id`      | Airflow S3 connection ID *(зависит от стенда)*                                    |
-| `meta`         | Содержимое `.meta` файла (JSON схема таблицы)                                     |
-| `parts`        | Список строк CSV; повтор заголовка обозначает начало новой части                  |
 """
 
 from __future__ import annotations
@@ -49,6 +39,7 @@ else:
 
 @dag(
     doc_md=__doc__,
+    description='Тестовые ZIP-пакеты для репликатора / TFS в S3 со свежими таймштампами',
     default_args={"owner": "DataLab (CI02420667)", "retries": 0},
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
     start_date=datetime(2025, 8, 7, tzinfo=timezone.utc),
@@ -76,6 +67,7 @@ def tools_test_package():
 
     @task(task_id="upload")
     def upload(**context):
+        """Собирает тестовый ZIP-пакет из `parts` и `meta` и кладёт его в S3."""
         p = context["params"]
         prefix = p["prefix"]
         group = p["group"]

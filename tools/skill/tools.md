@@ -1,14 +1,14 @@
 ---
 name: tools
-description: Индекс служебных дагов Airflow (каталог tools/, на сигме CI06932748/tools) — какой даг отвечает на какой вопрос, общее устройство (пул, сохраняемые параметры, расписание), итог дагов-проверок в тасках health_warn / health_errors, теги-роли. Подробности по дагам — навыки tools-system-health, tools-pg-activity, tools-log-events, tools-test-connections, tools-test-dags, tools-queue-analyze, tools-paused-runs. Используй, когда спрашивают про любой tools_*, «tools_* красный», «health_errors / health_warn», «plugins: нет отчёта», «как поменять расписание служебного дага», «где сохраняются параметры», «нет навыка на MCP / нет текста в DAG Docs», «метабаза растёт».
+description: Индекс служебных дагов Airflow (каталог tools/, на сигме CI06932748/tools) — какой даг отвечает на какой вопрос, общее устройство (пул, сохраняемые параметры, расписание), итог дагов-проверок в тасках health_warn / health_errors, теги-роли. Подробности по дагам — навыки tools-system-health, tools-pg-activity, tools-log-events, tools-test-connections, tools-test-dags, tools-queue-analyze, tools-paused-runs, tools-db-cleanup, tools-log-cleanup. Используй, когда спрашивают про любой tools_*, «tools_* красный», «health_errors / health_warn», «plugins: нет отчёта», «как поменять расписание служебного дага», «где сохраняются параметры», «нет навыка на MCP / нет текста в DAG Docs», «метабаза растёт», «целостность метабазы», «остатки REINDEX», «бакет логов переполнен».
 ---
 
 # Служебные даги (`tools/`) — индекс
 
-*2026-09-30 10:27 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:01 MSK · v2.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow (сигма и альфа). Источник правды — каталог
-`tools/` репозитория `af_dags`: `tools/readme.md` и шапка каждого модуля; при расхождении
+`tools/` репозитория `af_dags`: `tools/readme.md` (подробно) и шапка модуля (кратко); при расхождении
 прав код. На сигме каталог лежит как `CI06932748/tools/…`, общие функции — модуль
 `CI06932748.tools.utils` (в репозитории — `plugins/utils.py`). `s3_tools/` в навык не входит.
 
@@ -49,10 +49,12 @@ description: Индекс служебных дагов Airflow (каталог 
 - **Теги — роль:** `health` — плагин здоровья, `health_errors` пишет отчёт в
   `system_health/checks/<dag_id>.json`, его читает `get_system_health` → `plugins`; `clean` —
   удаляет; `AutoQA` — регрессия и проверка «работает ли» (`dummy` раз в час). Плагины: `system_pulse`, `system_health`, `pg_activity`, `log_events`,
-  `test_connections`, `test_dags`, `queue_analyze`.
+  `test_connections`, `test_dags`, `queue_analyze`, `db_cleanup`, `log_cleanup` (последние два — и `clean`).
 - **Пул `tools_pool`** (16 слотов). Короткие проверки идут с `priority_weight 900`,
-  `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Тяжёлые `test_dags`,
-  `test_hrp_operators` и чистильщики приоритета не получают намеренно.
+  `weight_rule='absolute'`: выше регрессии, ниже агента CTL (999/1000). Чистильщики — тоже
+  900: с весом по потомкам их вытесняли большие даги (`clean` полчаса в `scheduled` при пустом
+  пуле, сигма dev 01.10.2026). Тяжёлые `test_dags`, `test_hrp_operators` приоритета не получают
+  намеренно — висят в `scheduled` дольше, это не поломка (причину называет `tools_queue_analyze`).
 - **Сохраняемые параметры.** Форма запуска предзаполняется из Variable `tools_<имя>_params`
   (у `pg_activity` — `tools_pg_activity_cfg`), при её отсутствии — из кода. Записывает её
   только запуск с галочкой **`save_params`** — таск `params` (☮️, если галочки нет или значения
@@ -63,7 +65,7 @@ description: Индекс служебных дагов Airflow (каталог 
   вручную). Новое применяется **со следующего разбора файла**. Негодное значение таск `params`
   не записывает и падает ❌; уже записанное битым игнорируется в пользу кода.
 - **Разовые галочки не сохраняются никогда**: `purge` (`queue_analyze`), `terminate`
-  (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`). Исключение —
+  (`pg_activity`), `purge_docs` (`mcp_skills`), `cleanup_deleted` (`test_dags`), `reindex` и `drop_leftovers` (`db_cleanup`). Исключение —
   `close` у `paused_runs_cleanup`: сохраняемый, чтобы закрывали и плановые запуски.
 - **Создаются на паузе**: `db_cleanup`, `log_cleanup`, `paused_runs_cleanup`, ручные
   `test_kafka_*`. Плагины здоровья, `dummy`, `mcp_skills`,
@@ -81,10 +83,10 @@ description: Индекс служебных дагов Airflow (каталог 
 | `tools_log_events` | `30 6 * * *` | Сбои доставки по журналу `log` | ничего |
 | `tools_test_connections` | `15 23 * * *` | Список подключений secret backend (`collect`) и доступность каждого, важные — `critical` | Variable `local_connections` |
 | `tools_test_dags` | `0 23 * * *` | Дрожание сериализации, версии в S3, время разбора | ничего |
-| `tools_queue_analyze` | `10 9 * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
+| `tools_queue_analyze` | `10 * * * *` | Почему задачи ждут; брокер | брокер — только при `purge` |
 | `tools_paused_runs_cleanup` | `0 * * * *` | Раны у запаузенных дагов | Mark failed — только при `close` |
-| `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180) | **удаляет**; `dry_run=False` по умолчанию |
-| `tools_log_cleanup` | `17 8 * * *` | Сроки хранения по папкам бакета логов | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
+| `tools_db_cleanup` | `0 5 * * *` | Чистка метабазы старше `retention_days` (180); целостность метабазы (`integrity`, плагин здоровья с v2.0) | **удаляет**; `dry_run=False` по умолчанию, `dry_run` — только про `clean`; индексы — только при `reindex` / `drop_leftovers` и админской учётке |
+| `tools_log_cleanup` | `17 8 * * *` | Один срок бакета логов, уборка, статистика по папкам; заполнение учётки S3 к квоте (плагин здоровья с v2.5) — навык **`tools-log-cleanup`** | **удаляет** обходом; при `lifecycle` ещё и правило жизненного цикла |
 | `tools_mcp_skills` | `*/30 * * * *` | Навыки `*/skill/*.md` → `mcp_skill__*`; оглавление документации | Variables |
 | `test_hrp_operators` (без префикса) | `@once` | Регрессия операторов `hrp_operators` | тестовые таблицы и файлы, убирает за собой |
 | `tools_test_kafka_snd` / `_rcv` | вручную | Разовая отправка / просмотр топика | отправка **мимо очереди** тракта ТФС |

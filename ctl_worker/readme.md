@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-09-30 09:50 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -526,6 +526,31 @@ XCom из `ctl_monitor`: `{lid: {wid, wfn, sts, act, sch, ...}}` — перед�
 - **`tfs_kafka`** — триггерный DAG: читает `TransferFileCephRq` из Kafka, копирует указанные в XML файлы, затем отправляет квитанцию `TransferFileCephRs` (StatusCode=0 при успехе, 104 при ошибке). `ScenarioId` из XML используется как `tfs_id`.
 
 ---
+
+**Параметры `tfs_sensor`** (ручной запуск):
+
+| Параметр (UI) | Описание |
+|---|---|
+| `path` | `conn_id://bucket/prefix/mask` (при ручном запуске) |
+| `tfs_id` | Идентификатор источника |
+| `compress` | Сжать при копировании |
+| `done` | Удалить исходник после копирования |
+| `unzip` | Распаковать ZIP-архив |
+
+**Параметры `tfs_kafka`:**
+
+| Параметр (UI) | Описание |
+|---|---|
+| `path` | Базовый путь в TFS: `conn_id://bucket/prefix/` |
+| `tfs_id` | Fallback-идентификатор (если `ScenarioId` пуст) |
+| `compress` | Сжать при копировании |
+| `done` | Удалить исходник после копирования |
+| `unzip` | Распаковать ZIP-архив |
+| `kafka_rcv` | `kafka_config_id` для чтения — по умолчанию `tfs-kafka-out`; список kafka-коннектов берётся из Variable `local_connections` |
+| `topic_rcv` | Топик входящих сообщений |
+| `timeout` | Таймаут ожидания (мин, по умолчанию 60) |
+| `kafka_snd` | `kafka_config_id` для квитанции — по умолчанию `tfs-kafka-in` |
+| `topic_snd` | Топик квитанций (необязательно: пустой — квитанция не отправляется) |
 
 ### `ctl_test_conn.py` — Мониторинг подключений
 

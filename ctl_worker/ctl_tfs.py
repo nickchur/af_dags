@@ -1,42 +1,16 @@
 """### 📁 CTL TFS → S3
-*2026-09-30 09:25 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:20 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
+Два DAG'а копируют файлы из TFS в `edpetl-files`:
 
----
+- **`CTL.<profile>.tfs_sensor`** — каждые `tfs_interval` минут (5) опрашивает `tfs-in`-источники
+  из конфига, копирует найденное и публикует `DatasetAlias("TFS/<profile>")`. Вручную — по
+  `path` из формы.
+- **`CTL.<profile>.tfs_kafka`** — по триггеру читает `TransferFileCephRq` из Kafka, копирует файлы
+  из XML и отправляет квитанцию `TransferFileCephRs` (0 — успех, 104 — ошибка). `ScenarioId`
+  становится `tfs_id`.
 
-#### `CTL.<profile>.tfs_sensor` — по расписанию
-
-Каждые N минут (параметр `tfs_interval`, по умолчанию 5 мин) опрашивает все `tfs-in`-источники из конфига. При обнаружении файлов копирует их в S3 и публикует `DatasetAlias("TFS/<profile>")`.
-
-| Параметр (UI) | Описание |
-|---|---|
-| `path` | `conn_id://bucket/prefix/mask` (при ручном запуске) |
-| `tfs_id` | Идентификатор источника |
-| `compress` | Сжать при копировании |
-| `done` | Удалить исходник после копирования |
-| `unzip` | Распаковать ZIP-архив |
-
----
-
-#### `CTL.<profile>.tfs_kafka` — по событию Kafka
-
-Запускается внешним триггером. Читает сообщение `TransferFileCephRq` из Kafka, копирует указанные в XML файлы в S3, затем отправляет квитанцию `TransferFileCephRs` (StatusCode=0 при успехе, 104 при ошибке).
-
-`ScenarioId` из XML используется как `tfs_id`; `RqUID` — в квитанцию.
-
-| Параметр (UI) | Описание |
-|---|---|
-| `path` | Базовый путь в TFS: `conn_id://bucket/prefix/` |
-| `tfs_id` | Fallback-идентификатор (если `ScenarioId` пуст) |
-| `compress` | Сжать при копировании |
-| `done` | Удалить исходник после копирования |
-| `unzip` | Распаковать ZIP-архив |
-| `kafka_rcv` | `kafka_config_id` для чтения — по умолчанию `tfs-kafka-out`; список kafka-коннектов берётся из Variable `local_connections` |
-| `topic_rcv` | Топик входящих сообщений |
-| `timeout` | Таймаут ожидания (мин, по умолчанию 60) |
-| `kafka_snd` | `kafka_config_id` для квитанции — по умолчанию `tfs-kafka-in` |
-| `topic_snd` | Топик квитанций (необязательно: пустой — квитанция не отправляется) |
+Подробно: [ctl_worker/readme.md — ctl_tfs](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_tfspy--перемещение-файлов-из-tfs)
 """
 
 from airflow import DAG
@@ -322,15 +296,17 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     dagrun_timeout=sensor_timeout + timedelta(hours=1),
     render_template_as_native_obj=True,
     params={ 
-        "path": Param('', type="string", examples=list(tfs_conns.keys())), 
-        "tfs_id": "manual",
-        "compress": False, 
-        "done": False,
-        "unzip": False, 
+        "path": Param('', type="string", examples=list(tfs_conns.keys()),
+                      description="Ручной запуск: conn_id://bucket/prefix/mask; пусто — все tfs-in-источники конфига"),
+        "tfs_id": Param("manual", type="string", description="Идентификатор источника для ручного запуска (в tfs_kafka — если ScenarioId пуст)"),
+        "compress": Param(False, type="boolean", description="Сжать при копировании"),
+        "done": Param(False, type="boolean", description="Удалить исходник после копирования"),
+        "unzip": Param(False, type="boolean", description="Распаковать ZIP-архив"),
     },
     on_failure_callback=on_callback,
     on_success_callback=None,
     doc_md=__doc__,
+    description='TFS → S3 по расписанию: опрос источников tfs-in и копирование файлов',
 ) as dag:
 
     @task.sensor(
@@ -416,7 +392,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     path_list = tfs_wait()
 
     # Запускаем параллельно
-    tfs_copy.partial().expand(path=path_list)
+    tfs_copy.override(doc_md=tfs_copy.function.__doc__).expand(path=path_list)
 
 
 # ── Kafka-triggered DAG ──────────────────────────────────────────────────────
@@ -439,11 +415,12 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     catchup=False,
     render_template_as_native_obj=True,
     params={
-        "path":     Param('', type="string", examples=list(tfs_conns.keys())),
-        "tfs_id":   "manual",
-        "compress": False,
-        "done":     False,
-        "unzip":    False,
+        "path":     Param('', type="string", examples=list(tfs_conns.keys()),
+                          description="Базовый путь в TFS: conn_id://bucket/prefix/"),
+        "tfs_id": Param("manual", type="string", description="Идентификатор источника для ручного запуска (в tfs_kafka — если ScenarioId пуст)"),
+        "compress": Param(False, type="boolean", description="Сжать при копировании"),
+        "done": Param(False, type="boolean", description="Удалить исходник после копирования"),
+        "unzip": Param(False, type="boolean", description="Распаковать ZIP-архив"),
         # направления по стороне TFS: читаем через tfs-kafka-out, пишем через tfs-kafka-in
         "kafka_rcv": Param(KAFKA_RCV_CONN, type="string", description="kafka_config_id для чтения",
                            examples=KAFKA_CONN_IDS),
@@ -455,16 +432,15 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     },
     on_failure_callback=on_callback,
     doc_md=__doc__,
+    description='TFS → S3 по сообщению Kafka: копирование файлов и квитанция',
 ) as dag_kafka:
 
     @task(task_id='kafka_wait')
     def kafka_wait(**context):
-        """⏳ Ждёт любое сообщение из топика опросом на воркере.
-
-        Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
-        таск уходит в deferred и висит со статусом unknown. Поведение сохранено:
-        ждём не дольше params.timeout минут, по истечении — skip (был soft_fail=True).
-        """
+        """⏳ Ждёт любое сообщение из топика опросом на воркере."""
+        # Раньше здесь стоял AwaitMessageSensor, но он deferrable: без живого Triggerer
+        # таск уходит в deferred и висит со статусом unknown. Поведение сохранено:
+        # ждём не дольше params.timeout минут, по истечении — skip (был soft_fail=True).
         p = context['params']
         if not p.get('kafka_rcv') or not p.get('topic_rcv'):
             raise AirflowFailException("Params 'kafka_rcv' and 'topic_rcv' are required")
@@ -556,5 +532,5 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
 
     path_list = tfs_wait()
     kafka_wait() >> path_list
-    copies = tfs_copy.partial().expand(path=path_list)
+    copies = tfs_copy.override(doc_md=tfs_copy.function.__doc__).expand(path=path_list)
     copies >> send_receipt

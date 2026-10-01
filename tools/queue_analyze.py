@@ -1,66 +1,15 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-10-01 07:45 MSK · v3.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v3.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-До 24.09.2026 — `tools_queue_cleanup` (`queue_cleanup.py`): только разметка и чистка
-брокера. Теперь даг в первую очередь **разбирает** очередь — то, что 23–24.09.2026 на сигме
-выясняли руками по логу шедулера и ответам health, — а чистка брокера стала одним таском
-по галочке `purge`.
+Раз в час (в :10) разбирает, почему задачи ждут: лимиты дагов, пулы, приоритет, окно
+шедулера, ёмкость исполнителя, мусор в брокере и раздутый сет привязок ответных очередей.
+Выводы словами — в заметке `report`, разбор целиком — `queue_cleanup/<дата>/` в бакете логов.
+Плагин здоровья, вердикт не выше ⚠️: очередь — не авария.
 
-**Таски:** после `params` параллельно `broker`, `scheduler`, `capacity`, `pidbox`; `purge`
-(только при `purge`) ждёт `broker`; `report` — всех, при любом их исходе, → `health_warn` / `health_errors`.
-Дампы убирает `tools_log_cleanup` общим сроком бакета.
+**Таски:** `params` → `broker`, `scheduler`, `capacity`, `pidbox` → `purge` (по галке, после
+`broker`), `purge_pidbox` (по галке, после `pidbox`) → `report` → `health_warn` / `health_errors`.
 
-**Плагин здоровья** (тег `health`), раз в сутки в 09:10 MSK — в начале рабочего дня очередь
-занята, ночью разбирать нечего. Вердикт не выше ⚠️: очередь — не авария. Предупреждение —
-мусор в брокере не ниже `min_junk_share`, голодание по приоритету, раны, закрытые без старта,
-раздутый сет привязок ответных очередей и не отработавший сборщик; остальные выводы — справка в заметке. Плановый прогон брокер не
-чистит: `purge` разовая и не сохраняется. Отчёт для `get_system_health` пишет `health_errors`.
-
-| Таск | Что смотрит |
-|---|---|
-| `broker` | Сообщения очередей celery: живые и мусор (задача уже в терминальном состоянии или её нет в метабазе). Дамп мусора — в бакет логов |
-| `scheduler` | Почему задачи ждут в `scheduled`: лимит дага (`max_active_tasks`), исчерпанный пул, приоритет; раны, закрытые без единого старта; раны запаузенных дагов |
-| `capacity` | `queued`+`running` против `parallelism` × живые шедулеры; слоты воркеров из отбивок (`health_beacon`), если они есть на контуре |
-| `pidbox` | Сет привязок ответных очередей control-канала (`_kombu.binding.reply.celery.pidbox`): сколько записей, пять для примера; при `purge_pidbox` — удаляет сет |
-| `purge` | Удаление размеченного мусора из брокера — с прежними предохранителями |
-| `report` | Заметка на ран: разделы и **вывод словами** |
-
-**Правила вывода** — из разбора 23–24.09.2026:
-
-| Картина | Вывод |
-|---|---|
-| Даг ждёт, `queued`+`running` у него ≥ `max_active_tasks` | Упёрся в свой лимит: поднимать лимит в коде дага, а не `parallelism`. Сигма 23.09: 297 задач в `scheduled`, `raw_to_stable_*` с лимитом 4, `slot_reconciler gap=0` — слоты не текли |
-| Ждёт слот пула, пул занят целиком | Пул исчерпан |
-| Ждёт дольше `stale_min`, дагу и пулу есть место, вес ниже медианы ушедших в работу за час | Голодает из-за приоритета: `downstream` даёт большим дагам вес в сотни и тысячи (`tfs_kafka_snd` с весом 1 против 22–1921) — `priority_weight` + `weight_rule='absolute'` |
-| Ран failed за сутки, ни одна задача не стартовала, есть `skipped` | Закрыт `dagrun_timeout` без старта — след того же голодания (`tfs_kafka_snd` 12:00–15:00) |
-| `queued`+`running` ≥ `parallelism` × шедулеры | Слоты executor'а заняты: смотреть `slot_reconciler` в логе шедулера |
-| Мусора в брокере ≥ `min_junk_share` | Можно запускать с `purge` |
-| Раны запаузенных дагов в `queued` / `running` | Не поедут никогда — `tools_paused_runs_cleanup` |
-| Привязок ответных очередей ≥ `max_reply_bindings` | Каждый ответ воркера на ping/inspect читает сет целиком в главном цикле: задачи не берутся, ping молчит, liveness перезапускает поды (сигма dev 30.09.2026). Запуск с `purge_pidbox` |
-
-`parallelism` здесь — из конфига **воркера**, на котором идёт таск; у шедулера он может быть
-другим (vault перекрывает `airflow.cfg`). Значение шедулера даёт MCP `get_config_value` →
-`components` (etl-core #71).
-
-| Параметр | Описание |
-|---|---|
-| `stale_min` | Ждёт дольше — «давно ждёт», мин *(default: `5`, как у карточки Health)* |
-| `queues` | Очереди через запятую; пусто — собрать из конфигурации и метабазы *(default: пусто)* |
-| `min_junk_share` | Не удалять, если мусора меньше этой доли очереди *(default: `0.5`)* |
-| `max_delete` | Не удалять, если мусора больше этого числа *(default: `5000`)* |
-| `schedule` | Расписание; пусто — только вручную *(default: пусто)* |
-| `save_params` | Записать форму в Variable `tools_queue_analyze_params` *(default: `False`)* |
-| `max_reply_bindings` | Порог записей в сете привязок ответных очередей для вывода 📮 *(default: `1000`)* |
-| `purge` | Удалять размеченный мусор. **В Variable не сохраняется** *(default: `False`)* |
-| `purge_pidbox` | Удалить сет привязок ответных очередей. Задачи не теряются: в сете только адреса ответов на служебные команды, живые опрашивающие вернут свою запись при следующем опросе. **В Variable не сохраняется** *(default: `False`)* |
-
-Пороги прежнего дага (Variable `tools_queue_cleanup_cfg`) берутся значениями по умолчанию,
-пока не сохранена новая переменная. Дампы по-прежнему в `queue_cleanup/<YYYY-MM-DD>/`:
-`<HHMMSS>.json` — мусор брокера (из него сообщение возвращается `rpush` по `key` и
-`payload`), `<HHMMSS>_analyze.json` — разбор целиком, чтобы сравнивать запуски.
-
-Чего `broker` не заберёт — сообщения, которые воркеры уже держат в работе: их в очереди нет.
-Они вернутся туда через `visibility_timeout`, и повторный запуск их подберёт.
+Подробно: [tools/readme.md — queue_analyze](../../_plugin_dag_docs/?doc=tools/readme.md#queue_analyzepyqueue_analyzepy)
 """
 
 # tuple | None в сигнатуре: на 3.9 аннотация вычисляется при определении функции и
@@ -126,16 +75,16 @@ DEFAULTS = {
     # Как STALE_AFTER_SEC карточки Health (etl-core celery_health_plugin): младше — обычное
     # ожидание цикла шедулера
     "stale_min": 5,
-    # Раз в сутки в 09:10 MSK (cron в зоне start_date, как у соседних дагов; до 29.09.2026 —
-    # UTC, «10 6 * * *»): в начале рабочего дня очередь занята, ночью разбирать нечего
-    "schedule": "10 9 * * *",
+    # Каждый час в :10 (до 01.10.2026 — раз в сутки «10 9 * * *» MSK): прогон короче минуты,
+    # пустая очередь разбирается даром, а при нагрузке вывод нужен сразу, не наутро
+    "schedule": "10 * * * *",
     # Привязок ответных очередей больше этого — вывод 📮 и ⚠️ плагина. Живых опрашивающих
     # (маяки, liveness-пробы, пульс) — единицы на под, тысяча уже значит утечку
     "max_reply_bindings": 1000,
 }
 ONE_SHOT = ("purge", "purge_pidbox")
 MSK = timezone(timedelta(hours=3))
-# Плагин здоровья (тег health): раз в сутки плюс два часа на опоздание прогона
+# Плагин здоровья (тег health): сутки плюс два часа — переживает и сохранённое суточное расписание
 REPORT_TTL_SEC = 26 * 3600
 # Навык агента, на который отчёт плагина отсылает толкование выводов
 SKILL = "tools-queue-analyze"
@@ -363,25 +312,51 @@ def _median(values: list):
     return vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
 
 
-def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list, now, stale_min: int) -> dict:
+def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list, now, stale_min: int,
+                     window: int = None) -> dict:
     """Почему ждут задачи в ``scheduled`` — без Airflow, чтобы проверялось тестом.
 
     Args:
-        waiting: ``[{dag_id, pool, priority_weight, updated_at, is_paused, run_state, max_active_tasks}]``.
+        waiting: ``[{dag_id, pool, priority_weight, updated_at, is_paused, run_state, max_active_tasks,
+            logical_date}]``.
         active: ``{dag_id: queued+running}``.
         pools: ``{pool: {'slots': n, 'used': n}}``.
         dispatched: веса задач, стартовавших за последний час.
         now: Текущее время (aware).
         stale_min: Порог «давно ждёт», мин.
+        window: Сколько задач шедулер берёт из scheduled за цикл (``max_tis_per_query``, не больше
+            ``parallelism``); None — окно не оцениваем.
 
     Returns:
-        ``{'live', 'parked', 'stale', 'by_cause': {причина: n}, 'dags': [...], 'median_dispatched'}``.
-        Причина у давно ждущей живой задачи одна, по порядку проверки: лимит дага → пул →
-        приоритет → прочее. Лимит дага первым: при нём шедулер задачу не возьмёт при любом
-        весе и любом пуле.
+        ``{'live', 'parked', 'stale', 'by_cause': {причина: n}, 'dags': [...], 'median_dispatched',
+        'window'}``. Причина у давно ждущей живой задачи одна, по порядку проверки: лимит дага →
+        пул → окно → приоритет → прочее. Лимит дага первым: при нём шедулер задачу не возьмёт при
+        любом весе и любом пуле.
+
+        «Окно»: шедулер AF 2 берёт из scheduled первые ``window`` задач по весу, затем по дате рана,
+        и кончает цикл, как только среди них нашлось что запустить (``is_done`` в
+        ``_executable_task_instances_to_queued``). Если голову занимают задачи дагов на своём
+        лимите, задача за окном не рассматривается вовсе — при свободных воркерах и том же весе,
+        что у ушедших в работу (медиана тут не поможет). Сигма dev 01.10.2026: окно 63, из них ~53
+        на лимите дагов, 306 задач ждали без видимой причины, ручной tools_db_cleanup — 43 мин.
     """
     edge = now - timedelta(minutes=stale_min)
     median = _median(dispatched)
+
+    def at_limit(w):
+        limit = w.get("max_active_tasks")
+        return limit is not None and active.get(w["dag_id"], 0) >= limit
+
+    # Порядок выборки шедулера: вес по убыванию, затем дата рана
+    floor = datetime.min.replace(tzinfo=timezone.utc)
+    order = sorted((w for w in waiting if not w.get("is_paused") and w.get("run_state") == "running"),
+                   key=lambda w: (-(w.get("priority_weight") or 0), w.get("logical_date") or floor))
+    rank = {id(w): i for i, w in enumerate(order)}
+    head = order[:window] if window else []
+    blocked = {}
+    for w in head:
+        if at_limit(w):
+            blocked[w["dag_id"]] = blocked.get(w["dag_id"], 0) + 1
     dags, by_cause = {}, {}
     live = parked = stale = 0
     for w in waiting:
@@ -407,6 +382,8 @@ def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list,
             cause = "лимит дага"
         elif pool and pool["slots"] >= 0 and pool["used"] >= pool["slots"]:
             cause = f"пул {w.get('pool')}"
+        elif window and rank[id(w)] >= window and blocked:
+            cause = "окно"
         elif median is not None and (w.get("priority_weight") or 0) < median:
             cause = "приоритет"
         else:
@@ -420,7 +397,20 @@ def scheduler_causes(waiting: list, active: dict, pools: dict, dispatched: list,
         out.append(d)
     out.sort(key=lambda d: (-d["stale"], -d["waiting"]))
     return {"live": live, "parked": parked, "stale": stale, "by_cause": by_cause, "dags": out,
-            "median_dispatched": median, "dispatched_1h": len(dispatched)}
+            "median_dispatched": median, "dispatched_1h": len(dispatched),
+            "window": {"size": window, "blocked": sum(blocked.values()),
+                       "blocked_dags": sorted(blocked.items(), key=lambda x: -x[1]),
+                       "behind": max(len(order) - window, 0)} if window else None}
+
+
+def _scheduler_window() -> int:
+    """Сколько задач шедулер берёт из scheduled за цикл: ``max_tis_per_query`` (0 — без предела),
+    не больше ``parallelism``. Верхняя оценка: занятые слоты executor'а окно сужают ещё.
+    ``parallelism`` — из конфига воркера, на котором идёт таск; у шедулера он обычно тот же.
+    """
+    parallelism = conf.getint("core", "parallelism")
+    per_query = conf.getint("scheduler", "max_tis_per_query", fallback=16)
+    return parallelism if not per_query else min(per_query, parallelism)
 
 
 def _count(res) -> int:
@@ -578,6 +568,16 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
         pools = {c: n for c, n in sched.get("by_cause", {}).items() if c.startswith("пул ")}
         for c, n in pools.items():
             out.append(f"🏊 {c.capitalize()} исчерпан, ждут слота: {n}")
+        behind = sched.get("by_cause", {}).get("окно")
+        if behind:
+            win = sched["window"]
+            names = ", ".join(f"`{d}` {n}" for d, n in win["blocked_dags"][:5])
+            out.append(f"🧱 Окно шедулера забито: из первых {win['size']} задач по весу и дате рана "
+                       f"{win['blocked']} — даги на своём лимите ({names}); за окном ждут дольше {stale_min} мин "
+                       f"{behind} и не рассматриваются вовсе — цикл кончается, как только в окне нашлось что "
+                       "запустить. Лечится шириной окна (`parallelism`, `max_tis_per_query`), лимитами этих дагов "
+                       "или весом срочных (`priority_weight` + `weight_rule='absolute'`); ещё шедулер тут не "
+                       "поможет — очередь ставит один за раз")
         starving = [d for d in sched.get("dags", []) if d["causes"].get("приоритет")]
         if starving:
             names = ", ".join(f"`{d['dag_id']}` (вес {d['weight']}, {d['oldest_min']} мин)" for d in starving[:5])
@@ -586,7 +586,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
                        "`priority_weight` + `weight_rule='absolute'`")
         other = sched.get("by_cause", {}).get("прочее")
         if other:
-            out.append(f"❓ Ждут дольше {stale_min} мин без видимой причины (лимит дага, пул, приоритет — нет): "
+            out.append(f"❓ Ждут дольше {stale_min} мин без видимой причины (лимит дага, пул, окно, приоритет — нет): "
                        f"{other} — смотреть лог шедулера")
         timeout = sched.get("timeout_runs") or []
         if timeout:
@@ -627,6 +627,7 @@ def conclusions(sched: dict, cap: dict, broker: dict, p: dict, pidbox: dict = No
 
 @dag(
     doc_md=__doc__,
+    description='Почему задачи ждут в очереди: брокер, шедулер, ёмкость воркеров; по галке чистка брокера',
     owner_links={"DataLab (CI02420667)": "https://confluence.sberbank.ru/display/HRTECH/DataLab"},
     default_args={
         "owner": "DataLab (CI02420667)",
@@ -806,10 +807,13 @@ def tools_queue_analyze():
         with create_session() as session:
             waiting = [r._asdict() for r in (
                 session.query(TI.dag_id, TI.pool, TI.priority_weight, TI.updated_at,
-                              DagModel.is_paused, DagModel.max_active_tasks, DagRun.state.label("run_state"))
+                              DagModel.is_paused, DagModel.max_active_tasks, DagRun.state.label("run_state"),
+                              DagRun.execution_date.label("logical_date"))
                 .outerjoin(DagModel, DagModel.dag_id == TI.dag_id)
                 .outerjoin(DagRun, and_(DagRun.dag_id == TI.dag_id, DagRun.run_id == TI.run_id))
                 .filter(TI.state == "scheduled", TI.dag_id != me)
+                # В порядке шедулера: при обрезке по лимиту остаётся голова — окно
+                .order_by(TI.priority_weight.desc(), DagRun.execution_date)
                 .limit(SCHEDULED_LIMIT)
             )]
             active = dict(session.query(TI.dag_id, func.count())
@@ -846,7 +850,7 @@ def tools_queue_analyze():
                                    DagRun.dag_id != me)
                            .scalar())
 
-        out = scheduler_causes(waiting, active, pools, dispatched, now, p["stale_min"])
+        out = scheduler_causes(waiting, active, pools, dispatched, now, p["stale_min"], window=_scheduler_window())
         out.update(timeout_runs=timeout_runs, paused_runs=paused_runs, truncated=len(waiting) >= SCHEDULED_LIMIT,
                    pools={k: v for k, v in pools.items() if v["slots"] >= 0 and v["used"] >= v["slots"]})
         rows = ["| Даг | Ждут | Давно | Старейшая, мин | В работе / лимит | Вес | Причины |",
@@ -991,31 +995,43 @@ def tools_queue_analyze():
 
     @task(task_id="pidbox", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def pidbox(**context) -> dict:
-        """📮 Привязки ответных очередей control-канала: сколько их; при purge_pidbox — удалить."""
-        p = context["params"]
-        res = reply_bindings(purge=p["purge_pidbox"])
+        """📮 Привязки ответных очередей control-канала: сколько их и пять для примера."""
+        res = reply_bindings()
         text = f"привязок ответных очередей: {res['count']}"
+        if res["sample"]:
+            text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
+        add_note(text, context=context, level="Task", title="📮 pidbox")
+        return res
+
+    @task(task_id="purge_pidbox", trigger_rule=TriggerRule.NONE_FAILED)
+    def purge_pidbox(**context) -> dict:
+        """🧹 Удаляет сет привязок ответных очередей. Только при purge_pidbox=True."""
+        # Отдельным таском, а не флагом внутри `pidbox`: по сетке видно, запускалась ли чистка
+        # и упала ли она отдельно от подсчёта (ИФТ 01.10.2026: `purge` упал, а чистку привязок,
+        # прошедшую внутри `pidbox`, приняли за ту же неудачу).
+        from airflow.exceptions import AirflowSkipException
+
+        if not context["params"]["purge_pidbox"]:
+            raise AirflowSkipException("purge_pidbox=False — привязки не трогаем")
+        res = reply_bindings(purge=True)
+        text = f"привязок было: {res['count']}"
         if "left" in res:
             text += (f" · удалено {res['deleted']}, осталось {res['left']} (DEL ответил {res['del']}"
                      + (f", UNLINK {res['unlink']}" if "unlink" in res else "") + f", SREM {res['srem']}"
                      + (f", SPOP {res['spop']}" if "spop" in res else "") + ")")
             text += f"\n\nсервер: `{res.get('server')}`" + (f"\nпервый ответ SREM: `{res['srem_raw']}`" if res.get("srem_raw") else "") \
                 + (f"\nпроба удалений: `{res['probe']}`" if res.get("probe") else "")
-        if res["sample"]:
-            text += "\n" + "\n".join(f"- `{q}`" for q in res["sample"])
-        add_note(text, context=context, level="Task", title="📮 pidbox")
+        add_note(text, context=context, level="Task", title="🧹 привязки")
         return res
 
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(snapshot: dict = None, sched: dict = None, cap: dict = None, purged: dict = None,
-               bindings: dict = None, **context) -> str:
-        """📊 Выводы словами и сводка по разделам.
-
-        Запускается при любом исходе (`ALL_DONE`), поэтому любого словаря может не быть:
-        XCom упавшего или пропущенного таска не существует, и аргумент приезжает пустым.
-        Своё падение здесь хуже отсутствия сводки — дежурный получит два красных таска
-        вместо объяснения, что случилось с первым.
-        """
+               bindings: dict = None, cleared: dict = None, **context) -> str:
+        """📊 Выводы словами и сводка по разделам."""
+        # Запускается при любом исходе (`ALL_DONE`), поэтому любого словаря может не быть:
+        # XCom упавшего или пропущенного таска не существует, и аргумент приезжает пустым.
+        # Своё падение здесь хуже отсутствия сводки — дежурный получит два красных таска
+        # вместо объяснения, что случилось с первым.
         p = context["params"]
         purged = purged or {}
         dag_run = context["dag_run"]
@@ -1023,7 +1039,9 @@ def tools_queue_analyze():
         def state(task_id):
             return getattr(dag_run.get_task_instance(task_id), "state", None)
 
-        found = conclusions(sched or {}, cap or {}, snapshot or {}, p, bindings or {})
+        cleared = cleared or {}
+        # Вывод 📮 — по тому, что осталось после чистки (left), а не по счёту до неё
+        found = conclusions(sched or {}, cap or {}, snapshot or {}, p, {**(bindings or {}), **cleared})
         lines = ["**Выводы:**"] + [f"- {x}" for x in found] if found else ["**Выводы:** ✅ очередь в норме"]
 
         # Отказ порога отличается от выключенной галки: удаление запрашивали, и его не
@@ -1064,12 +1082,13 @@ def tools_queue_analyze():
             s = state("broker")
             lines.append("| брокер | очередь пуста |" if s == "skipped" else f"| брокер | ❌ не отработал ({s}) |")
         if bindings:
-            lines.append(f"| привязки ответов | {bindings['count']}"
-                         + (f", удалено {bindings['deleted']}, осталось {bindings['left']} (DEL {bindings.get('del')}, "
-                            f"SREM {bindings.get('srem')})" if "left" in bindings else "")
-                         + " |")
+            lines.append(f"| привязки ответов | {bindings['count']} |")
         else:
             lines.append(f"| привязки ответов | ❌ не прочитаны ({state('pidbox')}) |")
+        if "left" in cleared:
+            lines.append(f"| чистка привязок | удалено {cleared['deleted']}, осталось {cleared['left']} |")
+        elif state("purge_pidbox") == "failed":
+            lines.append("| чистка привязок | ❌ упала — лог таска `purge_pidbox` |")
         if stop:
             lines += ["", f"> ⛔️ {stop}"]
         if snapshot and snapshot.get("reasons"):
@@ -1085,7 +1104,8 @@ def tools_queue_analyze():
             S3Hook(aws_conn_id=AWS_CONN_ID, verify=False).load_string(
                 json.dumps({"platform": env_platform(), "stand": env_stand(), "conclusions": found, "scheduler": sched, "capacity": cap,
                             "broker": {k: v for k, v in (snapshot or {}).items() if k != "keys"},
-                            "purge": purged, "pidbox": bindings}, ensure_ascii=False, indent=2, default=str),
+                            "purge": purged, "pidbox": bindings,
+                            "purge_pidbox": cleared or None}, ensure_ascii=False, indent=2, default=str),
                 key=key, bucket_name=BUCKET_NAME, replace=True,
             )
             lines.append(f"\nРазбор целиком: `s3://{BUCKET_NAME}/{key}`")
@@ -1110,7 +1130,10 @@ def tools_queue_analyze():
     snapshot, sched, cap, bindings = broker(), scheduler(), capacity(), pidbox()
     done >> [snapshot, sched, cap, bindings]
     purged = purge(snapshot)
-    report(snapshot, sched, cap, purged, bindings) >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
+    # После подсчёта: в отчёте и «сколько было», и «сколько осталось»
+    cleared = purge_pidbox()
+    bindings >> cleared
+    report(snapshot, sched, cap, purged, bindings, cleared) >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
 
 
 tools_queue_analyze()

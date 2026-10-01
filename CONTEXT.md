@@ -36,8 +36,8 @@
 | `plugins/` | `plugins/readme.md` | 2026-09-30 | `openspec/specs/plugins/spec.md` | 2026-09-29 | 2026-09-30 |
 | `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 ⚠️ | `openspec/specs/s3-tools/spec.md` | 2026-09-24 ⚠️ | 2026-09-28 |
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-09-30 | `openspec/specs/tfs-kafka/spec.md` | 2026-09-29 | 2026-09-30 |
-| `tools/` | `tools/readme.md` | 2026-09-30 | `openspec/specs/tools/spec.md` | 2026-09-29 | 2026-09-30 |
+| `tools/` | `tools/readme.md` | 2026-09-30 | `openspec/specs/tools/spec.md` | 2026-09-29 | 2026-10-01 |
 | `xs_export/` | `xs_export/readme.md` | 2026-09-28 | `openspec/specs/xs-export/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
 | `GP/` | `GP/readme.md` | 2026-09-30 | снимок `HR_Data` @ `1a3a317` | 2026-09-26 | 2026-09-30 |
 
-*Собрано 2026-09-30 скриптом `sync_context.py`*
+*Собрано 2026-10-01 скриптом `sync_context.py`*

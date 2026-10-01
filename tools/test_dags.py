@@ -1,91 +1,17 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-09-28 12:35 MSK · v3.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 19:10 MSK · v3.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Ищет DAG'и, у которых сериализация переписывается на каждом парсинге файла, и выясняет
-причину. Выделен из `test_connections` (там остались проверки соединений).
+Раз в сутки (23:00 MSK) ищет DAG'и, у которых сериализация переписывается на каждом разборе
+файла, и выясняет причину. Группа `check_serialized` ловит дрожание (ждёт следующего разбора,
+бывает часами), группа `compare` ведёт версии сериализации в S3 и показывает, что изменилось.
+Вне групп: `parse_time` — медленные файлы, `dag_size` — DAG'и больше 300 тасков, `s3_quota` —
+заполнение учётки S3 дагов. Находками не падает: итог — `health_warn` / `health_errors`.
 
-Запускается ежедневно в 23:00 MSK.
+**Таски:** `check_serialized` (`check_serialized_dag` → `recheck_serialized_dag`), `compare`
+(`find_changed` → `snapshot_dags` → `compare_changed`) и `parse_time` → `report`; он, `dag_size` и
+`s3_quota` → `health_warn` / `health_errors`. `params` сохраняет параметры запуска.
 
-Две независимые группы: **`check_serialized`** ловит дрожание сериализации на парсинге
-(может ждать часами), **`compare`** ведёт версии в S3 и показывает, что изменилось
-(минуты). Итог обеих собирает `report`, вердикт здоровья — `health_warn` / `health_errors`.
-
-| Таск | Что делает |
-|---|---|
-| **`check_serialized.check_serialized_dag`** | Считает по `main.serialized_dag`, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час, плюс строка «на последнем парсинге» (`last_updated` попал в окно последнего разбора файла — `dag.last_parsed_time`). **Никогда не падает**: одного замера мало, чтобы отличить дрожание от деплоя. Возвращает список подозрительных DAG'ов, статистика — в XCom `serialized_stats` |
-| **`check_serialized.recheck_serialized_dag`** | Mapped-таск, по экземпляру на DAG из списка. Ждёт следующего парсинга (сдвига `dag.last_parsed_time`) и сравнивает сериализацию до и после, показывая расхождения по путям вида `.dag.params[0][1].schema.examples[0]` |
-| **`compare.find_changed`** | Находит DAG'и, у которых `dag_hash` разошёлся с последней сохранённой версией, то есть изменившиеся с прошлого прогона. Ничего не скачивает: хэш виден в имени объекта. Список — в XCom `changed_dags` и в заметку, возвращает только счётчики |
-| **`compare.snapshot_dags`** | Пишет новые версии в S3 — всех изменившихся, сколько бы их ни было — и возвращает для `expand` пары «прошлая версия → новая», не больше `COMPARE_LIMIT` (100), свежие первыми. Статистика — в XCom `snapshot_stats`, пары сверх лимита — в `not_compared` |
-| **`compare.compare_changed`** | Mapped-таск, по экземпляру на изменившийся DAG: сравнивает две соседние версии и показывает расхождения. **Никогда не падает**, итог в XCom `compare`. В списке mapped-тасков вместо `Map Index` — `dag_id` |
-| **`parse_time`** | Вне групп: разбирает все файлы DAG'ов и ищет выбросы по времени — медленнее `среднее + 3σ`. Отдельно отмечает файлы, перевалившие половину `dag_file_processor_timeout`: такой файл dag-processor бросит на полпути, и DAG'и из него исчезнут из `serialized_dag`. **Никогда не падает** Он же сверяет построенное с `serialized_dag` и показывает DAG'и, которые разобрались, но в таблицу не доехали: такой DAG виден в UI, но `trigger_dag` по нему падает с `DagNotFound` |
-| **`dag_size`** | Вне групп, с 28.09.2026 (до того — проверка часового `tools_system_health`): DAG'и по числу тасков — в определении и в последнем ране с раскрытыми mapped, классы 1 · 2–3 · 4–10 · 11–30 · 31–100 · 101–300 · >300. Больше 300 — ⚠️ в `health_warn`. Размер меняется только с выкладкой, поэтому раз в сутки |
-| **`report`** | Сводка всех веток: вердикты, время ожидания, расхождения, покрытие версиями, выбросы парсинга; вердикт здоровья в XCom `health` |
-| **`health_warn` / `health_errors`** | Итог плагина здоровья: ⚠️ немые сравнения, DAG больше 300 тасков; ❌ дрожащая сериализация — ран красный. Отчёт для `get_system_health` пишет `health_errors` |
-
-**Исключения:** DAG'и с id по префиксам из `SKIP_DAG_PREFIXES` (сейчас `deadlocker_*`)
-не проверяются вовсе — ни в статистике сериализации, ни в версиях, ни в покрытии.
-Нагрузочный генератор переписывает свои DAG'и сам по себе, и в отчётах это шум.
-Исключение не касается `parse_time`: он меряет разбор **файлов**, а не DAG'и по id.
-
-**Массовое изменение.** После выкладки или обновления core меняется сериализация сотен
-DAG'ов разом. Версии записываются все, а сравниваются первые `COMPARE_LIMIT`: остальные
-идут в сводку числом и списком в XCom `not_compared`. У массового изменения расхождения
-почти у всех одни и те же, а сотни экземпляров сравнения на часы заняли бы пул.
-
-**Параметры:**
-
-| Параметр | По умолчанию | Значение |
-|---|---|---|
-| `snapshot_limit` | `0` | Сколько DAG'ов обходить за прогон. `0` — все. Ненулевое включает ротацию: изменившиеся → без копии → с самой старой копией, полное покрытие за `ceil(всего / limit)` суток |
-| `schedule` | `0 23 * * *` | Расписание; пусто — только вручную. Сохраняется вместе со `snapshot_limit` галочкой `save_params` |
-| `cleanup_deleted` | `False` | Удалять ли версии DAG'ов, которых больше нет в `serialized_dag`. Выключено намеренно: пропажа чаще временная (Broken DAG, неудачный парсинг, `dag_stale_not_seen_duration`), и копия как раз тогда и нужна |
-
-**Хранилище версий:**
-
-```
-dag_snapshots/<dag_id>/00001.<dag_hash>.json.gz
-dag_snapshots/<dag_id>/00002.<dag_hash>.json.gz
-```
-
-Новая версия пишется **только когда сменился `dag_hash`** — если содержимое то же, объект не
-плодится, и в истории остаются ровно те точки, где DAG менялся. `dag_hash` вынесен в имя
-объекта: `list_objects_v2` пользовательские метаданные не отдаёт, и иначе на каждый DAG
-пришлось бы качать последнюю копию, чтобы понять, изменилось ли что-нибудь.
-
-Бакет и соединение — те же, что у логов задач (`[logging] remote_log_conn_id` /
-`remote_base_log_folder`), префикс в корне бакета. Срок хранения у бакета один на всё
-(`tools_log_cleanup`), поэтому последнюю версию неизменившегося DAG'а старше
-`SNAP_REFRESH_DAYS` (7 дней) прогон переписывает на месте — номер и содержимое те же, дата
-новая. Старые версии уходят по сроку сами. При ненулевом `snapshot_limit` полный круг
-обхода обязан укладываться в 7 дней.
-
-**Вердикты `compare_changed`** (сравниваются два неизменяемых объекта в S3, поэтому
-результат воспроизводим — перезапуск таска через неделю покажет то же самое):
-
-| Статус | | Значение |
-|---|---|---|
-| `changed` | 📝 | Есть расхождения — в отчёте пути |
-| `same_json` | ✅ | `dag_hash` разный, а JSON совпал |
-| `duplicate_dag_id` | 👯 | Сменился `fileloc` — два файла на один `dag_id` |
-| `snapshot_broken` | ⚠️ | Версия не читается или не разбирается |
-
-Если экземпляр сравнения упал и не оставил XCom, `report` считает его «немым» и пишет
-об этом отдельной строкой: версия уже записана, поэтому следующий прогон этот DAG не
-переоткроет — хэши совпадут. Чинится очисткой упавшего экземпляра: обе версии лежат
-в S3, он перечитает те же объекты и выдаст тот же вердикт.
-
-**Вердикты `recheck_serialized_dag`:**
-
-| Статус | | Значение |
-|---|---|---|
-| `stable` | ✅ | `dag_hash` совпал — прошлое изменение было разовым (деплой) |
-| `no_parse` | ⏱️ | Парсинга не дождались: очередь в dag-processor'е. Не падение |
-| `unstable` | ❌ | Сериализация переписана снова — разбор файла недетерминирован |
-| `duplicate_dag_id` | 👯 | Сменился `fileloc`: на один `dag_id` претендуют два файла и затирают сериализацию друг друга. Airflow такие коллизии между файлами не диагностирует — `AirflowDagDuplicatedIdException` срабатывает внутри одного `DagBag`, то есть одного файла |
-
-Итог каждого экземпляра уходит в XCom `recheck` — до возможного падения, иначе у упавшего
-таска не осталось бы return-значения. В списке mapped-тасков вместо `Map Index` `0,1,2…`
-показывается `dag_id`.
+Подробно: [tools/readme.md — test_dags](../../_plugin_dag_docs/?doc=tools/readme.md#test_dagspytest_dagspy)
 """
 
 from airflow.configuration import conf
@@ -98,14 +24,16 @@ from datetime import datetime, timedelta, timezone
 from logging import getLogger
 
 try:
+    from plugins.s3_utils import s3_account_usage, s3_fill_check  # type: ignore
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule,
-        store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, readable_size, saved_params,
+        saved_schedule, store_params_task,
     )
 except ImportError:
+    from CI06932748.tools.s3_utils import s3_account_usage, s3_fill_check  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, saved_params, saved_schedule,
-        store_params_task,
+        TOOLS_POOL, add_note, ensure_pool, on_callback, health_tasks, push_health, readable_size, saved_params,
+        saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -128,6 +56,12 @@ REPORT_TTL_SEC = 26 * 3600
 # Навык агента, на который отчёт плагина отсылает толкование вердиктов сериализации
 SKILL = "tools-test-dags"
 ONE_SHOT = ("cleanup_deleted",)
+# Учётка S3 с бакетом дагов: из неё ядро синхронизирует даги (S3DagSyncManager(aws_conn_id="s3"),
+# бакет — service_config.bucket_name в extra подключения). Квота у неё своя, отдельная от
+# учётки бакета логов — ту проверяет tools_log_cleanup
+DAGS_CONN_ID = "s3"
+# Потолок листинга бакетов учётки, у которых хранилище не отдаёт объём заголовком
+QUOTA_LIST_MINUTES = 10
 
 # Соединение и бакет берём из настроек логирования, а не именем: на DEV бакет подменяет
 # airflow_entrypoint (REMOTE_BASE_LOG_FOLDER), и хардкод туда не поедет. conf читается из
@@ -441,19 +375,48 @@ def dag_size_verdict(rows: list[dict]) -> dict:
             "summary": f"{head}; больше {TASKS_ALERT} тасков (в DAG'е/в последнем ране): {names}"}
 
 
+def dag_size_note(result: dict) -> str:
+    """Заметка dag_size: вердикт строкой, классы и крупные DAG'и таблицами."""
+    icon = {"healthy": "✅", "warn": "⚠️"}.get(result["status"], "❌")
+    if "classes" not in result:
+        return f"{icon} {result['summary']}"
+    lines = [f"{icon} DAG'ов {result['dags']}, больше {TASKS_ALERT} тасков: {result['over_alert']}", "",
+             "| Тасков | DAG'ов |", "|---|---|"]
+    lines += [f"| {c} | {n} |" for c, n in result["classes"].items() if n]
+    if result["unknown"]:
+        lines.append(f"| без данных | {result['unknown']} |")
+    if result["top"]:
+        lines += ["", "| DAG | в DAG'е | в ране | |", "|---|---|---|---|"]
+        lines += [f"| `{d}` | {v['tasks'] if v['tasks'] is not None else '?'} | {v['max_ti']} | "
+                  f"{'⏸' if v['paused'] else ''} |" for d, v in result["top"].items()]
+        if result["over_alert"] > len(result["top"]):
+            lines.append(f"\nи ещё {result['over_alert'] - len(result['top'])}")
+    return "\n".join(lines)
+
+
 def check_dag_size() -> dict:
     """DAG'и по числу тасков; больше TASKS_ALERT — warn."""
     from airflow.utils.session import create_session
     from sqlalchemy import text
 
-    with create_session() as session:
-        session.execute(text(f"set local statement_timeout = {DAG_SIZE_TIMEOUT_MS}"))
-        rows = [dict(r) for r in session.execute(text(SQL_DAG_SIZE)).mappings()]
+    try:
+        with create_session() as session:
+            session.execute(text(f"set local statement_timeout = {DAG_SIZE_TIMEOUT_MS}"))
+            rows = [dict(r) for r in session.execute(text(SQL_DAG_SIZE)).mappings()]
+    except Exception as exc:
+        # Свой лимит запроса — медленная метабаза, а не неисправность того, что меряем: warn,
+        # как в tools_system_health. Сигма dev 30.09.2026 23:35 MSK: в ту же минуту по таймауту
+        # падали и фоновые запросы вебсервера; на стенде запрос — 94 мс на 73 DAG'а, всё по индексам
+        if type(getattr(exc, "orig", None)).__name__ != "QueryCanceled":
+            raise
+        return {"status": "warn",
+                "summary": f"метабаза не ответила за {DAG_SIZE_TIMEOUT_MS // 1000} с — размер DAG'ов не посчитан"}
     return dag_size_verdict(rows)
 
 
 @dag(
     doc_md=__doc__,
+    description='DAG-и, чья сериализация переписывается на каждом разборе, и причина',
     default_args={
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,
@@ -483,18 +446,24 @@ def check_dag_size() -> dict:
         # 0 — без ограничения, копируем все DAG'и. Ненулевое значение включает ротацию
         # (изменившиеся и самые старые копии вперёд): полное покрытие набирается за
         # ceil(всего / snapshot_limit) суток
-        "snapshot_limit": Param(int(SAVED.get("snapshot_limit", 0)), type="integer", minimum=0),
+        "snapshot_limit": Param(int(SAVED.get("snapshot_limit", 0)), type="integer", minimum=0,
+                                description="Сколько DAG'ов обходить за прогон; 0 — все. Иначе ротация: полный круг за ceil(всего / limit) суток"),
         # Удаление копий DAG'ов, которых больше нет в serialized_dag — только вручную:
         # пропажа чаще временная (Broken DAG, неудачный парсинг, деактивация по
         # dag_stale_not_seen_duration), и копия как раз тогда и нужна
-        "cleanup_deleted": Param(False, type="boolean"),
+        "cleanup_deleted": Param(False, type="boolean",
+                                 description="Удалять версии DAG'ов, которых больше нет в serialized_dag. Пропажа чаще временная — по умолчанию копии хранятся"),
+        # Квота учётки S3 с бакетом дагов, если хранилище её не отдаёт заголовком; 0 — не задана
+        "quota_gb": Param(int(SAVED.get("quota_gb", 0)), type="integer", minimum=0, title="Квота S3 дагов (ГБ)",
+                          description="Квота учётки S3 с бакетом дагов (подключение s3), если хранилище её не "
+                                      "отдаёт; 0 — не задана, заполнение не проверяется"),
         "schedule": Param(
             SAVED.get("schedule", DEFAULT_SCHEDULE), type=["string", "null"], title="Расписание",
             description="cron или пресет (@daily); пусто — только вручную. Применяется со следующего разбора",
         ),
         "save_params": Param(
             False, type="boolean", title="Сохранить параметры",
-            description=f"Записать schedule и snapshot_limit в {PARAMS_VAR} (cleanup_deleted — нет)",
+            description=f"Записать schedule, snapshot_limit и quota_gb в {PARAMS_VAR} (cleanup_deleted — нет)",
         ),
     },
 )
@@ -532,19 +501,17 @@ def tools_test_dags():
                 "Не падает — отдаёт подозрительные DAG'и на перепроверку"),
     )
     def check_serialized_dag(**context) -> list[dict]:
-        """Считает, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час.
-
-        Строка в serialized_dag переписывается только когда меняется dag_hash, то есть
-        содержимое DAG'а после парсинга файла (serialized_dag.py:170). На стабильном стенде
-        последний парсинг файла не должен был ничего переписать — если переписал, значит
-        парсинг либо даёт каждый раз новый результат (значение из БД или API на уровне
-        модуля, текущее время, плавающий порядок списка), либо только что был деплой.
-
-        Различить эти два случая по одному замеру нельзя, поэтому таск не падает никогда:
-        он только считает статистику и возвращает список подозрительных DAG'ов, а вердикт
-        выносит recheck_serialized_dag, дождавшись следующего парсинга. Возврат — список
-        для expand, статистика уходит в XCom `serialized_stats` и в заметку.
-        """
+        """Считает, у скольких DAG'ов менялась сериализация за год, 3 месяца, месяц, неделю, сутки и час."""
+        # Строка в serialized_dag переписывается только когда меняется dag_hash, то есть
+        # содержимое DAG'а после парсинга файла (serialized_dag.py:170). На стабильном стенде
+        # последний парсинг файла не должен был ничего переписать — если переписал, значит
+        # парсинг либо даёт каждый раз новый результат (значение из БД или API на уровне
+        # модуля, текущее время, плавающий порядок списка), либо только что был деплой.
+        #
+        # Различить эти два случая по одному замеру нельзя, поэтому таск не падает никогда:
+        # он только считает статистику и возвращает список подозрительных DAG'ов, а вердикт
+        # выносит recheck_serialized_dag, дождавшись следующего парсинга. Возврат — список
+        # для expand, статистика уходит в XCom `serialized_stats` и в заметку.
         import time
 
         from airflow.configuration import conf
@@ -647,27 +614,29 @@ def tools_test_dags():
 
     @task(task_id="recheck_serialized_dag", map_index_template="{{ target_dag_id }}")
     def recheck_serialized_dag(target: dict, **context) -> dict:
-        """Ждёт следующего парсинга DAG'а и сравнивает сериализацию до и после.
-
-        check_serialized_dag говорит только «сериализация переписана на последнем
-        парсинге». Этот таск отвечает на следующий вопрос — что именно в ней меняется:
-        снимает JSON, дожидается сдвига `dag.last_parsed_time`, снимает второй и
-        показывает расхождения по путям. Одинаковый dag_hash после нового парсинга
-        означает, что прошлое изменение было разовым (деплой), а не дрожанием.
-
-        Здесь и выносится вердикт, поэтому таск падает — на `unstable` (второй парсинг снова
-        переписал сериализацию) и на `duplicate_dag_id` (сменился fileloc: на один dag_id
-        претендуют два файла, и они затирают сериализацию друг друга). `no_parse` не падение:
-        за окно ожидания парсинга могло не случиться из-за очереди в dag-processor'е.
-
-        Итог всегда уходит в XCom `recheck` (до возможного падения — иначе при падении
-        return-значения бы не осталось), оттуда его собирает report.
-        """
+        """Ждёт следующего парсинга DAG'а и сравнивает сериализацию до и после."""
+        # check_serialized_dag говорит только «сериализация переписана на последнем
+        # парсинге». Этот таск отвечает на следующий вопрос — что именно в ней меняется:
+        # снимает JSON, дожидается сдвига `dag.last_parsed_time`, снимает второй и
+        # показывает расхождения по путям. Одинаковый dag_hash после нового парсинга
+        # означает, что прошлое изменение было разовым (деплой), а не дрожанием.
+        #
+        # Здесь и выносится вердикт, поэтому таск падает — на `unstable` (второй парсинг снова
+        # переписал сериализацию) и на `duplicate_dag_id` (сменился fileloc: на один dag_id
+        # претендуют два файла, и они затирают сериализацию друг друга). `no_parse` не падение:
+        # за окно ожидания парсинга могло не случиться из-за очереди в dag-processor'е.
+        # `redeployed` тоже не падение: между снимками сменился сам исходник (выкладка ветки
+        # пришлась на окно ожидания), новый хэш законен. Так 01.10 на альфе прогон пометил
+        # unstable сам tools_test_dags — коммит доехал через три минуты после старта.
+        #
+        # Итог всегда уходит в XCom `recheck` (до возможного падения — иначе при падении
+        # return-значения бы не осталось), оттуда его собирает report.
         import time
 
         from airflow.configuration import conf
         from airflow.exceptions import AirflowFailException, AirflowSkipException
         from airflow.models.dag import DagModel
+        from airflow.models.dagcode import DagCode
         from airflow.models.serialized_dag import SerializedDagModel
         from airflow.operators.python import get_current_context
         from airflow.utils.session import create_session
@@ -692,14 +661,20 @@ def tools_test_dags():
                    + conf.getint("core", "dag_file_processor_timeout", fallback=600))
 
         def snapshot() -> tuple:
-            """(dag_hash, data, last_parsed_time, fileloc); data берём через ORM — она распакует zlib."""
+            """(dag_hash, data, last_parsed_time, fileloc, source); data берём через ORM — она распакует zlib."""
             with create_session() as session:
                 sdm = session.query(SerializedDagModel).filter(SerializedDagModel.dag_id == dag_id).one_or_none()
                 parsed = session.query(DagModel.last_parsed_time).filter(DagModel.dag_id == dag_id).scalar()
+                if not sdm:
+                    return None, None, parsed, None, None
+                # Исходник сравниваем текстом, а не по dag_code.last_updated: тот следует за mtime
+                # файла, а синк может переложить файл, не меняя содержимого
+                source = session.query(DagCode.source_code).filter(
+                    DagCode.fileloc_hash == DagCode.dag_fileloc_hash(sdm.fileloc)).scalar()
                 # fileloc берём из колонки, а не из JSON: она есть и при compress_serialized_dags
-                return (sdm.dag_hash, sdm.data, parsed, sdm.fileloc) if sdm else (None, None, parsed, None)
+                return sdm.dag_hash, sdm.data, parsed, sdm.fileloc, source
 
-        hash0, data0, parsed0, loc0 = snapshot()
+        hash0, data0, parsed0, loc0, code0 = snapshot()
         if hash0 is None or parsed0 is None:
             msg = f"☮️ {dag_id}: нет в serialized_dag или в dag — сравнивать не с чем"
             add_note(msg, context, level="task", title=f"☮️ {dag_id}")
@@ -711,11 +686,11 @@ def tools_test_dags():
         logger.info("⏳ %s: ждём следующего парсинга, last_parsed_time=%s, таймаут %dс",
                     dag_id, parsed0, timeout)
 
-        hash1, data1, parsed1, loc1 = hash0, data0, parsed0, loc0
+        hash1, data1, parsed1, loc1, code1 = hash0, data0, parsed0, loc0, code0
         poll = 0
         while time.time() < deadline:
             time.sleep(poke)
-            hash1, data1, parsed1, loc1 = snapshot()
+            hash1, data1, parsed1, loc1, code1 = snapshot()
             poll += 1
             # Пишем на каждом опросе, а не только по факту: промежуточная выгрузка лога
             # в S3 (hrp_adapter/logging/handlers.py) дёргается из emit, то есть по записи,
@@ -742,6 +717,15 @@ def tools_test_dags():
             add_note(msg, context, level="task", title=f"✅ {dag_id}")
             logger.info(msg)
             result = {"dag_id": dag_id, "status": "stable", "waited": round(waited), "diffs": 0}
+            add_xcom("recheck", result, context)
+            return result
+
+        if loc0 == loc1 and code0 and code1 and code0 != code1:
+            msg = (f"🚚 {dag_id}: за {waited:.0f}с выложен новый исходник — новый dag_hash "
+                   f"`{hash1}` законен, стабильность проверит следующий прогон")
+            add_note(msg, context, level="task", title=f"🚚 {dag_id}")
+            logger.info(msg)
+            result = {"dag_id": dag_id, "status": "redeployed", "waited": round(waited), "diffs": 0}
             add_xcom("recheck", result, context)
             return result
 
@@ -789,21 +773,19 @@ def tools_test_dags():
                 "`compare_changed` — после того, как snapshot_dags запишет новую версию"),
     )
     def find_changed(**context) -> dict:
-        """Отбирает изменившиеся DAG'и, ничего не скачивая.
-
-        «Изменился» определяется не окном по времени, а сравнением `dag_hash` с последней
-        сохранённой версией: hash другой — значит DAG менялся с тех пор, как мы его
-        записали, то есть с прошлого прогона (или с того, на котором до него дошла
-        ротация). Окно по часам такого не даёт: при пропущенном или задержавшемся
-        прогоне оно либо теряет изменения, либо повторно показывает уже показанные.
-
-        Хэш последней версии виден прямо в имени объекта, поэтому отбор стоит одного
-        листинга бакета и одного запроса метаданных — без единого GET.
-
-        Возвращает счётчики, а не список: список через return упирается в лимит XCom
-        контура (см. COMPARE_LIMIT), и после обновления core таск падал бы каждую ночь.
-        snapshot_dags отбирает изменившиеся сам — по тем же хэшам, минутой позже.
-        """
+        """Отбирает изменившиеся DAG'и, ничего не скачивая."""
+        # «Изменился» определяется не окном по времени, а сравнением `dag_hash` с последней
+        # сохранённой версией: hash другой — значит DAG менялся с тех пор, как мы его
+        # записали, то есть с прошлого прогона (или с того, на котором до него дошла
+        # ротация). Окно по часам такого не даёт: при пропущенном или задержавшемся
+        # прогоне оно либо теряет изменения, либо повторно показывает уже показанные.
+        #
+        # Хэш последней версии виден прямо в имени объекта, поэтому отбор стоит одного
+        # листинга бакета и одного запроса метаданных — без единого GET.
+        #
+        # Возвращает счётчики, а не список: список через return упирается в лимит XCom
+        # контура (см. COMPARE_LIMIT), и после обновления core таск падал бы каждую ночь.
+        # snapshot_dags отбирает изменившиеся сам — по тем же хэшам, минутой позже.
         import time
 
         from airflow.utils.session import create_session
@@ -859,17 +841,15 @@ def tools_test_dags():
                 "ротация: изменившиеся → без копии → с самой старой копией"),
     )
     def snapshot_dags(**context) -> list[dict]:
-        """Пишет новые версии и возвращает пары «прошлая версия → новая» для expand.
-
-        Пары идут именно return-значением: expand умеет раскрываться только по
-        `return_value` и на кастомном XCom-ключе падает ещё при разборе файла
-        (`mappedoperator.py:132`, «cannot map over XCom with custom key»). Поэтому
-        статистика для report уезжает в ключ `snapshot_stats`, а не наоборот.
-
-        Изменившиеся отбираются здесь же, а не приезжают от find_changed: тот же листинг и
-        те же хэши, но без списка в XCom. Версии пишутся всем изменившимся, на сравнение
-        уходят первые COMPARE_LIMIT пар — свежие первыми, остальные в `not_compared`.
-        """
+        """Пишет новые версии и возвращает пары «прошлая версия → новая» для expand."""
+        # Пары идут именно return-значением: expand умеет раскрываться только по
+        # `return_value` и на кастомном XCom-ключе падает ещё при разборе файла
+        # (`mappedoperator.py:132`, «cannot map over XCom with custom key»). Поэтому
+        # статистика для report уезжает в ключ `snapshot_stats`, а не наоборот.
+        #
+        # Изменившиеся отбираются здесь же, а не приезжают от find_changed: тот же листинг и
+        # те же хэши, но без списка в XCom. Версии пишутся всем изменившимся, на сравнение
+        # уходят первые COMPARE_LIMIT пар — свежие первыми, остальные в `not_compared`.
         import gzip
         import json
         import time
@@ -1014,16 +994,14 @@ def tools_test_dags():
 
     @task(task_id="compare_changed", map_index_template="{{ target_dag_id }}")
     def compare_changed(target: dict, **context) -> dict:
-        """Сравнивает две соседние версии сериализации одного DAG'а.
-
-        Обе версии — неизменяемые объекты в S3, а не «копия против текущего состояния
-        БД», поэтому результат воспроизводим: перезапуск таска через неделю покажет ровно
-        то же самое. Отсюда и место в цепочке — после snapshot_dags, который эту пару
-        и создал.
-
-        Не падает: изменение сериализации после деплоя — норма. Вердикт в заметке,
-        в логе и в XCom `compare`.
-        """
+        """Сравнивает две соседние версии сериализации одного DAG'а."""
+        # Обе версии — неизменяемые объекты в S3, а не «копия против текущего состояния
+        # БД», поэтому результат воспроизводим: перезапуск таска через неделю покажет ровно
+        # то же самое. Отсюда и место в цепочке — после snapshot_dags, который эту пару
+        # и создал.
+        #
+        # Не падает: изменение сериализации после деплоя — норма. Вердикт в заметке,
+        # в логе и в XCom `compare`.
         import gzip
         import json
         import time
@@ -1106,29 +1084,27 @@ def tools_test_dags():
                 "`среднее + 3σ`. Не падает — только отчёт"),
     )
     def parse_time(**context) -> dict:
-        """Ищет файлы, которые парсятся аномально долго.
-
-        Длительности разбора в метабазе нет: `dag.last_parsed_time` — это момент, а не
-        сколько заняло. Поэтому меряем сами, тем же способом, что и `airflow dags report`:
-        `DagBag` при обходе папки складывает в `dagbag_stats` по `FileLoadStat` на файл
-        (`models/dagbag.py:600-618`).
-
-        Порог — среднее плюс три сигмы по всем файлам. Три сигмы имеют смысл только на
-        достаточной выборке, поэтому при `MIN_FILES` файлах и меньше отчёт ограничивается
-        самыми медленными без вердикта «выброс».
-
-        Свойство метода, о котором стоит помнить: несколько тормозов сразу раздувают σ и
-        могут замаскировать друг друга — два файла по 30с среди десяти по полсекунды
-        поднимают порог до 40с и в выбросы не попадают. Поэтому таблица самых медленных
-        печатается всегда, а не только когда выброс нашёлся.
-
-        Разбор идёт в воркере и импортирует все файлы разом, то есть выполняет их код
-        верхнего уровня. У DAG'ов ctl там обращения к метабазе и секрет-бэкенду — на
-        чтение, но время прогона от этого зависит и растёт вместе с числом файлов.
-
-        Таск вне групп: он про то, как разбираются файлы, а не про то, что получается
-        в serialized_dag.
-        """
+        """Ищет файлы, которые парсятся аномально долго."""
+        # Длительности разбора в метабазе нет: `dag.last_parsed_time` — это момент, а не
+        # сколько заняло. Поэтому меряем сами, тем же способом, что и `airflow dags report`:
+        # `DagBag` при обходе папки складывает в `dagbag_stats` по `FileLoadStat` на файл
+        # (`models/dagbag.py:600-618`).
+        #
+        # Порог — среднее плюс три сигмы по всем файлам. Три сигмы имеют смысл только на
+        # достаточной выборке, поэтому при `MIN_FILES` файлах и меньше отчёт ограничивается
+        # самыми медленными без вердикта «выброс».
+        #
+        # Свойство метода, о котором стоит помнить: несколько тормозов сразу раздувают σ и
+        # могут замаскировать друг друга — два файла по 30с среди десяти по полсекунды
+        # поднимают порог до 40с и в выбросы не попадают. Поэтому таблица самых медленных
+        # печатается всегда, а не только когда выброс нашёлся.
+        #
+        # Разбор идёт в воркере и импортирует все файлы разом, то есть выполняет их код
+        # верхнего уровня. У DAG'ов ctl там обращения к метабазе и секрет-бэкенду — на
+        # чтение, но время прогона от этого зависит и растёт вместе с числом файлов.
+        #
+        # Таск вне групп: он про то, как разбираются файлы, а не про то, что получается
+        # в serialized_dag.
         import statistics
         import time
 
@@ -1313,7 +1289,7 @@ def tools_test_dags():
         except ImportError:
             from CI06932748.tools.utils import add_note  # type: ignore
 
-        icon_by_status = {"stable": "✅", "no_parse": "⏱️",
+        icon_by_status = {"stable": "✅", "no_parse": "⏱️", "redeployed": "🚚",
                           "unstable": "❌", "duplicate_dag_id": "👯"}
         dag_run = context["dag_run"]
         ti = context["ti"]
@@ -1453,7 +1429,7 @@ def tools_test_dags():
     # только свои ветки по task_id
     @task(task_id="params")
     def save_params(**context):
-        """💾 Сохраняет schedule и snapshot_limit как значения по умолчанию."""
+        """💾 Сохраняет schedule, snapshot_limit и quota_gb как значения по умолчанию."""
         return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     save_params()
@@ -1464,7 +1440,7 @@ def tools_test_dags():
     # за минуты. Внутри compare сравнение идёт последним — оно сличает две версии,
     # и вторую из них создаёт как раз snapshot_dags
     with TaskGroup(group_id=CHECK_GROUP, tooltip="Дрожание сериализации на парсинге") as tg_check:
-        recheck_serialized_dag.expand(target=check_serialized_dag())
+        recheck_serialized_dag.override(doc_md=recheck_serialized_dag.function.__doc__).expand(target=check_serialized_dag())
 
     with TaskGroup(group_id=COMPARE_GROUP, tooltip="Версии в S3 и что изменилось") as tg_compare:
         # expand раскрывается только по return_value: на кастомном ключе Airflow
@@ -1475,7 +1451,7 @@ def tools_test_dags():
         # список изменившихся через XCom упирался в лимит контура (см. COMPARE_LIMIT)
         pairs = snapshot_dags()
         find_changed() >> pairs
-        compare_changed.expand(target=pairs)
+        compare_changed.override(doc_md=compare_changed.function.__doc__).expand(target=pairs)
 
     # parse_time вне групп и ни от кого не зависит: он про разбор файлов, а не про
     # содержимое serialized_dag
@@ -1483,15 +1459,33 @@ def tools_test_dags():
     def dag_size(**context) -> dict:
         """📏 DAG'и по числу тасков: больше TASKS_ALERT — warn. Находкой не падает."""
         result = check_dag_size()
-        add_note(result["summary"], context, level="task", title="📏 dag_size")
+        add_note(dag_size_note(result), context, level="task", title="📏 dag_size")
         push_health({"dag_size": result}, context)
         return result
+
+    @task(task_id="s3_quota")
+    def s3_quota(**context) -> dict:
+        """🪣 Заполнение учётки S3 с бакетом дагов к её квоте. Находкой не падает; квоты нет — skip."""
+        from airflow.exceptions import AirflowSkipException
+
+        quota_gb = context["params"].get("quota_gb") or 0
+        account = s3_account_usage(
+            DAGS_CONN_ID, QUOTA_LIST_MINUTES if quota_gb else 0,
+            on_bucket=lambda name, size, sec: add_note(f"📦 `{name}`: {readable_size(size)}, {sec:.0f} с", context))
+        fill = s3_fill_check(account, quota_gb)
+        if not fill:
+            raise AirflowSkipException("квота учётки S3 дагов неизвестна: хранилище её не отдаёт, quota_gb=0")
+        icon = {"healthy": "✅", "warn": "⚠️", "error": "❌"}[fill["status"]]
+        add_note(f"{icon} **s3_fill** — {fill['summary']}", context, level="task")
+        push_health({"s3_fill": fill}, context)
+        return fill
 
     [tg_check, tg_compare, parse_time()] >> report_task
     # dag_size — сам по себе, как parse_time: про код DAG'ов, а не про сериализацию
     verdicts = health_tasks(ttl_sec=REPORT_TTL_SEC, skill=SKILL)
     report_task >> verdicts
     dag_size() >> verdicts
+    s3_quota() >> verdicts
 
 
 tools_test_dags()

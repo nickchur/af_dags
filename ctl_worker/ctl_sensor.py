@@ -1,5 +1,5 @@
 """### 📡 DAG: Сенсор CTL
-*2026-09-30 09:25 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждую минуту опрашивает CTL, фильтрует загрузки в статусах `RUNNING` / `TIME-WAIT` / `EVENT-WAIT` и запускает соответствующие DAG'и через `trigger_dag` или Dataset.
 
@@ -14,6 +14,8 @@
 останавливало приём загрузок). Подключения проверяет `CTL.<profile>.test_conn` и закрывает
 пулы: GP недоступен — `gp_pool` = 0, и `ctl_add_get` уходит в skip «перегрузка»; CTL
 недоступен — `ctl_add_get` падает на самом вызове API.
+
+Подробно: [ctl_worker/readme.md — ctl_sensor](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_sensorpy--сенсор-событий)
 """
 
 from airflow import DAG, Dataset
@@ -206,6 +208,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
     on_failure_callback=on_callback,
     # on_success_callback=on_callback,
     doc_md=__doc__,
+    description='Сенсор CTL раз в минуту: запускает даги воркфлоу активных загрузок',
 ) as dag:
 
             
@@ -217,31 +220,29 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
     @task(pool='ctl_pool')
     def ctl_add_get(**context):
-        """### Сбор активных загрузок из CTL
-
-        Опрашивает API CTL и получает список активных загрузок со статусами:
-        - `RUNNING`
-        - `TIME-WAIT`
-        - `EVENT-WAIT`
-
-        Фильтрует по:
-        - Профилю (`profile_id`)
-        - Активности (`alive == 'ACTIVE'`)
-        - Наличию `loading_id`, `wf_id`
-        - Статусу и логике предотвращения дублей
-
-        Сохраняет промежуточные данные в `ctl_working/<lid>` (не публично).
-
-        **Формат выхода:**
-        - Возвращает до MAX_XCOM задач в формате `params`.
-        - Пушит XCom: `lid_to_chk`, `lid_skiped`.
-
-        **Логирование:**
-        - Таблица с `lid` и `wf_name` через `add_note`.
-        - Количество пропущенных и обработанных задач.
-
-        **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
-        """
+        """Сбор активных загрузок из CTL"""
+        # Опрашивает API CTL и получает список активных загрузок со статусами:
+        # - `RUNNING`
+        # - `TIME-WAIT`
+        # - `EVENT-WAIT`
+        #
+        # Фильтрует по:
+        # - Профилю (`profile_id`)
+        # - Активности (`alive == 'ACTIVE'`)
+        # - Наличию `loading_id`, `wf_id`
+        # - Статусу и логике предотвращения дублей
+        #
+        # Сохраняет промежуточные данные в `ctl_working/<lid>` (не публично).
+        #
+        # **Формат выхода:**
+        # - Возвращает до MAX_XCOM задач в формате `params`.
+        # - Пушит XCom: `lid_to_chk`, `lid_skiped`.
+        #
+        # **Логирование:**
+        # - Таблица с `lid` и `wf_name` через `add_note`.
+        # - Количество пропущенных и обработанных задач.
+        #
+        # **Источник:** `/v4/api/loading` (через `ctl_loading_load`)
         cl = get_current_load('gp_pool')
         if cl['pool_slots'] - cl['scheduled'] <= 1:
             msg = "🔥 System is overloaded"
@@ -347,28 +348,26 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
         on_success_callback=None,
     )
     def ctl_add_chk(jsn, **context):
-        """### Проверка условий запуска и инициация workflow
-
-        Для каждой загрузки проверяет:
-        1. Необходимость повторного запуска (`ctl_chk_new`).
-        2. Готовность событий (`ctl_chk_expire`).
-        3. Необходимость отложенного запуска (`wf_wait` → `ctl_chk_wait`).
-
-        При успешной проверке:
-        - Обновляет статус в CTL на `WAIT-AF`.
-        - Запускает целевой DAG через `trigger_dag`.
-        - Или отправляет Dataset при активированном режиме `dug_run`.
-
-        **XCom:**
-        - Пушит `result` и `extra` (параметры запуска).
-        - Использует `outlet_events` для Dataset-сигналов.
-
-        **Режимы запуска:**
-        - `dug_run == 'dataset'`: сигнал через Dataset.
-        - Иначе: запуск через `trigger_dag`.
-
-        **Ссылка в логе:** добавляется ссылка на загрузку в интерфейсе CTL.
-        """
+        """Проверка условий запуска и инициация workflow"""
+        # Для каждой загрузки проверяет:
+        # 1. Необходимость повторного запуска (`ctl_chk_new`).
+        # 2. Готовность событий (`ctl_chk_expire`).
+        # 3. Необходимость отложенного запуска (`wf_wait` → `ctl_chk_wait`).
+        #
+        # При успешной проверке:
+        # - Обновляет статус в CTL на `WAIT-AF`.
+        # - Запускает целевой DAG через `trigger_dag`.
+        # - Или отправляет Dataset при активированном режиме `dug_run`.
+        #
+        # **XCom:**
+        # - Пушит `result` и `extra` (параметры запуска).
+        # - Использует `outlet_events` для Dataset-сигналов.
+        #
+        # **Режимы запуска:**
+        # - `dug_run == 'dataset'`: сигнал через Dataset.
+        # - Иначе: запуск через `trigger_dag`.
+        #
+        # **Ссылка в логе:** добавляется ссылка на загрузку в интерфейсе CTL.
         ti = context['task_instance']
         # return ctl_chk_loading(jsn, context)
 
@@ -482,21 +481,19 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
     # default_pool: только заметки — ни CTL, ни GP не трогает (раньше сидел в pg_pool)
     @task(pool='default_pool', trigger_rule = 'none_failed')
     def ctl_add_end(res, **context):
-        """### Сбор и логирование результатов
-
-        Выполняется после завершения всех `ctl_add_chk`.
-        Собирает результаты из XCom и формирует итоговый отчёт.
-
-        **Действия:**
-        - Собирает `result` из всех экземпляров `ctl_add_chk`.
-        - Преобразует в словарь `{lid: {action, name, msg}}`.
-        - Пушит в XCom под ключом `add_result`.
-        - Логирует полный список через `add_note`.
-
-        **Режим:** `trigger_rule = 'all_done'` — выполняется всегда.
-
-        **Назначение:** аудит, мониторинг, отладка.
-        """
+        """Сбор и логирование результатов"""
+        # Выполняется после завершения всех `ctl_add_chk`.
+        # Собирает результаты из XCom и формирует итоговый отчёт.
+        #
+        # **Действия:**
+        # - Собирает `result` из всех экземпляров `ctl_add_chk`.
+        # - Преобразует в словарь `{lid: {action, name, msg}}`.
+        # - Пушит в XCom под ключом `add_result`.
+        # - Логирует полный список через `add_note`.
+        #
+        # **Режим:** `trigger_rule = 'all_done'` — выполняется всегда.
+        #
+        # **Назначение:** аудит, мониторинг, отладка.
         ti = context['task_instance']
         wfs = ti.xcom_pull(key='result', task_ids=f'ctl_add_chk') or []
         wfs = {
@@ -524,7 +521,7 @@ with DAG(f'CTL.{get_config()["profile"]}.sensor',
 
        
     add_get = ctl_add_get()
-    add_chk = ctl_add_chk.expand(jsn = add_get)
+    add_chk = ctl_add_chk.override(doc_md=ctl_add_chk.function.__doc__).expand(jsn = add_get)
     add_end = ctl_add_end(add_chk)
         
 

@@ -1,62 +1,14 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-09-28 10:36 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Находит раны в `running` / `queued` у дагов на паузе и, если попросили, закрывает их —
-как кнопка **Mark failed** в UI.
+Раз в час находит раны в `running` / `queued` у дагов на паузе старше `older_than_hours` и,
+если попросили, закрывает их как **Mark failed**: незавершённые задачи → `skipped`, ран →
+`failed`. Шедулер запаузенный даг не разбирает, а `trigger_dag` паузу не смотрит — такой ран
+иначе висит вечно. Паузу даг не снимает. Создаётся на паузе.
 
-**Почему они висят.** Шедулер запаузенный даг не разбирает вовсе: не ставит задачи, не
-проверяет `dagrun_timeout` (AF 2.11.2, `models/dagrun.py:412`,
-`scheduler_job_runner.py:1665`). А `trigger_dag` (кнопка, API, наш сенсор) паузу не смотрит
-и создаёт ран сразу в `queued`. Такой ран не начнётся и не кончится, пока паузу не снимут, —
-а сняв её, человек получит пачку старых запусков разом. В `get_system_health` это
-`runs.paused_active`.
+**Таски:** `params` → `collect` (отчёт: раны, задачи, кто поставил паузу) → `close`.
 
-**Что считается зависшим** (порог `older_than_hours`):
-
-| Ран | Возраст считается от | Не трогаем |
-|---|---|---|
-| `queued` | `queued_at` (у старых ранов без него — `execution_date`) | — |
-| `running` | последнего движения: `max(end_date)` задач, иначе `start_date` | ран, где задача в `running`: она доработает (запрос в GP не рвём), и ран уйдёт в следующий проход |
-
-Правило то же, что у санитара `ctl_monitor` (`ctl_worker/ctl_monitor.py`), который на альфе
-закрывает такие раны CTL-дагов: отсчёт от движения, а не от старта, иначе ран, шедший пять
-часов и запаузенный сейчас, закрылся бы через час.
-
-**Закрытие** (`close=True`) — результат как у кнопки: незавершённые задачи → `skipped`, ран →
-`failed`. Делается одним запросом в одной сессии на ран, а не вызовом кнопки
-`set_dag_run_state_to_failed` (`airflow/api/common/mark_tasks.py`). У того два дефекта,
-оба пойманы на сигме 24.09.2026:
-
-* ищет каждую задачу рана в текущем коде дага — у старого рана задачи, которых в коде уже
-  нет, дают `KeyError` (`reload_adapt_1_pers_static_data_daily`, ран от 05.05);
-* ставит `skipped` каждой задаче своей сессией. В таске пул соединений выключен, то есть
-  это новое подключение к метабазе на задачу; одно повисло на переборе хостов, и таск
-  упал по `execution_timeout`.
-
-На ран пишется
-заметка, в журнал `log` — событие `paused_run_failed`. **Паузу даг не снимает** и сами даги
-не трогает. Задачи в `scheduled` у таких ранов лежат внутри `running` и уходят в `skipped`;
-у рана своего состояния `scheduled` нет.
-
-| Параметр | Описание |
-|---|---|
-| `older_than_hours` | Порог возраста, ч *(default: `24`)* |
-| `states` | Какие раны брать *(default: `running`, `queued`)* |
-| `dag_id_like` | Фильтр `dag_id`, SQL `LIKE` (`CTL.%`); пусто — все *(default: пусто)* |
-| `close` | Закрывать найденное; иначе только отчёт *(default: `False`)* |
-| `max_runs` | Предохранитель: найдено больше — не закрываем ничего, таск красный *(default: `200`)* |
-| `schedule` | Расписание: cron или пресет, пусто — только вручную *(default: `0 * * * *`)* |
-| `save_params` | Записать форму в Variable `tools_paused_runs_cleanup_params` *(default: `False`)* |
-
-`close` сохраняемый: чтобы закрывали и плановые запуски, один раз запустить с `close` и
-`save_params`. До этого плановые запуски только считают.
-
-**Таски:** `params` → `collect` → `close`. Отчёт `collect` — заметкой на ран: даги, раны, возраст,
-задачи по состояниям и **кто поставил паузу** — последнее событие паузы в `log` (UI, API,
-CLI). Паузу из кода (`update_dag_pause` CTL, `is_paused_upon_creation`) журнал не пишет —
-тогда «нет записи».
-
-Даг создаётся на паузе: закрывающий инструмент не должен включиться сам после выкладки.
+Подробно: [tools/readme.md — paused_runs_cleanup](../../_plugin_dag_docs/?doc=tools/readme.md#paused_runs_cleanuppypaused_runs_cleanuppy)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -137,6 +89,7 @@ def classify(runs, tis, now, older_than_hours):
 
 @dag(
     doc_md=__doc__,
+    description='Зависшие раны запаузенных дагов: отчёт и, по галке, Mark failed',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
@@ -161,11 +114,12 @@ def classify(runs, tis, now, older_than_hours):
     params={
         'older_than_hours': Param(
             SAVED.get('older_than_hours', 24), type='integer', minimum=1, title='Старше, ч',
-            description='queued — от постановки в очередь, running — от последнего движения задач',
+            description='Порог возраста рана, ч: queued — от постановки в очередь, running — от последнего движения задач',
         ),
         'states': Param(
             SAVED.get('states', RUN_STATES), type='array', examples=RUN_STATES,
             items={'type': 'string', 'enum': RUN_STATES}, title='Состояния рана',
+            description='Какие раны брать: queued — возраст от постановки в очередь, running — от последнего движения задач',
         ),
         'dag_id_like': Param(
             SAVED.get('dag_id_like', ''), type=['string', 'null'], title='Фильтр dag_id',

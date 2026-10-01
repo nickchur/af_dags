@@ -1,49 +1,17 @@
 """###🛠️ Обслуживание бакета логов
-*2026-09-29 09:07 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Ежедневно создаёт бакет (если не существует), выставляет один срок хранения на весь бакет,
-убирает старое и считает статистику по папкам. Бакет берётся из `[logging]
-remote_base_log_folder`.
+Раз в сутки обслуживает весь бакет логов (`[logging] remote_base_log_folder`): создаёт его,
+если нет, ставит один срок хранения на весь бакет, удаляет старое обходом и считает
+статистику по папкам. Плагин здоровья: заполнение учётки S3 к квоте, доля старых объектов,
+неполный обход — `health_warn` / `health_errors`.
 
-**Один срок на весь бакет** — решение 25.09.2026. Бакет логов — общее хранилище того, что
-даги кладут «на память»: под префиксом логов только логи задач, в корне — `ctl/` (снимки
-загрузок CTL), `tfs/` (квитанции и очередь ТФС), `docs/` (документация дагов),
-`system_health/`, `dag_snapshots/`, дампы `pg_activity/` и `queue_cleanup/`. Своих сроков у
-папок нет. Что должно жить дольше срока, его владелец переписывает сам: `test_dags` освежает
-копию неизменившегося дага, `tools_mcp_skills` — документы. Неотправленное из `tfs/queue/`
-за срок уже не нужно.
+⚠️ Правило жизненного цикла хранилище исполняет само: уменьшили `days` — лишнее удалится без
+обхода и отчёта. Эксперимент с меньшим сроком — только с `dry_run=True`.
 
-Правило жизненного цикла ставится на корень (`DeleteAfter`), правила на папки от прошлых
-версий DAG-а (`{префикс}DeleteAfter`) снимаются. На правила не полагаемся: через
-корпоративный шлюз они раньше не работали (см. `tools/pg_activity.py`), поэтому уборка всё
-равно идёт обходом, а отчёт показывает, сколько объектов старше срока нашлось при обходе.
+**Таски:** `params` → `layout` → `sweep` → `report` → `health_warn` / `health_errors`.
 
-⚠️ **Правило работает само и асинхронно.** Уменьшили срок — хранилище удалит всё лишнее
-своим сканером, без обхода и без отчёта. Проверено на стенде 16.09.2026: прогон с `days=7`
-поставил правило, и MinIO сам убрал 23,5 тыс. объектов старше недели. Поэтому разовый
-эксперимент с меньшим сроком делайте с `dry_run=True`: он покажет, что будет удалено, и не
-станет ни менять правила, ни удалять.
-
-| Параметр | Описание |
-|---|---|
-| 📅 `days`        | Срок хранения всего бакета (дни, default: `120`; на деве — `30` через `save_params`) |
-| ♻️ `lifecycle`   | `True` — выставлять правило жизненного цикла *(default)* |
-| 🧪 `dry_run`     | `True` — ничего не удалять и правил не менять, только посчитать |
-| ⏱ `max_minutes` | Потолок обхода бакета (минуты, default: `30`) |
-| ⏰ `schedule`    | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `17 8 * * *`)* |
-| 💾 `save_params` | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
-
-Значения по умолчанию берутся из переменной `tools_log_cleanup_params`, если она задана,
-иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
-разовый эксперимент в UI ночное окно не двигает, а осознанная правка двигает, без выкладки.
-Новое расписание подхватывается со следующего парсинга DAG-а; негодное значение таск
-`params` не записывает (падает), а уже записанное битым — игнорируется в пользу кода.
-
-**Таски:**
-- **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
-- **layout** — создание бакета, правило на корень, снятие правил на папки
-- **sweep** — один обход бакета: статистика по папкам и удаление всего, что старше срока
-- **report** — таблица по папкам в заметку и сводка в XCom
+Подробно: [tools/readme.md — log_cleanup](../../_plugin_dag_docs/?doc=tools/readme.md#log_cleanuppylog_cleanuppy)
 """
 
 from datetime import datetime, timedelta, timezone
@@ -57,14 +25,16 @@ from airflow.decorators import task, dag
 from airflow.utils.trigger_rule import TriggerRule
 
 try:
-    from plugins.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
+    from plugins.s3_utils import s3_account_usage, s3_drop_ttl, s3_fill_check, s3_set_ttl  # type: ignore
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params_task, saved_schedule,
+        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, readable_size, saved_params,
+        store_params_task, saved_schedule,
     )
 except ImportError:
-    from CI06932748.tools.s3_utils import s3_drop_ttl, s3_set_ttl  # type: ignore
+    from CI06932748.tools.s3_utils import s3_account_usage, s3_drop_ttl, s3_fill_check, s3_set_ttl  # type: ignore
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, readable_size, saved_params, store_params_task, saved_schedule,
+        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, readable_size, saved_params,
+        store_params_task, saved_schedule,
     )
 
 logger = logging.getLogger("airflow.task")
@@ -82,6 +52,13 @@ BUCKET_NAME = _LOG_BASE.split("/")[0]
 # Префикс логов задач: при обходе он идёт последним — он на порядки больше остальных папок
 PREFIX = _LOG_BASE[len(BUCKET_NAME):].strip("/")
 PREFIX = f"{PREFIX}/" if PREFIX else ""
+
+# Отчёт плагина здоровья: прогон раз в сутки, плюс запас на поздний старт
+REPORT_TTL_SEC = 26 * 3600
+# Доля объектов старше срока, найденных обходом: warn / error. Обход каждый день убирает
+# примерно день из срока (1/120), правило — почти всё; больше — уборка не справляется
+TTL_WARN, TTL_ERROR = 0.1, 0.5
+CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
 
 
 def _get_paginator(bucket_name=BUCKET_NAME, page_size=1_000, prefix=PREFIX):
@@ -116,6 +93,36 @@ def _walk_order(roots: list) -> list:
     return sorted(roots, key=lambda name: (bool(PREFIX) and PREFIX.startswith(name), name))
 
 
+def bucket_checks(swept: dict, quota_gb: int = 0) -> dict:
+    """Вердикты здоровья бакета по итогам обхода: ``fill``, ``ttl``, ``sweep``.
+
+    ``fill`` — занятое всеми бакетами учётки к её квоте из заголовков хранилища, иначе к
+    ``quota_gb``; нет обеих — проверки нет. ``ttl`` — доля объектов старше срока среди осмотренных.
+    """
+    folders = swept['folders']
+    objects = sum(row['objects'] for row in folders.values())
+    walked = sum(row['bytes'] for row in folders.values())
+    over = sum(row['over_ttl'] for row in folders.values())
+    checks = {}
+
+    account = swept.get('account') or {'buckets': {swept.get('bucket', BUCKET_NAME): walked},
+                                        'full': not swept.get('partial')}
+    if fill := s3_fill_check(account, quota_gb):
+        checks['fill'] = fill
+
+    share = over / objects if objects else 0
+    status = 'error' if share > TTL_ERROR else 'warn' if share > TTL_WARN else 'healthy'
+    checks['ttl'] = {'status': status, 'summary': (
+        f"старше срока {swept.get('days')} дн. {over} из {objects} объектов ({share:.0%})"
+        + ('' if status == 'healthy' else
+           ": правило жизненного цикла не работает, а обход не успевает; сразу после уменьшения срока — разово"))}
+
+    checks['sweep'] = ({'status': 'warn', 'summary': 'обход не закончен по max_minutes: данные неполные'}
+                       if swept.get('partial') else
+                       {'status': 'healthy', 'summary': f'обход закончен, папок {len(folders)}'})
+    return checks
+
+
 # Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
 # рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
 # Механика повторяет db_cleanup.py; общее на два DAG-а — чтение переменной
@@ -138,13 +145,20 @@ params = {
         'days', 120,
         type='integer',
         minimum=1,
-        description='Срок хранения всего бакета (дни)',
+        description='Срок хранения всего бакета, дни. ⚠️ Уменьшение хранилище исполнит само по правилу — пробовать с dry_run',
     ),
     'max_minutes': _param(
         'max_minutes', 30,
         type='integer',
         minimum=1,
         description='Потолок обхода бакета (минуты): не уложились — отчёт скажет, что обход неполный',
+    ),
+    'quota_gb': _param(
+        'quota_gb', 0,
+        type='integer',
+        minimum=0,
+        description='Квота учётки S3 (ГБ) на все её бакеты, если хранилище её не отдаёт; '
+                    '0 — не задана, заполнение не проверяется',
     ),
     'dry_run': _param(
         'dry_run', False,
@@ -172,19 +186,26 @@ params = {
 
 @dag(
     doc_md=__doc__,
+    description='Бакет логов: срок хранения, удаление старого, статистика по папкам',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 2,
         'retry_delay': timedelta(seconds=30),
+        # Иначе вес по потомкам (у sweep — 4) против сотен у больших дагов: планировщик берёт из
+        # scheduled верхушку по весу и заканчивает цикл, как только в ней нашлось что запустить
+        # (scheduler_job_runner, is_done), и до чистильщика очередь не доходит. Сигма dev
+        # 01.10.2026: db_cleanup.clean полчаса в scheduled при пустом пуле. Как у соседей по пулу — 900
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
         # Обход сам укладывается в max_minutes (30); потолок — от зависшего запроса к S3
         'execution_timeout': timedelta(hours=2),
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2026, 1, 22, tzinfo=MSK),
     schedule=saved_schedule(SAVED, DEFAULT_SCHEDULE, PARAMS_VAR),
-    tags=['DataTools', 'tools', 'clean'],
+    tags=['DataTools', 'tools', 'clean', 'health'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
@@ -253,15 +274,13 @@ def tools_log_cleanup():
 
     @task
     def sweep(**context):
-        """🧹 Обход бакета: статистика по папкам верхнего уровня и удаление старше срока.
-
-        Обход один на всё: листинг и удаление за проход, а не два прохода подряд — на бакете
-        с сотнями тысяч объектов второй листинг стоит столько же, сколько первый (замер на
-        стенде 16.09.2026: MinIO отдавал около 100 объектов в секунду, 24 тысячи — четыре
-        минуты). Отсюда же потолок по времени: не уложились — отчёт скажет, что данные
-        неполные, а слот пула не держим до бесконечности. Объекты прямо в корне бакета (без
-        папки) не обходятся: наши даги так не пишут.
-        """
+        """🧹 Обход бакета: статистика по папкам верхнего уровня и удаление старше срока."""
+        # Обход один на всё: листинг и удаление за проход, а не два прохода подряд — на бакете
+        # с сотнями тысяч объектов второй листинг стоит столько же, сколько первый (замер на
+        # стенде 16.09.2026: MinIO отдавал около 100 объектов в секунду, 24 тысячи — четыре
+        # минуты). Отсюда же потолок по времени: не уложились — отчёт скажет, что данные
+        # неполные, а слот пула не держим до бесконечности. Объекты прямо в корне бакета (без
+        # папки) не обходятся: наши даги так не пишут.
         params = context['params']
         days = int(params['days'])
         now = datetime.now(timezone.utc)
@@ -273,8 +292,11 @@ def tools_log_cleanup():
         batch: list[str] = []
         partial = False
 
-        # По папкам верхнего уровня, логи задач последними: иначе до остальных не дойдёт бюджет
-        for walk in _walk_order(_roots(s3_hook)):
+        # По папкам верхнего уровня, логи задач последними: иначе до остальных не дойдёт бюджет.
+        # Как clean у db_cleanup: строка на папку сверху по мере обхода
+        walks = _walk_order(_roots(s3_hook))
+        for i, walk in enumerate(walks, 1):
+            started = time.monotonic()
             _, pages = _get_paginator(prefix=walk)
             for page in pages:
                 for obj in page.get("Contents") or []:
@@ -306,6 +328,12 @@ def tools_log_cleanup():
                     partial = True
                     logger.warning(f"⚠️ обход прерван по времени на `{walk}`")
                     break
+            row = stats.get(walk) or {'objects': 0, 'bytes': 0, 'over_ttl': 0, 'deleted': 0}
+            gone = row['over_ttl'] if params['dry_run'] else row['deleted']
+            add_note(f"{'⏱️' if partial else '✅'} `{walk}` ({i}/{len(walks)}): {row['objects']} объектов, "
+                     f"{readable_size(row['bytes'])}, {'к удалению' if params['dry_run'] else 'удалено'} {gone}, "
+                     f"{time.monotonic() - started:.0f} с" + (' — прерван по max_minutes' if partial else ''),
+                     context)
             if partial:
                 break
         if batch:
@@ -316,24 +344,28 @@ def tools_log_cleanup():
             row['newest'] = row['newest'].isoformat(timespec='seconds') if row['newest'] else None
         deleted = sum(row['deleted'] for row in stats.values())
         over = sum(row['over_ttl'] for row in stats.values())
+        log_bytes = sum(row['bytes'] - row['deleted_bytes'] for row in stats.values())
+        account = s3_account_usage(
+            AWS_CONN_ID, params['max_minutes'] if params.get('quota_gb') else 0,
+            known={BUCKET_NAME: (log_bytes, not partial)},
+            on_bucket=lambda name, size, sec: add_note(f"📦 `{name}`: {readable_size(size)}, {sec:.0f} с", context))
         head = f"Сухой прогон: удалить нужно {over}" if params['dry_run'] else f"Удалено {deleted} объектов"
-        add_note(f"{head}, папок осмотрено {len(stats)}", context)
+        add_note(f"{head}, папок осмотрено {len(stats)} из {len(walks)}", context, title='Обход')
         return {
             'bucket': BUCKET_NAME,
             'days': days,
             'dry_run': bool(params['dry_run']),
             'checked_at': now.isoformat(timespec='seconds'),
             'partial': partial,
+            'account': account,
             'folders': stats,
         }
 
     @task
     def report(swept: dict, **context):
-        """📋 Таблица по папкам в заметку, сводка — в XCom.
-
-        Важное первым: заметка режется по MAX_NOTE_LEN, и в хвост должны уходить самые
-        мелкие папки, а не итог.
-        """
+        """📋 Таблица по папкам в заметку, сводка — в XCom."""
+        # Важное первым: заметка режется по MAX_NOTE_LEN, и в хвост должны уходить самые
+        # мелкие папки, а не итог.
         folders = swept['folders']
         total_objects = sum(row['objects'] for row in folders.values())
         total_bytes = sum(row['bytes'] for row in folders.values())
@@ -362,9 +394,15 @@ def tools_log_cleanup():
             # шлюзе не работают, и бакет держит обход
             lines.insert(1, f"объектов старше срока при обходе: {over_ttl}")
         add_note("\n".join(lines), context, title='Бакет логов', level='task,DAG')
+        # Как у db_cleanup: строка на проверку сверху; с конца, чтобы главная — fill — была наверху
+        checks = bucket_checks(swept, context['params'].get('quota_gb') or 0)
+        for name, check in reversed(checks.items()):
+            add_note(f"{CHECK_ICON[check['status']]} **{name}** — {check['summary']}", context, level='Task')
+        push_health(checks, context)
         return {**swept, 'totals': {'objects': total_objects, 'bytes': total_bytes, 'deleted': deleted}}
 
-    report(save_params() >> ensure_layout() >> sweep())
+    report(save_params() >> ensure_layout() >> sweep()) >> health_tasks(
+        ttl_sec=REPORT_TTL_SEC, skill='tools-log-cleanup')
 
 
 tools_log_cleanup()

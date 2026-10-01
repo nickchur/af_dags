@@ -1,44 +1,20 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-09-29 09:09 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 19:13 MSK · v2.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
-Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
-Большие таблицы (> 50 000 строк) удаляются порциями: по первичному ключу, если индекса по
-дате нет, а `id` есть (`task_reschedule`, `task_fail`, `job`, celery-таблицы), иначе по
-диапазону дат. До v1.14 условие «ран старше cutoff» у задач сравнивало `dag_id` само с собой
-и пропускало всё, а `dag_code` не чистился вовсе — та же ошибка с `fileloc_hash`.
-Порядок таблиц строится по внешним ключам — ребёнок раньше родителя, иначе каскад
-(`ON DELETE CASCADE`) утягивает детей в транзакцию родителя и батч перестаёт работать.
+Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
+родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
+удаление остатков прерванного REINDEX. Таск `integrity` проверяет целостность метабазы
+(плагин здоровья: находки → `health_warn` / `health_errors`).
 
-| Параметр            | Описание                                                                                   |
-|---------------------|--------------------------------------------------------------------------------------------|
-| 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
-| 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
-| 🧹 `vacuum`         | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
-| ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 5 * * *`)* |
-| 💾 `save_params`    | `True` — сохранить параметры этого запуска как значения по умолчанию, `False` *(default)* |
+Вакуум, переиндексация и удаление остатков (галки `vacuum`, `reindex`, `drop_leftovers`) —
+только при админской учётке метабазы в Vault, иначе нет ни галок, ни тасков.
 
-🔁 **Переиндексации нет (v1.11).** `REINDEX` убран целиком — тяжёлая операция под админским
-коннектом, от которой отказались (решение 21.09.2026). Ключ `reindex`, если он остался в
-`tools_db_cleanup_params`, ничего не включает и уйдёт из переменной при следующей записи
-параметров (`save_params=True` с изменёнными значениями).
+**Таски:** `params` → `drop_leftovers` → `clean` → `vacuum` → `reindex` → `report`, `integrity` →
+`health_warn` / `health_errors`.
 
-Значения по умолчанию берутся из переменной `tools_db_cleanup_params`, если она задана,
-иначе из кода. Записывается переменная только запуском с `save_params=True` — то есть
-разовый эксперимент в UI расписание не меняет, а осознанная правка меняет, без выкладки.
+> `dry_run=False` по умолчанию — это реальное удаление.
 
-`schedule` — такой же сохраняемый параметр: сам запуск идёт по старому расписанию,
-новое подхватывается со следующего парсинга DAG-а. Негодное значение таск `params` не
-записывает (падает), а уже записанное битым — игнорируется на парсинге в пользу кода.
-
-**Таски:**
-- **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
-- **clean** — подсчёт и удаление по каждой таблице; заметка обновляется после каждой таблицы
-- **vacuum** — VACUUM ANALYZE по очищенным таблицам
-- **report** — отчёт по размерам схемы `main` с delta к предыдущему запуску
-
-> `dry_run=False` по умолчанию — реальное удаление. Для проверки установите `dry_run=True`.
+Подробно: [tools/readme.md — db_cleanup](../../_plugin_dag_docs/?doc=tools/readme.md#db_cleanuppydb_cleanuppy)
 """
 
 # Только то, что нужно на парсинге DAG (scheduler/dag-processor): декораторы,
@@ -56,12 +32,12 @@ import logging
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
+        TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, get_af_conn, on_callback, readable_size,
+        TOOLS_POOL, add_note, af_admin_available, ensure_pool, get_af_conn, health_tasks, on_callback, push_health, readable_size,
         saved_params, store_params_task, saved_schedule,
     )
 
@@ -329,6 +305,476 @@ def _fmt_ts(ts):
     return ts.strftime('%H:%M:%S') if ts else '—'
 
 
+# ── Целостность метабазы (таск integrity) ─────────────────────────────
+# Только чтение каталога и статистики PG: без блокировок таблиц, секунды. Повод — сигма dev
+# 01.10.2026: прерванный несколько раз REINDEX SCHEMA CONCURRENTLY оставил на dag_run 551 лишний
+# индекс на 4 ГБ, каждая запись в dag_run обновляла их все, и шедулер с карточкой Health стояли.
+# amcheck (bt_index_check) не берём: читает индексы целиком и требует CREATE EXTENSION.
+
+INTEGRITY_TIMEOUT_MS = 30_000
+# Остаток REINDEX CONCURRENTLY: _ccnew — недостроенная копия, _ccold — старый индекс после
+# подмены. Повторные REINDEX SCHEMA перестраивают и остатки, отсюда цепочки _ccold1_ccold_ccnew
+LEFTOVER_SQL = "c.relname ~ '_cc(new|old)[0-9]*$'"
+LEFTOVER_SUFFIX = r'(_cc(?:new|old)\d*)+$'
+# PG встаёт на защиту от переполнения счётчика транзакций у 2 млрд
+XID_WARN, XID_ERROR = 1_000_000_000, 1_500_000_000
+# job.id, log.id, celery_taskmeta.id в AF 2.11 — int4
+SEQ_WARN, SEQ_ERROR = 0.7, 0.9
+VACUUM_TABLES = ('dag_run', 'task_instance', 'job', 'log', 'xcom', 'celery_taskmeta')
+DEAD_SHARE, DEAD_MIN = 0.2, 100_000
+LONG_TX = '1 hour'
+# Возраст горизонта вакуума в транзакциях. Сигма dev 01.10.2026: физический слот реплики держал
+# xmin на 2,1 млн, вакуум не убирал старые версии строк task_instance, и проверка пула шла
+# 1,5 с вместо 1 мс — шаг шедулера 25–35 с вместо 3 с
+XMIN_WARN, XMIN_ERROR = 100_000, 1_000_000
+# reindex: индекс, похудевший меньше, в итоговую заметку отдельной строкой не попадает
+REINDEX_NOTE_MIN = 1024 ** 2
+# Логические слоты (CDC чужих систем читают метабазу; сигма dev 01.10.2026 — три source_*) держат
+# только catalog_xmin: вакуум каталога, не task_instance. Их риск — WAL, который мастер копит,
+# пока потребитель стоит. ponytail: порог в ГБ без знания размера диска; поднять, если шумит
+LOGICAL_WAL_WARN_GB, LOGICAL_WAL_ERROR_GB = 5, 20
+CHECK_ICON = {'healthy': '✅', 'warn': '⚠️', 'error': '❌'}
+# Заметка в AF 2 — 1000 символов (колонка метабазы); запас на заголовок
+NOTE_BUDGET = 900
+
+
+class Feed:
+    """Заметка таска одним проходом: строки хода сверху вниз, в конце итог — строкой над ними.
+
+    Таблиц нет: в 1000 символов заметки широкая таблица вытесняла строки (сигма dev 01.10.2026 —
+    reindex на 116 индексов обрывался на десятом). Не влезает — в ходе видны последние строки,
+    в итоге — те, что передал done(keep=…), и «ещё N».
+    """
+
+    def __init__(self, context, title):
+        self.context, self.title, self.lines = context, title, []
+
+    def line(self, text, replace_last=False):
+        if replace_last and self.lines:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
+        self._write('', self.lines, tail=True)
+
+    def done(self, summary, keep=None, rest=''):
+        self._write(summary, self.lines if keep is None else keep, tail=False, rest=rest)
+
+    def _write(self, head, lines, tail, rest=''):
+        budget = NOTE_BUDGET - len(self.title) - len(head) - len(rest) - 40
+        picked, size = [], 0
+        for ln in (reversed(lines) if tail else lines):
+            # +3: перенос и два пробела жёсткого переноса от add_note
+            if size + len(ln) + 3 > budget:
+                break
+            picked.append(ln)
+            size += len(ln) + 3
+        if tail:
+            picked.reverse()
+        cut = len(lines) - len(picked)
+        more = f'… ещё {cut}' if cut else ''
+        body = [head] if head else []
+        body += ([more] if tail and more else []) + picked + ([more] if not tail and more else [])
+        body += [rest] if rest else []
+        add_note('\n'.join(body), context=self.context, level='Task', add=False, title=self.title)
+
+
+def _catalog(sql, **bind):
+    """SELECT по каталогу метабазы с потолком на запрос."""
+    from airflow.utils.session import create_session
+
+    with create_session() as session:
+        session.execute(text(f"SET LOCAL statement_timeout = {INTEGRITY_TIMEOUT_MS}"))
+        return [dict(r) for r in session.execute(text(sql), bind).mappings()]
+
+
+def _run_check(fn):
+    """Одна проверка; упала сама — error с причиной, таймаут метабазы — warn."""
+    ts = time.time()
+    try:
+        result = fn()
+    except Exception as exc:
+        logger.warning(f"{fn.__name__}: проверка упала", exc_info=True)
+        if type(getattr(exc, 'orig', None)).__name__ == 'QueryCanceled':
+            result = {'status': 'warn',
+                      'summary': f'метабаза не ответила за {INTEGRITY_TIMEOUT_MS // 1000} с'}
+        else:
+            result = {'status': 'error', 'summary': f'проверка упала: {type(exc).__name__}: {str(exc)[:200]}'}
+    result['sec'] = round(time.time() - ts, 2)
+    return result
+
+
+def check_indexes():
+    """Остатки прерванного REINDEX — error; невалидные и дубли — warn."""
+    rows = _catalog(f"""
+        SELECT t.relname AS tbl, c.relname AS idx, i.indisvalid AND i.indisready AS valid,
+               pg_relation_size(c.oid) AS bytes, {LEFTOVER_SQL} AS leftover
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main'
+    """)
+    leftovers, by_table = [r for r in rows if r['leftover']], {}
+    for r in leftovers:
+        cnt, size = by_table.get(r['tbl'], (0, 0))
+        by_table[r['tbl']] = (cnt + 1, size + r['bytes'])
+    invalid = [f"{r['tbl']}.{r['idx']}" for r in rows if not r['valid'] and not r['leftover']]
+    # Дубли — одинаковые колонки, классы операторов, выражения и условие; остатки не в счёт
+    dups = _catalog(f"""
+        SELECT t.relname AS tbl, string_agg(c.relname, ', ' ORDER BY c.relname) AS idx
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND NOT ({LEFTOVER_SQL})
+        GROUP BY t.relname, i.indrelid, i.indkey::text, i.indclass::text,
+                 coalesce(pg_get_expr(i.indexprs, i.indrelid), ''),
+                 coalesce(pg_get_expr(i.indpred, i.indrelid), '')
+        HAVING count(*) > 1
+    """)
+    parts = []
+    if by_table:
+        parts.append('остатки прерванного REINDEX: ' + ', '.join(
+            f'{t} {n} шт. ({readable_size(b)})' for t, (n, b) in sorted(by_table.items(), key=lambda x: -x[1][1])))
+    if invalid:
+        parts.append(f"невалидные: {', '.join(invalid[:10])}")
+    if dups:
+        parts.append('дубли: ' + '; '.join(f"{d['tbl']}: {d['idx']}" for d in dups[:10]))
+    status = 'error' if by_table else 'warn' if invalid or dups else 'healthy'
+    return {'status': status,
+            'summary': ' · '.join(parts) or f'{len(rows)} индексов, остатков, невалидных и дублей нет',
+            'leftovers': [r['idx'] for r in leftovers], 'invalid': invalid,
+            'duplicates': [d['idx'] for d in dups]}
+
+
+def check_wraparound():
+    """Возраст самой старой незамороженной транзакции базы и таблиц main."""
+    db_age = _catalog("SELECT age(datfrozenxid) AS age FROM pg_database WHERE datname = current_database()")[0]['age']
+    top = _catalog("""
+        SELECT c.relname AS tbl, age(c.relfrozenxid) AS age
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND c.relkind IN ('r', 't', 'm')
+        ORDER BY age(c.relfrozenxid) DESC LIMIT 3
+    """)
+    status = 'error' if db_age > XID_ERROR else 'warn' if db_age > XID_WARN else 'healthy'
+    return {'status': status,
+            'summary': f"возраст базы {db_age / 1e6:.0f} млн из 2000 млн; старше всех: "
+                       + ', '.join(f"{r['tbl']} {r['age'] / 1e6:.0f} млн" for r in top),
+            'age': db_age}
+
+
+def check_sequences():
+    """Доля израсходованного у последовательностей main: int4 кончается на 2,1 млрд."""
+    rows = _catalog("""
+        SELECT sequencename AS seq, last_value, max_value
+        FROM pg_sequences WHERE schemaname = 'main' AND last_value IS NOT NULL
+    """)
+    used = sorted(((r['last_value'] / r['max_value'], r['seq']) for r in rows), reverse=True)
+    worst = used[0][0] if used else 0
+    status = 'error' if worst > SEQ_ERROR else 'warn' if worst > SEQ_WARN else 'healthy'
+    return {'status': status,
+            'summary': (f"{len(rows)} последовательностей, больше всех: "
+                        + ', '.join(f'{s} {share:.1%}' for share, s in used[:3])) if used
+                       else 'последовательностей с last_value нет (или нет прав их видеть)'}
+
+
+def check_vacuum():
+    """Мёртвые строки ключевых таблиц: автовакуум не успевает."""
+    rows = _catalog("""
+        SELECT relname AS tbl, n_live_tup AS live, n_dead_tup AS dead,
+               greatest(last_vacuum, last_autovacuum) AS last_vac
+        FROM pg_stat_user_tables WHERE schemaname = 'main' AND relname = ANY(:t)
+    """, t=list(VACUUM_TABLES))
+    bad = [r for r in rows if r['dead'] > DEAD_MIN and r['dead'] > DEAD_SHARE * ((r['live'] or 0) + r['dead'])]
+    return {'status': 'warn' if bad else 'healthy',
+            'summary': ('мёртвых строк много: ' + ', '.join(
+                f"{r['tbl']} {readable_size(r['dead'], base=1000)} из "
+                f"{readable_size(r['live'] + r['dead'], base=1000)}, вакуум {r['last_vac'] or 'не было'}"
+                for r in bad)) if bad else f'{len(rows)} таблиц, автовакуум успевает'}
+
+
+def check_long_tx():
+    """Транзакции старше часа держат вакуум всей базы. Чужие сессии без pg_read_all_stats не видны."""
+    rows = _catalog(f"""
+        SELECT pid, usename, state, date_trunc('second', now() - xact_start) AS dur, left(query, 80) AS q
+        FROM pg_stat_activity
+        WHERE datname = current_database() AND backend_type = 'client backend'
+          AND xact_start < now() - interval '{LONG_TX}' AND pid <> pg_backend_pid()
+        ORDER BY xact_start LIMIT 5
+    """)
+    return {'status': 'warn' if rows else 'healthy',
+            'summary': ('транзакции дольше часа: ' + '; '.join(
+                f"pid {r['pid']} {r['usename']} {r['state']} {r['dur']}: {r['q']}" for r in rows))
+                       if rows else 'транзакций дольше часа нет'}
+
+
+def check_xmin_horizon():
+    """Кто держит горизонт вакуума таблиц: физические слоты реплик (с hot_standby_feedback — и
+    запросы на реплике) и сессии самой базы. Логические слоты — в check_logical_slots."""
+    rows = _catalog("""
+        SELECT 'слот ' || slot_name AS who, greatest(age(xmin), age(catalog_xmin)) AS age
+        FROM pg_replication_slots
+        WHERE slot_type = 'physical' AND (xmin IS NOT NULL OR catalog_xmin IS NOT NULL)
+        UNION ALL
+        SELECT 'pid ' || pid || coalesce(' ' || nullif(application_name, ''), ''), age(backend_xmin)
+        FROM pg_stat_activity WHERE backend_xmin IS NOT NULL AND pid <> pg_backend_pid()
+        ORDER BY 2 DESC LIMIT 3
+    """)
+    worst = rows[0]['age'] if rows else 0
+    status = 'error' if worst > XMIN_ERROR else 'warn' if worst > XMIN_WARN else 'healthy'
+    return {'status': status,
+            'summary': ('старше всех: ' + ', '.join(f"{r['who']} {r['age']:,}".replace(',', ' ') for r in rows)
+                        + (' транзакций — вакуум не убирает версии строк новее, индексы метабазы тяжелеют'
+                           if status != 'healthy' else ' транзакций'))
+                       if rows else 'горизонт никто не держит'}
+
+
+
+def check_logical_slots():
+    """Логические слоты: сколько WAL держат на мастере и стоит ли потребитель."""
+    rows = _catalog("""
+        SELECT slot_name, active, age(catalog_xmin) AS age,
+               pg_wal_lsn_diff(CASE WHEN pg_is_in_recovery() THEN pg_last_wal_replay_lsn()
+                                    ELSE pg_current_wal_lsn() END, restart_lsn) AS wal
+        FROM pg_replication_slots WHERE slot_type = 'logical'
+        ORDER BY wal DESC NULLS LAST
+    """)
+    if not rows:
+        return {'status': 'healthy', 'summary': 'логических слотов нет'}
+    gb = 1024 ** 3
+    worst = max(r['wal'] or 0 for r in rows) / gb
+    idle = [r['slot_name'] for r in rows if not r['active']]
+    status = ('error' if worst > LOGICAL_WAL_ERROR_GB
+              else 'warn' if worst > LOGICAL_WAL_WARN_GB or idle else 'healthy')
+    parts = [f"{r['slot_name']}{'' if r['active'] else ' (не подключён)'}: WAL {readable_size(r['wal'] or 0)}, "
+             f"catalog_xmin {format(r['age'] or 0, ',').replace(',', ' ')}" for r in rows[:3]]
+    return {'status': status,
+            'summary': '; '.join(parts) + (' — мастер копит WAL, пока потребитель не дочитает: к владельцу слота / DBA'
+                                           if status != 'healthy' else '')}
+
+
+def check_constraints():
+    """Ограничения, заведённые NOT VALID и не проверенные: данные могут их нарушать."""
+    rows = _catalog("""
+        SELECT conrelid::regclass::text AS tbl, conname
+        FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace
+        WHERE n.nspname = 'main' AND NOT c.convalidated
+    """)
+    return {'status': 'warn' if rows else 'healthy',
+            'summary': ('не проверены: ' + ', '.join(f"{r['tbl']}.{r['conname']}" for r in rows))
+                       if rows else 'все ограничения проверены'}
+
+
+INTEGRITY_CHECKS = (check_indexes, check_wraparound, check_sequences, check_vacuum, check_long_tx, check_xmin_horizon,
+                    check_logical_slots, check_constraints)
+
+
+def owner_problem(cur, tables=None):
+    """Чего не хватает учётке коннекта для работы с таблицами main; None — всё в порядке.
+
+    Ключи в Vault не говорят о правах: VACUUM, ANALYZE и REINDEX не владельца PG 16
+    пропускает с WARNING «permission denied … skipping it» без ошибки (проверено на стенде
+    01.10.2026 временной ролью), поэтому права проверяются до первой команды.
+    """
+    cur.execute("""
+        SELECT current_user, coalesce((SELECT rolsuper FROM pg_roles WHERE rolname = current_user), false),
+               coalesce(array_agg(c.relname ORDER BY c.relname)
+                        FILTER (WHERE NOT pg_has_role(current_user, c.relowner, 'MEMBER')), '{}')
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND c.relkind = 'r' AND (%(t)s::text[] IS NULL OR c.relname = ANY(%(t)s))
+    """, {'t': list(tables) if tables else None})
+    user, superuser, foreign = cur.fetchone()
+    if superuser or not foreign:
+        return None
+    return f"учётка {user} не владеет таблицами: {', '.join(foreign[:10])}" + (' и другими' if len(foreign) > 10 else '')
+
+
+def af_owner_problem(tables=None):
+    """owner_problem() на коннекте get_af_conn() — том, под которым пойдёт работа."""
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    try:
+        with conn.cursor() as cur:
+            return owner_problem(cur, tables)
+    finally:
+        conn.close()
+
+
+# Переиндексация: каждый индекс своей командой, от меньших к большим. Обрыв посреди
+# REINDEX SCHEMA CONCURRENTLY на сигме dev (01.10.2026) оставил 551 остаток на dag_run; по
+# одному индексу обрыв оставляет одну копию, и её убираем сразу. Порядок по размеру: за
+# бюджет успевает больше индексов, а недоделанными остаются немногие крупные — их видно
+REINDEX_BUDGET_SEC = 3 * 3600  # execution_timeout 4 ч: после бюджета новые не начинаем
+REINDEX_STATEMENT_TIMEOUT = '1h'
+
+
+def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
+    """REINDEX INDEX CONCURRENTLY по каждому индексу main, кроме остатков.
+
+    Returns: (done, failed, left) или строка — причина не начинать (нет прав).
+    Отказ индекса убирает его недостроенную копию (*_ccnew) сразу же, а не вышло — ещё раз в
+    конце; остальные индексы той же таблицы после отказа не начинаются (в left).
+    """
+    import re
+    from psycopg2 import sql as psql
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    rows = _catalog(f"""
+        SELECT t.relname AS tbl, c.relname AS idx, pg_relation_size(c.oid) AS bytes
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid
+        JOIN pg_class t ON t.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND NOT ({LEFTOVER_SQL})
+        ORDER BY pg_relation_size(c.oid), c.relname
+    """)
+    size_sql = ("SELECT c.relname, pg_relation_size(c.oid) FROM pg_class c "
+                "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'main' AND c.relkind = 'i' AND c.relname LIKE %s")
+    done, failed, left = [], [], []
+    started = time.monotonic()
+
+    def drop(cur, names):
+        """Удалить копии; вернуть те, что удалить не вышло."""
+        kept = []
+        for name in names:
+            try:
+                cur.execute(psql.SQL('DROP INDEX CONCURRENTLY IF EXISTS main.{}').format(psql.Identifier(name)))
+            except Exception as exc:
+                logger.warning(f"{name}: копию пока не удалить: {exc}")
+                kept.append(name)
+        return kept
+
+    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            problem = owner_problem(cur, sorted({r['tbl'] for r in rows}))
+            if problem:
+                return problem
+            cur.execute("SET lock_timeout = '30s'")
+            cur.execute(f"SET statement_timeout = '{REINDEX_STATEMENT_TIMEOUT}'")
+            blocked = set()  # таблицы с отказом: следующий индекс там оставил бы ещё одну копию
+            for r in rows:
+                if time.monotonic() - started > budget_sec or r['tbl'] in blocked:
+                    left.append(r)
+                    continue
+                ts = time.monotonic()
+                try:
+                    cur.execute(psql.SQL('REINDEX INDEX CONCURRENTLY main.{}').format(psql.Identifier(r['idx'])))
+                    cur.execute(size_sql, (r['idx'],))
+                    after = dict(cur.fetchall()).get(r['idx'])
+                    done.append({**r, 'after': after, 'sec': round(time.monotonic() - ts, 1)})
+                    if on_step:
+                        on_step(done[-1], None)
+                except Exception as exc:
+                    # Своя недостроенная копия: <idx>_ccnew[N]. ponytail: имя длиннее 63 символов
+                    # PG усекает — такую копию не узнаем, её найдёт integrity
+                    cur.execute(size_sql, (r['idx'] + '\\_ccnew%',))
+                    mine = [n for n, _ in cur.fetchall() if re.fullmatch(re.escape(r['idx']) + r'_ccnew\d*', n)]
+                    kept = drop(cur, mine)
+                    failed.append({**r, 'error': str(exc).strip()[:160], 'kept': kept,
+                                   'dropped': [n for n in mine if n not in kept]})
+                    blocked.add(r['tbl'])
+                    logger.warning(f"❌ {r['idx']}: {exc}")
+                    if on_step:
+                        on_step(failed[-1], failed[-1]['error'])
+            # Копию, которую не дал удалить тот же блокирующий (стенд: DROP CONCURRENTLY ждёт ту же
+            # транзакцию и падает по lock_timeout), пробуем ещё раз в конце — блокировка могла уйти
+            for r in failed:
+                if r['kept']:
+                    still = drop(cur, r['kept'])
+                    r['dropped'] += [n for n in r['kept'] if n not in still]
+                    r['kept'] = still
+    finally:
+        conn.close()
+    logger.info(f"🔁 переиндексировано {len(done)}, отказов {len(failed)}, не успели {len(left)}")
+    return done, failed, left
+
+
+# Остатки удаляются одной командой без CONCURRENTLY: каталог и файлы, секунды на все. Ей нужна
+# эксклюзивная блокировка таблиц, и пока она ждёт, остальные запросы к ним стоят за ней — поэтому
+# ждём недолго и повторяем. CONCURRENTLY по одному на сигме dev (01.10.2026) шёл 2 мин на индекс:
+# каждый дважды ждёт конца всех транзакций по dag_run, 551 остаток — это 18 ч
+DROP_LOCK_TIMEOUT = '3s'
+DROP_TRIES, DROP_PAUSE_SEC = 20, 15
+
+
+def drop_leftovers(names):
+    """DROP INDEX остатков REINDEX одной командой — только тех, у кого исходный индекс есть и валиден.
+
+    Под коннектом владельца (get_af_conn): у штатного пользователя Airflow прав нет. Не взяли
+    блокировку за ``DROP_LOCK_TIMEOUT`` — пауза и повтор, до ``DROP_TRIES`` раз. Команда упала по
+    другой причине (индекс держит ограничение) — по одному, чтобы назвать виновного; это строка
+    в итоге, а не падение.
+    """
+    import re
+    from psycopg2 import errors as pg_errors, sql as psql
+    from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+
+    valid = {r['idx'] for r in _catalog("""
+        SELECT c.relname AS idx FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'main' AND i.indisvalid AND i.indisready
+    """)}
+    todo, done, kept = [], [], []
+    for name in names:
+        base = re.sub(LEFTOVER_SUFFIX, '', name)
+        if base == name or base not in valid:
+            kept.append(f'{name}: исходного {base} нет или он невалиден')
+        else:
+            todo.append(name)
+    if not todo:
+        return done, kept
+    conn = PostgresHook(postgres_conn_id=get_af_conn()).get_conn()
+    try:
+        conn.autocommit = True
+        with conn.cursor() as cur:
+            problem = owner_problem(cur)
+            if problem:
+                return [], kept + [f'не выполнено: {problem}']
+            cur.execute(f"SET lock_timeout = '{DROP_LOCK_TIMEOUT}'")
+            cur.execute("SET statement_timeout = '10min'")
+
+            def drop(batch):
+                """None — удалены; иначе причина. lock — не взяли блокировку ни разу."""
+                stmt = psql.SQL('DROP INDEX IF EXISTS {}').format(
+                    psql.SQL(', ').join(psql.Identifier('main', n) for n in batch))
+                for attempt in range(1, DROP_TRIES + 1):
+                    try:
+                        cur.execute(stmt)
+                        return None
+                    except pg_errors.LockNotAvailable:
+                        logger.info(f"🧹 {len(batch)} шт.: блокировка не взята за {DROP_LOCK_TIMEOUT}, "
+                                    f"попытка {attempt}/{DROP_TRIES}")
+                        if attempt < DROP_TRIES:
+                            time.sleep(DROP_PAUSE_SEC)
+                    except Exception as exc:
+                        return str(exc).strip()[:120]
+                return f'lock: блокировку не взяли за {DROP_TRIES} попыток по {DROP_LOCK_TIMEOUT}'
+
+            started = time.monotonic()
+            error = drop(todo)
+            if error is None:
+                done = todo
+            elif error.startswith('lock:'):
+                kept += [f'{n}: {error[6:]}' for n in todo]
+            else:
+                logger.warning(f"🧹 одной командой не вышло ({error}) — по одному")
+                for name in todo:
+                    error = drop([name])
+                    if error is None:
+                        done.append(name)
+                    else:
+                        kept.append(f"{name}: {error.removeprefix('lock: ')}")
+            logger.info(f"🧹 остатков удалено {len(done)} за {time.monotonic() - started:.1f} с")
+    finally:
+        conn.close()
+    logger.info(f"🧹 остатков удалено {len(done)}, оставлено {len(kept)}")
+    return done, kept
+
+
 # Значения по умолчанию для формы запуска: код задаёт запасной вариант, переменная —
 # рабочий. Пишет переменную только запуск с save_params=True, см. таск params.
 PARAMS_VAR = 'tools_db_cleanup_params'
@@ -343,6 +789,14 @@ def _param(key, default, **kwargs):
 # 05:00 MSK: cron в зоне start_date, как у соседних дагов (до 29.09.2026 — UTC, '0 2 * * *')
 DEFAULT_SCHEDULE = '0 5 * * *'
 MSK = timezone(timedelta(hours=3))
+ONE_SHOT = ('drop_leftovers', 'reindex')
+# Строка хода удаления остатков в заметке integrity — не чаще (как NOTE_EVERY_SEC у clean)
+# Админская учётка метабазы в Vault (get_af_conn). Без неё VACUUM, REINDEX и удаление индексов
+# невозможны — ни задач, ни параметров для них не создаём: спрашивать о том, что даг сделать
+# не может, незачем. Права самой учётки проверяет таск перед работой (owner_problem)
+ADMIN = af_admin_available()
+# Плагин здоровья (тег health): сутки плюс два часа на опоздание ночного прогона
+REPORT_TTL_SEC = 26 * 3600
 
 
 
@@ -356,12 +810,7 @@ params = {
     'dry_run': _param(
         'dry_run', False,
         type='boolean',
-        description='True — только подсчёт, False — реальное удаление',
-    ),
-    'vacuum': _param(
-        'vacuum', True,
-        type='boolean',
-        description='True — VACUUM ANALYZE, False — пропустить',
+        description='True — только подсчёт в clean, False — реальное удаление. На vacuum, reindex и drop_leftovers не влияет',
     ),
     'custom': _param(
         'custom', False,
@@ -391,22 +840,52 @@ params = {
         description='True — сохранить параметры этого запуска как значения по умолчанию',
     ),
 }
+if ADMIN:
+    params.update({
+        'vacuum': _param(
+            'vacuum', True,
+            type='boolean',
+            description='True — VACUUM ANALYZE очищенных таблиц, False — пропустить',
+        ),
+        # Разовые: из кода, не из SAVED, и в ONE_SHOT — ключ reindex: true, оставшийся в
+        # Variable от v1.10, их не включит (так 18.09.2026 «выключенный» реиндекс запускался)
+        'reindex': Param(
+            False,
+            type='boolean',
+            description='True — перестроить индексы main по одному (REINDEX INDEX CONCURRENTLY), '
+                        'от меньших к большим. Разовая: в Variable не сохраняется',
+        ),
+        'drop_leftovers': Param(
+            False,
+            type='boolean',
+            description='True — удалить остатки прерванного REINDEX (индексы *_ccnew/*_ccold), '
+                        'у которых исходный индекс есть и валиден. Разовая: в Variable не сохраняется',
+        ),
+    })
 
 
 @dag(
     doc_md=__doc__,
+    description='Чистка метабазы Airflow по сроку хранения; вакуум, переиндексация и проверки целостности по галкам',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',
         'pool': TOOLS_POOL,
         'retries': 0,
+        # Иначе вес по потомкам (у clean — 7) против сотен у больших дагов: планировщик берёт из
+        # scheduled верхушку по весу и заканчивает цикл, как только в ней нашлось что запустить
+        # (scheduler_job_runner, is_done), и до чистильщика очередь не доходит. Сигма dev
+        # 01.10.2026: clean полчаса в scheduled при пустом пуле. Как у соседей по пулу — 900
+        'priority_weight': 900,
+        'weight_rule': 'absolute',
         # Потолок от зависания на блокировке, а не от медленной чистки: VACUUM по таблице
         # сам ограничен часом (db_vacuum), удаление идёт порциями
         'execution_timeout': timedelta(hours=4),
         'on_failure_callback': on_callback,
     },
     start_date=datetime(2025, 8, 7, tzinfo=MSK),
-    tags=['DataTools', 'tools', 'clean'],
+    # Тег health — роль: таск integrity даёт вердикт, get_system_health читает отчёт
+    tags=['DataTools', 'tools', 'clean', 'health'],
     catchup=False,
     is_paused_upon_creation=True,
     max_active_runs=1,
@@ -420,12 +899,13 @@ def tools_db_cleanup():
     @task(task_id='params')
     def save_params(**context):
         """💾 Сохраняет параметры запуска в переменную как значения по умолчанию."""
-        return store_params_task(PARAMS_VAR, SAVED, context)
+        return store_params_task(PARAMS_VAR, SAVED, context, one_shot=ONE_SHOT)
 
     # NONE_FAILED, а не дефолтный ALL_SUCCESS: params штатно пропускает себя при
     # save_params=False, а пропуск апстрима по ALL_SUCCESS утягивает в skip всю цепочку
     @task(task_id='clean', trigger_rule=TriggerRule.NONE_FAILED)
     def clean(**context):
+        """Удаляет записи метабазы старше `retention_days` (при `dry_run` только считает); отдаёт список таблиц для vacuum."""
         from airflow.exceptions import AirflowFailException
         from airflow.utils.db_cleanup import config_dict as _cleanup_config
         from airflow.utils.session import create_session
@@ -574,18 +1054,6 @@ def tools_db_cleanup():
             return {'count': count, 'min_date': min_date, 'max_date': max_date,
                     'idx': idx, 'batches': batches}
 
-        def _note_rows(res):
-            return [
-                f"|{t}|{readable_size(r['count'], base=1000)}"
-                f"|{_fmt_date(r['min_date'])}"
-                f"|{r['idx']}"
-                f"|{r.get('duration', '')}|"
-                for t, r in res.items()
-            ]
-
-        HDR = ['|Таблица|Строк|Min|Idx|Время|',
-               '|-|-|-|-|-|']
-
         custom = p.get('custom', False)
         table_names = list(_cleanup_config.keys()) + (list(_CUSTOM_TABLES.keys()) if custom else [])
         try:
@@ -598,19 +1066,25 @@ def tools_db_cleanup():
         results = {}
         mode = '🔍 dry_run' if dry_run else '🗑️ удалено'
         _ts_total = time.time()
+        n = len(table_names)
+        # Заметка дописывается сверху строкой на таблицу, а не переписывается таблицей целиком:
+        # свежее — наверху, ход чистки виден, итоговая таблица ложится сверху в конце.
+        # Внутри долгой таблицы — строка хода не чаще раза в NOTE_EVERY_SEC, и она заменяет
+        # прошлую строку хода той же таблицы: порций бывают сотни
+        NOTE_EVERY_SEC = 300
+        last_note = {'at': time.time(), 'progress': False}
+        feed = Feed(context, f'🗑️ clean ({mode}, {retention_days}d)')
 
         for i, tbl in enumerate(table_names, 1):
             _ts = time.time()
 
             def _on_batch(done, total, count, min_date, idx, _tbl=tbl, _i=i):
-                elapsed = round(time.time() - _ts_total, 2)
-                cur = {'count': count, 'min_date': min_date, 'idx': idx,
-                       'duration': f'{done}/{total}'}
-                subtotal = sum(r['count'] for r in results.values()) + count
-                prog = f"|*{_i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
-                add_note('\n'.join(HDR + _note_rows(results) + _note_rows({_tbl: cur}) + [prog]),
-                         context=context, level='Task',
-                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+                if time.time() - last_note['at'] < NOTE_EVERY_SEC:
+                    return
+                last_note['at'] = time.time()
+                feed.line(f"⏳ {_tbl} ({_i}/{n}): порция {done}/{total}, {readable_size(count, base=1000)} строк, "
+                          f"{round(time.time() - _ts, 1)} с", replace_last=last_note['progress'])
+                last_note['progress'] = True
 
             try:
                 with create_session() as session:
@@ -619,12 +1093,8 @@ def tools_db_cleanup():
                 logger.warning(f"⚠️ {tbl}: {e}")
                 results[tbl] = {'count': 0, 'min_date': None, 'idx': '⚠️',
                                  'duration': str(e)[:40], 'batches': 0}
-                elapsed = round(time.time() - _ts_total, 2)
-                subtotal = sum(r['count'] for r in results.values())
-                prog = f"|*{i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
-                add_note('\n'.join(HDR + _note_rows(results) + [prog]),
-                         context=context, level='Task',
-                         title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+                feed.line(f"⚠️ {tbl} ({i}/{n}): {str(e)[:120]}", replace_last=last_note['progress'])
+                last_note.update(at=time.time(), progress=False)
                 continue
             info['duration'] = round(time.time() - _ts, 2)
             results[tbl] = info
@@ -634,21 +1104,18 @@ def tools_db_cleanup():
                 f"idx={info['idx']} batches={info['batches']} {info['duration']}s"
             )
 
-            subtotal = sum(r['count'] for r in results.values())
-            elapsed = round(time.time() - _ts_total, 2)
-            progress = f"|*{i}/{len(table_names)}*|*{readable_size(subtotal, base=1000)}*|||*{elapsed}*|"
-            add_note('\n'.join(HDR + _note_rows(results) + [progress]),
-                     context=context, level='Task',
-                     title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+            feed.line(f"✅ {tbl} ({i}/{n}): {readable_size(info['count'], base=1000)} строк, {info['duration']} с",
+                      replace_last=last_note['progress'])
+            last_note.update(at=time.time(), progress=False)
 
         duration = round(time.time() - _ts_total, 2)
 
         if results:
             total = sum(r['count'] for r in results.values())
-            footer = f"|**Итого**|**{readable_size(total, base=1000)}**|||**{duration}**|"
-            lines = HDR + _note_rows(results) + [footer]
-            add_note('\n'.join(lines), context=context, level='Task',
-                     title=f'🗑️ clean ({mode}, {retention_days}d)', add=False)
+            # В итоге — только таблицы, где что-то было: пустые не интересны
+            feed.done(f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}'
+                      f' ⏱ {duration}s',
+                      keep=[ln for ln in feed.lines if not ln.startswith('✅') or ': 0 строк' not in ln])
             add_note(
                 f'{mode} {readable_size(total, base=1000)} строк | cutoff: {cutoff.strftime("%Y-%m-%d")}'
                 f' ⏱ {duration}s',
@@ -664,6 +1131,7 @@ def tools_db_cleanup():
 
     @task(task_id='vacuum', trigger_rule=TriggerRule.ALL_DONE)
     def vacuum(**context):
+        """VACUUM ANALYZE таблиц, которые чистил `clean`, под админской учёткой."""
         from airflow.exceptions import AirflowSkipException
 
         p = context['params']
@@ -674,27 +1142,34 @@ def tools_db_cleanup():
         tables = context['ti'].xcom_pull(task_ids='clean') or []
         if not tables:
             raise AirflowSkipException('нет таблиц из clean')
-        before = db_stats(tables)
         # Штатный пользователь Airflow не владеет таблицами main и VACUUM их молча
-        # пропускает — идём админским коннектом из Vault.
+        # пропускает — идём админским коннектом из Vault, проверив его права заранее
+        problem = af_owner_problem(tables)
+        if problem:
+            add_note(problem, context=context, level='DAG,Task', title='🧹 vacuum ☮️')
+            raise AirflowSkipException(problem)
+        before = db_stats(tables)
         conn_id = get_af_conn()
 
         results, skipped = [], []
-        for tbl in tables:
+        n = len(tables)
+        # Как у clean: строка на таблицу — ход виден, пока идёт вакуум (до 15 мин на таблицу);
+        # в конце строки с мёртвыми до/после и итог над ними
+        feed = Feed(context, '🧹 vacuum')
+        for i, tbl in enumerate(tables, 1):
             _ts = time.time()
+            icon, why = '✅', ''
             try:
                 db_vacuum(tbl, conn_id, full=False, timeout=timeout)
             except AirflowSkipException as e:
                 logger.warning(f"☮️ {tbl}: {e}")
-                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'☮️ {str(e)[:60]}'})
-                continue
+                icon, why = '☮️', str(e)[:60]
             except Exception as e:
                 logger.warning(f"⚠️ {tbl}: {e}")
-                skipped.append({'table': tbl, 'duration': round(time.time() - _ts, 2),
-                                'status': f'❌ {str(e)[:60]}'})
-                continue
-            results.append({'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': '✅'})
+                icon, why = '❌', str(e)[:60]
+            row = {'table': tbl, 'duration': round(time.time() - _ts, 2), 'status': f'{icon} {why}'.strip()}
+            (results if icon == '✅' else skipped).append(row)
+            feed.line(f"{icon} {tbl} ({i}/{n}): {row['duration']} с" + (f" — {why}" if why else ''))
 
         if not results and not skipped:
             add_note('нет таблиц для вакуума', context=context, level='DAG,Task', title='🧹 vacuum')
@@ -713,22 +1188,17 @@ def tools_db_cleanup():
             r['last_vacuum'] = _fmt_ts(last_vac)
             logger.info(f"🔎 {r['table']}: мёртвых {r['dead']} | last_vacuum={last_vac}")
 
-        lines = [
-            '| Таблица | Время, с | Мёртвых | last_vacuum | Статус |',
-            '|---------|---------|---------|-------------|--------|',
-        ] + [
-            f"| `{r['table']}` | {r['duration']} | {r['dead']} | {r['last_vacuum']} | {r['status']} |"
-            for r in results + skipped
-        ]
         total = round(sum(r['duration'] for r in results + skipped), 2)
-        lines.append(f"| **Итого** | **{total} с** | | | **{len(results)}/{len(tables)}** |")
-        add_note('\n'.join(lines), context=context, level='Task', title='🧹 vacuum')
-        add_note(f'{len(results)}/{len(tables)} таблиц за {total} с'
-                 + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''),
-                 context=context, level='DAG', title='🧹 vacuum')
+        summary = (f'{len(results)}/{len(tables)} таблиц за {total} с'
+                   + (f' | ☮️ пропущено {len(skipped)}' if skipped else ''))
+        feed.done(summary, keep=[f"{r['status'][:2].strip()} {r['table']}: {r['duration']} с, мёртвых {r['dead']}"
+                                 + (f" — {r['status'][2:].strip()}" if r['status'][2:].strip() else '')
+                                 for r in skipped + results])
+        add_note(summary, context=context, level='DAG', title='🧹 vacuum')
 
     @task(task_id='report', trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
+        """Сводка рана: сколько удалено по таблицам, сравнение с прошлым запуском."""
         from airflow.models import DagRun, XCom
         from airflow.utils.session import create_session
 
@@ -778,17 +1248,9 @@ def tools_db_cleanup():
                 'dead_rows':  readable_size(dead or 0, base=1000),
             })
 
-        lines = [
-            '|Таблица|Current|Δ|Записей|Удалённых|',
-            '|-|-|-|-|-|',
-        ] + [
-            f"|{r['table']}|{r['after']}|{r['delta']}|{r['live_rows']}|{r['dead_rows']}|"
-            for r in data
-        ]
-
-        report_md = '\n'.join(lines)
-        logger.info(f"📊 Отчёт по схеме main:\n{report_md}")
-        add_note(report_md, context=context, level='Task', title='📊 Схема main')
+        lines = [f"{r['table']}: {r['after']}" + (f" ({r['delta']})" if r['delta'] else '')
+                 + f", записей {r['live_rows']}, мёртвых {r['dead_rows']}" for r in data]
+        logger.info("📊 Отчёт по схеме main:\n" + '\n'.join(lines))
 
         total_after = sum(r[1] or 0 for r in rows)
         total_live  = sum(r[2] or 0 for r in rows)
@@ -801,20 +1263,119 @@ def tools_db_cleanup():
         else:
             delta_str  = '—'
             before_str = '—'
-        summary = (
-            f"| Таблиц | Last | Current | Δ | Записей | Удалённых |\n"
-            f"|--------|-----|-------|---|---------|----------|\n"
-            f"| {readable_size(len(rows), base=1000)}"
-            f" | {before_str}"
-            f" | {readable_size(total_after)}"
-            f" | {delta_str}"
-            f" | {readable_size(total_live, base=1000)}"
-            f" | {readable_size(total_dead, base=1000)} |"
-        )
+        summary = (f"{len(rows)} таблиц: {before_str} → {readable_size(total_after)} ({delta_str}), "
+                   f"записей {readable_size(total_live, base=1000)}, мёртвых {readable_size(total_dead, base=1000)}")
+        # Таблицы — от крупных: в 1000 символов заметки влезают главные
+        Feed(context, '📊 Схема main').done(summary, keep=lines)
+        if not ADMIN:
+            summary += ('\n\n☮️ Админской учётки метабазы в Vault нет: вакуум, переиндексация и '
+                        'удаление остатков не создаются — статистику ведёт автовакуум')
         add_note(summary, context=context, level='DAG', title='📊 Схема main')
 
         return data
 
-    save_params() >> clean() >> vacuum() >> report()
+    @task(task_id='integrity', trigger_rule=TriggerRule.ALL_DONE)
+    def integrity(**context):
+        """🩺 Целостность метабазы: индексы, wraparound, последовательности, вакуум, транзакции."""
+        # Как у clean и vacuum: строка на проверку по мере выполнения, в конце итог над ними —
+        # сначала находки, потом здоровые
+        feed = Feed(context, '🩺 integrity')
+        checks = {}
+        for fn in INTEGRITY_CHECKS:
+            name = fn.__name__.removeprefix('check_')
+            c = checks[name] = _run_check(fn)
+            feed.line(f"{CHECK_ICON[c['status']]} {name} ({c['sec']} с) — {c['summary']}")
+        hint = ''
+        if checks['indexes'].get('leftovers'):
+            hint = ('Удалить остатки: ручной запуск с галкой `drop_leftovers` — отдельный таск в начале '
+                         'рана, исходные индексы проверяются перед удалением' if ADMIN else
+                         'Удалить остатки — вручную одной командой `DROP INDEX` с `lock_timeout`: админской учётки '
+                         'метабазы в Vault нет, галки `drop_leftovers` в форме нет')
+        bad = [n for n, c in checks.items() if c['status'] != 'healthy']
+        feed.done(f"{len(checks) - len(bad)}/{len(checks)} в порядке" + (f", находки: {', '.join(bad)}" if bad else ''),
+                  keep=sorted(feed.lines, key=lambda ln: ln.startswith('✅')), rest=hint)
+        push_health({n: {k: v for k, v in c.items() if k in ('status', 'summary', 'sec')}
+                     for n, c in checks.items()}, context)
+        return {n: c['status'] for n, c in checks.items()}
+
+    # Первым после params: с остатками каждая запись в таблицу и VACUUM обновляют все лишние
+    # индексы (сигма dev 01.10.2026 — 551 на dag_run, шаг шедулера 35 с), а перестройка рядом с
+    # чужим *_ccnew назвала бы свою копию *_ccnew1. dry_run галку не отменяет: она явная,
+    # а dry_run про строки clean (так же у reindex с v2.9)
+    @task(task_id='drop_leftovers', trigger_rule=TriggerRule.NONE_FAILED)
+    def drop_leftovers_task(**context):
+        """🩹 Остатки прерванного REINDEX — только по разовой галке, до тяжёлых тасков."""
+        from airflow.exceptions import AirflowSkipException
+
+        if not context['params'].get('drop_leftovers'):
+            raise AirflowSkipException('галка drop_leftovers не стоит')
+        leftovers = _run_check(check_indexes).get('leftovers') or []
+        if not leftovers:
+            add_note('🩹 остатков прерванного REINDEX нет', context=context, level='Task')
+            return {'done': 0, 'kept': 0}
+        started = time.time()
+        done, kept = drop_leftovers(leftovers)
+        add_note(f'🧹 остатков удалено {len(done)}, оставлено {len(kept)}, {time.time() - started:.0f} с'
+                 + ''.join(f'\n- {k}' for k in kept[:20]), context=context, level='Task', title='🩹 drop_leftovers')
+        return {'done': len(done), 'kept': len(kept)}
+
+    @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
+    def reindex(**context):
+        """🔁 Переиндексация по одному индексу — только по разовой галке; dry_run её не отменяет."""
+        from airflow.exceptions import AirflowFailException, AirflowSkipException
+
+        p = context['params']
+        if not p.get('reindex'):
+            raise AirflowSkipException('галка reindex не стоит')
+        feed = Feed(context, '🔁 reindex')
+
+        def step(r, error):
+            # Как у clean и vacuum: строка на индекс по ходу, в конце итог над главными строками
+            feed.line(f"{'❌' if error else '✅'} {r['idx']} ({r['tbl']}): "
+                      + (error[:100] if error else f"{readable_size(r['bytes'])} → "
+                         f"{readable_size(r['after']) if r['after'] is not None else '—'}, {r['sec']} с"))
+
+        res = reindex_one_by_one(on_step=step)
+        if isinstance(res, str):
+            add_note(res, context=context, level='DAG,Task', title='🔁 reindex ☮️')
+            raise AirflowSkipException(res)
+        done, failed, left = res
+        # В итоге — отказы и индексы, похудевшие от REINDEX_NOTE_MIN, крупные первыми;
+        # мелочь (8 КБ → 8 КБ) одной строкой «ещё N»
+        lines = [f"❌ {r['idx']} ({r['tbl']}): {r['error'][:100]}"
+                 + (f"; копия удалена: {', '.join(r['dropped'])}" if r['dropped'] else '')
+                 + (f"; копия осталась: {', '.join(r['kept'])}" if r['kept'] else '') for r in failed]
+        gained = sorted((r for r in done if r['bytes'] - (r['after'] or r['bytes']) >= REINDEX_NOTE_MIN),
+                        key=lambda r: r['bytes'] - (r['after'] or r['bytes']), reverse=True)
+        lines += [f"✅ {r['idx']} ({r['tbl']}): {readable_size(r['bytes'])} → {readable_size(r['after'])}, "
+                  f"{r['sec']} с" for r in gained]
+        rest = (f"остальные {len(done) - len(gained)} — меньше {readable_size(REINDEX_NOTE_MIN)} разницы"
+                if len(done) > len(gained) else '')
+        if left:
+            rest += (f"\n⏱️ не начаты (бюджет {REINDEX_BUDGET_SEC // 3600} ч или отказ на таблице): {len(left)}, "
+                     "крупнейшие — " + ', '.join(f"{r['idx']} ({readable_size(r['bytes'])})" for r in left[-3:]))
+        saved = sum(r['bytes'] - (r['after'] or r['bytes']) for r in done)
+        summary = (f"перестроено {len(done)}, освобождено {readable_size(max(saved, 0))}"
+                   + (f", отказов {len(failed)}" if failed else '') + (f", не начаты {len(left)}" if left else ''))
+        feed.done(summary, keep=lines, rest=rest.strip())
+        add_note(summary, context=context, level='DAG', title='🔁 reindex')
+        if failed:
+            raise AirflowFailException(f"отказов {len(failed)}: " + ', '.join(r['idx'] for r in failed))
+        return summary
+
+    params_done = save_params()
+    tail = clean()
+    if ADMIN:
+        params_done >> drop_leftovers_task() >> tail
+    else:
+        params_done >> tail
+    if ADMIN:
+        # integrity — после переиндексации: иначе приняла бы копию идущей перестройки за
+        # остаток, а копию от убитой по таймауту — поймает
+        vacuumed, reindexed = vacuum(), reindex()
+        tail >> vacuumed >> reindexed
+        tail = reindexed
+    tail >> report()
+    tail >> integrity() >> health_tasks(ttl_sec=REPORT_TTL_SEC, skill='tools-db-cleanup')
 
 tools_db_cleanup()

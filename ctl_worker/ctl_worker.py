@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-30 09:25 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -16,6 +16,8 @@
 воркфлоу выполняется ожидание, а код результата берётся из профиля — `ok`, `ok-no` или
 `ok-no-error`. Параметр воркфлоу из CTL режим не включает. Потоки с префиксами из
 `test_real` (по умолчанию отчёты `pc1080.mail_`, `pc1080.check_`) выполняются по-настоящему.
+
+Подробно: [ctl_worker/readme.md — ctl_worker](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_workerpy--рабочий-процесс-загрузки)
 """
 # Airflow 2.10.1
 
@@ -599,26 +601,25 @@ def build_worker_dag(w):
         # on_success_callback=on_callback,
         params=wf_params,
         doc_md=doc_md, 
+        description=f"Воркфлоу CTL {wf_name}: run_prm → run_exe → run_val → run_sts → run_end",
         **conf, 
     ) as dag:
 
 
         @task(pool='ctl_pool', retries=0) #   execution_timeout=prm_task_to,  retries=0: POST /loading неидемпотентен — ретрай создаёт дубль loading_id
         def run_prm(wf, params=None, **context):
-            """### Инициализация параметров и создание загрузки
-
-            - Обрабатывает триггер (событие, время, ручной запуск).
-            - Формирует `params` с учётом retry, времени и типа запуска.
-            - Создаёт новую загрузку в CTL через `/v4/api/wf/{wid}/loading`.
-            - Обновляет статус на `RUNNING`.
-
-            **XCom Output:** `params` — полный набор параметров для следующих задач.
-
-            **Особенности:**
-            - Поддерживает `scheduleAfterStart` — перевод в режим расписания
-              (в режиме `af` не передаётся: расписаниями владеет Airflow).
-            - Автоматически удаляет расписание, если `!singleLoading`.
-            """
+            """Инициализация параметров и создание загрузки"""
+            # - Обрабатывает триггер (событие, время, ручной запуск).
+            # - Формирует `params` с учётом retry, времени и типа запуска.
+            # - Создаёт новую загрузку в CTL через `/v4/api/wf/{wid}/loading`.
+            # - Обновляет статус на `RUNNING`.
+            #
+            # **XCom Output:** `params` — полный набор параметров для следующих задач.
+            #
+            # **Особенности:**
+            # - Поддерживает `scheduleAfterStart` — перевод в режим расписания
+            #   (в режиме `af` не передаётся: расписаниями владеет Airflow).
+            # - Автоматически удаляет расписание, если `!singleLoading`.
             chk_any_conn('ctl')
             ti = context['task_instance']
             set_pause(wf['name'], wf['category'])
@@ -787,7 +788,7 @@ def build_worker_dag(w):
             # statement_timeout — общий потолок задачи заранее не посчитать
             @task(pool='gp_pool', execution_timeout=None)
             def run_tfs(wf, **context):
-                """### Загрузка файлов из TFS"""
+                """Загрузка файлов из TFS"""
                 from pathlib import Path
                 
                 ti = context['task_instance']
@@ -917,24 +918,22 @@ def build_worker_dag(w):
         # он обязан быть ниже execution_timeout — лестница timeout_ladder это держит.
         @task(pool='gp_pool', retries=1, execution_timeout=exe_timeout + EXE_MARGIN)
         def run_exe(wf, **context):
-            """### Выполнение бизнес-логики в Greenplum
-
-            Повторная попытка ETL не запускает: она спрашивает журнал Greenplum, не
-            выполнилась ли загрузка в прошлый раз, и отдаёт найденный ответ. Не нашла —
-            падает, оставляя повтор за CTL.
-
-            - Запускает SQL-процедуру через `gp_exe`.
-            - Возвращает результат:
-            - `res`: код (положительный — успех, ноль — нет данных, отрицательный — ошибка).
-            - `msg`: сообщение.
-            - `cdc`, `hub`, `stat`, `html` — опциональные метрики.
-
-            **XCom Output:** `result` — словарь с результатом выполнения.
-
-            **Особенности:**
-            - Использует `PostgresHook` для подключения к Greenplum.
-            - Логирует PID и время начала.
-            """     
+            """Выполнение бизнес-логики в Greenplum"""
+            # Повторная попытка ETL не запускает: она спрашивает журнал Greenplum, не
+            # выполнилась ли загрузка в прошлый раз, и отдаёт найденный ответ. Не нашла —
+            # падает, оставляя повтор за CTL.
+            #
+            # - Запускает SQL-процедуру через `gp_exe`.
+            # - Возвращает результат:
+            # - `res`: код (положительный — успех, ноль — нет данных, отрицательный — ошибка).
+            # - `msg`: сообщение.
+            # - `cdc`, `hub`, `stat`, `html` — опциональные метрики.
+            #
+            # **XCom Output:** `result` — словарь с результатом выполнения.
+            #
+            # **Особенности:**
+            # - Использует `PostgresHook` для подключения к Greenplum.
+            # - Логирует PID и время начала.
             chk_any_conn('gp')
             ti = context['task_instance']
             wf_prm = get_params(context)
@@ -1054,6 +1053,7 @@ def build_worker_dag(w):
             # короткие служебные запросы, и занимать их публикацией датасета незачем.
             @task(outlets=[ DatasetAlias(f"TFS/{profile}/{wf_tfs_out}") ],)
             def run_out(wf, **context):
+                """Публикует Dataset `TFS/<профиль>/<wf_tfs_out>` для выгрузки в ТФС."""
                 pass
 
         outlets = [DatasetAlias(f"CTL/{profile}/{e}") for e in w_eids]
@@ -1061,6 +1061,7 @@ def build_worker_dag(w):
         # быстрее — пока run_end стоит в очереди ctl_pool, загрузка висит в RUNNING
         @task(outlets=outlets, priority_weight=900)
         def run_end(wf, **context):
+            """Закрывает загрузку в CTL по результату `run_exe` и публикует Dataset-ы сущностей."""
             ti = context['task_instance']
             chk_any_conn('ctl')
             wf_prm = get_params(context)

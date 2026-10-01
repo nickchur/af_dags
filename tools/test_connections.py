@@ -1,39 +1,14 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-09-30 09:50 MSK · v3.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:18 MSK · v3.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
-Автоматизированный аудит и тестирование всех подключений из secret backend.
-Ежедневно в 23:15 MSK. Первый таск `collect` снимает список подключений из secret backend
-(и обновляет Variable `local_connections` для выпадающих списков kafka-подключений), дальше в
-mapped-таск `check` проверяет подключения этого списка — экземпляр на подключение, в сетке
-подписан «группа · `conn_id`». Состав проверок всегда свежий: парсинг файла
-Variable не читает. До 29.09.2026 список снимал отдельный даг `tools_show_connections`.
+Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
+(и обновляет Variable `local_connections`), mapped `check` — по экземпляру на подключение,
+`report` — таблица ✅/❌/☮️ в заметке. Упало важное (`critical`) — ❌, ран красный;
+вспомогательное — ⚠️, ран зелёный.
 
-| Группа | Условие (conn_id / type) | Описание проверки |
-|---|---|---|
-| **tfs** | `tfs` в ID **и** тип `aws` | Проверка S3-бакетов через `list_buckets()` |
-| **s3** | тип `aws` (без tfs) | Проверка прав доступа к объектному хранилищу |
-| **postgres** | тип `postgres` | `SELECT current_user, current_database()` |
-| **ctl** | тип `http`, `ctl*` или FQDN | Вызов `GET /v5/api/info` (Kerberos Auth) |
-| **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
-| **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
-| **trino** | тип `trino` | Валидация сессии через `TrinoHook`; нерезолвящийся хост → `☮️` |
-| **redis** | тип `redis` | Проверка доступности через `redis.Redis(...).ping()` |
-| **other** | прочие | Помечаются символом `☮️` (пропуск) |
+**Таски:** `params` → `collect` → `check` (mapped) → `report` → `health_warn` / `health_errors`.
 
-**Особенности:**
-- **Группы**: набор задан в коде (таблица выше). Флаги `skip_<группа>` (`skip_kafka`, …,
-  секция «Пропуск групп»): подключения группы не проверяются (☮️, не ошибка); сохраняются с
-  `save_params`.
-  Не снялся список (`collect` упал) — ❌ `health_errors`, проверять было нечего.
-- **Изоляция**: Сбой одного коннекта не влияет на проверку остальных.
-- **Отчетность**: таск `report` формирует Markdown-таблицу со всеми статусами (⭐ — важное) в заметке рана.
-- **Важные и вспомогательные**: параметр `critical` — шаблоны `conn_id` (fnmatch), по умолчанию
-  `airflowdb`, `ctl`, `s3` и подключение бакета логов; сохраняется с `save_params`. Упавшее
-  подключение роняет свой таск, но ран краснеет (❌ `health_errors`, уведомление) только из-за
-  важного; вспомогательное — ⚠️ `health_warn`, ран зелёный. Отчёт плагина здоровья пишет
-  `health_errors`.
-- **Проверка сериализации DAG'ов** вынесена в отдельный DAG `tools_test_dags`
-  (`tools/test_dags.py`) — она ждёт парсинга файлов и живёт по своим часам.
+Подробно: [tools/readme.md — test_connections](../../_plugin_dag_docs/?doc=tools/readme.md#test_connectionspytest_connectionspy)
 """
 
 from fnmatch import fnmatch
@@ -262,6 +237,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 
 @dag(
     doc_md=__doc__,
+    description='Проверка всех подключений из secret backend: важные красят ран, остальные — предупреждение',
     default_args={
         "owner": "DataLab (CI02420667)",
         "pool": TOOLS_POOL,
@@ -388,12 +364,13 @@ def tools_test_connections():  # noqa: PLR0915
             raise AirflowSkipException(msg)
         return _run_test(item["conn_id"], item["conn_type"], **context)
 
-    checks = check.expand(item=collect())
+    checks = check.override(doc_md=check.function.__doc__).expand(item=collect())
 
 
     # --- Summary ---
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):  # noqa: PLR0915
+        """Сводка проверок: таблица по группам и причины падений."""
         from airflow.models import TaskInstance
         from airflow.utils.session import create_session
 

@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка подключений CTL
-*2026-09-30 09:25 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:02 MSK · v1.4 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Непрерывный сенсор (каждую минуту, `reschedule`) — проверяет доступность всех соединений из `get_config()['conns']`.
 Поддерживает типы: `Postgres`, `S3`, `KerberosHttp`.
@@ -14,6 +14,8 @@
 `timeout`, и `soft_fail` делает из этого skipped. Состояние задачи о здоровье подключения не
 говорит: сбой виден в заметке `chk_*` (❌) и в обнулённом пуле подключения.
 Красный ран — только `dagrun_timeout`: ран не уложился в отведённое время.
+
+Подробно: [ctl_worker/readme.md — ctl_test_conn](../../_plugin_dag_docs/?doc=ctl_worker/readme.md#ctl_test_connpy--мониторинг-подключений)
 """
 
 from datetime import timedelta, datetime, timezone
