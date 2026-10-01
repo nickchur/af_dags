@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 16:15 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:27 MSK · v2.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -15,7 +15,7 @@
 | 📅 `retention_days` | Хранить записи не старше N дней *(default: `180` = 6 мес, минимум 30)*                    |
 | 🔍 `dry_run`        | `True` — только подсчёт без удаления, `False` — реальное удаление *(default)*             |
 | 🧹 `vacuum` ¹       | `True` — VACUUM ANALYZE после очистки *(default)*, `False` — пропустить                   |
-| 🔁 `reindex` ¹      | Разовая: перестроить индексы `main` по одному, от меньших к большим; не при `dry_run`, не сохраняется *(default: `False`)* |
+| 🔁 `reindex` ¹      | Разовая: перестроить индексы `main` по одному, от меньших к большим; `dry_run` её не отменяет, не сохраняется *(default: `False`)* |
 | 🩹 `drop_leftovers` ¹ | Разовая: удалить остатки прерванного REINDEX (`*_ccnew`/`*_ccold`), у которых исходный индекс есть и валиден; не сохраняется *(default: `False`)* |
 | ➕ `custom`     | `True` — включить `dag_code` и `dag_pickle`, `False` — только стандартные *(default)*     |
 | ⏰ `schedule`      | Расписание DAG-а: cron или пресет `@daily`, пусто — только вручную *(default: `0 5 * * *`)* |
@@ -848,7 +848,7 @@ if ADMIN:
             False,
             type='boolean',
             description='True — перестроить индексы main по одному (REINDEX INDEX CONCURRENTLY), '
-                        'от меньших к большим; не при dry_run',
+                        'от меньших к большим; dry_run не отменяет',
         ),
         'drop_leftovers': Param(
             False,
@@ -1323,7 +1323,7 @@ def tools_db_cleanup():
     # Первым после params: с остатками каждая запись в таблицу и VACUUM обновляют все лишние
     # индексы (сигма dev 01.10.2026 — 551 на dag_run, шаг шедулера 35 с), а перестройка рядом с
     # чужим *_ccnew назвала бы свою копию *_ccnew1. dry_run галку не отменяет: она явная,
-    # а dry_run про строки clean
+    # а dry_run про строки clean (так же у reindex с v2.9)
     @task(task_id='drop_leftovers', trigger_rule=TriggerRule.NONE_FAILED)
     def drop_leftovers_task(**context):
         """🩹 Остатки прерванного REINDEX — только по разовой галке, до тяжёлых тасков."""
@@ -1343,14 +1343,12 @@ def tools_db_cleanup():
 
     @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
     def reindex(**context):
-        """🔁 Переиндексация по одному индексу — только по разовой галке и не при dry_run."""
+        """🔁 Переиндексация по одному индексу — только по разовой галке; dry_run её не отменяет."""
         from airflow.exceptions import AirflowFailException, AirflowSkipException
 
         p = context['params']
         if not p.get('reindex'):
             raise AirflowSkipException('галка reindex не стоит')
-        if p.get('dry_run'):
-            raise AirflowSkipException('dry_run — индексы не перестраиваем')
         total = {'n': 0}
 
         def step(r, error):
