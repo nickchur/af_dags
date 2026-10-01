@@ -1,17 +1,7 @@
 """### 🛠️ Загрузка контента в S3
-*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает текстовый контент в S3 из параметров запуска DAG.
-
-| Параметр        | Описание                                                   |
-|-----------------|------------------------------------------------------------|
-| 📡 `s3_conn_id`  | ID подключения к S3 (тип `aws`)                            |
-| 📋 `bucket_name` | Имя бакета                                                 |
-| 🔑 `s3_key`      | Путь / ключ объекта в S3                                   |
-| 📝 `content`     | Список строк или base64-текст; `{{empty}}` → пустая строка |
-| 🗜️ `compress`    | Сжатие: `none` \| `gz` \| `zip`                            |
-| 🔄 `replace`     | Перезаписать если существует *(default: `False`)*          |
-| ✅ `done_file`   | Создать пустой `<s3_key>.done` после загрузки *(default: `False`)* |
 
 ---
 
@@ -79,9 +69,9 @@ s3_conns=get_conns_by_type(conn_type='aws')
     max_active_tasks=1,
     schedule_interval=None,
     params={
-        "s3_conn_id": Param('s3', type="string", examples=s3_conns),
-        "bucket_name": Param('', type="string",),
-        "s3_key": Param('', type="string",),
+        "s3_conn_id": Param('s3', type="string", examples=s3_conns, description='S3-подключение (тип aws)'),
+        "bucket_name": Param('', type="string", description='Бакет'),
+        "s3_key": Param('', type="string", description='Ключ объекта; для zip — путь архива и имя файла внутри (см. описание дага)'),
         "content": Param([],
             title="content",
             type=["array", "null"],

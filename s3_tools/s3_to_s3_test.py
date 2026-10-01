@@ -1,20 +1,8 @@
 """### 🔍 DAG: Копирование/перемещение файлов S3 → S3
-*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Находит файлы по маске и копирует (или перемещает) их в целевой бакет.
 
-| Параметр | Описание |
-|---|---|
-| `src_path` | `conn_id://bucket/prefix/mask` |
-| `dst_path` | `conn_id://bucket/prefix/` |
-| `compress` | Сжать при копировании |
-| `unzip` | Распаковать ZIP перед копированием |
-| `done` | Создать `.done`-файл в dst после копирования |
-| `timestamp` | Добавить метку времени к имени файла |
-| `copy` | Копировать файл *(default: `True`)* |
-| `delete` | Удалить источник после копирования |
-| `max_items` | Макс. количество файлов (default: `25`) |
-| `reverse` | Сортировка от новых к старым |
 """
 
 from datetime import datetime, timedelta, timezone
@@ -62,15 +50,15 @@ for conn in get_conns_by_type(conn_type='aws'):
     render_template_as_native_obj=True,
     on_failure_callback=on_callback,
     params={
-        'src_path': Param('', type='string', examples=[s + ('*.*' if not s.endswith('//') else '') for s in s3_list]),
-        'dst_path': Param('', type='string', examples=s3_list),
+        'src_path': Param('', type='string', examples=[s + ('*.*' if not s.endswith('//') else '') for s in s3_list], description='conn_id://bucket/prefix/mask'),
+        'dst_path': Param('', type='string', examples=s3_list, description='conn_id://bucket/prefix/'),
         'compress': Param(False, type='boolean', description='Сжать при копировании'),
         'unzip': Param(False, type='boolean', description='Распаковать ZIP перед копированием'),
         'done': Param(False, type='boolean', description='Создать .done-файл после копирования'),
         'timestamp': Param(False, type='boolean', description='Добавить метку времени к имени файла'),
         'copy': Param(True, type='boolean', description='Копировать файл'),
         'delete': Param(False, type='boolean', description='Удалить источник после копирования'),
-        'max_items': Param(MAX_ITEMS, type='integer', minimum=1, maximum=1000),
+        'max_items': Param(MAX_ITEMS, type='integer', minimum=1, maximum=1000, description='Сколько файлов взять, не больше'),
         'reverse': Param(True, type='boolean', description='Сортировка от новых к старым'),
     },
 )

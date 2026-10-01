@@ -1,18 +1,8 @@
 """### 👁️ DAG: Просмотр файлов S3
-*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список объектов по маске, сортирует и читает содержимое файлов (txt, gz, zip).
 
-| Параметр | Описание |
-|---|---|
-| `aws_conn_id` | ID подключения к S3 |
-| `prefix` | `bucket/prefix/mask` (поддерживает `*`, `?`) |
-| `order_by` | Сортировка: `None` \| `Key` \| `Date` \| `Size` \| `Name` \| `Ext` |
-| `reverse` | Обратный порядок сортировки *(default: `True`)* |
-| `items` | Количество файлов для чтения (default: `10`) |
-| `rows` | Количество строк превью на файл (default: `300`) |
-| `page_size` | Размер страницы пагинации (default: `1000`) |
-| `max_items` | Макс. кол-во объектов при сканировании (default: `10000`) |
 """
 
 from datetime import datetime, timedelta, timezone
@@ -60,14 +50,14 @@ def _split_mask(full_path):
     on_failure_callback=on_callback,
     on_success_callback=on_callback,
     params={
-        'aws_conn_id': Param('s3', type='string', enum=get_conns_by_type(conn_type='aws'), title='ID подключения'),
-        'prefix': Param('dataplatform-monitoring/dataplatform-etl/*.log.gz', type=['string', 'null'], title='bucket/prefix/mask'),
-        'order_by': Param('Date', type='string', enum=['None', 'Key', 'Date', 'Size', 'Name', 'Ext']),
-        'reverse': Param(True, type='boolean'),
-        'items': Param(10, type='integer', minimum=1, maximum=100),
-        'rows': Param(300, type='integer', minimum=1, maximum=1000),
-        'page_size': Param(1000, type='integer', minimum=1, maximum=1000),
-        'max_items': Param(10000, type='integer', minimum=1, maximum=100000),
+        'aws_conn_id': Param('s3', type='string', enum=get_conns_by_type(conn_type='aws'), title='ID подключения', description='S3-подключение'),
+        'prefix': Param('dataplatform-monitoring/dataplatform-etl/*.log.gz', type=['string', 'null'], title='bucket/prefix/mask', description='bucket/prefix/mask; в маске работают * и ?'),
+        'order_by': Param('Date', type='string', enum=['None', 'Key', 'Date', 'Size', 'Name', 'Ext'], description='Сортировка списка'),
+        'reverse': Param(True, type='boolean', description='Обратный порядок сортировки'),
+        'items': Param(10, type='integer', minimum=1, maximum=100, description='Сколько файлов прочитать'),
+        'rows': Param(300, type='integer', minimum=1, maximum=1000, description='Сколько строк превью на файл'),
+        'page_size': Param(1000, type='integer', minimum=1, maximum=1000, description='Размер страницы листинга'),
+        'max_items': Param(10000, type='integer', minimum=1, maximum=100000, description='Потолок объектов при сканировании'),
     },
 )
 def tools_s3_check_logs():

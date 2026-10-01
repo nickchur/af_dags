@@ -1,14 +1,8 @@
 """### ⏱️ DAG: Управление TTL правилами S3
-*2026-10-01 17:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 18:21 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Просматривает, устанавливает или удаляет правила жизненного цикла (TTL) объектов в S3-бакете.
 
-| Параметр | Описание |
-|---|---|
-| `conn` | `conn_id/bucket` (из доступных S3-соединений) |
-| `prefix` | Префикс объектов для правила TTL |
-| `days` | Срок жизни объектов в днях (default: `30`) |
-| `drop` | Удалить все правила TTL *(default: `False`)* |
 """
 
 from datetime import datetime, timedelta, timezone
@@ -51,10 +45,10 @@ s3_list = [
     on_failure_callback=on_callback,
     on_success_callback=on_callback,
     params={
-        'conn': Param('s3', type='string', enum=s3_list, title='conn_id/bucket'),
-        'prefix': Param('', type=['string', 'null']),
-        'days': Param(30, type='integer', minimum=0, maximum=1000, title='TTL days'),
-        'drop': Param(False, type='boolean', title='Drop all rules'),
+        'conn': Param('s3', type='string', enum=s3_list, title='conn_id/bucket', description='conn_id/bucket из доступных S3-подключений'),
+        'prefix': Param('', type=['string', 'null'], description='Префикс объектов, на который ставится правило'),
+        'days': Param(30, type='integer', minimum=0, maximum=1000, title='TTL days', description='Срок жизни объектов, дни'),
+        'drop': Param(False, type='boolean', title='Drop all rules', description='Удалить все правила TTL бакета'),
     },
 )
 def tools_s3_set_ttl():
