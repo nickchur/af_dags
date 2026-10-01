@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 14:44 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 15:10 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Удаляет устаревшие записи из метабазы Airflow прямыми SQL-запросами (без CTAS-архивирования).
 Для таблиц, связанных с `dag_run`, используются существующие индексы через косвенные условия.
@@ -45,10 +45,11 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 новое подхватывается со следующего парсинга DAG-а. Негодное значение таск `params` не
 записывает (падает), а уже записанное битым — игнорируется на парсинге в пользу кода.
 
-**Таски:** `params` → `clean` → `vacuum` → `reindex` → `report` и `integrity` →
+**Таски:** `params` → `drop_leftovers` → `clean` → `vacuum` → `reindex` → `report` и `integrity` →
 `health_warn` / `health_errors`; без админской учётки — `params` → `clean` → `report` и `integrity`.
 `integrity` идёт последним, чтобы не принять копию идущей перестройки за остаток.
 - **params** — сохранение параметров запуска в переменную (пропускается при `save_params=False`)
+- **drop_leftovers** (v2.6) — остатки прерванного REINDEX, только по разовой галке; строка хода раз в 5 мин
 - **clean** — подсчёт и удаление по каждой таблице; заметка дописывается **сверху** строкой на таблицу
   (в долгой таблице — строка хода не чаще раза в 5 мин), итоговая таблица ложится сверху в конце (v2.2;
   до того заметка переписывалась целиком на каждой порции). Так же с v2.3 и остальные: `vacuum` —
@@ -72,7 +73,9 @@ CONCURRENTLY` одной командой при обрыве оставлял �
 | `long_tx` | транзакции дольше часа (держат вакуум; чужие без `pg_read_all_stats` не видны) | есть | — |
 | `constraints` | ограничения `NOT VALID`, так и не проверенные | есть | — |
 
-Остатки удаляет только разовая галка `drop_leftovers`: `DROP INDEX CONCURRENTLY` по одному под коннектом владельца
+Остатки удаляет только разовая галка `drop_leftovers` — отдельным таском сразу после `params`,
+до `clean`, `vacuum` и `reindex` (с остатками каждая запись и VACUUM обновляют все лишние
+индексы); `dry_run` её не отменяет. `DROP INDEX CONCURRENTLY` по одному под коннектом владельца
 (`get_af_conn`), и только тот остаток, у которого исходный индекс (имя без суффиксов) есть и
 валиден. Остальное — строкой в заметке. `amcheck` не используется: читает индексы целиком.
 
@@ -1249,32 +1252,9 @@ def tools_db_cleanup():
             checks[name] = _run_check(fn)
             line(name, checks[name])
         lines = []
-        leftovers = checks['indexes'].get('leftovers') or []
-        if leftovers and context['params'].get('drop_leftovers'):
-            try:
-                # Как clean: строка хода сверху не чаще раза в NOTE_EVERY_SEC — остатков бывают сотни
-                started, last = time.time(), {'at': time.time()}
-
-                def step(i, n, done, kept):
-                    if time.time() - last['at'] < DROP_NOTE_EVERY_SEC:
-                        return
-                    last['at'] = time.time()
-                    add_note(f"⏳ остатки: {i - 1}/{n}, удалено {len(done)}, оставлено {len(kept)}, "
-                             f"{time.time() - started:.0f} с", context=context, level='Task')
-
-                done, kept = drop_leftovers(leftovers, on_step=step)
-            except Exception as exc:  # нет коннекта владельца или метабаза отказала — вердикт важнее
-                logger.warning('drop_leftovers: не выполнено', exc_info=True)
-                done, kept = [], [f'не выполнено: {type(exc).__name__}: {str(exc)[:160]}']
-            lines.append(f'🧹 остатков удалено {len(done)}, оставлено {len(kept)}'
-                         + ''.join(f'\n- {k}' for k in kept[:20]))
-            checks['indexes'] = _run_check(check_indexes)
-            add_note('\n'.join(lines), context=context, level='Task')
-            lines = []
-            line('indexes', checks['indexes'], ' после удаления')
-        elif leftovers:
-            lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` '
-                         '(исходные индексы проверяются перед удалением)' if ADMIN else
+        if checks['indexes'].get('leftovers'):
+            lines.append('Удалить остатки: ручной запуск с галкой `drop_leftovers` — отдельный таск в начале '
+                         'рана, исходные индексы проверяются перед удалением' if ADMIN else
                          'Удалить остатки — вручную `DROP INDEX CONCURRENTLY`: админской учётки '
                          'метабазы в Vault нет, галки `drop_leftovers` в форме нет')
         if lines:
@@ -1282,6 +1262,36 @@ def tools_db_cleanup():
         push_health({n: {k: v for k, v in c.items() if k in ('status', 'summary', 'sec')}
                      for n, c in checks.items()}, context)
         return {n: c['status'] for n, c in checks.items()}
+
+    # Первым после params: с остатками каждая запись в таблицу и VACUUM обновляют все лишние
+    # индексы (сигма dev 01.10.2026 — 551 на dag_run, шаг шедулера 35 с), а перестройка рядом с
+    # чужим *_ccnew назвала бы свою копию *_ccnew1. dry_run галку не отменяет: она явная,
+    # а dry_run про строки clean
+    @task(task_id='drop_leftovers', trigger_rule=TriggerRule.NONE_FAILED)
+    def drop_leftovers_task(**context):
+        """🩹 Остатки прерванного REINDEX — только по разовой галке, до тяжёлых тасков."""
+        from airflow.exceptions import AirflowSkipException
+
+        if not context['params'].get('drop_leftovers'):
+            raise AirflowSkipException('галка drop_leftovers не стоит')
+        leftovers = _run_check(check_indexes).get('leftovers') or []
+        if not leftovers:
+            add_note('🩹 остатков прерванного REINDEX нет', context=context, level='Task')
+            return {'done': 0, 'kept': 0}
+        # Как clean: строка хода сверху не чаще раза в DROP_NOTE_EVERY_SEC — остатков бывают сотни
+        started, last = time.time(), {'at': time.time()}
+
+        def step(i, n, done, kept):
+            if time.time() - last['at'] < DROP_NOTE_EVERY_SEC:
+                return
+            last['at'] = time.time()
+            add_note(f"⏳ остатки: {i - 1}/{n}, удалено {len(done)}, оставлено {len(kept)}, "
+                     f"{time.time() - started:.0f} с", context=context, level='Task')
+
+        done, kept = drop_leftovers(leftovers, on_step=step)
+        add_note(f'🧹 остатков удалено {len(done)}, оставлено {len(kept)}, {time.time() - started:.0f} с'
+                 + ''.join(f'\n- {k}' for k in kept[:20]), context=context, level='Task', title='🩹 drop_leftovers')
+        return {'done': len(done), 'kept': len(kept)}
 
     @task(task_id='reindex', trigger_rule=TriggerRule.ALL_DONE)
     def reindex(**context):
@@ -1328,7 +1338,10 @@ def tools_db_cleanup():
 
     params_done = save_params()
     tail = clean()
-    params_done >> tail
+    if ADMIN:
+        params_done >> drop_leftovers_task() >> tail
+    else:
+        params_done >> tail
     if ADMIN:
         # integrity — после переиндексации: иначе приняла бы копию идущей перестройки за
         # остаток, а копию от убитой по таймауту — поймает
