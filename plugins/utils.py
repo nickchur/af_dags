@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-01 13:09 MSK · v1.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 19:13 MSK · v1.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -200,6 +200,24 @@ def get_current_load(pool_name, pool=True, session=None):
 
     return res
     
+def _hard_breaks(text):
+    """Одиночный перенос строки → жёсткий (два пробела в конце строки).
+
+    Заметку UI рендерит markdown'ом, а там одиночный перенос — пробел: лента из строк
+    сливалась в один абзац (db_cleanup clean, альфа 01.10.2026). Внутри ``` не трогаем;
+    таблицам и заголовкам хвостовые пробелы безразличны.
+    """
+    out, fence = [], False
+    lines = text.split('\n')
+    for i, ln in enumerate(lines):
+        if ln.lstrip().startswith('```'):
+            fence = not fence
+        elif not fence and ln.strip() and i + 1 < len(lines) and lines[i + 1].strip():
+            ln = ln.rstrip() + '  '
+        out.append(ln)
+    return '\n'.join(out)
+
+
 def add_note(msg, context=None, level='task', add=True, title='', compact=False):
 
     if not context:
@@ -216,6 +234,7 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
         # compact=False — каждое значение на новой строке
         msg = PrettyPrinter(indent=4, compact=compact).pformat(msg).replace("'", '')
         msg = '```\n' + msg + '\n```'
+    msg = _hard_breaks(msg)
 
     logger.info(f"📝 Note added to {level} {title}:\n{msg}")
     
@@ -575,7 +594,8 @@ def readable_size(size_bytes, base=1024):
     if i >= len(units): i = len(units) - 1
     if i < 0: i = 0
 
-    size_value = round(size_bytes / (base ** i), 2)
+    # Без дробной части у единиц: «3 строк», а не «3.0»
+    size_value = size_bytes if i == 0 else round(size_bytes / (base ** i), 2)
     
     return f"{sign}{size_value} {units[i]}".rstrip()
 

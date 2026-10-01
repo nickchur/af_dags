@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-01 18:58 MSK · v2.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 19:13 MSK · v2.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
@@ -363,10 +363,11 @@ class Feed:
         budget = NOTE_BUDGET - len(self.title) - len(head) - len(rest) - 40
         picked, size = [], 0
         for ln in (reversed(lines) if tail else lines):
-            if size + len(ln) + 1 > budget:
+            # +3: перенос и два пробела жёсткого переноса от add_note
+            if size + len(ln) + 3 > budget:
                 break
             picked.append(ln)
-            size += len(ln) + 1
+            size += len(ln) + 3
         if tail:
             picked.reverse()
         cut = len(lines) - len(picked)
