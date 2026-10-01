@@ -23,6 +23,10 @@ try:
     from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
 except ImportError:
     from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+try:
+    from plugins import af_meta  # type: ignore
+except ImportError:
+    from CI06932748.tools import af_meta  # type: ignore
 
 # Пул заводим при парсинге: к планированию первого таска он уже есть
 ensure_pool(TOOLS_POOL)
@@ -63,11 +67,17 @@ def tools_dummy():
     @task(task_id='ping')
     def ping(**context):
         """Отмечает, где выполнилась задача и сколько ждала шедулер и воркер."""
-        ti = context['ti']
-        empty = context['dag_run'].get_task_instance('dummy_task')
+        # Airflow 3: у RuntimeTaskInstance нет queued_dttm и hostname, у DagRun — get_task_instance;
+        # моменты обеих задач — из метабазы одним запросом
+        ti, dr = context['ti'], context['dag_run']
+        rows = {r['task_id']: r for r in af_meta.sql(
+            "SELECT task_id, hostname, queued_dttm, start_date, end_date FROM task_instance"
+            " WHERE dag_id = %s AND run_id = %s AND task_id IN ('ping', 'dummy_task') AND map_index = -1",
+            (dr.dag_id, dr.run_id))}
+        me, empty = rows.get('ping') or {}, rows.get('dummy_task') or {}
         add_note(
-            f"✅ выполнено на {ti.hostname}: шедулер {_sec(empty and empty.end_date, ti.queued_dttm)}, "
-            f"очередь {_sec(ti.queued_dttm, ti.start_date)}",
+            f"✅ выполнено на {me.get('hostname') or '?'}: шедулер {_sec(empty.get('end_date'), me.get('queued_dttm'))}, "
+            f"очередь {_sec(me.get('queued_dttm'), me.get('start_date') or ti.start_date)}",
             context, level='task',
         )
 

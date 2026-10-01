@@ -776,8 +776,12 @@ def check_delivery(ti, dag_run) -> dict:
     Опоздание считаем только у ранов по расписанию: у ручного data_interval_end ни при чём.
     """
     delivery = None
-    if ti.queued_dttm and ti.start_date:
-        delivery = round((ti.start_date - ti.queued_dttm).total_seconds(), 1)
+    # Airflow 3: у RuntimeTaskInstance нет queued_dttm — оба момента берём из строки задачи
+    row = (_pg_rows("select queued_dttm, start_date from task_instance where id = :id",
+                    {"id": str(ti.id)}) or [{}])[0]
+    queued, started = row.get("queued_dttm"), row.get("start_date")
+    if queued and started:
+        delivery = round((started - queued).total_seconds(), 1)
     lag = None
     if getattr(dag_run, "run_type", None) == "scheduled" and dag_run.start_date and dag_run.data_interval_end:
         lag = round((dag_run.start_date - dag_run.data_interval_end).total_seconds(), 1)
