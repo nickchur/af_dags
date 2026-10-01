@@ -1,5 +1,5 @@
 """### 🗂️ DAG: Просмотрщик S3
-*2026-09-02 09:44 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список ключей из S3-бакета и читает содержимое файлов.
 
@@ -52,6 +52,7 @@ def _late_template(op, **fields):
 
 @dag(
     doc_md=__doc__,
+    description='Ключи бакета S3 и содержимое файлов',
     owner_links={
         'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab',
         'Korchagin Viacheslav': 'mailto:VYurKorchagin@sberbank.ru',

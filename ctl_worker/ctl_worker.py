@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-09-30 09:25 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Dataset`, `Cron`, `DatasetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -599,6 +599,7 @@ def build_worker_dag(w):
         # on_success_callback=on_callback,
         params=wf_params,
         doc_md=doc_md, 
+        description=f"Воркфлоу CTL {wf_name}: run_prm → run_exe → run_val → run_sts → run_end",
         **conf, 
     ) as dag:
 

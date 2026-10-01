@@ -1,5 +1,5 @@
 """### ⏱️ DAG: Управление TTL правилами S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Просматривает, устанавливает или удаляет правила жизненного цикла (TTL) объектов в S3-бакете.
 
@@ -33,6 +33,7 @@ s3_list = [
 
 @dag(
     doc_md=__doc__,
+    description='Правила жизненного цикла (TTL) бакета S3: показать, выставить, удалить',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

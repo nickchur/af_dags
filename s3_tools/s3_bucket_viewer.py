@@ -1,5 +1,5 @@
 """### 🪣 DAG: Просмотр бакетов S3
-*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Выводит список бакетов для выбранного S3-подключения.
 
@@ -18,6 +18,7 @@ from plugins.utils import get_conns_by_type  # type: ignore
 
 @dag(
     doc_md=__doc__,
+    description='Список бакетов выбранного S3-подключения',
     owner_links={
         'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab',
         'Korchagin Viacheslav': 'mailto:VYurKorchagin@sberbank.ru',

@@ -1,5 +1,5 @@
 """### 🔔 DAG: События CTL → Airflow Dataset
-*2026-09-30 09:25 MSK · v1.5 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 5 минут получает события из CTL и публикует Dataset'ы для оркестрации DAG'ов.
 
@@ -68,6 +68,7 @@ with DAG(f'CTL.{get_config()["profile"]}.events',
     on_failure_callback=on_callback,
     # on_success_callback=on_callback,
     doc_md=__doc__,
+    description='События CTL раз в 5 минут → Dataset-ы для запуска воркфлоу',
 ) as dag:
     
     @task.sensor(

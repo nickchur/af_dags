@@ -1,4 +1,5 @@
 """### 🛠️ Загрузка контента в S3
+*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Загружает текстовый контент в S3 из параметров запуска DAG.
 
@@ -63,6 +64,7 @@ s3_conns=get_conns_by_type(conn_type='aws')
 @dag(
     # dag_id='tools_s3_from_content',
     doc_md=__doc__,
+    description='Загрузить текст из параметров запуска в объект S3',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args = {
         'owner': 'DataLab (CI02420667)',

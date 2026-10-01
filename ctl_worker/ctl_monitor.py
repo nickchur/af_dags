@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-09-30 09:25 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -188,6 +188,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
     # страховка от зависшего рана: окно сенсора плюс час на задачи после него
     dagrun_timeout=sensor_timeout + timedelta(hours=1),
     doc_md=__doc__,
+    description='Мониторинг загрузок CTL: SLA, повторы, ABORTED, зависшие таски',
 ) as dag:
     
     

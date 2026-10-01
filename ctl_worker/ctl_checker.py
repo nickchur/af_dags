@@ -1,5 +1,5 @@
 """### 🔍 DAG: Проверка API CTL
-*2026-09-30 09:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск HTTP-запроса к CTL API для диагностики и отладки.
 
@@ -92,7 +92,7 @@ params={
 # Основная логика DAG
 with DAG(
     dag_id="tools_ctl_check_api",
-    description="Tools: CTL Check API",
+    description="Ручной запрос к CTL API для диагностики",
     default_args={
         "owner": "EDP.ETL", 
         "retries": 0,

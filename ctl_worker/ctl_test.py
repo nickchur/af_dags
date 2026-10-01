@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-09-30 09:25 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.7 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Dataset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -124,6 +124,7 @@ else:
         on_failure_callback=on_callback,
         # on_success_callback=on_callback,
         doc_md=__doc__,
+        description='Симулятор нагрузки CTL: события, Dataset-ы или запуски воркфлоу',
     ) as dag:
     
         @task(pool='ctl_pool')

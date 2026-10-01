@@ -1,5 +1,5 @@
 """### 🔍 DAG: Копирование/перемещение файлов S3 → S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Находит файлы по маске и копирует (или перемещает) их в целевой бакет.
 
@@ -44,6 +44,7 @@ for conn in get_conns_by_type(conn_type='aws'):
 
 @dag(
     doc_md=__doc__,
+    description='Копировать или переместить файлы S3 по маске в другой бакет',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

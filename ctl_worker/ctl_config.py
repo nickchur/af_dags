@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-09-30 09:25 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -190,6 +190,7 @@ with DAG(f'CTL.{config["profile"]}.config',
         "CTL_PIN": '',
     },
     doc_md=__doc__,
+    description='Конфигурация CTL: параметры в Variable ctl_config, ручной запуск по PIN',
 ) as dag:
     
     @task

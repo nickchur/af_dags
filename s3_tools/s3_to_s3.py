@@ -1,5 +1,5 @@
 """### 📦 DAG: Копирование между S3-бакетами
-*2026-08-20 22:15 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Копирует объект из одного S3-бакета в другой с опциональным сжатием.
 
@@ -47,6 +47,7 @@ s3_conns = get_conns_by_type(conn_type='aws')
 
 @dag(
     doc_md=__doc__,
+    description='Копировать объект между бакетами S3, по желанию со сжатием',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

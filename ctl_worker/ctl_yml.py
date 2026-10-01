@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-09-30 09:25 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -39,7 +39,7 @@ profiles = {
 
 with DAG(f"CTL_{get_config()['profile']}.yml", 
     tags=['CTL', get_config()['profile'], 'CTL_agent', 'tools'],
-    description='CTL',
+    description='Экспорт конфигурации CTL в YAML на S3, ручной запуск',
     start_date=datetime(2025, 1, 1, tzinfo=timezone.utc), 
     schedule=None, 
     catchup=False, 

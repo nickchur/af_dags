@@ -1,5 +1,5 @@
 """### 👁️ DAG: Просмотр файлов S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Получает список объектов по маске, сортирует и читает содержимое файлов (txt, gz, zip).
 
@@ -42,6 +42,7 @@ def _split_mask(full_path):
 
 @dag(
     doc_md=__doc__,
+    description='Объекты S3 по маске и чтение файлов (txt, gz, zip)',
     owner_links={'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab'},
     default_args={
         'owner': 'DataLab (CI02420667)',

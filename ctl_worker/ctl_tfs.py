@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-09-30 09:25 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модуль содержит два DAG'а для копирования файлов из TFS (источник S3) в `edpetl-files`.
 
@@ -331,6 +331,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
     on_failure_callback=on_callback,
     on_success_callback=None,
     doc_md=__doc__,
+    description='TFS → S3 по расписанию: опрос источников tfs-in и копирование файлов',
 ) as dag:
 
     @task.sensor(
@@ -455,6 +456,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_kafka',
     },
     on_failure_callback=on_callback,
     doc_md=__doc__,
+    description='TFS → S3 по сообщению Kafka: копирование файлов и квитанция',
 ) as dag_kafka:
 
     @task(task_id='kafka_wait')

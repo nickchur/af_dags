@@ -1,5 +1,5 @@
 """### 📋 DAG: Список бакетов S3
-*2026-08-04 10:35 MSK · v1.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 17:35 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Перечисляет все бакеты по всем S3-подключениям с размером, количеством объектов и TTL.
 """
@@ -16,6 +16,7 @@ logger = getLogger("airflow.task")
 
 @dag(
     doc_md=__doc__,
+    description='Все бакеты всех S3-подключений: размер, число объектов, TTL',
     owner_links={
         'DataLab (CI02420667)': 'https://confluence.sberbank.ru/display/HRTECH/DataLab',
         'Korchagin Viacheslav': 'mailto:VYurKorchagin@sberbank.ru',
