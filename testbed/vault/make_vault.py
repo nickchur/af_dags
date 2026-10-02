@@ -1,5 +1,5 @@
 """### 🔐 Скрипт: эмуляция /vault/secrets/application для тестового стенда
-*2026-10-02 10:21 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-02 11:12 MSK · v1.3 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 НЕ DAG — консольный скрипт стенда, лежит в `testbed/vault/`. Каталог `testbed/` убран из
 разбора Airflow корневым `.airflowignore`; и без него файл при импорте ничего не выполняет —
@@ -20,7 +20,7 @@
     TFS_KAFKA_URLS_IN/OUT (+ *_EXTRA)                 → 'tfs-kafka-in' / 'tfs-kafka-out'
     PG_<ТЕНАНТ> с блоком services                     → '<тенант>-<db>-read' / '-write'
     PG_ALPHA: cap_gp → adb_dev_comm                   → 'alpha-adb_dev_comm-read/-write' (GP альфы)
-    HTTP_CONNECTIONS: ctl                             → 'ctl' (CTL API, kerberos_auth как на альфе)
+    HTTP_CONNECTIONS: ctl                             → 'ctl' (CTL API; Kerberos даёт KerberosHttpHook, а не extra)
 
 GP и CTL — по Kerberos, как на альфе (KDC — testbed/kdc): пароль GP в PG_ALPHA пустой. Задан
 пароль (STAND_GP_PASSWORD) — Kerberos-роли он не мешает, libpq его просто не использует; роль
@@ -147,7 +147,10 @@ def build_payload() -> dict:
         }),
         "HTTP_CONNECTIONS": json.dumps({"ctl": {
             "schema": "http", "host": CTL_HOST, "port": 9080,
-            "extra": json.dumps({"kerberos_auth": True, "verify": False}),
+            # HttpHook кладёт ключи extra в заголовки запроса: флаг вроде kerberos_auth=true
+            # роняет вызов («Header part (True) … must be of type str or bytes»). Kerberos
+            # включает сам KerberosHttpHook, в extra — только то, что хук забирает в опции.
+            "extra": json.dumps({"verify": False}),
             "description": "Эмулятор CTL API (testbed/ctl_worker), Kerberos: HTTP/" + CTL_HOST,
         }}, ensure_ascii=False),
 

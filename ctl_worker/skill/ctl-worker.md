@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-10-02 10:53 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 11:12 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -360,6 +360,9 @@ title="<имя таблицы>")`; не нашлась — `confluence_search` �
 - **CTL**: карточка загрузки — статус, лог статуса (`WAIT-AF`, `NEW-AF`, `RUN …`, `END …`),
   настройки повторов воркфлоу, `wf_timeout`.
 - Ошибка внутри SQL воркфлоу (`res -4…-9`) — владелец воркфлоу, не платформа.
+- Ошибка самого вызова CTL из инструментов (`ctl_*` вернул 5xx, 401, таймаут, ошибку заголовка
+  или Kerberos) — платформа: подключение `ctl` или сервис CTL. О потоке она ничего не говорит —
+  состояние загрузки тогда смотри по рану и заметкам в Airflow.
 - **SLA-алерты**, Greenplum: `tb_ctl_alerts` (все заведённые, `close_ts` пустой — открыт),
   дата данных объекта — `tb_log_workflow_stat` (`wf_obj`, `data_max`). Правило потока —
   параметры `wf_alert` / `wf_alert_data` / `wf_alert_group` в CTL.

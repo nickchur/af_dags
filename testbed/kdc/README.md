@@ -1,6 +1,6 @@
 # 🎟️ Kerberos на стенде: KDC, CTL и GP по билету
 
-*2026-10-02 10:26 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 11:12 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 На альфе CTL API и Greenplum пускают только по Kerberos: `KerberosHttpHook` (SPNEGO) и libpq
 (GSSAPI) берут билет из кэша пода, пароль в подключении GP пустой. Без KDC на стенде эти ветки
@@ -12,7 +12,7 @@
 | Принципалы и keytab'ы | `hrplt_etl` (Airflow), `HTTP/ctl-mock.stand` (эмулятор CTL), `postgres/gp.stand` (GP); keytab'ы — `/opt/aftest/kdc/keytabs`, 600 |
 | Клиент хоста | [`krb5.conf`](krb5.conf) → `/etc/krb5.conf`, пакет `krb5-user`; `/etc/hosts`: `kdc.stand ctl-mock.stand gp.stand` → 127.0.0.1 |
 | Билет Airflow | юнит [`airflow-kerberos`](airflow-kerberos.service) (`airflow kerberos`); в `airflow.env` — `AIRFLOW__KERBEROS__PRINCIPAL/KEYTAB/CCACHE` и `KRB5CCNAME` |
-| CTL | `ctl-mock` с `CTL_MOCK_KERBEROS_KEYTAB` (см. [`ctl_worker`](../ctl_worker/README.md#kerberos)), подключение `ctl` → `ctl-mock.stand`, `extra: {"kerberos_auth": true}` |
+| CTL | `ctl-mock` с `CTL_MOCK_KERBEROS_KEYTAB` (см. [`ctl_worker`](../ctl_worker/README.md#kerberos)), подключение `ctl` → `ctl-mock.stand`; Kerberos включает `KerberosHttpHook`, в `extra` флага нет — `HttpHook` превратил бы его в заголовок |
 | GP | база `adb_dev_comm` (как на альфе); `pg_hba`: `host adb_dev_comm hrplt_etl all gss include_realm=0 krb_realm=STAND.TEST`; keytab — `$PGDATA/krb5.keytab` (`krb_server_keyfile`) |
 
 Подключения — **из секретов, как на контуре**: `ctl` из `HTTP_CONNECTIONS`, GP —
