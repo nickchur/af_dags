@@ -15,7 +15,7 @@ TS=$(date -u +%Y%m%d%H%M%S)
 NAME="pc1080.ue_exchange_${TS}.csv"
 OUT="/tmp/${NAME}"
 
-docker exec -i aftest-postgres psql -U airflow -d gp_test -v ON_ERROR_STOP=1 -q -c "
+docker exec -i aftest-postgres psql -U airflow -d adb_dev_comm -v ON_ERROR_STOP=1 -q -c "
 COPY (
     SELECT wf_id, wf_name, wf_key, wf_data
     FROM s_grnplm_vd_hr_edp_vda.pr_exchange(${PKG_ID})

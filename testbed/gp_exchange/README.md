@@ -1,5 +1,7 @@
 # Тестовый стенд обмена: Greenplum на PostgreSQL
 
+*2026-10-02 10:22 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+
 Проверяет тракт целиком — от сборки пакета в базе-источнике до целевых таблиц
 ClickHouse: `pr_exchange` (PG) → TSV → S3 → `import_gp_ue_exchange` → `gp_vw_*`.
 
@@ -22,9 +24,9 @@ ClickHouse: `pr_exchange` (PG) → TSV → S3 → `import_gp_ue_exchange` → `g
 ## Как развернуть (тестовый стенд `testsrv`)
 
 ```bash
-docker exec -i aftest-postgres psql -U airflow -d postgres -c "CREATE DATABASE gp_test;"
+docker exec -i aftest-postgres psql -U airflow -d postgres -c "CREATE DATABASE adb_dev_comm;"
 for f in 10_schema 20_views 30_pr_exchange 40_data; do
-    docker exec -i aftest-postgres psql -U airflow -d gp_test -v ON_ERROR_STOP=1 < $f.sql
+    docker exec -i aftest-postgres psql -U airflow -d adb_dev_comm -v ON_ERROR_STOP=1 < $f.sql
 done
 docker exec -i aftest-clickhouse clickhouse-client --multiquery < 50_clickhouse.sql
 docker exec -i aftest-clickhouse clickhouse-client --multiquery < 55_seed_log.sql

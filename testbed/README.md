@@ -1,5 +1,5 @@
 # 🧰 Тестовый стенд
-*2026-10-02 10:04 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:23 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 То, что нужно, чтобы гонять DAG'и репозитория живьём на стенде (`ssh testsrv`,
 `/opt/aftest`): эмуляторы внешних систем, схемы, фикстуры, скрипты разворачивания. Здесь нет
@@ -15,6 +15,7 @@ DAG'ов, и на контуры это не нужно.
 |---|---|
 | [`ctl_worker/`](ctl_worker/README.md) | Эмулятор CTL API (без Kerberos и Greenplum) и сборщик фикстур из снимка `edpetl-ctl`: полный цикл `run_prm → run_exe → run_end` на стенде |
 | [`atlassian/`](atlassian/README.md) | Эмулятор Confluence (серверы delta и sber) и Jira под MCP `mcp-atlassian`: навыки со ссылками на Confluence проверяются на стенде; корпоративное наполнение — только на стенде |
+| [`kdc/`](kdc/README.md) | Kerberos: KDC `STAND.TEST`, CTL (SPNEGO) и GP (GSSAPI) по билету, подключения из секретов как на альфе |
 | [`gp_exchange/`](gp_exchange/README.md) | Greenplum на PostgreSQL: пакет обмена собирается по-настоящему и проезжает весь путь до `gp_vw_*` |
 | [`vault/`](vault/make_vault.py) | `make_vault.py` — эмуляция `/vault/secrets/application`: payload в формате боевого sigma DEV, секреты только из переменных окружения |
 | [`check_status_contract.py`](check_status_contract.py) | Линтер контракта `(status, payload)`: находит вызовы решателей `ctl_chk_*`, результат которых не разобран |

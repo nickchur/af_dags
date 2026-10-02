@@ -1,5 +1,5 @@
 """### 🔐 Скрипт: эмуляция /vault/secrets/application для тестового стенда
-*2026-09-14 06:53 MSK · v1.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-02 10:21 MSK · v1.2 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 НЕ DAG — консольный скрипт стенда, лежит в `testbed/vault/`. Каталог `testbed/` убран из
 разбора Airflow корневым `.airflowignore`; и без него файл при импорте ничего не выполняет —
@@ -19,6 +19,12 @@
         (URL в форме 'native://host:port'; порт, отличный от 9000, включает secure)
     TFS_KAFKA_URLS_IN/OUT (+ *_EXTRA)                 → 'tfs-kafka-in' / 'tfs-kafka-out'
     PG_<ТЕНАНТ> с блоком services                     → '<тенант>-<db>-read' / '-write'
+    PG_ALPHA: cap_gp → adb_dev_comm                   → 'alpha-adb_dev_comm-read/-write' (GP альфы)
+    HTTP_CONNECTIONS: ctl                             → 'ctl' (CTL API, kerberos_auth как на альфе)
+
+GP и CTL — по Kerberos, как на альфе (KDC — testbed/kdc): пароль GP в PG_ALPHA пустой. Задан
+пароль (STAND_GP_PASSWORD) — Kerberos-роли он не мешает, libpq его просто не использует; роль
+без строки gss в pg_hba войдёт по нему, как парольные подключения на контуре.
 
 🔑 Секретов в файле нет и быть не должно: репозиторий публичный. Логины, пароли и адреса
 берутся из переменных окружения, умолчания — заведомо нерабочие заглушки. Перед запуском:
@@ -58,6 +64,12 @@ CH_USER      = os.getenv("STAND_CH_USER",      "CHANGE_ME")
 CH_PASSWORD  = os.getenv("STAND_CH_PASSWORD",  "CHANGE_ME")
 PG_USER      = os.getenv("STAND_PG_USER",      "CHANGE_ME")
 PG_PASSWORD  = os.getenv("STAND_PG_PASSWORD",  "CHANGE_ME")
+# GP альфы: база adb_dev_comm, роль = принципал Kerberos без realm (pg_hba: include_realm=0).
+GP_HOST     = os.getenv("STAND_GP_HOST",     "gp.stand:5432")
+GP_USER     = os.getenv("STAND_GP_USER",     "hrplt_etl")
+GP_PASSWORD = os.getenv("STAND_GP_PASSWORD", "")
+# Имя хоста CTL обязано совпадать с принципалом HTTP/<хост> из keytab эмулятора.
+CTL_HOST    = os.getenv("STAND_CTL_HOST",    "ctl-mock.stand")
 
 REQUIRED = ("STAND_MINIO_KEY", "STAND_MINIO_SECRET", "STAND_CH_USER",
             "STAND_CH_PASSWORD", "STAND_PG_USER", "STAND_PG_PASSWORD")
@@ -124,6 +136,20 @@ def build_payload() -> dict:
             "af_db_host_default": PG_HOST,
             "services": {"dwh": {"af_db_name_1": "dwh"}},
         }),
+
+        # GP альфы (тенант alpha, сервис cap_gp) — по Kerberos, пароль пустой, как в бою.
+        "PG_ALPHA": json.dumps({
+            "USER_AIRFLOW_READ":           GP_USER,
+            "USER_AIRFLOW_READ_PASSWORD":  GP_PASSWORD,
+            "USER_AIRFLOW_WRITE":          GP_USER,
+            "USER_AIRFLOW_WRITE_PASSWORD": GP_PASSWORD,
+            "services": {"cap_gp": {"af_db_host_1": GP_HOST, "af_db_name_1": "adb_dev_comm"}},
+        }),
+        "HTTP_CONNECTIONS": json.dumps({"ctl": {
+            "schema": "http", "host": CTL_HOST, "port": 9080,
+            "extra": json.dumps({"kerberos_auth": True, "verify": False}),
+            "description": "Эмулятор CTL API (testbed/ctl_worker), Kerberos: HTTP/" + CTL_HOST,
+        }}, ensure_ascii=False),
 
         "S3_SYNC_TIME": "60",
         "login": "worker",
