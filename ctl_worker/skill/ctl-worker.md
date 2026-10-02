@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-09-26 21:10 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:07 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -312,6 +312,26 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 | `loading_id` сменился | заметка `ctl_action` монитора | `reStarted`: монитор закрыл старую загрузку и создал новую |
 | `run_exe` failed «Повтор N: …» | заметка задачи, лог попытки 1 | раздел 3: исход прошлой попытки неизвестен |
 | у потока нет дага `CTL.*` | «⚠️ Потоки вне присмотра» у загрузчика | не `HR_Data` + `dummy` и не в категории UE (раздел 5а) |
+
+## 9а. Таблицы GP: описание в Confluence
+
+Что лежит в таблице, которую грузит поток (колонки, ключи, источник, смысл полей), описано не
+здесь, а в корпоративном Confluence — пространство **HRData** на `confluence.delta.sbrf.ru`:
+
+- корень — «HR Data»: https://confluence.delta.sbrf.ru/display/HRData/HR+Data
+  (https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=1774392110);
+- страница таблицы, например: https://confluence.delta.sbrf.ru/display/HRData/ue_circle_of_contacts
+
+**Когда открывать:** вопрос про содержимое таблицы — «что значит поле X», «почему пусто Y»,
+«какие данные приносит поток». Состояние загрузки по-прежнему смотри в Airflow: Confluence
+описывает таблицу, а не загрузку.
+
+**Как:** через MCP к `confluence.delta.sbrf.ru` — `confluence_get_page(space_key="HRData",
+title="<имя таблицы>")`; не нашлась — `confluence_search` с CQL
+`space = HRData AND title ~ "<имя таблицы>"`.
+
+**Нет такого MCP** — скажи DE подключить его (`MCP_DE.md`, раздел 4 «Confluence и Jira»), а о
+колонках не гадай.
 
 ## 10. Чего не советовать
 
