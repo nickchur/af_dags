@@ -1,11 +1,12 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-02 15:05 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:08 MSK · v1.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
 | Функция | Описание |
 |---|---|
-| `add_note()` | Структурированные заметки в Airflow UI (DAG/Task) |
+| `add_note()` | Структурированные заметки в Airflow UI (DAG/Task), новое сверху, строка под `FOR UPDATE` |
+| `Feed` | Заметка таска без таблиц: строки хода снизу (`line`), итог сверху (`done`), предел 1000 знаков |
 | `add_xcom()` | Запись в XCom с обрезкой коллекций до `MAX_XCOM` элементов |
 | `on_callback()` | Обработчик событий success/failure/retry |
 | `pool_slots()` | Размер пула — только из сторожа подключений (`test_conn`) |

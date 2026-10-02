@@ -105,13 +105,13 @@ def days_between(newer: datetime, older: datetime) -> float:
     return (newer - older).total_seconds() / 86400
 
 
-# Каталоги, у которых документ назван по содержимому, а не readme.
-DOC_NAMES = {'plugins': 'utils.md'}
+# Каталоги без readme: документ — шапки самих модулей (docstring), он не отстаёт от кода.
+DOCSTRING_DOCS = {'plugins'}
 
 
 def readme_of(folder: Path) -> Path | None:
-    for name in (DOC_NAMES.get(folder.name), 'readme.md', 'README.md'):
-        if name and (folder / name).exists():
+    for name in ('readme.md', 'README.md'):
+        if (folder / name).exists():
             return folder / name
     return None
 
@@ -129,7 +129,7 @@ def check_projects() -> list[str]:
         readme = readme_of(folder)
         spec = REPO / 'openspec' / 'specs' / capability / 'spec.md'
 
-        if readme is None:
+        if readme is None and folder_name not in DOCSTRING_DOCS:
             problems.append(f"{folder_name}/: нет readme")
         if not spec.exists():
             problems.append(f"{folder_name}/: нет спецификации openspec/specs/{capability}/spec.md")
@@ -244,8 +244,7 @@ def check_gp_snapshot() -> list[str]:
 def check_version_lines() -> list[str]:
     """Вторая строка документа — дата, версия, автор. Правило репозитория."""
     problems = []
-    for md in sorted(REPO.glob('*.md')) + sorted(REPO.glob('*/readme.md')) + sorted(REPO.glob('*/README.md')) \
-            + [REPO / d / f for d, f in DOC_NAMES.items()]:
+    for md in sorted(REPO.glob('*.md')) + sorted(REPO.glob('*/readme.md')) + sorted(REPO.glob('*/README.md')):
         if '.claude' in md.parts or 'openspec' in md.parts:
             continue
         if str(md.relative_to(REPO)) in GENERATED:

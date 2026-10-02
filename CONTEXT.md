@@ -8,7 +8,7 @@
 | Что | Где | Кто пишет |
 |---|---|---|
 | **Правила работы** (rules) | `CLAUDE.md` в корне | человек |
-| **Как устроено** | `<каталог>/readme.md` (у `plugins/` — `utils.md`) | человек |
+| **Как устроено** | `<каталог>/readme.md` (у `plugins/` — шапки модулей) | человек |
 | **Что обязано работать** (SDD) | `openspec/specs/<capability>/spec.md`, общий контекст — `openspec/project.md` | человек, через `/opsx:propose` |
 | **Навыки и команды агента** | `.claude/skills/`, `.claude/commands/` | генерирует `openspec init`, правит человек |
 
@@ -33,7 +33,7 @@
 | `ctl_worker/` | `ctl_worker/readme.md` | 2026-10-02 | `openspec/specs/ctl-worker/spec.md` | 2026-09-29 | 2026-10-01 |
 | `er_export/` | `er_export/README.md` | 2026-10-01 | `openspec/specs/er-export/spec.md` | 2026-09-01 ⚠️ | 2026-10-01 |
 | `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 ⚠️ | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
-| `plugins/` | `plugins/utils.md` | 2026-10-02 | `openspec/specs/plugins/spec.md` | 2026-09-29 ⚠️ | 2026-10-02 |
+| `plugins/` | шапки модулей | — | `openspec/specs/plugins/spec.md` | 2026-09-29 ⚠️ | 2026-10-02 |
 | `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 ⚠️ | `openspec/specs/s3-tools/spec.md` | 2026-09-24 ⚠️ | 2026-10-01 |
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-10-01 | `openspec/specs/tfs-kafka/spec.md` | 2026-09-29 | 2026-10-01 |
 | `tools/` | `tools/readme.md` | 2026-10-02 | `openspec/specs/tools/spec.md` | 2026-10-01 | 2026-10-02 |

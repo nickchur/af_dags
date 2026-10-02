@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-10-02 15:05 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:08 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, потому что
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -14,6 +14,19 @@
 читатель обязаны смотреть в одно место. ClickHouse и Postgres — зеркала для аналитики
 и глаз: пишем в них, если задан их conn_id, и их сбой тракт не роняет. Три реализации
 дают одинаковые сигнатуры, различие только в том, кто из них обязателен.
+
+Что внутри:
+- **контур** (`ENV_SPACE`) — по наличию `ENVIRONMENT`, почему так — у константы; от него
+  топик отправки: `TFS.PKAPHR.IN` на альфе, `TFS.HRPLT.IN` на сигме;
+- **маршруты и лимиты** — `TFS_ROUTES`, скользящие ограничения темпа (10/с, 200/мин,
+  500/ч, 2000/сутки), выбор топика по сценарию;
+- **очередь отправки** — `enqueue_files`, `pending`, `mark_sent`, `missing_in_bucket`;
+- **пауза** — `pause_rules`, `pause_reason`, `split_pending`, `pause_set` / `pause_clear`,
+  нарастающий алерт `claim_pause_alerts` (1, 2, 4, 8 … часа);
+- **квитанции** — `parse_receipt` (строка на файл, ключ `(rq_uid, file_name)`),
+  `stale_sent` — сверка неподтверждённых.
+Проверить настройки — дамп `get_config()`: рядом выведенный `ENV_SPACE` и `ENVIRONMENT`.
+JSON в бакете логов пишется с отступами — его читают люди.
 """
 from __future__ import annotations
 
