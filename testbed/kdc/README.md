@@ -1,6 +1,6 @@
 # 🎟️ Kerberos на стенде: KDC, CTL и GP по билету
 
-*2026-10-02 10:23 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:26 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 На альфе CTL API и Greenplum пускают только по Kerberos: `KerberosHttpHook` (SPNEGO) и libpq
 (GSSAPI) берут билет из кэша пода, пароль в подключении GP пустой. Без KDC на стенде эти ветки
@@ -40,8 +40,19 @@ ssh testsrv 'cd /opt/aftest/kdc && docker compose up -d --build'
 #     ALTER SYSTEM SET krb_server_keyfile, строка gss в pg_hba.conf, роль hrplt_etl IN ROLE airflow, pg_reload_conf()
 ```
 
-Новая учётка (GP переходит на Kerberos целиком, учёток станет несколько) — строка
-`принципал=файл.keytab` в `KRB5_PRINCIPALS` и перезапуск контейнера.
+**Несколько учёток** (GP переходит на Kerberos целиком, учёток станет несколько) — без
+перезапуска чего-либо: KDC заводит принципал на ходу, у клиента у каждой учётки свой кэш
+билетов (`KRB5CCNAME`), билеты друг другу не мешают. Проверено на стенде:
+
+```bash
+docker exec aftest-kdc kadmin.local -q "addprinc -randkey <учётка>@STAND.TEST"
+docker exec aftest-kdc kadmin.local -q "ktadd -k /keytabs/<учётка>.keytab <учётка>@STAND.TEST"
+KRB5CCNAME=FILE:/tmp/<учётка>_cc kinit -kt /opt/aftest/kdc/keytabs/<учётка>.keytab <учётка>@STAND.TEST
+```
+
+Роль в GP — одноимённая (`include_realm=0`) и строка `gss` в `pg_hba` для неё, затем
+`pg_reload_conf()`. Чтобы учётка пережила пересоздание тома KDC, допишите её и в
+`KRB5_PRINCIPALS` в `docker-compose.yml`.
 
 Keytab выгружается только при первом создании принципала: `ktadd` меняет ключ, и розданные
 keytab'ы перестали бы подходить. Пересоздать — удалить файл keytab и перезапустить контейнер.
