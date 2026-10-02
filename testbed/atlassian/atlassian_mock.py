@@ -1,5 +1,5 @@
-"""📚 Эмулятор Confluence и Jira Server/DC для тестового стенда.
-*2026-10-02 10:41 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+"""📚 Эмулятор Confluence, Jira и Bitbucket Server/DC для тестового стенда.
+*2026-10-02 13:16 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Зачем. GigaCode ходит в корпоративный Confluence (их несколько: confluence.delta.sbrf.ru,
 confluence.sberbank.ru) и в Jira через MCP `mcp-atlassian`, по экземпляру на сервер. Чтобы
@@ -7,9 +7,12 @@ confluence.sberbank.ru) и в Jira через MCP `mcp-atlassian`, по экзе
 этот эмулятор отвечает на то, что спрашивает `mcp-atlassian` 0.23 (набор снят прогоном его
 инструментов чтения; на неизвестный путь — 404 и строка в журнале).
 
-Один код — три экземпляра (`atlassian-mock@.service`): `ATLASSIAN_MOCK_SERVER` =
-`delta` / `sber` (Confluence) или `jira`. Только чтение, вход по Bearer PAT, как на
-Server/DC.
+Bitbucket (stash.delta.sbrf.ru, stash.sigma.sbrf.ru) — то же для MCP
+`@atlassian-dc-mcp/bitbucket`: агент читает DDL и код по ссылке на репозиторий.
+
+Один код — несколько экземпляров (`atlassian-mock@.service`): `ATLASSIAN_MOCK_SERVER` =
+`delta` / `sber` (Confluence), `jira` или `stash-delta` / `stash-sigma` (Bitbucket). Только
+чтение, вход по Bearer PAT, как на Server/DC.
 
 Наполнение — каталог `ATLASSIAN_MOCK_FIXTURES`:
 
@@ -18,10 +21,11 @@ Server/DC.
                                           Confluence — `import_html_export.py`)
     confluence/<server>/<SPACE>/_space.yaml  имя и описание пространства (необязательно)
     jira/issues.json                      задачи: key, summary, description, status, labels, …
+    bitbucket/<server>/<PROJECT>/<slug>.git  bare-клон репозитория (git clone --bare)
 
-Id страниц, ключи пространств и названия — как в корпоративном Confluence: тогда ссылка
+Id страниц, ключи пространств и названия, ключи проектов и slug — как в корпоративных серверах: тогда ссылка
 вида `/pages/viewpage.action?pageId=…` или `/display/<SPACE>/<Title>` из навыка находит
-страницу и здесь. Корпоративное содержимое живёт только на стенде, в git его нет.
+страницу и здесь; так же `/projects/<P>/repos/<r>/browse/<path>` находит файл. Корпоративное содержимое живёт только на стенде, в git его нет.
 
 Запуск (юнит делает то же самое):
 
@@ -40,6 +44,7 @@ import logging
 import os
 import re
 import shlex
+import subprocess
 import zlib
 from datetime import datetime, timezone
 from functools import lru_cache
@@ -52,7 +57,7 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse, Response
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 logger = logging.getLogger('atlassian_mock')
@@ -500,6 +505,195 @@ async def jira_link_types(request: Request):
     return JSONResponse({'issueLinkTypes': []})
 
 
+# ── Bitbucket: репозитории — bare-клоны, читаются git'ом ─────────────────────
+
+def _repos() -> dict[tuple[str, str], Path]:
+    """(PROJECT, slug) → bare-клон. Без кэша: положил клон — виден сразу."""
+    root = FIXTURES / 'bitbucket' / SERVER
+    return {(d.parent.name.upper(), d.name[:-4].lower()): d for d in sorted(root.glob('*/*.git'))}
+
+
+def git(repo: Path, *args: str) -> str:
+    # safe.directory: клоны кладутся не тем пользователем, под которым идёт юнит
+    out = subprocess.run(['git', '-c', 'safe.directory=*', '-C', str(repo), *args],
+                         capture_output=True, text=True, timeout=30)
+    if out.returncode:
+        raise FileNotFoundError(out.stderr.strip())
+    return out.stdout
+
+
+def _bb_page(request: Request, items: list) -> dict:
+    start = int(request.query_params.get('start', 0) or 0)
+    limit = int(request.query_params.get('limit', PAGE_SIZE) or PAGE_SIZE)
+    chunk = items[start:start + limit]
+    last = start + limit >= len(items)
+    return {'size': len(chunk), 'limit': limit, 'start': start, 'isLastPage': last, 'values': chunk,
+            **({} if last else {'nextPageStart': start + limit})}
+
+
+def _bb_404(what: str) -> JSONResponse:
+    return JSONResponse({'errors': [{'context': None, 'message': f'{what} does not exist.',
+                                     'exceptionName': 'com.atlassian.bitbucket.NoSuchEntityException'}]},
+                        status_code=404)
+
+
+def project_json(key: str) -> dict:
+    return {'key': key, 'id': zlib.crc32(key.encode()) % 10**5, 'name': key, 'public': False, 'type': 'NORMAL',
+            'links': {'self': [{'href': f'/projects/{key}'}]}}
+
+
+def repo_json(key: str, slug: str) -> dict:
+    return {'slug': slug, 'id': zlib.crc32(f'{key}/{slug}'.encode()) % 10**5, 'name': slug, 'scmId': 'git',
+            'state': 'AVAILABLE', 'statusMessage': 'Available', 'forkable': True, 'public': False,
+            'project': project_json(key),
+            'links': {'clone': [{'href': f'/scm/{key.lower()}/{slug}.git', 'name': 'http'}],
+                      'self': [{'href': f'/projects/{key}/repos/{slug}/browse'}]}}
+
+
+def _repo(request: Request) -> tuple[str, str, Path | None]:
+    key, slug = request.path_params['key'].upper(), request.path_params['slug'].lower()
+    return key, slug, _repos().get((key, slug))
+
+
+async def bb_projects(request: Request):
+    keys = sorted({k for k, _ in _repos()})
+    return JSONResponse(_bb_page(request, [project_json(k) for k in keys]))
+
+
+async def bb_project(request: Request):
+    key = request.path_params['key'].upper()
+    return JSONResponse(project_json(key)) if any(k == key for k, _ in _repos()) else _bb_404(f'Project {key}')
+
+
+async def bb_repos(request: Request):
+    key = request.path_params.get('key', request.query_params.get('projectkey', '')).upper()
+    items = [repo_json(k, s) for k, s in _repos() if not key or k == key]
+    return JSONResponse(_bb_page(request, items))
+
+
+async def bb_repo(request: Request):
+    key, slug, repo = _repo(request)
+    return JSONResponse(repo_json(key, slug)) if repo else _bb_404(f'Repository {key}/{slug}')
+
+
+def read_path(repo: Path, path: str, at: str | None) -> str:
+    """Файл — его текст; каталог — листинг дерева, как отдаёт /raw Bitbucket на каталог."""
+    ref = at or 'HEAD'
+    path = path.strip('/')
+    if not path or git(repo, 'cat-file', '-t', f'{ref}:{path}').strip() == 'tree':
+        return git(repo, 'ls-tree', ref, f'{path}/' if path else '')
+    return git(repo, 'show', f'{ref}:{path}')
+
+
+async def bb_raw(request: Request):
+    key, slug, repo = _repo(request)
+    if not repo:
+        return _bb_404(f'Repository {key}/{slug}')
+    path = request.path_params.get('path', '')
+    try:
+        return PlainTextResponse(read_path(repo, path, request.query_params.get('at')))
+    except FileNotFoundError:
+        return _bb_404(f'The path "{path}"')
+
+
+async def bb_branches(request: Request):
+    key, slug, repo = _repo(request)
+    if not repo:
+        return _bb_404(f'Repository {key}/{slug}')
+    head = git(repo, 'symbolic-ref', 'HEAD').strip()
+    rows = git(repo, 'for-each-ref', '--format=%(refname)\t%(objectname)', 'refs/heads').splitlines()
+    items = [{'id': ref, 'displayId': ref.removeprefix('refs/heads/'), 'type': 'BRANCH', 'latestCommit': sha,
+              'latestChangeset': sha, 'isDefault': ref == head}
+             for ref, sha in (r.split('\t') for r in rows)]
+    return JSONResponse(_bb_page(request, items))
+
+
+async def bb_commits(request: Request):
+    key, slug, repo = _repo(request)
+    if not repo:
+        return _bb_404(f'Repository {key}/{slug}')
+    qp = request.query_params
+    rng = qp.get('until') or 'HEAD'
+    if qp.get('since'):
+        rng = f'{qp["since"]}..{rng}'
+    args = ['log', '--format=%H%x1f%h%x1f%an%x1f%ae%x1f%at%x1f%cn%x1f%ce%x1f%ct%x1f%P%x1f%B%x1e', rng]
+    if qp.get('path'):
+        args += ['--', qp['path']]
+    try:
+        out = git(repo, *args)
+    except FileNotFoundError as e:
+        return JSONResponse({'errors': [{'message': str(e)}]}, status_code=404)
+    items = []
+    for rec in out.split('\x1e'):
+        if not rec.strip():
+            continue
+        sha, short, an, ae, at, cn, ce, ct, parents, msg = rec.strip('\n').split('\x1f')
+        items.append({'id': sha, 'displayId': short, 'message': msg.strip(),
+                      'author': {'name': an, 'emailAddress': ae}, 'authorTimestamp': int(at) * 1000,
+                      'committer': {'name': cn, 'emailAddress': ce}, 'committerTimestamp': int(ct) * 1000,
+                      'parents': [{'id': p, 'displayId': p[:11]} for p in parents.split()]})
+    return JSONResponse(_bb_page(request, items))
+
+
+def parse_search(query: str) -> tuple[dict, list[str]]:
+    """'repo:BIGDATA/hr_data ext:sql tb_log' → ({'repo': …, 'ext': …}, ['tb_log'])."""
+    mods, words = {}, []
+    for tok in shlex.split(query or ''):
+        name, sep, val = tok.partition(':')
+        if sep and name.lower() in ('repo', 'project', 'ext', 'lang', 'path'):
+            mods[name.lower()] = val
+        else:
+            words.append(tok)
+    return mods, words
+
+
+async def bb_search(request: Request):
+    """Поиск кода: все слова запроса в файле (git grep --all-match), как у Bitbucket — без морфологии."""
+    body = await request.json()
+    mods, words = parse_search(body.get('query', ''))
+    limit = int((body.get('limits') or {}).get('primary', PAGE_SIZE))
+    per_file = int((body.get('limits') or {}).get('secondary', 3))
+    values = []
+    for (key, slug), repo in _repos().items():
+        if mods.get('project', key).upper() != key or mods.get('repo', f'{key}/{slug}').lower() != f'{key}/{slug}'.lower():
+            continue
+        if not words:
+            continue
+        args = ['grep', '-n', '-I', '-i', '-F', '--all-match', *sum((['-e', w] for w in words), []), 'HEAD']
+        if mods.get('ext'):
+            args += ['--', f'*.{mods["ext"]}']
+        try:
+            out = git(repo, *args)
+        except FileNotFoundError:  # git grep без совпадений — код 1
+            continue
+        hits: dict[str, list] = {}
+        for line in out.splitlines():
+            _, path, num, text = line.split(':', 3)
+            hits.setdefault(path, []).append({'line': int(num), 'text': html.escape(text)})
+        values += [{'repository': repo_json(key, slug), 'file': path, 'hitCount': len(h), 'pathMatches': [],
+                    'hitContexts': [[c] for c in h[:per_file]]} for path, h in hits.items()]
+    return JSONResponse({'scope': {'type': 'GLOBAL'}, 'query': {'substituted': False},
+                         'code': {'category': 'primary', 'isLastPage': len(values) <= limit, 'count': len(values),
+                                  'start': 0, 'nextStart': limit, 'values': values[:limit]}})
+
+
+BB_USER = {'name': 'stand', 'emailAddress': 'stand@stand.test', 'id': 1, 'displayName': USER['displayName'],
+           'active': True, 'slug': 'stand', 'type': 'NORMAL'}
+
+
+async def bb_users(request: Request):
+    return JSONResponse(BB_USER if 'slug' in request.path_params else _bb_page(request, [BB_USER]))
+
+
+async def bb_empty_page(request: Request):
+    return JSONResponse(_bb_page(request, []))
+
+
+async def bb_browse(request: Request):
+    """Веб-ссылка /projects/<P>/repos/<r>/browse/<path> — текст файла или листинг каталога."""
+    return await bb_raw(request)
+
+
 # ── Сборка ───────────────────────────────────────────────────────────────────
 
 PUBLIC_PATHS = ('/pages/viewpage.action', '/display/')
@@ -552,12 +746,37 @@ JIRA_ROUTES = [
     Route('/rest/api/2/issueLinkType', jira_link_types),
 ]
 
+_BB_REPO = '/rest/api/latest/projects/{key}/repos/{slug}'
+BITBUCKET_ROUTES = [
+    Route('/rest/api/latest/projects', bb_projects),
+    Route('/rest/api/latest/projects/{key}', bb_project),
+    Route('/rest/api/latest/projects/{key}/repos', bb_repos),
+    Route('/rest/api/latest/repos', bb_repos),
+    Route(_BB_REPO, bb_repo),
+    Route(_BB_REPO + '/raw/{path:path}', bb_raw),
+    Route(_BB_REPO + '/browse', bb_raw),
+    Route(_BB_REPO + '/browse/{path:path}', bb_raw),
+    Route(_BB_REPO + '/branches', bb_branches),
+    Route(_BB_REPO + '/commits', bb_commits),
+    Route(_BB_REPO + '/pull-requests', bb_empty_page),
+    Route('/rest/api/latest/dashboard/pull-requests', bb_empty_page),
+    Route('/rest/api/1.0/dashboard/pull-requests', bb_empty_page),
+    Route('/rest/api/latest/inbox/pull-requests', bb_empty_page),
+    Route('/rest/api/latest/users', bb_users),
+    Route('/rest/api/latest/users/{slug}', bb_users),
+    Route('/rest/search/latest/search', bb_search, methods=['POST']),
+    Route('/projects/{key}/repos/{slug}/browse', bb_browse),
+    Route('/projects/{key}/repos/{slug}/browse/{path:path}', bb_browse),
+]
+
+
 async def not_found(request: Request, exc) -> JSONResponse:
     """JSON и на неизвестный путь: текстовый 404 клиент принимает за битый ответ, а не за «нет»."""
     return JSONResponse({'statusCode': 404, 'message': f'{request.url.path}: не эмулируется'}, status_code=404)
 
 
-app = Starlette(routes=JIRA_ROUTES if SERVER == 'jira' else CONFLUENCE_ROUTES,
+ROUTES = {'jira': JIRA_ROUTES, 'stash-delta': BITBUCKET_ROUTES, 'stash-sigma': BITBUCKET_ROUTES}
+app = Starlette(routes=ROUTES.get(SERVER, CONFLUENCE_ROUTES),
                 middleware=[Middleware(BaseHTTPMiddleware, dispatch=guard)],
                 exception_handlers={404: not_found})
 
@@ -569,4 +788,6 @@ if __name__ == '__main__':
     assert order == 'lastmodified DESC'
     assert parse_query('key in (E360-1, E360-2)')[0] == [[('key', 'in', ['E360-1', 'E360-2'])]]
     assert _cmp('!=', 'Done', ['done']) is False and _words_in('круг общения', 'Круг общения сотрудника')
+    assert parse_search('repo:BIGDATA/hr_data ext:sql "tb log" pr_x') == (
+        {'repo': 'BIGDATA/hr_data', 'ext': 'sql'}, ['tb log', 'pr_x'])
     print('ok')

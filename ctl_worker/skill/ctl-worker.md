@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-10-02 11:12 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 13:51 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -330,13 +330,37 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 «какие данные приносит поток». Состояние загрузки по-прежнему смотри в Airflow: Confluence
 описывает таблицу, а не загрузку.
 
-**Как:** через MCP к `confluence.delta.sbrf.ru` — `confluence_get_page(space_key="HRData",
-title="<имя таблицы>")`; не нашлась — `confluence_search` с CQL
-`space = HRData AND title ~ "<имя таблицы>"`. Все таблицы одной схемы —
-`confluence_get_page_children` у страницы схемы.
+**Как:** через MCP к `confluence.delta.sbrf.ru`. Имена инструментов зависят от MCP — смотри,
+какие подключены:
+
+- корпоративный MCP Confluence — `search_content(space_key="HRData", title="<имя таблицы>")`,
+  по id — `get_content_by_id(id="<id>")`; не нашлась — `search_content_cql` с CQL
+  `space = HRData AND title ~ "<имя таблицы>"`; все таблицы схемы — `get_children` у страницы схемы;
+- `mcp-atlassian` — `confluence_get_page(space_key="HRData", title="<имя таблицы>")`,
+  `confluence_search`, `confluence_get_page_children`.
 
 **Нет такого MCP** — скажи DE подключить его (`MCP_DE.md`, раздел 4 «Confluence и Jira»), а о
 колонках не гадай.
+
+## 9б. DDL таблиц и функций GP: Bitbucket
+
+Confluence описывает смысл, а точное определение — колонки, типы, сигнатуры функций движка —
+лежит в репозитории HR_Data на `stash.delta.sbrf.ru`:
+https://stash.delta.sbrf.ru/projects/BIGDATA/repos/hr_data/browse/sql/create/s_grnplm_vd_hr_edp_<схема>
+(под схемой — `tables`, `views`, `functions`; файл — `<имя>.sql`).
+
+**Когда открывать:** `run_exe` упал с ошибкой GP про колонку, тип или функцию —
+`column … does not exist`, `function … does not exist`, несовпадение типов. Сверь текст ошибки с
+DDL и назови файл и коммит, после которого разошлось.
+
+**Как:** через MCP Bitbucket к `stash.delta.sbrf.ru` —
+`bitbucket_getFileContent(projectKey="BIGDATA", repositorySlug="hr_data",
+path="sql/create/s_grnplm_vd_hr_edp_<схема>/tables/<таблица>.sql")`; путь каталога даёт листинг.
+Кто и когда менял — `bitbucket_getCommits(..., path=…)`. Инструменты записи не вызывай.
+
+**Нет такого MCP** — скажи DE подключить его (`MCP_DE.md`, раздел 4 «Bitbucket»); о колонках и
+типах не гадай. Помни: в репозитории — то, что задумано, а на сервере может быть иначе, если
+DDL не выкатили.
 
 ## 10. Чего не советовать
 

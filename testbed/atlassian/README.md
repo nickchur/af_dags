@@ -1,17 +1,21 @@
-# 📚 Эмулятор Confluence и Jira
-*2026-10-02 10:53 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+# 📚 Эмулятор Confluence, Jira и Bitbucket
+*2026-10-02 13:51 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Корпоративный Confluence у Сбера не один: `confluence.delta.sbrf.ru`, `confluence.sberbank.ru`.
-GigaCode ходит в них и в Jira через MCP [`mcp-atlassian`](https://pypi.org/project/mcp-atlassian/),
-по экземпляру на сервер: один экземпляр знает один адрес. DE подключают его сами, контур этот
-MCP не даёт. Чтобы навыки, которые ссылаются на Confluence, проверялись до контура, на стенде
-стоит сервер с тем же REST.
+GigaCode ходит в них и в Jira через MCP, который DE подключают сами, контур его не даёт.
+MCP бывает двух видов: корпоративный MCP Confluence и MCP Jira (SberWorks, центральный, вход по
+личному PAT) и [`mcp-atlassian`](https://pypi.org/project/mcp-atlassian/), по экземпляру на
+сервер. Имена инструментов у них разные, навыки знают оба. Чтобы навыки, которые ссылаются на
+Confluence, проверялись до контура, на стенде стоит сервер с тем же REST. Проверяется он через
+`mcp-atlassian`: корпоративный сервер к стенду не подключить.
 
 | Экземпляр | Что изображает | Порт на стенде |
 |---|---|---|
 | `atlassian-mock@delta` | `confluence.delta.sbrf.ru` | `127.0.0.1:8090` |
 | `atlassian-mock@jira` | Jira | `127.0.0.1:8091` |
 | `atlassian-mock@sber` | `confluence.sberbank.ru` | `127.0.0.1:8092` |
+| `atlassian-mock@stash-delta` | Bitbucket `stash.delta.sbrf.ru` | `127.0.0.1:8093` |
+| `atlassian-mock@stash-sigma` | Bitbucket `stash.sigma.sbrf.ru` | `127.0.0.1:8094` |
 
 Один код — [`atlassian_mock.py`](atlassian_mock.py), сервер выбирает `ATLASSIAN_MOCK_SERVER`.
 Только чтение, вход по Bearer PAT, как на Server/DC.
@@ -82,7 +86,9 @@ scp -r atlassian_mock.py /tmp/atl-fixtures testsrv:/opt/aftest/atlassian-mock/  
 #   ATLASSIAN_MOCK_FIXTURES=/opt/aftest/atlassian-mock/fixtures
 #   ATLASSIAN_MOCK_TOKENS=<PAT>
 # delta.env: ATLASSIAN_MOCK_SERVER=delta PORT=8090; jira.env: …=jira PORT=8091; sber.env: …=sber PORT=8092
-systemctl enable --now atlassian-mock@delta atlassian-mock@jira atlassian-mock@sber
+# stash-delta.env: …=stash-delta PORT=8093; stash-sigma.env: …=stash-sigma PORT=8094
+systemctl enable --now atlassian-mock@delta atlassian-mock@jira atlassian-mock@sber \
+    atlassian-mock@stash-delta atlassian-mock@stash-sigma
 ```
 
 ## Подключение mcp-atlassian
@@ -97,4 +103,48 @@ READ_ONLY_MODE=true CONFLUENCE_URL=http://localhost:18092 CONFLUENCE_PERSONAL_TO
 mcp-atlassian                                                                     # confluence-sber
 ```
 
-Самопроверка разбора CQL и JQL: `python atlassian_mock.py`.
+## Bitbucket
+
+DDL таблиц и код функций лежат в корпоративном Bitbucket Server, и серверов у него тоже
+несколько. Корпоративный «MCP сервер BitBucket CI» пока открыт только агентам AI Hub SberWorks. Агент DE читает их через MCP
+[`@atlassian-dc-mcp/bitbucket`](https://www.npmjs.com/package/@atlassian-dc-mcp/bitbucket),
+по экземпляру на сервер. Так при разборе падения он сверяет текст ошибки с DDL по ссылке из
+навыка. Эмулятор отвечает на REST его инструментов чтения. Набор снят прогоном версии 0.35:
+
+- проекты и репозитории;
+- файл по пути и ветке (`/raw`); на каталог — листинг дерева, как у Bitbucket;
+- ветки;
+- коммиты по пути: кто и когда менял DDL;
+- поиск кода (`/rest/search/latest`): все слова запроса в файле, модификаторы `repo:`,
+  `project:`, `ext:`;
+- пользователь;
+- пустые списки PR.
+
+Сравнение веток (`compare/diff`) не эмулируется: для разбора падений оно не нужно.
+
+**Веб-ссылка** `/projects/<P>/repos/<r>/browse/<path>` отдаёт текст файла или листинг.
+Ссылку из навыка можно открыть на стенде, заменив хост.
+
+**Наполнение** — bare-клоны `fixtures/bitbucket/<server>/<PROJECT>/<slug>.git`, с теми же
+ключами проектов и slug, что на настоящих серверах. Читаются `git`, сервер git не нужен.
+Положенный клон виден сразу, перезапуск не нужен. На стенде:
+
+| Сервер | Репозиторий | Что в нём |
+|---|---|---|
+| `stash-delta` | `BIGDATA/hr_data` | клон HR_Data: DDL GP, `sql/create/<схема>/tables\|functions` |
+| `stash-sigma` | `HRPLATFORM/app-dataplatform-etl-dags` | клон af_dags |
+
+```bash
+git init --bare hr_data.git && git -C hr_data.git fetch ~/HR_Data '+refs/remotes/origin/*:refs/heads/*'
+git -C hr_data.git symbolic-ref HEAD refs/heads/develop     # ветка по умолчанию — как на сервере
+# → /opt/aftest/atlassian-mock/fixtures/bitbucket/stash-delta/BIGDATA/hr_data.git
+```
+
+Подключение MCP (туннель `-L 18093:127.0.0.1:8093 -L 18094:127.0.0.1:8094`):
+
+```bash
+BITBUCKET_API_BASE_PATH=http://localhost:18093/rest BITBUCKET_API_TOKEN=<PAT> \
+npx -y @atlassian-dc-mcp/bitbucket                                               # bitbucket-delta
+```
+
+Самопроверка разбора CQL, JQL и запросов поиска кода: `python atlassian_mock.py`.
