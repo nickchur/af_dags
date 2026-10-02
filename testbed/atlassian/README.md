@@ -1,5 +1,5 @@
 # 📚 Эмулятор Confluence и Jira
-*2026-10-02 10:41 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:53 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Корпоративный Confluence у Сбера не один: `confluence.delta.sbrf.ru`, `confluence.sberbank.ru`.
 GigaCode ходит в них и в Jira через MCP [`mcp-atlassian`](https://pypi.org/project/mcp-atlassian/),
@@ -56,8 +56,9 @@ fixtures/
 - **HTML-экспорт пространства** (штатная выгрузка Confluence: `index.html`, `toc.html`, по
   файлу на страницу) раскладывает [`import_html_export.py`](import_html_export.py) — id и
   названия из заголовков страниц, дерево из `toc.html`, корень — куда ведёт `index.html`.
-  Картинок в экспорте нет, вместо них подпись `[изображение]`. Так на `sber` лежит
-  пространство `HRTECH`: документация сервиса авторизации, корень `1247712729`.
+  Картинок в экспорте нет, вместо них подпись `[изображение]`. Так на стенде лежат
+  `sber`/`HRTECH` (документация сервиса авторизации, корень `1247712729`) и `delta`/`HRData`
+  (ветка «ПКАП1080» с описаниями таблиц GP, около 1550 страниц, `--parent 1774392110`).
 
   ```bash
   python3 import_html_export.py <каталог экспорта> --server sber --space HRTECH \

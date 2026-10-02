@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-10-02 10:07 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:53 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -320,6 +320,10 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 
 - корень — «HR Data»: https://confluence.delta.sbrf.ru/display/HRData/HR+Data
   (https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=1774392110);
+- описания таблиц — в ветке «[1] ПКАП1080 (CI02750757)» → «ПКАП1080 (Схемы)»
+  (https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=16079355940): под ней страница
+  на каждую схему (`s_grnplm_vd_hr_edp_stg`, `…_dds`, `…_srv_wf` и т. д.), под схемой —
+  страница на таблицу или вьюху. Название страницы — голое имя таблицы, без схемы;
 - страница таблицы, например: https://confluence.delta.sbrf.ru/display/HRData/ue_circle_of_contacts
 
 **Когда открывать:** вопрос про содержимое таблицы — «что значит поле X», «почему пусто Y»,
@@ -328,7 +332,8 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 
 **Как:** через MCP к `confluence.delta.sbrf.ru` — `confluence_get_page(space_key="HRData",
 title="<имя таблицы>")`; не нашлась — `confluence_search` с CQL
-`space = HRData AND title ~ "<имя таблицы>"`.
+`space = HRData AND title ~ "<имя таблицы>"`. Все таблицы одной схемы —
+`confluence_get_page_children` у страницы схемы.
 
 **Нет такого MCP** — скажи DE подключить его (`MCP_DE.md`, раздел 4 «Confluence и Jira»), а о
 колонках не гадай.

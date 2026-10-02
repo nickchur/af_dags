@@ -1,5 +1,5 @@
 """📥 HTML-экспорт пространства Confluence → страницы эмулятора.
-*2026-10-02 10:41 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:53 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Штатный экспорт Confluence в HTML (каталог с `index.html`, `toc.html`, `assets/`, по файлу на
 страницу) раскладывается в `confluence/<server>/<SPACE>/<id>.html` с теми же id, названиями и
@@ -10,7 +10,8 @@
         --out /opt/aftest/atlassian-mock/fixtures
 
 Id и название страницы берутся из `<h1 id="src-<id>">`, дерево — из `toc.html`, корень —
-страница, на которую ведёт `index.html` (у него родителя нет). Картинок в экспорте нет —
+страница, на которую ведёт `index.html`; его родитель — `--parent` (выгружают обычно ветку,
+а не всё пространство: у ветки ПКАП1080 в HRData родитель — домашняя «HR Data»). Картинок в экспорте нет —
 вместо них остаётся подпись `[изображение]`.
 """
 from __future__ import annotations
@@ -63,6 +64,7 @@ def main() -> None:
     ap.add_argument('--server', required=True, help='delta | sber')
     ap.add_argument('--space', required=True, help='ключ пространства, как в корпоративном Confluence')
     ap.add_argument('--name', help='название пространства (по умолчанию — из заголовка страниц)')
+    ap.add_argument('--parent', help='id родителя корневой страницы, если выгружена ветка пространства')
     ap.add_argument('--out', type=Path, required=True)
     a = ap.parse_args()
 
@@ -86,9 +88,9 @@ def main() -> None:
             m = re.search(r'<title>.*? - (.*?)</title>', f.read_text(encoding='utf-8'), re.S)
             space_name = html.unescape(m.group(1)).strip() if m else a.space
     for pid, (title, body) in pages.items():
-        parent = None if pid == root_id else toc.parent.get(pid) or root_id
+        parent = a.parent if pid == root_id else toc.parent.get(pid) or root_id
         head = [f'title: {json.dumps(title, ensure_ascii=False)}', 'labels: ["export"]']
-        if parent and parent in pages:
+        if parent and (parent in pages or parent == a.parent):
             head.insert(1, f'parent: {parent}')
         (space / f'{pid}.html').write_text('---\n' + '\n'.join(head) + '\n---\n' + body + '\n', encoding='utf-8')
     if not (space / '_space.yaml').exists():
