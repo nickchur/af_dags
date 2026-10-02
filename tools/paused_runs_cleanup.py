@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-10-01 18:18 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час находит раны в `running` / `queued` у дагов на паузе старше `older_than_hours` и,
 если попросили, закрывает их как **Mark failed**: незавершённые задачи → `skipped`, ран →
@@ -20,11 +20,11 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, Feed, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
+        TOOLS_POOL, Feed, ensure_pool, on_callback, saved_params, saved_schedule, store_params_task,
     )
 
 logger = getLogger("airflow.task")
@@ -43,8 +43,6 @@ RUN_STATES = ['running', 'queued']
 #: События журнала, которыми Airflow пишет паузу: UI (`paused`, с 2.10 и `ui.paused`),
 #: REST API (`patch_dag`), CLI. Пауза из кода записи не оставляет.
 PAUSE_EVENTS = ('paused', 'ui.paused', 'patch_dag', 'api.patch_dag', 'cli_dag_pause')
-#: Сколько ранов показываем в заметке; полный список — в логе таска и XCom
-NOTE_ROWS = 50
 #: Потолок выборки: столько ранов запаузенных дагов не бывает, это защита памяти воркера
 FETCH_LIMIT = 5000
 LOG_EVENT = 'paused_run_failed'
@@ -212,25 +210,20 @@ def tools_paused_runs_cleanup():
         by_dag = {}
         for r in todo:
             by_dag.setdefault(r['dag_id'], []).append(r)
-        lines = ["| Даг | Ранов | Старейший, ч | Пауза (последняя запись) |", "|---|---:|---:|---|"]
-        for dag_id, rs in sorted(by_dag.items(), key=lambda kv: -len(kv[1])):
-            lines.append(f"| `{dag_id}` | {len(rs)} | {max(r['age_h'] for r in rs)} | {who(dag_id)} |")
-        lines += ["", "| Даг | Ран | Состояние | Возраст, ч | Задачи |", "|---|---|---|---:|---|"]
-        for r in sorted(todo, key=lambda r: -r['age_h'])[:NOTE_ROWS]:
-            tasks = ', '.join(f"{k} {v}" for k, v in sorted(r['tasks'].items())) or 'нет'
-            lines.append(f"| `{r['dag_id']}` | `{r['run_id']}` | {r['state']} | {r['age_h']} | {tasks} |")
-        if len(todo) > NOTE_ROWS:
-            lines.append(f"| … | ещё {len(todo) - NOTE_ROWS} | | | полный список в логе таска |")
-        if busy:
-            lines.append(f"\n⏳ Не тронуты — задача ещё в running: {len(busy)} "
-                         f"({', '.join(sorted({r['dag_id'] for r in busy})[:10])})")
+        # Строка на даг, затем раны от старых; таблица вытесняла строки из 1000 символов заметки
+        lines = [f"⏸️ `{dag_id}`: ранов {len(rs)}, старейший {max(r['age_h'] for r in rs)} ч · пауза: {who(dag_id)}"
+                 for dag_id, rs in sorted(by_dag.items(), key=lambda kv: -len(kv[1]))]
+        for r in sorted(todo, key=lambda r: -r['age_h']):
+            tasks = ', '.join(f"{k} {v}" for k, v in sorted(r['tasks'].items())) or 'задач нет'
+            lines.append(f"`{r['dag_id']}` `{r['run_id']}`: {r['state']}, {r['age_h']} ч · {tasks}")
+        rest = (f"⏳ не тронуты — задача ещё в running: {len(busy)} "
+                f"({', '.join(sorted({r['dag_id'] for r in busy})[:10])})" if busy else '')
 
-        title = (f"⏸️ Зависших ранов у запаузенных дагов: {len(todo)} "
-                 f"(старше {p['older_than_hours']} ч, дагов {len(by_dag)}; всего активных {len(rows)})")
-        logger.info("%s\n%s", title, "\n".join(f"{r['dag_id']} {r['run_id']} {r['state']} {r['age_h']} ч"
-                                               for r in todo))
-        add_note("\n".join(lines) if todo or busy else "ничего не найдено", context,
-                 level='DAG,task', title=title)
+        summary = (f"зависших ранов {len(todo)} у {len(by_dag)} дагов (старше {p['older_than_hours']} ч; "
+                   f"всего активных {len(rows)})" if todo or busy else "ничего не найдено")
+        logger.info("%s\n%s", summary, "\n".join(f"{r['dag_id']} {r['run_id']} {r['state']} {r['age_h']} ч"
+                                                 for r in todo))
+        Feed(context, '⏸️ collect').done(summary, keep=lines, rest=rest, dag=True)
         return [{'dag_id': r['dag_id'], 'run_id': r['run_id'], 'state': r['state'],
                  'age_h': r['age_h'], 'paused': who(r['dag_id'])} for r in todo]
 
@@ -258,12 +251,10 @@ def tools_paused_runs_cleanup():
                 logger.exception("❌ %s %s", r['dag_id'], r['run_id'])
                 failed.append({**r, 'error': f"{type(e).__name__}: {e}"})
 
-        lines = [f"✅ `{r['dag_id']}` `{r['run_id']}` — {r['how']}" for r in done[:NOTE_ROWS]]
-        if len(done) > NOTE_ROWS:
-            lines.append(f"… и ещё {len(done) - NOTE_ROWS}")
-        lines += [f"❌ `{r['dag_id']}` `{r['run_id']}` — {r['error']}" for r in failed]
-        title = f"🧹 Закрыто ранов: {len(done)}, ошибок {len(failed)}"
-        add_note("\n".join(lines), context, level='DAG,task', title=title)
+        lines = ([f"❌ `{r['dag_id']}` `{r['run_id']}` — {r['error']}" for r in failed]
+                 + [f"✅ `{r['dag_id']}` `{r['run_id']}` — {r['how']}" for r in done])
+        title = f"закрыто ранов {len(done)}, ошибок {len(failed)}"
+        Feed(context, '🧹 close').done(title, keep=lines, dag=True)
         if failed:
             raise AirflowFailException(f"{title}: " + "; ".join(f"{r['dag_id']} {r['run_id']}" for r in failed))
         return {'closed': len(done)}

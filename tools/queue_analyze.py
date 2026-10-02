@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-10-01 18:18 MSK · v3.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v3.24 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час (в :10) разбирает, почему задачи ждут: лимиты дагов, пулы, приоритет, окно
 шедулера, ёмкость исполнителя, мусор в брокере и раздутый сет привязок ответных очередей.
@@ -32,12 +32,12 @@ from airflow.utils.trigger_rule import TriggerRule
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
+        TOOLS_POOL, Feed, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
         env_platform, env_stand, store_params_task,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
+        TOOLS_POOL, Feed, add_note, ensure_pool, health_tasks, on_callback, push_health, saved_params, saved_schedule,
         env_platform, env_stand, store_params_task,
     )
 
@@ -124,8 +124,6 @@ READ_LIMIT = 50_000
 # Потолок выборки scheduled: на сигме 23.09 их было 297; десятки тысяч — уже авария,
 # и для выводов хватит первой партии (в отчёте помечено)
 SCHEDULED_LIMIT = 20_000
-# Строк в таблице дагов в заметке
-NOTE_ROWS = 30
 
 
 
@@ -853,16 +851,13 @@ def tools_queue_analyze():
         out = scheduler_causes(waiting, active, pools, dispatched, now, p["stale_min"], window=_scheduler_window())
         out.update(timeout_runs=timeout_runs, paused_runs=paused_runs, truncated=len(waiting) >= SCHEDULED_LIMIT,
                    pools={k: v for k, v in pools.items() if v["slots"] >= 0 and v["used"] >= v["slots"]})
-        rows = ["| Даг | Ждут | Давно | Старейшая, мин | В работе / лимит | Вес | Причины |",
-                "|---|---:|---:|---:|---|---|---|"]
-        for d in out["dags"][:NOTE_ROWS]:
-            causes = ", ".join(f"{k} {v}" for k, v in d["causes"].items()) or "—"
-            rows.append(f"| `{d['dag_id']}` | {d['waiting']} | {d['stale']} | {d['oldest_min']} | "
-                        f"{d['active']} / {d['max_active_tasks']} | {d['weight']} | {causes} |")
-        title = (f"🗓️ scheduled: живых {out['live']} (давно {out['stale']}), припарковано {out['parked']}; "
-                 f"закрыто без старта {len(timeout_runs)}; ранов на паузе {paused_runs}")
-        add_note("\n".join(rows) if out["dags"] else "живых scheduled нет", context=context,
-                 level="Task", title=title)
+        lines = [f"`{d['dag_id']}`: ждут {d['waiting']} (давно {d['stale']}, старейшая {d['oldest_min']} мин) · "
+                 f"в работе {d['active']}/{d['max_active_tasks']} · вес {d['weight']} · "
+                 + (", ".join(f"{k} {v}" for k, v in d["causes"].items()) or "причин нет")
+                 for d in out["dags"]]
+        summary = (f"живых {out['live']} (давно {out['stale']}), припарковано {out['parked']}; "
+                   f"закрыто без старта {len(timeout_runs)}; ранов на паузе {paused_runs}")
+        Feed(context, "🗓️ scheduled").done(summary, keep=lines)
         return out
 
     @task(task_id="capacity", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
@@ -1055,40 +1050,40 @@ def tools_queue_analyze():
         else:
             deleted = "☮️ не удаляли"
 
-        lines += ["", "| Раздел | Итог |", "|---|---|"]
+        lines.append("")
         if sched:
             causes = ", ".join(f"{k} {v}" for k, v in sched["by_cause"].items()) or "—"
-            lines.append(f"| scheduled | живых {sched['live']}, давно ждут {sched['stale']} ({causes}), "
-                         f"припарковано {sched['parked']} |")
-            lines.append(f"| приоритет | ушло в работу за час {sched['dispatched_1h']}, медиана веса "
-                         f"{sched['median_dispatched']} |")
+            lines.append(f"🗓️ scheduled: живых {sched['live']}, давно ждут {sched['stale']} ({causes}), "
+                         f"припарковано {sched['parked']}")
+            lines.append(f"⚖️ приоритет: ушло в работу за час {sched['dispatched_1h']}, медиана веса "
+                         f"{sched['median_dispatched']}")
         else:
-            lines.append(f"| scheduled | ❌ разбор не отработал ({state('scheduler')}) |")
+            lines.append(f"🗓️ scheduled: ❌ разбор не отработал ({state('scheduler')})")
         if cap:
-            lines.append(f"| ёмкость | queued {cap['queued']} + running {cap['running']} из {cap['capacity']} "
-                         f"(parallelism воркера {cap['parallelism']} × шедулеров {cap['schedulers']}) |")
+            lines.append(f"🔋 ёмкость: queued {cap['queued']} + running {cap['running']} из {cap['capacity']} "
+                         f"(parallelism воркера {cap['parallelism']} × шедулеров {cap['schedulers']})")
             pods = cap.get("pods")
-            lines.append(f"| воркеры | живых {pods['alive']}, слоты {pods['slots_busy']}/{pods['slots_total']} |"
-                         if pods else f"| воркеры | отбивок нет: {cap.get('pods_error')} |")
+            lines.append(f"👷 воркеры: живых {pods['alive']}, слоты {pods['slots_busy']}/{pods['slots_total']}"
+                         if pods else f"👷 воркеры: отбивок нет: {cap.get('pods_error')}")
         else:
-            lines.append(f"| ёмкость | ❌ не отработала ({state('capacity')}) |")
+            lines.append(f"🔋 ёмкость: ❌ не отработала ({state('capacity')})")
         if snapshot:
             lines += [
-                f"| брокер | сообщений {snapshot['total']}, живых {snapshot['live']}, мусора {snapshot['junk']} |",
-                f"| удалено | {deleted} · осталось {purged.get('left', '—')} |",
-                f"| дамп мусора | `s3://{BUCKET_NAME}/{snapshot['dump_key']}` |",
+                f"📨 брокер: сообщений {snapshot['total']}, живых {snapshot['live']}, мусора {snapshot['junk']}",
+                f"🧹 удалено: {deleted} · осталось {purged.get('left', '—')}",
+                f"🗑️ дамп мусора: `s3://{BUCKET_NAME}/{snapshot['dump_key']}`",
             ]
         else:
             s = state("broker")
-            lines.append("| брокер | очередь пуста |" if s == "skipped" else f"| брокер | ❌ не отработал ({s}) |")
+            lines.append("📨 брокер: очередь пуста" if s == "skipped" else f"📨 брокер: ❌ не отработал ({s})")
         if bindings:
-            lines.append(f"| привязки ответов | {bindings['count']} |")
+            lines.append(f"📮 привязки ответов: {bindings['count']}")
         else:
-            lines.append(f"| привязки ответов | ❌ не прочитаны ({state('pidbox')}) |")
+            lines.append(f"📮 привязки ответов: ❌ не прочитаны ({state('pidbox')})")
         if "left" in cleared:
-            lines.append(f"| чистка привязок | удалено {cleared['deleted']}, осталось {cleared['left']} |")
+            lines.append(f"🧹 чистка привязок: удалено {cleared['deleted']}, осталось {cleared['left']}")
         elif state("purge_pidbox") == "failed":
-            lines.append("| чистка привязок | ❌ упала — лог таска `purge_pidbox` |")
+            lines.append("🧹 чистка привязок: ❌ упала — лог таска `purge_pidbox`")
         if stop:
             lines += ["", f"> ⛔️ {stop}"]
         if snapshot and snapshot.get("reasons"):

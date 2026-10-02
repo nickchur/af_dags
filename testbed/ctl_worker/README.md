@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-09-26 21:38 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 07:29 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -11,7 +11,7 @@
 
 | Файл | Что делает |
 | :--- | :--- |
-| `ctl_mock.py` | сам эмулятор: starlette + psycopg2, порт 9080 |
+| `ctl_mock.py` | сам эмулятор: starlette + psycopg2, порт 9080 (у AF3 — 9081) |
 | `schema.sql` | схема `ctl_mock` в стендовом postgres и заглушки `pr_swf_start_ctl` / `pr_log_ctl` |
 | `fixtures_from_cache.py` | снимок бакета `edpetl-ctl` → фикстуры эмулятора |
 | `ctl-mock.service` | systemd-юнит |
@@ -76,6 +76,38 @@ curl -s http://127.0.0.1:9080/v5/api/info
 и стенд не получает ни одного дага воркера. Для тракта хватает пары десятков; в набор
 всегда попадают воркфлоу тех загрузок, что приехали из снимка.
 
+## Второй экземпляр — для AF3
+
+С общим эмулятором ран AF3 двигал загрузки и события стенда AF2, поэтому у AF3 свой
+экземпляр того же кода. Общие у двух стендов только MinIO, ClickHouse и Kafka.
+
+| | AF2 | AF3 |
+| :--- | :--- | :--- |
+| Каталог и юнит | `/opt/aftest/ctl-mock`, `ctl-mock` | `/opt/aftest/ctl-mock3`, `ctl-mock3` |
+| Порт | 9080 | 9081 |
+| База состояния и GP | `gp_test` | `gp_test3` |
+| Подключения vault | `/vault/secrets/application` | `/vault/secrets/application3` (`ctl` → 9081) |
+| Бакеты CTL | `edpetl-ctl`, `edpetl-files` | `edpetl-ctl3`, `edpetl-files3` |
+| Бакет логов | `hrplt-test` | `hrplt-test3` |
+
+```bash
+# База — копия gp_test; номера загрузок сдвинуты, чтобы не совпадать с AF2 в общих бакетах и логах
+docker exec aftest-postgres createdb -U airflow gp_test3
+docker exec aftest-postgres sh -c 'pg_dump -U airflow gp_test | psql -qU airflow gp_test3'
+docker exec aftest-postgres psql -U airflow -d gp_test3 -c "select setval('ctl_mock.loading_id_seq', 93000000)"
+
+# Каталог — копия ctl-mock; в ctl-mock.env база gp_test3, в юните порт 9081 и каталог ctl-mock3
+cp -a /opt/aftest/ctl-mock /opt/aftest/ctl-mock3
+sed -i 's#/gp_test$#/gp_test3#; s#ctl-mock/#ctl-mock3/#' /opt/aftest/ctl-mock3/ctl-mock.env
+sed 's#ctl-mock#ctl-mock3#g; s#9080#9081#' ctl-mock.service > /etc/systemd/system/ctl-mock3.service
+systemctl daemon-reload && systemctl enable --now ctl-mock3
+curl -s http://127.0.0.1:9081/v5/api/info
+```
+
+Метабаза AF3 своя, поэтому в ней же заводятся `alpha-adb_dev_comm-read` / `-write` на
+`gp_test3`, а `ctl_config` AF3 смотрит на `http://127.0.0.1:9081` и бакеты `*3`. Файл vault
+AF3 выбирает `scripts/stand_af3_env.sh` из etl-core-3.
+
 ## Что нужно в Airflow
 
 | Что | Значение на стенде |
@@ -134,6 +166,16 @@ CTL кладёт в `params` загрузки два ключа, без кото
 ```bash
 curl -s -X POST 'http://127.0.0.1:9080/v4/api/wf/<wf_id>/loading?scheduleAfterStart=false' \
      -H 'Content-Type: application/json' -d '{"wfp_run_type": "NO-WAIT"}'
+```
+
+Эмулятор ставит новой загрузке START и дальше её не двигает; сенсор берёт только RUNNING,
+TIME-WAIT и EVENT-WAIT, а монитор перезапускает START лишь через час (`new_grace`). Поэтому
+в RUNNING её переводят руками, и лог обязан быть пустым: RUNNING с логом сенсор считает уже
+запущенным и пропускает.
+
+```bash
+curl -s -X PUT 'http://127.0.0.1:9080/v4/api/loading/<lid>/status' \
+     -H 'Content-Type: application/json' -d '{"status": "RUNNING", "log": ""}'
 ```
 
 Дальше `ctl_sensor` (раз в минуту) её видит и поднимает даг воркера. Смотреть глазами:

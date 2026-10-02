@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-01 19:13 MSK · v1.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -303,6 +303,52 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
             session.close()
     except Exception as e:
         logger.warning(f"Failed to update note: {e}")
+
+# Заметке — 1000 символов (колонка метабазы AF 2); запас на заголовок
+NOTE_BUDGET = 900
+
+
+class Feed:
+    """Заметка таска одним проходом, без таблиц: строки хода сверху вниз, в конце итог над ними.
+
+    В 1000 символов заметки широкая таблица вытесняла строки (сигма dev 01.10.2026 — reindex
+    на 116 индексов обрывался на десятом). Не влезает — в ходе видны последние строки, в итоге
+    те, что переданы в done(keep=…), и «ещё N». done(dag=True) пишет итог строкой и в заметку рана.
+    """
+
+    def __init__(self, context, title):
+        self.context, self.title, self.lines = context, title, []
+
+    def line(self, text, replace_last=False):
+        if replace_last and self.lines:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
+        self._write('', self.lines, tail=True)
+
+    def done(self, summary, keep=None, rest='', dag=False):
+        self._write(summary, self.lines if keep is None else keep, tail=False, rest=rest)
+        if dag:
+            add_note(summary, context=self.context, level='DAG', title=self.title)
+
+    def _write(self, head, lines, tail, rest=''):
+        budget = NOTE_BUDGET - len(self.title) - len(head) - len(rest) - 40
+        picked, size = [], 0
+        for ln in (reversed(lines) if tail else lines):
+            # +3: перенос и два пробела жёсткого переноса от add_note
+            if size + len(ln) + 3 > budget:
+                break
+            picked.append(ln)
+            size += len(ln) + 3
+        if tail:
+            picked.reverse()
+        cut = len(lines) - len(picked)
+        more = f'… ещё {cut}' if cut else ''
+        body = [head] if head else []
+        body += ([more] if tail and more else []) + picked + ([more] if not tail and more else [])
+        body += [rest] if rest else []
+        add_note('\n'.join(body), context=self.context, level='Task', add=False, title=self.title)
+
 
 def add_xcom(key, value, context=None):
     """Кладёт значение в XCom, обрезая коллекции до MAX_XCOM элементов.
