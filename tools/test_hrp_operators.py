@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-01 22:26 MSK · v1.11 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-02 07:41 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
@@ -423,6 +423,12 @@ def test_hrp_operators_dag():
             for stmt in _ch_create_sql(table, typed=False).split(";"):
                 if stmt.strip():
                     ch.execute(stmt)
+        if IS_DEV:
+            # Таргет ch_to_ch — три колонки (см. click_to_click). cleanup его сносит, поэтому создаётся
+            # здесь: без этого каждый второй прогон падал на UNKNOWN_TABLE
+            ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{T_CH_TO_CH}")
+            ch.execute(f"CREATE TABLE {CH_SCHEMA}.{T_CH_TO_CH} (id Int32, name String, s_special String) "
+                       "ENGINE = MergeTree() ORDER BY id")
         ch.execute(_ch_insert_sql(SRC))
         logger.info("ClickHouse setup complete: %d rows in %s.%s", EXPECTED_ROWS, CH_SCHEMA, SRC)
 
@@ -859,7 +865,7 @@ def test_hrp_operators_dag():
     # ──────────────────────────── report ──────────────────────────────────────
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
-        """Собирает статусы всех тасков прогона в markdown-таблицу (как в test_connections)."""
+        """Собирает статусы тасков прогона в заметку рана: упавшие первыми, успешные одной строкой."""
         # Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
         # недоступна (setup пропущен по ошибке соединения) или активна.
         # Airflow 3: у задачи нет сессии метабазы — состояния соседей через Execution API
@@ -881,7 +887,7 @@ def test_hrp_operators_dag():
                 icon, skip = "☮️", skip + 1
             else:
                 icon, fail = "❌", fail + 1
-            rows.append(f"| {icon} | `{task_id}` | {state} |")
+            rows.append(("❌☮️✅".index(icon[0]), f"{icon} `{task_id}`" + (f" — {state}" if icon != "✅" else "")))
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
         params = context["params"]
@@ -901,8 +907,12 @@ def test_hrp_operators_dag():
         sys_line = "**Системы:** " + " · ".join(sys_status)
 
         headline = f"🧪 HRP operators: ✅ {ok} / ❌ {fail} / ☮️ {skip}"
-        table = "| Статус | Таск | State |\n|---|---|---|\n" + "\n".join(rows)
-        add_note(sys_line + "\n\n" + table, context, level="DAG", title=headline)
+        # Без таблицы: в 1000 символов заметки она вытесняла строки. Упавшие и пропущенные —
+        # строкой на таск, успешные — одной строкой в конце: её и режет лимит
+        lines = [row for rank, row in sorted(rows) if rank < 3]
+        ok_ids = [row[2:] for rank, row in sorted(rows) if rank == 3]
+        lines += [f"✅ ({len(ok_ids)}): " + ", ".join(ok_ids)] if ok_ids else []
+        add_note(sys_line + "\n\n" + "\n".join(lines), context, level="DAG", title=headline)
         logger.info("%s | %s", headline, " · ".join(sys_status))
 
     # ──────────────────────────── cleanup ─────────────────────────────────────
