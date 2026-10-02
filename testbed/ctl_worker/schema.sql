@@ -1,11 +1,11 @@
 -- Состояние эмулятора CTL и заглушки процедур Greenplum
--- 2026-09-01 12:20 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
+-- 2026-10-02 10:22 MSK · v1.1 · Nick Churkin · NSChurkin@sber.ru
 --
--- Разворачивается в стендовый postgres, база gp_test — ту же базу видит и conn 'gp'
+-- Разворачивается в стендовый postgres, база adb_dev_comm — ту же базу видит и conn 'gp'
 -- из ctl_config: заглушки pr_swf_start_ctl и pr_log_ctl обязаны лежать там, куда ходит
 -- gp_exe, иначе run_exe упадёт на первом же шаге.
 --
---   docker exec -i aftest-postgres psql -U airflow -d gp_test < schema.sql
+--   docker exec -i aftest-postgres psql -U airflow -d adb_dev_comm < schema.sql
 --
 --
 -- 📦 ЧТО ЗДЕСЬ

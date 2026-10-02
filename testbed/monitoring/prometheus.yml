@@ -1,0 +1,12 @@
+# Prometheus тестового стенда: опрашивает /admin/metrics вебсервера, как Prometheus сигмы.
+# 2026-10-02 10:25 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
+global:
+  scrape_interval: 30s
+  scrape_timeout: 20s
+scrape_configs:
+  - job_name: airflow-webserver
+    metrics_path: /platform/app-dataplatform-etl-webserver/admin/metrics/
+    static_configs:
+      - targets: ["127.0.0.1:8080"]
+        labels:
+          contour: stand

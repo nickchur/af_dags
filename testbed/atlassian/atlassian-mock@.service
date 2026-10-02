@@ -1,0 +1,27 @@
+# Эмулятор Confluence/Jira для тестового стенда → /etc/systemd/system/atlassian-mock@.service
+# 2026-10-02 10:04 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
+#
+#   systemctl daemon-reload && systemctl enable --now atlassian-mock@delta atlassian-mock@sber atlassian-mock@jira \
+#       atlassian-mock@stash-delta atlassian-mock@stash-sigma
+#   journalctl -u 'atlassian-mock@*' -f
+#
+# Экземпляр = сервер: delta (confluence.delta.sbrf.ru), sber (confluence.sberbank.ru), jira,
+# stash-delta и stash-sigma (Bitbucket stash.delta.sbrf.ru, stash.sigma.sbrf.ru).
+# Порт и имя сервера — в /opt/aftest/atlassian-mock/<экземпляр>.env, путь к наполнению и
+# токены — в common.env (chmod 600: там PAT). Слушает только 127.0.0.1, снаружи — через туннель.
+
+[Unit]
+Description=Atlassian mock %i (тестовый стенд Airflow)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/aftest/atlassian-mock
+EnvironmentFile=/opt/aftest/atlassian-mock/common.env
+EnvironmentFile=/opt/aftest/atlassian-mock/%i.env
+ExecStart=/opt/aftest/venv/bin/python -m uvicorn atlassian_mock:app --host 127.0.0.1 --port ${PORT} --log-level warning
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

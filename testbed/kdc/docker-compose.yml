@@ -1,0 +1,23 @@
+# KDC стенда отдельным проектом compose: infra/ стенда (метабаза, S3, клик) не трогаем.
+# 2026-10-02 10:12 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
+#   cd /opt/aftest/kdc && docker compose up -d --build
+services:
+  kdc:
+    build: .
+    image: aftest-kdc:1
+    container_name: aftest-kdc
+    restart: unless-stopped
+    environment:
+      KRB5_REALM: STAND.TEST
+      KRB5_PRINCIPALS: >-
+        hrplt_etl@STAND.TEST=hrplt_etl.keytab
+        HTTP/ctl-mock.stand@STAND.TEST=ctl-mock.keytab
+        postgres/gp.stand@STAND.TEST=gp.keytab
+    ports:
+      - "127.0.0.1:88:88/tcp"
+      - "127.0.0.1:88:88/udp"
+    volumes:
+      - ./keytabs:/keytabs
+      - kdc-db:/var/lib/krb5kdc
+volumes:
+  kdc-db:

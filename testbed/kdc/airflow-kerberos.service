@@ -1,0 +1,22 @@
+# Продление билета Kerberos для Airflow стенда → /etc/systemd/system/airflow-kerberos.service
+# 2026-10-02 10:13 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru
+#
+# Встроенный `airflow kerberos`: kinit по [kerberos] keytab/principal в [kerberos] ccache и
+# продление раз в reinit_frequency. Воркер, планировщик и вебсервер берут билет из того же
+# кэша через KRB5CCNAME в airflow.env — так KerberosHttpHook (CTL) и libpq (GP) идут по тем же
+# веткам, что на контуре.
+
+[Unit]
+Description=Airflow Kerberos ticket renewer (тестовый стенд)
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/aftest
+EnvironmentFile=/opt/aftest/airflow.env
+ExecStart=/opt/aftest/venv/bin/airflow kerberos
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

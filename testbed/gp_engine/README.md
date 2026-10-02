@@ -1,8 +1,8 @@
 # Движок srv_wf и отчёты CTL на стенде (PostgreSQL)
-*2026-09-26 20:36 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:22 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Настоящий движок загрузок (`pr_swf_start_ctl` и его журналы) и отчёты CTL (`pr_mail_*`,
-`pr_check_*`) в базе `gp_test` тестового стенда. Зачем: стенд работает постоянно в тестовом
+`pr_check_*`) в базе `adb_dev_comm` тестового стенда. Зачем: стенд работает постоянно в тестовом
 режиме (`test_mode`), и отчёты там строятся по-настоящему (`test_real` в `ctl_config`) поверх
 журнала, который наполняют тестовые прогоны. На этих данных проверяются навыки агента
 `ctl-worker` и `ctl-reports` и MCP-инструменты `ctl_workflow`/`ctl_report`.
@@ -17,7 +17,7 @@
   замена таблиц-двойников стенда обмена (`testbed/gp_exchange/10_schema.sql`) настоящими
   вьюхами с теми же колонками, переименование журнала заглушки `tb_log_ctl` в
   `tb_log_ctl_mock_old` (другая структура; журналы не удаляем).
-- `deploy.sh` — сборка, бэкап схем (`/opt/aftest/gp_test-srv-backup-*.sql`), прогон, пересоздание
+- `deploy.sh` — сборка, бэкап схем (`/opt/aftest/adb_dev_comm-srv-backup-*.sql`), прогон, пересоздание
   вьюх обмена, которые уходят каскадом.
 
 ```bash

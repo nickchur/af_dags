@@ -1,5 +1,5 @@
 # 🧰 Тестовый стенд
-*2026-09-24 12:17 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 13:16 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 То, что нужно, чтобы гонять DAG'и репозитория живьём на стенде (`ssh testsrv`,
 `/opt/aftest`): эмуляторы внешних систем, схемы, фикстуры, скрипты разворачивания. Здесь нет
@@ -14,6 +14,9 @@ DAG'ов, и на контуры это не нужно.
 | Каталог | Что это |
 |---|---|
 | [`ctl_worker/`](ctl_worker/README.md) | Эмулятор CTL API (без Kerberos и Greenplum) и сборщик фикстур из снимка `edpetl-ctl`: полный цикл `run_prm → run_exe → run_end` на стенде |
+| [`atlassian/`](atlassian/README.md) | Эмулятор Confluence (серверы delta и sber) и Jira под MCP `mcp-atlassian`, Bitbucket (stash.delta, stash.sigma) под MCP `@atlassian-dc-mcp/bitbucket`: навыки со ссылками на Confluence и репозитории проверяются на стенде; корпоративное наполнение — только на стенде |
+| [`kdc/`](kdc/README.md) | Kerberos: KDC `STAND.TEST`, CTL (SPNEGO) и GP (GSSAPI) по билету, подключения из секретов как на альфе |
+| [`monitoring/`](monitoring/README.md) | Prometheus опрашивает `/admin/metrics` вебсервера, как на сигме |
 | [`gp_exchange/`](gp_exchange/README.md) | Greenplum на PostgreSQL: пакет обмена собирается по-настоящему и проезжает весь путь до `gp_vw_*` |
 | [`vault/`](vault/make_vault.py) | `make_vault.py` — эмуляция `/vault/secrets/application`: payload в формате боевого sigma DEV, секреты только из переменных окружения |
 | [`check_status_contract.py`](check_status_contract.py) | Линтер контракта `(status, payload)`: находит вызовы решателей `ctl_chk_*`, результат которых не разобран |

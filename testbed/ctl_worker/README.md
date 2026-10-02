@@ -1,6 +1,6 @@
 # 🎭 Эмулятор CTL API для тестового стенда
 
-*2026-10-02 07:29 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 14:53 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `ctl_worker/` — единственный каталог репозитория, который до сих пор проверялся только
 выкладкой на alpha: все его даги ходят в CTL API, а он живёт на контуре и закрыт Kerberos.
@@ -18,14 +18,21 @@
 
 Справочники (воркфлоу, категории, сущности, профиль) — фикстуры, только чтение.
 Состояние (загрузки, статусы, параметры, statval'ы, расписание воркфлоу) — в postgres,
-база `gp_test`, схема `ctl_mock`.
+база `adb_dev_comm`, схема `ctl_mock`.
 
-## Почему это работает без Kerberos
+## Kerberos
 
+С 02.10.2026 эмулятор на стенде AF2 закрыт Kerberos, как настоящий CTL: задан
+`CTL_MOCK_KERBEROS_KEYTAB` (keytab с `HTTP/ctl-mock.stand`, KDC — [`testbed/kdc`](../kdc/README.md)),
+подключение `ctl` смотрит на `ctl-mock.stand`. Запрос без билета получает `401` с
+`WWW-Authenticate: Negotiate`, `KerberosHttpHook` повторяет его с токеном из кэша
+`airflow kerberos` — та же ветка кода, что на альфе. В журнале `ctl_mock.api_log` это пара
+`401` → `200` на каждый новый сеанс.
+
+Без переменной (так работает `ctl-mock3` для AF3) авторизации нет вовсе:
 `KerberosHttpHook` ставит `HTTPKerberosAuth(mutual_authentication=OPTIONAL)` без
-`force_preemptive`, а requests-kerberos генерирует токен только в ответ на `401` с
-`WWW-Authenticate: Negotiate`. Эмулятор 401 не отдаёт — ни KDC, ни keytab не нужны.
-Проверено живьём: `GET /v5/api/info` из `chk_any_conn` доходит и возвращает 200.
+`force_preemptive`, а requests-kerberos генерирует токен только в ответ на `401` — эмулятор
+его тогда не отдаёт, KDC и keytab не нужны.
 
 ## Почему не нужен Greenplum
 
@@ -64,7 +71,7 @@ unzip -q edpetl-ctl.zip -d /tmp/ctlsnap
 /opt/aftest/venv/bin/python fixtures_from_cache.py /tmp/ctlsnap/edpetl-ctl /opt/aftest/ctl-mock/fixtures 25
 
 # 2. Схема состояния и заглушки GP
-docker exec -i aftest-postgres psql -U airflow -d gp_test < schema.sql
+docker exec -i aftest-postgres psql -U airflow -d adb_dev_comm < schema.sql
 
 # 3. Сервис
 cp ctl-mock.service /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now ctl-mock
@@ -113,7 +120,7 @@ AF3 выбирает `scripts/stand_af3_env.sh` из etl-core-3.
 | Что | Значение на стенде |
 | :--- | :--- |
 | Подключение `ctl` | в payload `HTTP_CONNECTIONS`: `{"schema": "http", "host": "127.0.0.1", "port": 9080}` |
-| Подключения `gp` / `ppl` | `alpha-adb_dev_comm-read` / `-write` → postgres `gp_test` |
+| Подключения `gp` / `ppl` | `alpha-adb_dev_comm-read` / `-write` → postgres `adb_dev_comm` |
 | Подключение `pg` | `airflowdb` → метабаза |
 | Variable `ctl_config` | копия `ctl_config.json` с этими conn_id, `simulator: "event"`, `test_mode: "ok-no-error"` и бакетами `edpetl-ctl` / `edpetl-files` |
 | Пулы | `ctl_pool`, `gp_pool` — без них таски висят в очереди |
@@ -231,7 +238,8 @@ curl -s -X POST 'http://127.0.0.1:9080/v4/api/loading/0/entity/<eid>/stat/2/stat
   видеть суммарную частоту тракта: `rate_limit()` держит порог только внутри процесса. Пики
   за прошлое — по журналу: `select date_trunc('second', ts), count(*) from ctl_mock.api_log …`.
   26.09.2026 пик был 15/с — `ctl_send_html` слал фрагменты отчёта вместе с действиями монитора.
-- **Kerberos не проверяется** — на стенде его нет.
+- **Kerberos — настоящий** (MIT KDC в контейнере), но realm свой, `STAND.TEST`, а принципал
+  Airflow — `hrplt_etl`, а не боевая учётка.
 - **Боевые процедуры GP** — с 26.09.2026 настоящие: движок `pr_swf_start_ctl` и отчёты
   собираются из снимка `GP/` (`testbed/gp_engine/`). Заглушки из `schema.sql` он заменяет.
 - **Потоки-отчёты** (`pc1080.mail_*`) в снимке с боя отсутствуют — они в

@@ -1,5 +1,5 @@
 """🎭 Эмулятор CTL API для тестового стенда.
-*2026-09-15 10:00 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:13 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Отвечает так, как отвечает CTL нашим дагам: справочники — из фикстур (снимок боевого
 бакета `edpetl-ctl`, развёрнутый `fixtures_from_cache.py`), состояние загрузок — в
@@ -9,12 +9,15 @@ postgres, схема `ctl_mock` (`schema.sql`). Ничего, кроме наш�
 
 Запуск (юнит `ctl-mock.service` делает то же самое):
 
-    CTL_MOCK_DSN='postgresql://airflow:pass@127.0.0.1:5432/gp_test' \\
+    CTL_MOCK_DSN='postgresql://airflow:pass@127.0.0.1:5432/adb_dev_comm' \\
     CTL_MOCK_FIXTURES=/opt/aftest/ctl-mock/fixtures \\
     /opt/aftest/venv/bin/python -m uvicorn ctl_mock:app --host 127.0.0.1 --port 9080
 
-Никакой авторизации: `KerberosHttpHook` шлёт Negotiate только в ответ на 401, а мы 401
-не отдаём — значит ни KDC, ни keytab на стенде не нужны.
+Авторизация — как у настоящего CTL, по Kerberos (SPNEGO), если задан
+`CTL_MOCK_KERBEROS_KEYTAB` (keytab с `HTTP/<имя хоста>`, KDC — `testbed/kdc`): запрос без
+`Authorization: Negotiate` получает 401 с `WWW-Authenticate: Negotiate`, и `KerberosHttpHook`
+повторяет его с билетом. Без переменной авторизации нет: хук шлёт Negotiate только в ответ на
+401, а мы его тогда не отдаём — KDC и keytab не нужны (так работает `ctl-mock3` для AF3).
 
 ⚠️ Это эмулятор, а не спецификация: он повторяет то, что читает наш код. Поля, которых
 мы не касаемся, приезжают из снимка как есть, но выдуманные эмулятором объекты (новая
@@ -22,6 +25,7 @@ postgres, схема `ctl_mock` (`schema.sql`). Ничего, кроме наш�
 """
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import os
@@ -41,7 +45,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-DSN = os.getenv('CTL_MOCK_DSN', 'postgresql://airflow:airflow@127.0.0.1:5432/gp_test')
+DSN = os.getenv('CTL_MOCK_DSN', 'postgresql://airflow:airflow@127.0.0.1:5432/adb_dev_comm')
 logger = logging.getLogger('ctl_mock')
 
 FIXTURES = Path(os.getenv('CTL_MOCK_FIXTURES', Path(__file__).with_name('fixtures')))
@@ -643,9 +647,46 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+KRB_KEYTAB = os.getenv('CTL_MOCK_KERBEROS_KEYTAB')
+_krb_creds = None
+
+
+def _acceptor():
+    """Учётка приёма SPNEGO из keytab: любой принципал из него (HTTP/<хост>)."""
+    global _krb_creds
+    if _krb_creds is None:
+        import gssapi  # noqa: PLC0415 — нужен только с Kerberos
+        os.environ['KRB5_KTNAME'] = KRB_KEYTAB
+        _krb_creds = gssapi.Credentials(usage='accept')
+    return _krb_creds
+
+
+async def negotiate(request: Request, call_next):
+    """SPNEGO как у CTL: без билета — 401 Negotiate, с билетом — ответ и токен взаимной проверки."""
+    if not KRB_KEYTAB:
+        return await call_next(request)
+    import gssapi  # noqa: PLC0415
+    auth = request.headers.get('authorization', '')
+    challenge = {'WWW-Authenticate': 'Negotiate'}
+    if not auth.startswith('Negotiate '):
+        return JSONResponse({'error': 'Kerberos authentication required'}, status_code=401, headers=challenge)
+    try:
+        ctx = gssapi.SecurityContext(creds=_acceptor(), usage='accept')
+        out = ctx.step(base64.b64decode(auth[len('Negotiate '):]))
+        if not ctx.complete:
+            raise ValueError('контекст SPNEGO не завершён за один шаг')
+    except (gssapi.exceptions.GSSError, ValueError) as err:
+        logger.warning('ctl-mock: Kerberos отклонён: %s', err)
+        return JSONResponse({'error': f'Kerberos authentication failed: {err}'}, status_code=401, headers=challenge)
+    response = await call_next(request)
+    if out:
+        response.headers['WWW-Authenticate'] = 'Negotiate ' + base64.b64encode(out).decode()
+    return response
+
+
 def route(path, handler, methods=('GET',)):
     """Один обработчик под обе версии API: v4 и v5 отличаются только авторизацией,
-    а у нас её нет — контракт один и тот же."""
+    а она у нас одна на обе (Kerberos или никакой) — контракт один и тот же."""
     return [Route(f'/v4/api{path}', handler, methods=list(methods)),
             Route(f'/v5/api{path}', handler, methods=list(methods))]
 
@@ -697,4 +738,5 @@ async def lifespan(_app):
 # on_startup и app.middleware('http') из starlette 1.x убраны — только lifespan и
 # явный список middleware.
 app = Starlette(routes=routes, lifespan=lifespan,
-                middleware=[Middleware(BaseHTTPMiddleware, dispatch=log_requests)])
+                middleware=[Middleware(BaseHTTPMiddleware, dispatch=log_requests),
+                            Middleware(BaseHTTPMiddleware, dispatch=negotiate)])
