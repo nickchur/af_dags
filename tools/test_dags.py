@@ -1,5 +1,5 @@
 """### 🧬 DAG: Проверка сериализации DAG'ов
-*2026-10-01 22:37 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:05 MSK · v3.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:00 MSK) ищет DAG'и, у которых сериализация переписывается на каждом разборе
 файла, и выясняет причину. Группа `check_serialized` ловит дрожание (ждёт следующего разбора,
@@ -904,7 +904,7 @@ def tools_test_dags():
                     "captured_at": captured_at,
                     "prev_hash": last["hash"] if last else None,
                     "data": sdm.data,
-                }, ensure_ascii=False).encode("utf-8"))
+                }, ensure_ascii=False, indent=1).encode("utf-8"))
 
             new_key = _snap_key(dag_id, version, dag_hash)
             hook.load_bytes(body, key=new_key, bucket_name=SNAP_BUCKET, replace=True)

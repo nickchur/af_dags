@@ -31,7 +31,7 @@ MARKER = '.from-repo'          # чем помечены копии, котор�
 
 sys.path.insert(0, str(REPO / '.claude' / 'scripts'))
 from check_context import (  # noqa: E402
-    PROJECTS, REFERENCES, git, gp_paths, last_commit, readme_of)
+    DOCSTRING_DOCS, PROJECTS, REFERENCES, git, gp_paths, last_commit, readme_of)
 
 
 def sync_gp() -> list[str]:
@@ -124,7 +124,7 @@ def freshness_table() -> str:
 
         rows.append(
             f"| `{folder_name}/` | "
-            f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else '—'} | {age(readme)} | "
+            f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else 'шапки модулей' if folder_name in DOCSTRING_DOCS else '—'} | {age(readme)} | "
             f"{'`openspec/specs/' + capability + '/spec.md`' if spec.exists() else '—'} | {age(spec)} | "
             f"{code_ts:%Y-%m-%d}" + " |" if code_ts else "— |")
 
@@ -142,7 +142,7 @@ def freshness_table() -> str:
         code_ts = last_commit(folder_name)
         rows.append(
             f"| `{folder_name}/` | "
-            f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else '—'} | "
+            f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else 'шапки модулей' if folder_name in DOCSTRING_DOCS else '—'} | "
             f"{last_commit(str(readme.relative_to(REPO))):%Y-%m-%d} | "
             f"{origin} | {meta['copied'] if src.exists() else '—'} | "
             f"{code_ts:%Y-%m-%d} |")
@@ -165,7 +165,7 @@ def write_context_md() -> None:
 | Что | Где | Кто пишет |
 |---|---|---|
 | **Правила работы** (rules) | `CLAUDE.md` в корне | человек |
-| **Как устроено** | `<каталог>/readme.md` | человек |
+| **Как устроено** | `<каталог>/readme.md` (у `plugins/` — шапки модулей) | человек |
 | **Что обязано работать** (SDD) | `openspec/specs/<capability>/spec.md`, общий контекст — `openspec/project.md` | человек, через `/opsx:propose` |
 | **Навыки и команды агента** | `.claude/skills/`, `.claude/commands/` | генерирует `openspec init`, правит человек |
 

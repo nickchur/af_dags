@@ -1,11 +1,12 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-01 22:37 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:08 MSK · v1.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
 | Функция | Описание |
 |---|---|
-| `add_note()` | Структурированные заметки в Airflow UI (DAG/Task) |
+| `add_note()` | Структурированные заметки в Airflow UI (DAG/Task), новое сверху, строка под `FOR UPDATE` |
+| `Feed` | Заметка таска без таблиц: строки хода снизу (`line`), итог сверху (`done`), предел 1000 знаков |
 | `add_xcom()` | Запись в XCom с обрезкой коллекций до `MAX_XCOM` элементов |
 | `on_callback()` | Обработчик событий success/failure/retry |
 | `pool_slots()` | Размер пула — только из сторожа подключений (`test_conn`) |
@@ -1042,12 +1043,12 @@ def report_health(checks, context=None, ttl_sec=7200):
             for name, c in checks.items()
         },
     }
-    text = json.dumps(report, ensure_ascii=False, default=str)
+    text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     if len(text.encode()) > HEALTH_MAX_BYTES:
         # Статусы и строки важнее подробностей: без data отчёт core ещё прочтёт
         for c in report['checks'].values():
             c['data'] = {'dropped': 'отчёт больше 256 КБ'}
-        text = json.dumps(report, ensure_ascii=False, default=str)
+        text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     try:
         bucket = conf.get('logging', 'remote_base_log_folder').split('://', 1)[1].split('/', 1)[0]
         S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')).load_string(

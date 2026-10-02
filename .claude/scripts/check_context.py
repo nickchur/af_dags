@@ -105,6 +105,10 @@ def days_between(newer: datetime, older: datetime) -> float:
     return (newer - older).total_seconds() / 86400
 
 
+# Каталоги без readme: документ — шапки самих модулей (docstring), он не отстаёт от кода.
+DOCSTRING_DOCS = {'plugins'}
+
+
 def readme_of(folder: Path) -> Path | None:
     for name in ('readme.md', 'README.md'):
         if (folder / name).exists():
@@ -125,7 +129,7 @@ def check_projects() -> list[str]:
         readme = readme_of(folder)
         spec = REPO / 'openspec' / 'specs' / capability / 'spec.md'
 
-        if readme is None:
+        if readme is None and folder_name not in DOCSTRING_DOCS:
             problems.append(f"{folder_name}/: нет readme")
         if not spec.exists():
             problems.append(f"{folder_name}/: нет спецификации openspec/specs/{capability}/spec.md")
