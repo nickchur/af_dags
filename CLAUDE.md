@@ -1,5 +1,5 @@
 # CLAUDE.md — правила работы в этом репозитории
-*2026-10-01 18:21 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:05 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 DAG'и и общие модули Apache Airflow для HR-платформы. Восемь каталогов — восемь
 независимых проектов; общий у них рантайм и `plugins/`, откуда остальные берут утилиты.
@@ -12,7 +12,7 @@ DAG'и и общие модули Apache Airflow для HR-платформы. �
 |---|---|
 | Что система **обязана** делать | `openspec/specs/<capability>/spec.md` |
 | Общий контекст: стек, контуры, соглашения | `openspec/project.md` |
-| **Как устроено** конкретное место | `<каталог>/readme.md` |
+| **Как устроено** конкретное место | `<каталог>/readme.md` (у `plugins/` — `utils.md`) |
 | Обзор репозитория и цепочка данных | `readme.md` |
 | Карта артефактов и их свежесть | `CONTEXT.md` (собирается автоматически) |
 | Навыки и команды агента | `.claude/skills/`, `.claude/commands/` |

@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, утилиты и хранилище тракта Kafka ↔ ТФС.
-*2026-09-23 20:30 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:05 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Живёт в `plugins`, а не рядом с дагами, потому что
 модулем пользуются ДВА каталога — `tfs_kafka` (приём и отправка) и `er_export`
@@ -922,7 +922,7 @@ def run_state_set(context, key: str, value) -> None:
     if hook.check_for_key(key=obj, bucket_name=bucket):
         state = _json.loads(hook.read_key(key=obj, bucket_name=bucket))
     state[key] = value
-    hook.load_string(string_data=_json.dumps(state, ensure_ascii=False),
+    hook.load_string(string_data=_json.dumps(state, ensure_ascii=False, indent=2),
                      key=obj, bucket_name=bucket, replace=True)
 
 
@@ -1279,7 +1279,7 @@ def _s3_save_receipts(rows: list[dict]) -> None:
 
     for uid, uid_rows in by_uid.items():
         hook, bucket, key = _s3_hook_key(f"{s3_base()}/receipts/{uid}.json")
-        hook.load_string(string_data=_json.dumps(uid_rows, ensure_ascii=False),
+        hook.load_string(string_data=_json.dumps(uid_rows, ensure_ascii=False, indent=2),
                          key=key, bucket_name=bucket, replace=True)
         # Лог записи в ИСТОЧНИК ИСТИНЫ. Без него единственным следом квитанции в логах
         # оставался INSERT зеркала: выключи ClickHouse — и в логе не видно вообще ничего.
@@ -1315,7 +1315,7 @@ def _s3_enqueue(rows: list[dict]) -> None:
         # Имя ключа — только RqUID: package_ts лежит внутри объекта, и порядок пакетов
         # строится по содержимому (см. _s3_pending), а не по именам.
         hook, bucket, key = _s3_hook_key(f"{s3_base()}/queue/pending/{r['rq_uid']}.json")
-        hook.load_string(string_data=_json.dumps(r, ensure_ascii=False, default=str),
+        hook.load_string(string_data=_json.dumps(r, ensure_ascii=False, indent=2, default=str),
                          key=key, bucket_name=bucket, replace=True)
 
 

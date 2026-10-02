@@ -1,5 +1,5 @@
 # 🛠️ Общие модули `plugins/`
-*2026-10-01 22:37 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:05 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Модули, которыми пользуются даги нескольких каталогов: утилиты Airflow, S3, тракт ТФС.
 

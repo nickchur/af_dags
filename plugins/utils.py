@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-01 22:37 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 15:05 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -1042,12 +1042,12 @@ def report_health(checks, context=None, ttl_sec=7200):
             for name, c in checks.items()
         },
     }
-    text = json.dumps(report, ensure_ascii=False, default=str)
+    text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     if len(text.encode()) > HEALTH_MAX_BYTES:
         # Статусы и строки важнее подробностей: без data отчёт core ещё прочтёт
         for c in report['checks'].values():
             c['data'] = {'dropped': 'отчёт больше 256 КБ'}
-        text = json.dumps(report, ensure_ascii=False, default=str)
+        text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     try:
         bucket = conf.get('logging', 'remote_base_log_folder').split('://', 1)[1].split('/', 1)[0]
         S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')).load_string(

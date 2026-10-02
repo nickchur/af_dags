@@ -105,9 +105,13 @@ def days_between(newer: datetime, older: datetime) -> float:
     return (newer - older).total_seconds() / 86400
 
 
+# Каталоги, у которых документ назван по содержимому, а не readme.
+DOC_NAMES = {'plugins': 'utils.md'}
+
+
 def readme_of(folder: Path) -> Path | None:
-    for name in ('readme.md', 'README.md'):
-        if (folder / name).exists():
+    for name in (DOC_NAMES.get(folder.name), 'readme.md', 'README.md'):
+        if name and (folder / name).exists():
             return folder / name
     return None
 
@@ -240,7 +244,8 @@ def check_gp_snapshot() -> list[str]:
 def check_version_lines() -> list[str]:
     """Вторая строка документа — дата, версия, автор. Правило репозитория."""
     problems = []
-    for md in sorted(REPO.glob('*.md')) + sorted(REPO.glob('*/readme.md')) + sorted(REPO.glob('*/README.md')):
+    for md in sorted(REPO.glob('*.md')) + sorted(REPO.glob('*/readme.md')) + sorted(REPO.glob('*/README.md')) \
+            + [REPO / d / f for d, f in DOC_NAMES.items()]:
         if '.claude' in md.parts or 'openspec' in md.parts:
             continue
         if str(md.relative_to(REPO)) in GENERATED:

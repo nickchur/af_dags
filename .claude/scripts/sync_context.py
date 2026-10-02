@@ -165,7 +165,7 @@ def write_context_md() -> None:
 | Что | Где | Кто пишет |
 |---|---|---|
 | **Правила работы** (rules) | `CLAUDE.md` в корне | человек |
-| **Как устроено** | `<каталог>/readme.md` | человек |
+| **Как устроено** | `<каталог>/readme.md` (у `plugins/` — `utils.md`) | человек |
 | **Что обязано работать** (SDD) | `openspec/specs/<capability>/spec.md`, общий контекст — `openspec/project.md` | человек, через `/opsx:propose` |
 | **Навыки и команды агента** | `.claude/skills/`, `.claude/commands/` | генерирует `openspec init`, правит человек |
 
