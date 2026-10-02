@@ -1,5 +1,5 @@
 """📚 Эмулятор Confluence и Jira Server/DC для тестового стенда.
-*2026-10-02 09:56 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:41 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Зачем. GigaCode ходит в корпоративный Confluence (их несколько: confluence.delta.sbrf.ru,
 confluence.sberbank.ru) и в Jira через MCP `mcp-atlassian`, по экземпляру на сервер. Чтобы
@@ -14,6 +14,8 @@ Server/DC.
 Наполнение — каталог `ATLASSIAN_MOCK_FIXTURES`:
 
     confluence/<server>/<SPACE>/<id>.md   страница: шапка YAML (title, parent, labels) + Markdown
+    confluence/<server>/<SPACE>/<id>.html та же шапка + готовый XHTML (импорт HTML-экспорта
+                                          Confluence — `import_html_export.py`)
     confluence/<server>/<SPACE>/_space.yaml  имя и описание пространства (необязательно)
     jira/issues.json                      задачи: key, summary, description, status, labels, …
 
@@ -89,14 +91,17 @@ def confluence() -> tuple[dict, dict]:
         meta = yaml.safe_load(meta_file.read_text(encoding='utf-8')) if meta_file.exists() else {}
         spaces[key] = {'id': zlib.crc32(key.encode()) % 10**8, 'key': key, 'name': meta.get('name', key),
                        'description': meta.get('description', ''), 'type': 'global'}
-        for f in sorted(space_dir.glob('*.md')):
+        for f in sorted([*space_dir.glob('*.md'), *space_dir.glob('*.html')]):
             head, body = _split_front_matter(f.read_text(encoding='utf-8'))
+            is_html = f.suffix == '.html'
             pid = str(head.get('id', f.stem))
             pages[pid] = {
                 'id': pid, 'space': key, 'title': str(head.get('title', f.stem)),
                 'parent': str(head['parent']) if head.get('parent') else None,
                 'labels': [str(x) for x in head.get('labels', [])],
-                'storage': md.render(body), 'text': body, 'updated': _mtime(f),
+                'storage': body if is_html else md.render(body),
+                'text': html.unescape(re.sub(r'<[^>]+>', ' ', body)) if is_html else body,
+                'updated': _mtime(f),
             }
     return spaces, pages
 

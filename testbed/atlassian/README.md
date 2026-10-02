@@ -1,5 +1,5 @@
 # 📚 Эмулятор Confluence и Jira
-*2026-10-02 10:04 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:41 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Корпоративный Confluence у Сбера не один: `confluence.delta.sbrf.ru`, `confluence.sberbank.ru`.
 GigaCode ходит в них и в Jira через MCP [`mcp-atlassian`](https://pypi.org/project/mcp-atlassian/),
@@ -43,6 +43,7 @@ MCP не даёт. Чтобы навыки, которые ссылаются н
 ```
 fixtures/
   confluence/<server>/<SPACE>/<id>.md      шапка YAML (title, parent, labels) + Markdown
+  confluence/<server>/<SPACE>/<id>.html    та же шапка + готовый XHTML (импорт HTML-экспорта)
   confluence/<server>/<SPACE>/_space.yaml  name, description (необязательно)
   jira/issues.json                         key, summary, description, status, labels, comments, created, updated
 ```
@@ -52,6 +53,16 @@ fixtures/
   Например, `delta`/`HRData`: «HR Data» `1774392110`, описания таблиц GP
   (`ue_circle_of_contacts`). Их содержимое корпоративное и **живёт только на стенде**, в git
   его нет: репозиторий публичный.
+- **HTML-экспорт пространства** (штатная выгрузка Confluence: `index.html`, `toc.html`, по
+  файлу на страницу) раскладывает [`import_html_export.py`](import_html_export.py) — id и
+  названия из заголовков страниц, дерево из `toc.html`, корень — куда ведёт `index.html`.
+  Картинок в экспорте нет, вместо них подпись `[изображение]`. Так на `sber` лежит
+  пространство `HRTECH`: документация сервиса авторизации, корень `1247712729`.
+
+  ```bash
+  python3 import_html_export.py <каталог экспорта> --server sber --space HRTECH \
+      --out /opt/aftest/atlassian-mock/fixtures
+  ```
 - **Сгенерированное** собирает [`build_fixtures.py`](build_fixtures.py):
   - пространства `ETL` (docs и навыки etl-core) и `AFDAGS` (readme и навыки af_dags) на
     `delta`;
