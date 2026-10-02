@@ -30,7 +30,7 @@
 
 | Каталог | Как устроено | Обновлён | Что обязано работать | Обновлена | Код |
 |---|---|---|---|---|---|
-| `ctl_worker/` | `ctl_worker/readme.md` | 2026-10-01 | `openspec/specs/ctl-worker/spec.md` | 2026-09-29 | 2026-10-01 |
+| `ctl_worker/` | `ctl_worker/readme.md` | 2026-10-02 | `openspec/specs/ctl-worker/spec.md` | 2026-09-29 | 2026-10-01 |
 | `er_export/` | `er_export/README.md` | 2026-10-01 | `openspec/specs/er-export/spec.md` | 2026-09-01 ⚠️ | 2026-10-01 |
 | `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 ⚠️ | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
 | `plugins/` | `plugins/readme.md` | 2026-10-01 | `openspec/specs/plugins/spec.md` | 2026-09-29 | 2026-10-01 |
