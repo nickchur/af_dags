@@ -9,8 +9,8 @@
 |---|---|---|
 | **Правила работы** (rules) | `CLAUDE.md` в корне | человек |
 | **Как устроено** | `<каталог>/readme.md` (у `plugins/` — шапки модулей) | человек |
-| **Что обязано работать** (SDD) | `openspec/specs/<capability>/spec.md`, общий контекст — `openspec/project.md` | человек, через `/opsx:propose` |
-| **Навыки и команды агента** | `.claude/skills/`, `.claude/commands/` | генерирует `openspec init`, правит человек |
+| **Что обязано работать** (SDD) | `docs/sberpowers/specs/<возможность>-baseline.md` и дельты рядом, планы — `docs/sberpowers/plans/`, общий контекст — `openspec/project.md` | человек, через навыки SberPowers (`specify` → `learn`) |
+| **Навыки агента** | `.claude/skills/` | набор SberPowers без правок, обновляется заменой каталогов |
 
 Память агента (`~/.claude/projects/*/memory/`) в репозиторий не входит: она про
 конкретного человека и его прошлые сессии, а не про проект.
@@ -30,14 +30,14 @@
 
 | Каталог | Как устроено | Обновлён | Что обязано работать | Обновлена | Код |
 |---|---|---|---|---|---|
-| `ctl_worker/` | `ctl_worker/readme.md` | 2026-10-02 | `openspec/specs/ctl-worker/spec.md` | 2026-10-04 | 2026-10-01 |
-| `er_export/` | `er_export/README.md` | 2026-10-01 | `openspec/specs/er-export/spec.md` | 2026-10-04 | 2026-10-01 |
-| `gp_exchange/` | `gp_exchange/readme.md` | 2026-09-14 ⚠️ | `openspec/specs/gp-exchange/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
-| `plugins/` | шапки модулей | — | `openspec/specs/plugins/spec.md` | 2026-10-04 | 2026-10-02 |
-| `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 ⚠️ | `openspec/specs/s3-tools/spec.md` | 2026-09-24 ⚠️ | 2026-10-01 |
-| `tfs_kafka/` | `tfs_kafka/README.md` | 2026-10-01 | `openspec/specs/tfs-kafka/spec.md` | 2026-09-29 | 2026-10-01 |
-| `tools/` | `tools/readme.md` | 2026-10-02 | `openspec/specs/tools/spec.md` | 2026-10-04 | 2026-10-02 |
-| `xs_export/` | `xs_export/readme.md` | 2026-09-28 | `openspec/specs/xs-export/spec.md` | 2026-08-31 ⚠️ | 2026-09-28 |
+| `ctl_worker/` | `ctl_worker/readme.md` | 2026-10-04 | `docs/sberpowers/specs/ctl-worker-baseline.md` | 2026-10-04 | 2026-10-01 |
+| `er_export/` | `er_export/README.md` | 2026-10-01 | `docs/sberpowers/specs/er-export-baseline.md` | 2026-10-04 | 2026-10-01 |
+| `gp_exchange/` | `gp_exchange/readme.md` | 2026-10-04 | `docs/sberpowers/specs/gp-exchange-baseline.md` | 2026-10-04 | 2026-09-28 |
+| `plugins/` | шапки модулей | — | `docs/sberpowers/specs/plugins-baseline.md` | 2026-10-04 | 2026-10-02 |
+| `s3_tools/` | `s3_tools/readme.md` | 2026-09-24 ⚠️ | `docs/sberpowers/specs/s3-tools-baseline.md` | 2026-10-04 | 2026-10-01 |
+| `tfs_kafka/` | `tfs_kafka/README.md` | 2026-10-01 | `docs/sberpowers/specs/tfs-kafka-baseline.md` | 2026-10-04 | 2026-10-01 |
+| `tools/` | `tools/readme.md` | 2026-10-04 | `docs/sberpowers/specs/tools-baseline.md` | 2026-10-04 | 2026-10-04 |
+| `xs_export/` | `xs_export/readme.md` | 2026-09-28 | `docs/sberpowers/specs/xs-export-baseline.md` | 2026-10-04 | 2026-09-28 |
 | `GP/` | `GP/readme.md` | 2026-09-30 | снимок `HR_Data` @ `1a3a317` | 2026-09-26 | 2026-09-30 |
 
 *Собрано 2026-10-04 скриптом `sync_context.py`*
