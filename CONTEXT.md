@@ -38,6 +38,6 @@
 | `tfs_kafka/` | `tfs_kafka/README.md` | 2026-10-01 | `docs/sberpowers/specs/tfs-kafka-baseline.md` | 2026-10-04 | 2026-10-01 |
 | `tools/` | `tools/readme.md` | 2026-10-04 | `docs/sberpowers/specs/tools-baseline.md` | 2026-10-04 | 2026-10-04 |
 | `xs_export/` | `xs_export/readme.md` | 2026-09-28 | `docs/sberpowers/specs/xs-export-baseline.md` | 2026-10-04 | 2026-09-28 |
-| `GP/` | `GP/readme.md` | 2026-09-30 | снимок `HR_Data` @ `1a3a317` | 2026-09-26 | 2026-09-30 |
+| `GP/` | `GP/readme.md` | 2026-09-30 | снимок `HR_Data` @ `01779be` | 2026-10-04 | 2026-09-30 |
 
 *Собрано 2026-10-04 скриптом `sync_context.py`*

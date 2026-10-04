@@ -184,19 +184,22 @@ begin
                     , (now() - status_dttm)::interval(0) status_time
                 --    , status, status_log
                     , concat(status, ': ', status_log) status_info
-                    , wf_id
                     , b.profile
     --                , b.category
                     , split_part(category, '.', 1) category
                     , split_part(category, '.', 2) subcat
     --                , b.name 
                     , replace(name, 'pc1080.', '') name
-                    , replace(connected, ',', ',<br>') connected
-                    , replace(replace(wf_sched, ',', ',<br>'), '{', '{<br>') wf_sched
-                    , replace(param, ';', ';<br>') param
                 from vw_log_ctl_loading a
                 left join vw_log_ctl_wf b on a.wf_id=b.id
                 where alive = 'ACTIVE' and b.category like 'p1080%'
+                    -- EVENT-WAIT - поток на расписании ждёт своих событий, CTL держит такую
+                    -- загрузку всегда (месяцами, это штатно). Их было 385 из 506 строк, раздел
+                    -- весил 250 тыс. символов при пределе отправки в CTL из Airflow 50 тыс. и до
+                    -- письма не доходил. Ждущие дольше wf_interval есть в CTL Old and Working
+                    -- (pr_mail_ctl_report), их число по категориям - в CTL All WF.
+                    -- connected, wf_sched, param - свойства потока, а не загрузки: убраны туда же.
+                    and status is distinct from 'EVENT-WAIT'
                 order by n
             )$sql$;
             html = pr_tbl2html(sql, txt, 'order by n', style);
@@ -233,18 +236,34 @@ begin
 
         txt = 'CTL All WF';
         if txt = any(reports) or reports = '{All}' or nullif(reports, '{}') is null then
+            -- Сводка по категориям, а не список потоков: справочник из 808 потоков с
+            -- параметрами весил 250 тыс. символов при пределе отправки в CTL из Airflow
+            -- 50 тыс. и до письма не доходил. Сам справочник - в CTL и в vw_log_ctl_wf.
+            -- event_wait - загрузки, ждущие событий (из CTL All Active они убраны).
             sql = $sql$(
-                select row_number() over(order by ts desc, id) as n 
-                    , ts, id
-                    , profile
-                    , split_part(category, '.', 2) category
-                    , replace(name, 'pc1080.', '') name
-                    , scheduled, deleted, singleloading
-                    , replace(connected, ',', ',<br>') connected
-                    , replace(replace(wf_sched, ',', ',<br>'), '{', '{<br>') wf_sched
-                    , replace(replace(replace(param, ';', ';<br>'), '''', ''), '"', '') param
-                from vw_log_ctl_wf a
-                where category like 'p1080%'
+                select row_number() over(order by a.category, a.profile) as n
+                    , a.*
+                from (
+                    select split_part(w.category, '.', 2) category
+                        , w.profile
+                        , count(1) flows
+                        , count(1) filter (where w.scheduled and not w.deleted) scheduled
+                        , count(1) filter (where not w.scheduled and not w.deleted) not_scheduled
+                        , count(1) filter (where w.deleted) deleted
+                        , sum(l.event_wait) event_wait
+                        , sum(l.running) running
+                    from vw_log_ctl_wf w
+                    left join (
+                        select wf_id
+                            , count(1) filter (where status = 'EVENT-WAIT') event_wait
+                            , count(1) filter (where status not in ('EVENT-WAIT', 'TIME-WAIT')) running
+                        from vw_log_ctl_loading
+                        where alive = 'ACTIVE'
+                        group by 1
+                    ) l on l.wf_id = w.id
+                    where w.category like 'p1080%'
+                    group by 1, 2
+                ) a
                 order by n
             )$sql$;
             html = pr_tbl2html(sql, txt, 'order by n', style);
@@ -306,6 +325,10 @@ begin
                 FROM vw_swf_ctl_log
                 where true and loading_id IS NOT NULL
                     and end_ts >= (now() - '1 hour'::interval)::date
+                    -- Только неуспешные шаги: успешные посчитаны в CTL Today этого же письма.
+                    -- Журнал всех шагов за сутки на стенде - 1 206 строк и 475 тыс. символов
+                    -- при пределе отправки в CTL из Airflow 50 тыс.: до письма не доходил.
+                    and res::text <> '1'
                 order by 1
             )$sql$;
             html = pr_tbl2html(sql, txt, 'order by n', style);

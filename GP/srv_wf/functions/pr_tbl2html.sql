@@ -4,6 +4,7 @@ CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_tbl2html(tbl text, subj text DEFAUL
 	VOLATILE
 as $body$
 
+
 declare 
     html text = '';
     style text;
@@ -129,6 +130,7 @@ exception when OTHERS then
         return e_txt;
     end;
 end;
+
 
 $body$
 EXECUTE ON ANY;

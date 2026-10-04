@@ -4,6 +4,7 @@ CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_swf_start_ctl(wf_jsn json)
 	VOLATILE
 as $body$
 
+
 -- pr_swf_start_ctl(wf_jsn json) -> json
 -- 2026-08-04 16:45 MSK, v1.1, Чуркин Николай
 --
@@ -245,6 +246,7 @@ begin
         end;
     end;
 end; 
+
 $body$
 EXECUTE ON ANY;
 	

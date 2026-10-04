@@ -1,21 +1,4 @@
--- E360-6367. Заведённые SLA алерты потоков CTL.
--- 2026-09-09 18:10 MSK, v1.3, Чуркин Николай
---
--- Распределение случайное: значений wf_id десятки, а сегментов в бою 200 - хэш по
--- нему сложил бы всю таблицу на пятую часть узлов.
---
--- Отметки реакции нет намеренно. Реакция - это возврат res = -6 из того же вызова,
--- который завёл строку, так что отдельная колонка всегда повторяла бы ts.
---
--- А вот close_ts нужен: без него алерт висел бы в отчёте все hist суток и после того,
--- как данные подъехали. Его проставляет тот вызов, в котором правило отработало чисто,
--- одним update по открытым строкам - единственный update в функции.
---
--- if not exists: скрипт выкладки идемпотентен, повторный прогон таблицу не трогает.
--- Оборотная сторона - структуру он и не поправит: если колонки менялись, таблицу
--- надо снести вручную (и потерять историю) либо править alter'ом.
-
-CREATE TABLE if not exists s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts (
+CREATE TABLE s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts (
 	ts timestamp without time zone not null DEFAULT clock_timestamp(),
 	wf_id bigint null,
 	wf_name text null,
@@ -29,15 +12,14 @@ CREATE TABLE if not exists s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts (
 )
 WITH (appendonly=true, orientation=column, compresstype=zstd)
 DISTRIBUTED RANDOMLY;
-
-COMMENT ON TABLE s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts IS 'Заведённые SLA алерты потоков CTL. v1.3, 2026-09-09';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.ts IS 'Время заведения алерта';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.wf_id IS 'Идентификатор потока в CTL';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.wf_name IS 'Имя потока';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.alert_grp IS 'Группа алерта';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.alert_key IS 'Ключ правила';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.period_ts IS 'Начало периода правила';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.res IS 'Код результата';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.msg IS 'Причина алерта';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.jsn IS 'Правило и замер';
-COMMENT ON COLUMN s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.close_ts IS 'Время закрытия: правило отработало без алерта';
+comment on table s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts is 'Заведённые SLA алерты потоков CTL. v1.3, 2026-09-09';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.ts is 'Время заведения алерта';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.wf_id is 'Идентификатор потока в CTL';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.wf_name is 'Имя потока';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.alert_grp is 'Группа алерта';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.alert_key is 'Ключ правила';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.period_ts is 'Начало периода правила';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.res is 'Код результата';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.msg is 'Причина алерта';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.jsn is 'Правило и замер';
+comment on column s_grnplm_vd_hr_edp_srv_wf.tb_ctl_alerts.close_ts is 'Время закрытия: правило отработало без алерта';

@@ -5,7 +5,7 @@ CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(grp text DEFAULT NU
 as $body$
 
 -- E360-6367. SLA алерты потоков CTL.
--- 2026-09-09 23:50 MSK, v1.17, Чуркин Николай
+-- 2026-09-26 23:10 MSK, v1.18, Чуркин Николай
 --
 -- Механизм общий: правило вешается на любой поток CTL. Тикет пришёл от Пакетной
 -- выгрузки, но ни функция, ни таблица к ней не привязаны - не сужайте описание обратно.
@@ -208,66 +208,25 @@ begin
         ) on commit drop distributed randomly;
 
         for r in select wf_id, wf_name, rule_txt, data_txt, alert_grp from tmp_alert_rule order by wf_name loop
-            r_jsn = r.rule_txt::json;
-            r_kind = coalesce(nullif(r_jsn->>'kind', ''), 'daily');
-            last_dt = null;
+            -- Каждое правило - в своём блоке. Правило, на котором падает запрос (obj ссылается на
+            -- удалённую таблицу, lag или at не приводятся к типу, expr с ошибкой), раньше роняло
+            -- весь вызов: отчёт уходил с -9, и алертов не было видно ни по одному потоку.
+            -- Теперь такое правило само становится алертом с ключом rule error: владелец видит
+            -- его в письме своей группы. В tmp_alert_ok оно не попадает - непроверенное правило
+            -- ничего не закрывает. Блок с exception в GP - подтранзакция на правило; правил
+            -- десятки, это дёшево.
+            begin
+                sql = null;         -- в jsn ошибки должен попасть запрос этого правила
+                r_jsn = r.rule_txt::json;
+                r_kind = coalesce(nullif(r_jsn->>'kind', ''), 'daily');
+                last_dt = null;
 
-            if r_kind = 'heartbeat' then
-                r_every = coalesce(nullif(r_jsn->>'every', ''), '1 day')::interval;
-                -- Окно хартбита прибито к сетке, иначе период "плыл" бы от вызова к вызову.
-                per_ts = to_timestamp(floor(extract(epoch from now()) / extract(epoch from r_every))
-                                      * extract(epoch from r_every))::timestamp;
+                if r_kind = 'heartbeat' then
+                    r_every = coalesce(nullif(r_jsn->>'every', ''), '1 day')::interval;
+                    -- Окно хартбита прибито к сетке, иначе период "плыл" бы от вызова к вызову.
+                    per_ts = to_timestamp(floor(extract(epoch from now()) / extract(epoch from r_every))
+                                          * extract(epoch from r_every))::timestamp;
 
-                select max(a.ts) into last_dt
-                from tb_log_ctl a
-                join vw_log_ctl_loading l on l.id = a.id
-                where a.obj = 'statval'
-                  and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 1)
-                  and l.wf_id = r.wf_id;
-
-                r_key = format('stat %s / %s', coalesce(r_jsn->>'stat', '1'), r_every);
-                if last_dt is null or last_dt < now() - r_every then
-                    r_msg = format('нет статистики %s за %s, последняя %s'
-                        , coalesce(r_jsn->>'stat', '1'), r_every
-                        , coalesce(left(last_dt::text, 19), 'никогда'));
-                    insert into tmp_alert_new
-                    values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
-                          , json_build_object('rule', r_jsn, 'last', left(last_dt::text, 19)));
-                else
-                    insert into tmp_alert_ok values (r.wf_id, r_key);
-                end if;
-            else
-                r_at = coalesce(nullif(r_jsn->>'at', ''), '00:00')::time;
-
-                -- Последний наступивший дедлайн и предыдущий. Перебором по календарю: так
-                -- все виды, включая "последнее число квартала", считаются одной формулой.
-                -- 800 дней - две годовые отсечки назад: предыдущая нужна режиму события.
-                select max(dl) filter (where rn = 1), max(dl) filter (where rn = 2)
-                into per_ts, prev_ts
-                from (
-                    select d + r_at as dl, row_number() over (order by d desc) as rn
-                    from generate_series(current_date - 800, current_date, '1 day'::interval) d
-                    where ( r_kind = 'daily'
-                         or (r_kind = 'workdays'  and extract(dow from d) between 1 and 5)
-                         or (r_kind = 'weekly'    and extract(dow from d) = coalesce((r_jsn->>'dow')::int4, 1))
-                         or (r_kind = 'monthly'   and extract(day from d) = coalesce((r_jsn->>'day')::int4, 1))
-                         or (r_kind = 'yearly'    and extract(month from d) = coalesce((r_jsn->>'month')::int4, 1)
-                                                  and extract(day from d) = coalesce((r_jsn->>'day')::int4, 1))
-                         or (r_kind = 'quarterly' and d::date = (date_trunc('quarter', d) + interval '3 month' - interval '1 day')::date)
-                          )
-                      and d + r_at <= now()
-                ) a
-                where rn <= 2;
-
-                if per_ts is null then
-                    bad_cnt = bad_cnt + 1;   -- вид правила неизвестен
-                    continue;
-                end if;
-
-                if r.data_txt is null then
-                    -- Режим события: дедлайн есть, бизнес-дату не смотрим. Спрашиваем только,
-                    -- отдавал ли поток статистику в текущем периоде, то есть после прошлого
-                    -- дедлайна. Параметра wf_alert_data нет - и проверять в данных нечего.
                     select max(a.ts) into last_dt
                     from tb_log_ctl a
                     join vw_log_ctl_loading l on l.id = a.id
@@ -275,58 +234,119 @@ begin
                       and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 1)
                       and l.wf_id = r.wf_id;
 
-                    r_key = format('%s %s event stat %s', r_kind, r_at, coalesce(r_jsn->>'stat', '1'));
-                    if last_dt is null or (prev_ts is not null and last_dt <= prev_ts) then
-                        r_msg = format('к %s поток не отдал статистику %s, последняя %s'
-                            , left(per_ts::text, 16), coalesce(r_jsn->>'stat', '1')
+                    r_key = format('stat %s / %s', coalesce(r_jsn->>'stat', '1'), r_every);
+                    if last_dt is null or last_dt < now() - r_every then
+                        r_msg = format('нет статистики %s за %s, последняя %s'
+                            , coalesce(r_jsn->>'stat', '1'), r_every
                             , coalesce(left(last_dt::text, 19), 'никогда'));
                         insert into tmp_alert_new
                         values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
-                              , json_build_object('rule', r_jsn, 'since', left(prev_ts::text, 16)
-                                                , 'last', left(last_dt::text, 19)));
+                              , json_build_object('rule', r_jsn, 'last', left(last_dt::text, 19)));
                     else
                         insert into tmp_alert_ok values (r.wf_id, r_key);
                     end if;
                 else
-                    -- Режим данных: что именно сверять, лежит в wf_alert_data.
-                    d_jsn = r.data_txt::json;
-                    r_lag = coalesce(nullif(d_jsn->>'lag', ''), '0 day')::interval;
-                    if coalesce(d_jsn->>'obj', '') !~ '^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$'
-                       or coalesce(d_jsn->>'expr', '') ~ ';' then
-                        bad_cnt = bad_cnt + 1;
+                    r_at = coalesce(nullif(r_jsn->>'at', ''), '00:00')::time;
+
+                    -- Последний наступивший дедлайн и предыдущий. Перебором по календарю: так
+                    -- все виды, включая "последнее число квартала", считаются одной формулой.
+                    -- 800 дней - две годовые отсечки назад: предыдущая нужна режиму события.
+                    select max(dl) filter (where rn = 1), max(dl) filter (where rn = 2)
+                    into per_ts, prev_ts
+                    from (
+                        select d + r_at as dl, row_number() over (order by d desc) as rn
+                        from generate_series(current_date - 800, current_date, '1 day'::interval) d
+                        where ( r_kind = 'daily'
+                             or (r_kind = 'workdays'  and extract(dow from d) between 1 and 5)
+                             or (r_kind = 'weekly'    and extract(dow from d) = coalesce((r_jsn->>'dow')::int4, 1))
+                             or (r_kind = 'monthly'   and extract(day from d) = coalesce((r_jsn->>'day')::int4, 1))
+                             or (r_kind = 'yearly'    and extract(month from d) = coalesce((r_jsn->>'month')::int4, 1)
+                                                      and extract(day from d) = coalesce((r_jsn->>'day')::int4, 1))
+                             or (r_kind = 'quarterly' and d::date = (date_trunc('quarter', d) + interval '3 month' - interval '1 day')::date)
+                              )
+                          and d + r_at <= now()
+                    ) a
+                    where rn <= 2;
+
+                    if per_ts is null then
+                        bad_cnt = bad_cnt + 1;   -- вид правила неизвестен
                         continue;
                     end if;
-                    -- Схему можно писать коротко: stg.tb_addresses разворачивается в
-                    -- s_grnplm_vd_hr_edp_stg.tb_addresses - тем же правилом, что sch в
-                    -- pr_swf_start_ctl. Полное имя оставляем как есть. Сравнение по левым 19
-                    -- символам, а не like: в like подчёркивание было бы шаблоном.
-                    r_obj = d_jsn->>'obj';
-                    if left(r_obj, 19) <> 's_grnplm_vd_hr_edp_' then
-                        r_obj = 's_grnplm_vd_hr_edp_' || r_obj;
-                    end if;
-                    need_dt = (per_ts - r_lag)::date;
 
-                    if nullif(d_jsn->>'expr', '') is not null then
-                        sql = format('select (%s)::timestamp from %s', d_jsn->>'expr', r_obj);
-                    else
-                        sql = format('select max(%I)::timestamp from tb_log_workflow_stat where wf_obj = %L'
-                                   , coalesce(nullif(d_jsn->>'field', ''), 'data_max'), r_obj);
-                    end if;
-                    execute sql into last_dt;
+                    if r.data_txt is null then
+                        -- Режим события: дедлайн есть, бизнес-дату не смотрим. Спрашиваем только,
+                        -- отдавал ли поток статистику в текущем периоде, то есть после прошлого
+                        -- дедлайна. Параметра wf_alert_data нет - и проверять в данных нечего.
+                        select max(a.ts) into last_dt
+                        from tb_log_ctl a
+                        join vw_log_ctl_loading l on l.id = a.id
+                        where a.obj = 'statval'
+                          and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 1)
+                          and l.wf_id = r.wf_id;
 
-                    r_key = format('%s %s T-%s', r_kind, r_at, r_lag);
-                    if last_dt is null or last_dt::date < need_dt then
-                        r_msg = format('нет данных за %s, последние %s'
-                            , need_dt, coalesce(left(last_dt::text, 19), 'никогда'));
-                        insert into tmp_alert_new
-                        values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
-                              , json_build_object('rule', r_jsn, 'data', d_jsn, 'obj', r_obj
-                                                , 'need', need_dt, 'last', left(last_dt::text, 19)));
+                        r_key = format('%s %s event stat %s', r_kind, r_at, coalesce(r_jsn->>'stat', '1'));
+                        if last_dt is null or (prev_ts is not null and last_dt <= prev_ts) then
+                            r_msg = format('к %s поток не отдал статистику %s, последняя %s'
+                                , left(per_ts::text, 16), coalesce(r_jsn->>'stat', '1')
+                                , coalesce(left(last_dt::text, 19), 'никогда'));
+                            insert into tmp_alert_new
+                            values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
+                                  , json_build_object('rule', r_jsn, 'since', left(prev_ts::text, 16)
+                                                    , 'last', left(last_dt::text, 19)));
+                        else
+                            insert into tmp_alert_ok values (r.wf_id, r_key);
+                        end if;
                     else
-                        insert into tmp_alert_ok values (r.wf_id, r_key);
+                        -- Режим данных: что именно сверять, лежит в wf_alert_data.
+                        d_jsn = r.data_txt::json;
+                        r_lag = coalesce(nullif(d_jsn->>'lag', ''), '0 day')::interval;
+                        if coalesce(d_jsn->>'obj', '') !~ '^[a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*$'
+                           or coalesce(d_jsn->>'expr', '') ~ ';' then
+                            bad_cnt = bad_cnt + 1;
+                            continue;
+                        end if;
+                        -- Схему можно писать коротко: stg.tb_addresses разворачивается в
+                        -- s_grnplm_vd_hr_edp_stg.tb_addresses - тем же правилом, что sch в
+                        -- pr_swf_start_ctl. Полное имя оставляем как есть. Сравнение по левым 19
+                        -- символам, а не like: в like подчёркивание было бы шаблоном.
+                        r_obj = d_jsn->>'obj';
+                        if left(r_obj, 19) <> 's_grnplm_vd_hr_edp_' then
+                            r_obj = 's_grnplm_vd_hr_edp_' || r_obj;
+                        end if;
+                        need_dt = (per_ts - r_lag)::date;
+
+                        if nullif(d_jsn->>'expr', '') is not null then
+                            sql = format('select (%s)::timestamp from %s', d_jsn->>'expr', r_obj);
+                        else
+                            sql = format('select max(%I)::timestamp from tb_log_workflow_stat where wf_obj = %L'
+                                       , coalesce(nullif(d_jsn->>'field', ''), 'data_max'), r_obj);
+                        end if;
+                        execute sql into last_dt;
+
+                        r_key = format('%s %s T-%s', r_kind, r_at, r_lag);
+                        if last_dt is null or last_dt::date < need_dt then
+                            r_msg = format('нет данных за %s, последние %s'
+                                , need_dt, coalesce(left(last_dt::text, 19), 'никогда'));
+                            insert into tmp_alert_new
+                            values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
+                                  , json_build_object('rule', r_jsn, 'data', d_jsn, 'obj', r_obj
+                                                    , 'need', need_dt, 'last', left(last_dt::text, 19)));
+                        else
+                            insert into tmp_alert_ok values (r.wf_id, r_key);
+                        end if;
                     end if;
                 end if;
-            end if;
+
+                -- Правило проверено (алерт по данным или нет - неважно): оно исправно, и его
+                -- прошлые "rule error" гасятся.
+                insert into tmp_alert_ok values (r.wf_id, 'rule error');
+            exception when OTHERS then
+                get stacked diagnostics r_msg = MESSAGE_TEXT;
+                insert into tmp_alert_new
+                values (r.wf_id, r.wf_name, r.alert_grp, 'rule error', current_date::timestamp
+                      , format('правило не проверено: %s', r_msg)
+                      , json_build_object('rule', r.rule_txt, 'data', r.data_txt, 'sql', sql));
+            end;
         end loop;
 
         -- Заводим только то, о чём в этих сутках ещё не сообщали. Отдельной отметки реакции
@@ -476,4 +496,4 @@ $body$
 EXECUTE ON ANY;
 
 -- DEFAULT в сигнатуре COMMENT ON недопустим, как и в DROP FUNCTION — только типы.
-COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.17, 2026-09-09';
+COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.18, 2026-09-26';
