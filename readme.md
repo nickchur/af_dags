@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-09-30 09:27 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 12:07 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -164,37 +164,33 @@ bash .githooks/install.sh
 
 ## Спецификации
 
-Каждый каталог репозитория — отдельный проект со своей спецификацией в `openspec/specs/`:
-что система обязана делать, требованиями и сценариями. Общий контекст (стек, контуры,
+Каждый каталог репозитория — отдельный проект со своей baseline-спецификацией в
+`docs/sberpowers/specs/`: что система обязана делать — требования `REQ-<возможность>-NN`,
+критерии приёмки, ограничения и происхождение шрамов. Общий контекст (стек, контуры,
 соглашения) — в `openspec/project.md`.
 
-| Каталог | Спецификация | Состояние |
-|---|---|---|
-| `ctl_worker/` | `openspec/specs/ctl-worker/spec.md` | полная |
-| `plugins/` | `openspec/specs/plugins/spec.md` | полная |
-| `er_export/` | `openspec/specs/er-export/spec.md` | полная |
-| `tfs_kafka/` | `openspec/specs/tfs-kafka/spec.md` | полная |
-| `xs_export/` | `openspec/specs/xs-export/spec.md` | полная |
-| `s3_tools/` | `openspec/specs/s3-tools/spec.md` | полная |
-| `tools/` | `openspec/specs/tools/spec.md` | полная |
-| `gp_exchange/` | `openspec/specs/gp-exchange/spec.md` | полная |
+| Каталог | Спецификация |
+|---|---|
+| `ctl_worker/` | `docs/sberpowers/specs/ctl-worker-baseline.md` |
+| `plugins/` | `docs/sberpowers/specs/plugins-baseline.md` |
+| `er_export/` | `docs/sberpowers/specs/er-export-baseline.md` |
+| `tfs_kafka/` | `docs/sberpowers/specs/tfs-kafka-baseline.md` |
+| `xs_export/` | `docs/sberpowers/specs/xs-export-baseline.md` |
+| `s3_tools/` | `docs/sberpowers/specs/s3-tools-baseline.md` |
+| `tools/` | `docs/sberpowers/specs/tools-baseline.md` |
+| `gp_exchange/` | `docs/sberpowers/specs/gp-exchange-baseline.md` |
 
 Спека описывает требуемое поведение, а не текущее состояние кода: расхождение между ними —
 это дефект, который видно сравнением, а не повод переписать спеку. Так были найдены и
 закрыты два расхождения в `gp-exchange` — первая загрузка потока и публикация события на
 пустом ветвлении; оба проверены прогоном на стенде (`testbed/gp_exchange/`).
 
-```bash
-npm i -g --prefix ~/.local @fission-ai/openspec   # CLI (в /usr прав нет)
-openspec list --specs                             # что описано
-openspec show er-export                           # прочитать спеку
-openspec validate --all --strict                  # проверить формат
-```
-
-Правка поведения начинается с предложения — `/opsx:propose "что меняем"`, — которое кладёт
-в `openspec/changes/` дельту (`ADDED` / `MODIFIED` / `REMOVED`), задачи и обоснование.
-После реализации `/opsx:archive` вливает дельту в основную спецификацию. Readme отвечает на
-«как устроено», спека — на «что обязано работать»; дублировать одно в другом не нужно.
+Процесс — SberPowers: изменение поведения начинается с дельта-спеки
+`docs/sberpowers/specs/ГГГГ-ММ-ДД-<изменение>.md` (ADDED / MODIFIED / REMOVED) и плана в
+`docs/sberpowers/plans/`; после реализации дельта вливается в baseline. Формат baseline
+проверяет `python3 .claude/scripts/check_baseline.py`. До 04.10.2026 спецификации велись в
+OpenSpec — их история в `openspec/changes/archive/`. Readme отвечает на «как устроено»,
+спека — на «что обязано работать»; дублировать одно в другом не нужно.
 
 ---
 

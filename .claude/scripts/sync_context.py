@@ -110,7 +110,7 @@ def freshness_table() -> str:
     for folder_name, capability in sorted(PROJECTS.items()):
         folder = REPO / folder_name
         readme = readme_of(folder)
-        spec = REPO / 'openspec' / 'specs' / capability / 'spec.md'
+        spec = REPO / 'docs' / 'sberpowers' / 'specs' / f'{capability}-baseline.md'
         code_ts = last_commit(f'{folder_name}/*.py') or last_commit(folder_name)
 
         def age(path: Path | None) -> str:
@@ -126,7 +126,7 @@ def freshness_table() -> str:
         rows.append(
             f"| `{folder_name}/` | "
             f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else 'шапки модулей' if folder_name in DOCSTRING_DOCS else '—'} | {age(readme)} | "
-            f"{'`openspec/specs/' + capability + '/spec.md`' if spec.exists() else '—'} | {age(spec)} | "
+            f"{'`docs/sberpowers/specs/' + capability + '-baseline.md`' if spec.exists() else '—'} | {age(spec)} | "
             f"{code_ts:%Y-%m-%d}" + " |" if code_ts else "— |")
 
     # Справочники: спеки нет и не будет, поэтому вместо неё — откуда снят снимок.
@@ -167,8 +167,8 @@ def write_context_md() -> None:
 |---|---|---|
 | **Правила работы** (rules) | `CLAUDE.md` в корне | человек |
 | **Как устроено** | `<каталог>/readme.md` (у `plugins/` — шапки модулей) | человек |
-| **Что обязано работать** (SDD) | `openspec/specs/<capability>/spec.md`, общий контекст — `openspec/project.md` | человек, через `/opsx:propose` |
-| **Навыки и команды агента** | `.claude/skills/`, `.claude/commands/` | генерирует `openspec init`, правит человек |
+| **Что обязано работать** (SDD) | `docs/sberpowers/specs/<возможность>-baseline.md` и дельты рядом, планы — `docs/sberpowers/plans/`, общий контекст — `openspec/project.md` | человек, через навыки SberPowers (`specify` → `learn`) |
+| **Навыки агента** | `.claude/skills/` | набор SberPowers без правок, обновляется заменой каталогов |
 
 Память агента (`~/.claude/projects/*/memory/`) в репозиторий не входит: она про
 конкретного человека и его прошлые сессии, а не про проект.

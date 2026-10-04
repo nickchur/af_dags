@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-02 15:06 MSK · v1.73 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 12:07 MSK · v1.74 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -910,7 +910,7 @@ dag_snapshots/<dag_id>/00002.<dag_hash>.json.gz
 *   **Документация дагов** — второй таск `publish_docs`: остальные `.md` (README каталогов,
     QUICKSTART, ТЗ) в `docs/<путь>` бакета логов, оглавление с заголовками — в Variable `af_docs`.
     Их показывает пункт UI **Docs → DAG Docs** (etl-core, `plugins/dag_docs_plugin.py`).
-    Не публикуются навыки (они уже есть), `CLAUDE.md`, `CONTEXT.md`, `openspec/`, `testbed/`.
+    Не публикуются навыки (они уже есть), `CLAUDE.md`, `CONTEXT.md`, `openspec/`, `docs/` (спеки и планы), `testbed/`.
 *   **Тексты — в бакете логов с 25.09.2026**, на обоих контурах одним путём: вебсервер читает
     их через лог-сервер воркера. У записи оглавления поле `at` — когда записан текст; текст
     переписывается и при смене файла, и когда `at` старше `DOC_REFRESH_DAYS` (7 дней), чтобы не
