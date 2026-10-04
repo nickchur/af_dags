@@ -32,21 +32,30 @@
 ## Ограничения и контракты
 
 - Идентификатор DAG'а пакета: `export_er__<replica>__<dag_group>` (REQ-er-export-01).
+- Пустая `dag_group` приводится к `0` — значение по умолчанию (REQ-er-export-01).
 - Маска частей ключа (`replica`, `dag_group`, `schema_name`, `extract_name`): `[A-Za-z0-9_-]` без двойного подчёркивания `__` (REQ-er-export-03).
 - Имя архива пакета: `{replica}__{ts}__{dag_group}__{table}__{часть}_{всего}_{строк}.zip` (REQ-er-export-05).
 - Имя тикета: `{replica}__{ts}.tkt` (REQ-er-export-05).
 - Имена файлов данных и `.meta` внутри архива: `{schema}__{table}__{ts}__…` (REQ-er-export-05).
+- Имена файлов пакета приводятся к нижнему регистру; метку времени выдаёт таск в пуле с одним слотом на реплику (REQ-er-export-05).
 - Имя DAG настройки: `export_er_setup` (REQ-er-export-06).
 - Имя управляющей таблицы: `export.er_wf_meta` (REQ-er-export-06).
 - Имя переменной с метаданными пакетов: `datalab_er_wfs` (REQ-er-export-06).
 - Имя переменной с общими настройками: `datalab_er_config` (REQ-er-export-07).
+- Запрещённые символы в названии `Param(section=…)`: точка, `#`, `:`, `[`, `]`, `,` (REQ-er-export-08).
 - Имя переменной контура: `ENV_STAND` (или `ENVIRONMENT`) (REQ-er-export-09).
+- Карта контуров лимита: `PROM` — без лимита, прочие известные — лимит из настроек, неизвестный — без лимита (REQ-er-export-09).
 - Режимы выгрузки: `delta`, `recent`, ручная выгрузка с периодом (REQ-er-export-10).
+- Параметры ручного режима `date_from`/`date_to`/`shift_state`, отказ в `init` при сдвиге назад или отметке без периода (REQ-er-export-10).
+- `trigger_rule` сохранения статуса допускает пропущенных предшественников (REQ-er-export-11).
+- Ключ правила паузы: реплика с группой, маршрут, метка времени; в очередь кладётся тот же ключ — имя пакета, а не голая реплика (REQ-er-export-12, REQ-er-export-13).
 - Имя таблицы истории ЕР: `export.er_extract_history` (REQ-er-export-14).
 - Ключ выгрузки в истории: `replica`, `schema_name`, `extract_name` (REQ-er-export-14).
 - Поля происхождения записи в истории: `dag_id`, `run_id`, `dag_group`, `package_ts`, режим выгрузки (REQ-er-export-14).
 - Таблица истории xStream `export.extract_history` не используется для записей ЕР (REQ-er-export-14).
+- Единицы окна: `overlap` — секунды, `increment` — минуты; источник — настройка поставки, не строка истории (REQ-er-export-15).
 - Значение `increment` по умолчанию: `0` (REQ-er-export-15).
+- Начальная точка: `lower_bound`, иначе `min(time_field)` минус секунда; порог предупреждения — состояние раньше 2000 года (REQ-er-export-17).
 - Ключ списка зарезервированных слов Hive в настройках: `HIVE_RESERVED` (REQ-er-export-18).
 - Суффикс зарезервированных слов Hive: `_` (REQ-er-export-18).
 - Значение списка `HIVE_RESERVED` по умолчанию: пусто (REQ-er-export-18).
