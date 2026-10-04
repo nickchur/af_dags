@@ -1,5 +1,5 @@
 """🚀 DAG-фабрика ER-выгрузок (ClickHouse → S3 → TFS).
-*2026-10-01 18:04 MSK · v3.24 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 14:30 MSK · v3.25 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один DAG — один пакет — одна группа поставок — один внешний тикет. Пакет задаётся парой
 `replica` + `dag_group` (двумя колонками `export.er_wf_meta`), а даг называется
@@ -372,9 +372,10 @@ class _ZipReader:
 def _source_start(hook, cfg) -> datetime:
     """🌱 Начальная точка новой поставки без lower_bound: min(time_field) по её запросу.
 
-    Пустой источник ClickHouse отдаёт как NULL (Nullable) или как 1970-01-01 (DateTime):
-    начала у данных ещё нет — таблица пропускается, состояние не пишется, и следующий ран
-    спросит снова.
+    Даты до 2000 года запрос отбрасывает (_prep_min). Пустой источник — начала у данных ещё
+    нет: таблица пропускается, состояние не пишется, и следующий ран спросит снова. Строки
+    есть, но все до 2000 года — ошибка: молчаливый вечный пропуск выглядел бы как «пусто».
+    time_field типа Date ClickHouse отдаёт датой — она приводится к полуночи.
     """
     if not cfg.get('sql_min'):
         raise AirflowFailException(
@@ -383,12 +384,19 @@ def _source_start(hook, cfg) -> datetime:
         )
     sql = cfg['sql_min'].replace('{condition}', '1=1').replace('{export_time}', 'now64(6)')
     row = get_dict_from_ch(hook, sql)
-    start = row[0]['start'] if row else None
+    start, rows = (row[0]['er_start'], row[0]['er_rows']) if row else (None, 0)
+    if rows and (start is None or start.year < 2000):
+        raise AirflowFailException(
+            f"{cfg['schema_name']}.{cfg['tbl']}: в источнике {rows} строк, но у всех {cfg.get('time_field')} "
+            "раньше 2000 года — начало данных не вычислить. Проставьте lower_bound в params поставки"
+        )
     if start is None or start.year < 2000:
         raise AirflowSkipException(
             f"🌱 {cfg['schema_name']}.{cfg['tbl']}: источник пуст — начальная точка не определена, "
             "ждём первых данных"
         )
+    if not isinstance(start, datetime):
+        start = datetime.combine(start, datetime.min.time())
     if start.tzinfo is not None:
         start = start.astimezone(timezone.utc).replace(tzinfo=None)
     return start.replace(microsecond=0) - timedelta(seconds=1)
@@ -397,8 +405,8 @@ def _source_start(hook, cfg) -> datetime:
 @task(task_id='init')
 def _er_init(cfg, **context):
     """⚙️ Инициализирует состояние выгрузки и возвращает словарь SQL-литералов для шаблонов."""
-    # Delta-режим: читает export.extract_current_vw; при первом запуске создаёт bootstrap-состояние
-    # с time_from/time_to = lower_bound.
+    # Delta-режим: читает export.extract_current_vw; при первом запуске стартует с lower_bound,
+    # а пустой lower_bound — с начала данных источника (_source_start).
     # Recent-режим: вычисляет окно [now() - recent_interval, now()] без обращения к CH.
     # Период: date_from/date_to из DAG Params перебивают состояние и помечают ран как ad_hoc;
     # с галкой shift_state период записывается в историю и дельта продолжает от date_to.
@@ -604,6 +612,15 @@ def _er_init(cfg, **context):
                 f"не позже достигнутого {result['extract_time']}. Для повторной выгрузки прошлого "
                 "снимите галку «Сдвинуть состояние дельты»"
             )
+        # И не дальше текущего времени. Сдвиг на завтра: следующая дельта получила бы окно
+        # (завтра, сейчас] — пустое, и строки, пришедшие между ранами, не выгрузил бы никто;
+        # а её строка в истории с extract_time = завтра перебивала бы в argMax все следующие,
+        # и до завтра поставка выгружала бы одно растущее окно по кругу.
+        if shift and _parse_ts(date_to) > datetime.now(timezone.utc).replace(tzinfo=None):
+            raise AirflowFailException(
+                f"{cfg['schema_name']}.{cfg['tbl']}: сдвиг состояния не дальше текущего времени — "
+                f"date_to ({date_to}) в будущем. Задайте «Дата по» не позже текущего момента (UTC)"
+            )
         result.update({
             'time_from':    f"'{date_from}'",
             'time_to':      f"'{date_to}'",
@@ -629,10 +646,11 @@ def _er_init(cfg, **context):
                              'time_from', 'time_to', 'ad_hoc']
     note = {k: result.get(k) for k in shown}
 
-    # 🐢 Сколько ранов осталось до текущего времени. Окно двигается на increment минут за
-    # ран (schedule_next взводит следующий сам), поэтому отставание в неделю — это сотни
-    # циклов. Человеку это надо видеть сразу: лечится либо разовой выгрузкой за период,
-    # либо временно увеличенным increment, но никак не ожиданием.
+    # 🐢 Сколько ранов осталось до текущего времени. Бывает только с потолком окна
+    # (increment > 0): окно двигается на increment минут за ран, и отставание в неделю —
+    # это сотни циклов. При increment = 0 окно всегда до текущего времени, блок молчит.
+    # Человеку это надо видеть сразу: лечится снятием потолка (increment = 0) или сдвигом
+    # состояния (период с галкой shift_state), но никак не ожиданием.
     if str(result.get('is_current')).lower() != 'true':
         behind = (datetime.now(timezone.utc).replace(tzinfo=None)
                   - _parse_ts(str(result['time_to']).strip("'")))
@@ -1037,7 +1055,8 @@ def _er_save_status(gcfg, **context):
     # из неё следующий ран и посчитает своё окно.
     #
     # Разовая выгрузка за период (ad_hoc) состояние не двигает — иначе следующая штатная
-    # дельта оттолкнулась бы от вручную заданных границ.
+    # дельта оттолкнулась бы от вручную заданных границ. Исключение — галка shift_state:
+    # тогда init ставит ad_hoc='False', и период записывается как обычное окно.
     from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
     # wait_confirm вернул время получения квитанций; при skip (auto_confirm=1) — None

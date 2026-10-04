@@ -1,5 +1,5 @@
 """⚙️ Конфигурация, константы и сборщики фреймворка ER-выгрузок.
-*2026-09-29 13:18 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 14:30 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 CH-коннект (dlab-click) и S3 (s3-tfs-hrplt) заданы здесь, но переопределяются из
 Variable `datalab_er_config` — как и BUCKET, TFS_MAP, LIMITS и умолчания параметров
@@ -1245,12 +1245,19 @@ def export_sql(entry: dict, params: dict, table_key: str = '') -> dict:
         return build_sql(m)
 
     def _prep_min(key):
-        """Начало данных источника: min(time_field) по тому же FROM/JOIN/WHERE, без окна."""
+        """Начало данных источника: min(time_field) по тому же FROM/JOIN/WHERE, без окна.
+
+        Даты до 2000 года — мусор вроде нулевого DateTime: одна такая строка дала бы
+        min = 1970, и живой источник выглядел бы пустым. Поэтому minIf, а счётчик строк
+        отличает пустой источник от источника из одного мусора (_source_start).
+        Алиасы с префиксом: ClickHouse подставляет алиас из SELECT в WHERE.
+        """
         m = entry.get(key)
         tf = str(params.get('time_field') or '').strip()
         if not (isinstance(m, dict) and "fields" not in m and tf) or params['full_export']:
             return ""
-        return build_sql({**m, "fields": [f"min({tf}) AS start"]})
+        return build_sql({**m, "fields": [f"minIf({tf}, {tf} >= '2000-01-01') AS er_start",
+                                          "count() AS er_rows"]})
 
     def _prep_data(key):
         """Тот же запрос, но только с data-колонками — build_meta делает по нему DESCRIBE."""
