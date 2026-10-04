@@ -76,16 +76,17 @@ def sync_tree(kind: str) -> tuple[int, int]:
     """Копирует .claude/<kind>/* в ~/.claude/<kind>/, убирая свои устаревшие копии."""
     src_root = REPO / '.claude' / kind
     dst_root = HOME_CLAUDE / kind
-    if not src_root.is_dir():
+    # Каталога в репозитории нет (у commands — с переходом на SberPowers) — копировать нечего,
+    # но свои прежние копии из ~/.claude всё равно убрать
+    src_items = [p for p in src_root.iterdir() if p.is_dir()] if src_root.is_dir() else []
+    if not src_items and not dst_root.is_dir():
         return 0, 0
     dst_root.mkdir(parents=True, exist_ok=True)
 
-    ours = {p.name for p in src_root.iterdir() if p.is_dir()}
+    ours = {p.name for p in src_items}
     copied = removed = 0
 
-    for item in src_root.iterdir():
-        if not item.is_dir():
-            continue
+    for item in src_items:
         dst = dst_root / item.name
         if dst.exists():
             shutil.rmtree(dst)
