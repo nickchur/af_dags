@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Исполнитель задачи execute — agy вместо субагента: `agy_task.sh NN <модель> [fix]`.
-# *2026-10-04 12:05 MSK · v2.0 · Nick Churkin · NSChurkin@sber.ru*
+# *2026-10-04 12:06 MSK · v2.1 · Nick Churkin · NSChurkin@sber.ru*
 #
 # Берёт бриф .sberpowers/tasks/NN-brief.md (и NN-context.md, если диспетчер его написал),
 # собирает промпт из шаблона навыка execute/references/implementer-prompt.md и запускает agy
@@ -14,7 +14,7 @@
 # «execute: исполнитель agy»). Модели — `agy models`. Ключ не передаётся: у agy своя
 # авторизация в ~/.gemini (параллельные запросы ключа к Bitwarden падали).
 set -euo pipefail
-NN=${1:?номер задачи, например 01}; MODEL=${2:?модель agy, например gemini-3.8-flash-high}; MODE=${3:-}
+NN=${1:?номер задачи, например 01}; MODEL=${2:?модель agy, например gemini-3.8-flash-high}; MODE=${3:-}   # fix — Critical/Important из ревью, minor — хвост Minor
 MAIN=$(git rev-parse --show-toplevel); cd "$MAIN"
 T=.sberpowers/tasks; BRIEF=$T/$NN-brief.md; REPORT=$T/$NN-report.md
 [ -f "$BRIEF" ] || { echo "нет брифа $BRIEF" >&2; exit 2; }
@@ -55,6 +55,15 @@ if [ "$MODE" = fix ]; then
 Ревью нашло проблемы: прочитай $(ls $T/$NN-review-*.md | grep -v package | tr '\n' ' ')— исправь находки
 Critical и Important (Minor не трогай), затем допиши в $REPORT раздел «Fix-проход»: что
 исправлено по каждой находке и чем проверено."
+elif [ "$MODE" = minor ]; then
+  PROMPT+="
+
+## Это проход по Minor
+
+Все раунды ревью приняты; остались замечания Minor: прочитай $(ls $T/$NN-review-*.md | grep -v package | tr '\n' ' ')—
+исправь в файле задачи все Minor, кроме тех, что ревьюер отнёс к исходнику («так в исходнике»,
+«вопрос к следующей дельте») или пометил «требование плана». Смысл сверяй с исходником, ничего не
+выдумывай. Затем допиши в $REPORT раздел «Проход по Minor»: что исправлено и что оставлено с причиной."
 fi
 
 echo "agy: задача $NN, модель $MODEL${MODE:+, $MODE} → $T/$NN-agy.log" >&2
