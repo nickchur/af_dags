@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Сверка baseline-спек SberPowers: формат и полнота перевода из OpenSpec.
-*2026-10-04 11:20 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru*
+*2026-10-04 12:05 MSK · v1.1 · Nick Churkin · NSChurkin@sber.ru*
 
     check_baseline.py ctl-worker tools …   # перевод: openspec/specs/<cap>/spec.md → baseline
     check_baseline.py                      # формат всех docs/sberpowers/specs/*-baseline.md
@@ -13,6 +13,10 @@
 требования не меньше, чем было `#### Scenario:`; каждая строка «Происхождения» перенесена
 дословно — и «откуда», и «когда пересматривать». Смысл формулировок проверяет ревьюер,
 скрипт ловит то, что исполнитель потерял или выдумал.
+
+Заодно ловит признаки текста, собранного скриптом (пустое «действие» в сценариях,
+«дано —» у большинства строк), и внешние упоминания: документ уезжает в корпоративный
+репозиторий.
 
 Выход: 0 — всё сходится, 1 — есть расхождения.
 """
@@ -62,6 +66,16 @@ def check_format(path: Path, cap: str) -> tuple[list[str], list[tuple[str, str]]
             problems.append(f"в «{name}» нет {', '.join(missing)}")
     if not ids:
         problems.append(f"нет ни одного требования вида **REQ-{cap}-NN**")
+    # признаки текста, собранного скриптом по шаблону: пустое «действие» в сценариях
+    # (так выглядели оба отклонённых прохода 04.10.2026), «дано —» у большинства строк
+    rows = re.findall(r'^\|\s*REQ-.*$', section(text, '## Критерии приёмки'), re.M)
+    if (n := sum('действие —' in r for r in rows)):
+        problems.append(f"«действие —» в {n} сценариях: действие есть у каждого сценария")
+    if rows and (n := sum('дано —' in r for r in rows)) > len(rows) // 3:
+        problems.append(f"«дано —» в {n} из {len(rows)} сценариев: предусловие вынесено в действие?")
+    # документ уезжает в корпоративный репозиторий
+    for word in sorted(set(re.findall(r'PR #\d+|\b(?:Claude|GitHub|Gemini|agy)\b', text, re.I))):
+        problems.append(f"внешнее упоминание «{word}»")
     return problems, [(r[0], r[2]) for r in reqs]
 
 

@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # Исполнитель задачи execute — agy вместо субагента: `agy_task.sh NN <модель> [fix]`.
-# *2026-10-04 11:35 MSK · v1.2 · Nick Churkin · NSChurkin@sber.ru*
+# *2026-10-04 12:05 MSK · v2.0 · Nick Churkin · NSChurkin@sber.ru*
 #
 # Берёт бриф .sberpowers/tasks/NN-brief.md (и NN-context.md, если диспетчер его написал),
 # собирает промпт из шаблона навыка execute/references/implementer-prompt.md и запускает agy
-# в корне репозитория без подтверждений. Отчёт agy пишет в NN-report.md, лог — NN-agy.log.
+# без подтверждений в своей копии репозитория — worktree ../<репо>-wtNN от текущего HEAD:
+# параллельные задачи не видят друг друга, а git status копии показывает ровно работу задачи.
+# Отчёт и лог (NN-report.md, NN-agy.log) копируются обратно в .sberpowers/tasks/; копия
+# остаётся для проверки диспетчером — коммит в ней, cherry-pick в ветку, worktree remove.
 # С третьим аргументом `fix` agy чинит находки ревью из NN-review-*.md и дописывает отчёт.
 #
 # agy НЕ коммитит: коммит делает диспетчер после механической проверки (CLAUDE.md,
-# «execute: исполнитель agy»). Модели — `agy models`; ключ — секрет agy в Bitwarden.
+# «execute: исполнитель agy»). Модели — `agy models`. Ключ не передаётся: у agy своя
+# авторизация в ~/.gemini (параллельные запросы ключа к Bitwarden падали).
 set -euo pipefail
-NN=${1:?номер задачи, например 01}; MODEL=${2:?модель agy, например gemini-3.1-pro-high}; MODE=${3:-}
-cd "$(git rev-parse --show-toplevel)"
+NN=${1:?номер задачи, например 01}; MODEL=${2:?модель agy, например gemini-3.8-flash-high}; MODE=${3:-}
+MAIN=$(git rev-parse --show-toplevel); cd "$MAIN"
 T=.sberpowers/tasks; BRIEF=$T/$NN-brief.md; REPORT=$T/$NN-report.md
 [ -f "$BRIEF" ] || { echo "нет брифа $BRIEF" >&2; exit 2; }
-S=$(secret agy) || exit 1; eval "$S"; export GEMINI_API_KEY; unset S
+WT=$MAIN-wt$NN
+[ -d "$WT" ] && { echo "копия $WT уже есть — проверь и убери: git worktree remove --force $WT" >&2; exit 2; }
+git worktree add -q --detach "$WT" HEAD && cp -r .sberpowers "$WT/" && cd "$WT"
 
 TITLE=$(sed -n '1s/^#* *//p' "$BRIEF")
 CONTEXT=$( [ -f "$T/$NN-context.md" ] && cat "$T/$NN-context.md" || echo "Контекста сверх брифа нет.")
@@ -52,5 +58,8 @@ Critical и Important (Minor не трогай), затем допиши в $REP
 fi
 
 echo "agy: задача $NN, модель $MODEL${MODE:+, $MODE} → $T/$NN-agy.log" >&2
-timeout 25m agy -p "$PROMPT" --model "$MODEL" --dangerously-skip-permissions --print-timeout 20m \
-  > >(tee -a "$T/$NN-agy.log") 2>&1
+rc=0; timeout 25m agy -p "$PROMPT" --model "$MODEL" --dangerously-skip-permissions --print-timeout 20m \
+  >> "$T/$NN-agy.log" 2>&1 || rc=$?
+cp "$T/$NN-"* "$MAIN/$T/"
+echo "── agy rc=$rc · копия $WT"; tail -8 "$T/$NN-agy.log"
+echo "── изменения в копии:"; git status --short; git diff --stat
