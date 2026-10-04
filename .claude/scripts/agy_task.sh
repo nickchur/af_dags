@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Исполнитель задачи execute — agy вместо субагента: `agy_task.sh NN <модель> [fix]`.
-# *2026-10-04 11:10 MSK · v1.0 · Nick Churkin · NSChurkin@sber.ru*
+# *2026-10-04 11:23 MSK · v1.1 · Nick Churkin · NSChurkin@sber.ru*
 #
 # Берёт бриф .sberpowers/tasks/NN-brief.md (и NN-context.md, если диспетчер его написал),
 # собирает промпт из шаблона навыка execute/references/implementer-prompt.md и запускает agy
@@ -43,7 +43,7 @@ if [ "$MODE" = fix ]; then
 
 ## Это fix-проход
 
-Ревью нашло проблемы: прочитай $(ls $T/$NN-review-*.md | tr '\n' ' ')— исправь находки
+Ревью нашло проблемы: прочитай $(ls $T/$NN-review-*.md | grep -v package | tr '\n' ' ')— исправь находки
 Critical и Important (Minor не трогай), затем допиши в $REPORT раздел «Fix-проход»: что
 исправлено по каждой находке и чем проверено."
 fi
