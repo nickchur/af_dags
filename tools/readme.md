@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-05 22:00 MSK · v1.75 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-05 22:39 MSK · v1.75 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -129,7 +129,7 @@ nullable-колонках.
 - Postgres: таблицы в `airflowdb` (схема `public`); на таблицу и каждую колонку ставится
   `COMMENT` (требование Quality Gate).
 - ClickHouse: таблицы в схеме `technical`, имена по имени теста.
-- S3: connection `s3-archive`, бакет `test_operators`, префикс `hrp_tests/`.
+- S3: connection `s3-archive`, бакет `test-operators` (в задаче — `test_operators`, но `_` в имени бакета S3 недопустим), префикс `hrp_tests/`.
 
 **Методология**
 1. **Setup** — DROP/CREATE источников и таргетов (PG + CH) с данными (NULL, спецсимволы, массивы);

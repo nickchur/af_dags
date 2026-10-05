@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-05 22:00 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-05 22:39 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
@@ -86,7 +86,9 @@ ensure_pool(TOOLS_POOL)
 DEFAULT_PG_CONN = "airflowdb"
 DEFAULT_CH_CONN = "dlab-click"
 DEFAULT_S3_CONN = "s3-archive"
-DEFAULT_S3_BUCKET = "test_operators"  # бакет из HRPDATALAB-14479
+# В тикете HRPDATALAB-14479 — test_operators, но «_» в имени бакета S3 недопустим (MinIO стенда
+# отказывает: «Bucket name contains invalid characters»)
+DEFAULT_S3_BUCKET = "test-operators"
 S3_PREFIX = "hrp_tests/"
 
 PG_SCHEMA = "main"
