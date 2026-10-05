@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-10-02 14:40 MSK · v3.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 12:07 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -578,7 +578,7 @@ raise_status(st, ld_sts)
 
 `skip` даёт штатный пропуск, поэтому у следующего таска в цепочке нужен
 `trigger_rule=NONE_FAILED`. Требования к поведению DAG'ов каталога —
-в [`openspec/specs/ctl-worker/spec.md`](../openspec/specs/ctl-worker/spec.md).
+в [`docs/sberpowers/specs/ctl-worker-baseline.md`](../docs/sberpowers/specs/ctl-worker-baseline.md).
 
 ## ⚙️ Интеграция с Airflow
 

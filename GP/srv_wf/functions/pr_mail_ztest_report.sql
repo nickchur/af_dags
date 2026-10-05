@@ -35,6 +35,8 @@ begin
                 from (
                     select row_number() over(order by split_part(z.object, '.', 1) desc, ts desc) n 
                         , left(z.ts::text, 16) dttm
+                        , left(z.first_ts::text, 16) first_fail
+                        , z.fails
                         , replace(split_part(z.object, '.', 1), 's_grnplm_vd_hr_edp_', '') sch
                         , split_part(z.object, '.', 2) object
                         , z.ztest_ok
@@ -56,14 +58,27 @@ begin
                         --, z.notes 
                         --, (z.notes->>'msg') msg
                         , (z.notes->>'cfg') cfg
-                    from s_grnplm_vd_hr_edp_srv_dq.vw_ztest z
-                    where true
-                        --and ts >= current_date -1 --and ts < current_date
-                        and ts >= (now() - '6 hours'::interval)::date
-        --                and (not ztest_ok or split_part(z.object, '.', 1) ~ 's_grnplm_vd_hr_edp_vd')
-                        and not ztest_ok 
-                        and split_part(z.object, '.', 1) in ('s_grnplm_vd_hr_edp_vd','s_grnplm_vd_hr_edp_stg')
-                        --and (error is not null or split_part(z.object, '.', 1) ~ 's_grnplm_vd_hr_edp_vd')
+                    -- Одна строка на проверку (объект, дата ключа, конфиг) - последняя, а не каждый
+                    -- прогон. Z-тест объекта гоняется при каждой загрузке, и одна непрошедшая
+                    -- проверка повторялась в отчёте десятки раз: 25.09.2026 в письме было 209
+                    -- строк на 10 объектов (tb_scpl_json_schemas - 160), 110 тыс. символов при
+                    -- пределе отправки в CTL 50 тыс. - раздел до письма не доходил. Повторы
+                    -- теперь видны числом: fails - сколько раз упала, first_fail - с какого времени (оба -
+                    -- в пределах окна отчёта, как и сами строки).
+                    from (
+                        select distinct on (z.object, z.key_date, z.notes->>'cfg') z.*
+                            , count(1) over(partition by z.object, z.key_date, z.notes->>'cfg') fails
+                            , min(z.ts) over(partition by z.object, z.key_date, z.notes->>'cfg') first_ts
+                        from s_grnplm_vd_hr_edp_srv_dq.vw_ztest z
+                        where true
+                            --and ts >= current_date -1 --and ts < current_date
+                            and ts >= (now() - '6 hours'::interval)::date
+            --                and (not ztest_ok or split_part(z.object, '.', 1) ~ 's_grnplm_vd_hr_edp_vd')
+                            and not ztest_ok 
+                            and split_part(z.object, '.', 1) in ('s_grnplm_vd_hr_edp_vd','s_grnplm_vd_hr_edp_stg')
+                            --and (error is not null or split_part(z.object, '.', 1) ~ 's_grnplm_vd_hr_edp_vd')
+                        order by z.object, z.key_date, z.notes->>'cfg', z.ts desc
+                    ) z
                 ) a
                 order by 1  
             )$sql$;

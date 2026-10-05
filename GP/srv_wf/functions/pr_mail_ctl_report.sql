@@ -323,11 +323,12 @@ begin
                     , a.auto
                     -- , alive
                     -- , start_dttm, end_dttm, profile
-                    , status_dttm::timestamp(0)::text
+                    -- status_dttm и wf_id убраны: первое есть в status_time, второе - в name.
+                    -- Раздел на проде доходил до 49,7 тыс. символов при пределе отправки в CTL
+                    -- из Airflow 50 тыс.; каждая ячейка - ещё ~20 символов разметки.
                     , (now()::timestamp(0) - status_dttm::timestamp(0))::interval(0) status_time
                     -- , status, status_log
                     , concat(status, ': ', replace(status_log, '''', '')) status_info
-                    , wf_id
                     -- , b.profile
                     -- , b.category
                     -- , split_part(category, '.', 1) category

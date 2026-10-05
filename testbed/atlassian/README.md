@@ -120,6 +120,14 @@ DDL таблиц и код функций лежат в корпоративно
 - пользователь;
 - пустые списки PR.
 
+Второй вид MCP — форк [`mcp-atlassian-with-bitbucket`](https://pypi.org/project/mcp-atlassian-with-bitbucket/)
+(тот же `mcp-atlassian` плюс `bitbucket_*`; его ставит корпоративный навык GigaCode). Он ходит в
+`/rest/api/1.0` вместо `latest`, проверяет связь через `application-properties`, а файл и
+каталог читает JSON-ом REST `/browse` (`lines` и `children.values`). Эмулятор отдаёт всё это;
+прогнаны версия 1.0.5, `READ_ONLY_MODE=true`. Его `bitbucket_search_code` шлёт
+`GET /rest/api/1.0/search` — такого пути в Bitbucket DC нет, эмулятор, как и настоящий сервер,
+отвечает 404.
+
 Сравнение веток (`compare/diff`) не эмулируется: для разбора падений оно не нужно.
 
 **Веб-ссылка** `/projects/<P>/repos/<r>/browse/<path>` отдаёт текст файла или листинг.

@@ -1,5 +1,5 @@
 """⚙️ DAG настройки ER-выгрузок: правка `export.er_wf_meta`, проверка и синхронизация.
-*2026-10-01 18:03 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 14:30 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Один ран смотрит запись `export.er_wf_meta`, проверяет её на живом ClickHouse (запрос
 собирается тем же кодом, что у выгрузки, и выполняется с `LIMIT 0`), пишет новую версию и
@@ -945,14 +945,19 @@ def er_setup_dag():
             result['kind'] = 'поставка'
             check_group_names(merged['replica'], merged.get('dag_group'), errors)
             if check_table(info['row'], info['key'], errors, info['params']):
-                # Начальную точку дельты проверяем до записи: иначе новая поставка без
-                # lower_bound всплыла бы только ошибкой синхронизации всего пакета.
+                # Поставку, застрявшую в 1970-м, называем до записи. Проверка даёт только
+                # предупреждение, поэтому сбой запроса к вью — тоже предупреждение: иначе
+                # он уронил бы check, и «Записать несмотря на проверку» не помогла бы.
                 triple = (merged['replica'], merged['schema_name'], merged['extract_name'])
-                cur = get_dict_from_ch(hook, f"""
-                    SELECT reached FROM {_cfg['HIST_CURRENT_VW']}
-                    WHERE replica = '{_q(triple[0])}' AND schema_name = '{_q(triple[1])}'
-                      AND extract_name = '{_q(triple[2])}'
-                """)
+                try:
+                    cur = get_dict_from_ch(hook, f"""
+                        SELECT reached FROM {_cfg['HIST_CURRENT_VW']}
+                        WHERE replica = '{_q(triple[0])}' AND schema_name = '{_q(triple[1])}'
+                          AND extract_name = '{_q(triple[2])}'
+                    """)
+                except Exception as err:
+                    warnings.append(f"состояние дельты не прочитано, застрявшая поставка не проверена: {ch_error(err)}")
+                    cur = []
                 check_start(merged, info, {triple: cur[0]['reached']} if cur else {}, errors, warnings)
 
             # Расписание и групповые параметры у поставки игнорируются — предупреждаем
@@ -1143,15 +1148,22 @@ def er_setup_dag():
         }
         ch_comments = ch_table_comments(hook, sources_by_key) if sources_by_key else {}
 
-        # Достигнутые состояния — чтобы отличить новую поставку без начальной точки от
-        # работающей (check_start). Один запрос на весь синк, вью маленькая.
-        reached = {
-            (r['replica'], r['schema_name'], r['extract_name']): r['reached']
-            for r in get_dict_from_ch(
-                hook, f"SELECT replica, schema_name, extract_name, reached FROM {_cfg['HIST_CURRENT_VW']}")
-        }
+        # Достигнутые состояния — чтобы найти поставки, застрявшие в 1970-м (check_start).
+        # Один запрос на весь синк, вью маленькая. Он нужен только ради предупреждения:
+        # сбой не должен остановить синк и сохранение правок всех пакетов.
+        try:
+            reached = {
+                (r['replica'], r['schema_name'], r['extract_name']): r['reached']
+                for r in get_dict_from_ch(
+                    hook, f"SELECT replica, schema_name, extract_name, reached FROM {_cfg['HIST_CURRENT_VW']}")
+            }
+            reached_err = ''
+        except Exception as err:
+            reached, reached_err = {}, ch_error(err)
 
         wfs, errors, warnings = build_wfs(tables, defaults, ch_comments, reached)
+        if reached_err:
+            warnings.append(f"состояние дельты не прочитано, застрявшие поставки не проверены: {reached_err}")
 
         if not wfs:
             raise ValueError(

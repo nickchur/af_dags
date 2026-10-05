@@ -12,7 +12,7 @@
   * документ не отстал от кода больше, чем на STALE_DAYS дней;
   * строка версии на месте (дата · версия · автор во второй строке);
   * ссылки на файлы внутри документов не битые;
-  * openspec validate --all --strict проходит.
+  * baseline-спеки SberPowers в порядке (формат check_baseline.py).
 
 Выход: 0 — всё хорошо, 1 — есть замечания. Хуки код возврата игнорируют (это
 предупреждение, а не запрет), CI может на него опираться.
@@ -29,7 +29,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[2]
 
 # Каталог-проект: свой readme, своя спецификация, своё место в карте артефактов.
-# Ключ — каталог, значение — имя capability в openspec (kebab-case).
+# Ключ — каталог, значение — возможность: docs/sberpowers/specs/<возможность>-baseline.md.
 PROJECTS = {
     'ctl_worker': 'ctl-worker',
     'plugins': 'plugins',
@@ -127,12 +127,12 @@ def check_projects() -> list[str]:
 
         code_ts = last_commit(f'{folder_name}/*.py') or last_commit(folder_name)
         readme = readme_of(folder)
-        spec = REPO / 'openspec' / 'specs' / capability / 'spec.md'
+        spec = REPO / 'docs' / 'sberpowers' / 'specs' / f'{capability}-baseline.md'
 
         if readme is None and folder_name not in DOCSTRING_DOCS:
             problems.append(f"{folder_name}/: нет readme")
         if not spec.exists():
-            problems.append(f"{folder_name}/: нет спецификации openspec/specs/{capability}/spec.md")
+            problems.append(f"{folder_name}/: нет спецификации docs/sberpowers/specs/{capability}-baseline.md")
 
         if code_ts is None:
             continue
@@ -272,21 +272,11 @@ def check_links() -> list[str]:
 
 
 def check_specs() -> list[str]:
-    """Спецификации разбираются самим openspec, а не только глазами."""
-    exe = None
-    for candidate in (Path.home() / '.local/bin/openspec', Path('/usr/local/bin/openspec')):
-        if candidate.exists():
-            exe = str(candidate)
-            break
-    if exe is None:
-        return ["openspec не установлен — спецификации не проверены "
-                "(npm i -g --prefix ~/.local @fission-ai/openspec)"]
-    out = subprocess.run([exe, 'validate', '--all', '--strict'],
-                         cwd=REPO, capture_output=True, text=True)
-    if out.returncode != 0:
-        tail = (out.stdout + out.stderr).strip().splitlines()[-3:]
-        return ["openspec validate --all --strict не прошёл: " + ' / '.join(tail)]
-    return []
+    """Baseline-спеки разбираются тем же скриптом, что ими пользуется learn."""
+    sys.path.insert(0, str(REPO / '.claude' / 'scripts'))
+    from check_baseline import SPECS, check_format
+    return [f"{p.name}: {problem}" for p in sorted(SPECS.glob('*-baseline.md'))
+            for problem in check_format(p, p.name.removesuffix('-baseline.md'))[0]]
 
 
 def main() -> int:

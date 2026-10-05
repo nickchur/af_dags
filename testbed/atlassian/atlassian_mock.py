@@ -1,5 +1,5 @@
 """📚 Эмулятор Confluence, Jira и Bitbucket Server/DC для тестового стенда.
-*2026-10-02 13:16 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-03 14:46 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Зачем. GigaCode ходит в корпоративный Confluence (их несколько: confluence.delta.sbrf.ru,
 confluence.sberbank.ru) и в Jira через MCP `mcp-atlassian`, по экземпляру на сервер. Чтобы
@@ -8,7 +8,8 @@ confluence.sberbank.ru) и в Jira через MCP `mcp-atlassian`, по экзе
 инструментов чтения; на неизвестный путь — 404 и строка в журнале).
 
 Bitbucket (stash.delta.sbrf.ru, stash.sigma.sbrf.ru) — то же для MCP
-`@atlassian-dc-mcp/bitbucket`: агент читает DDL и код по ссылке на репозиторий.
+`@atlassian-dc-mcp/bitbucket` и для форка `mcp-atlassian-with-bitbucket` (REST под `/rest/api/1.0`,
+файл и каталог — JSON `/browse`): агент читает DDL и код по ссылке на репозиторий.
 
 Один код — несколько экземпляров (`atlassian-mock@.service`): `ATLASSIAN_MOCK_SERVER` =
 `delta` / `sber` (Confluence), `jira` или `stash-delta` / `stash-sigma` (Bitbucket). Только
@@ -581,7 +582,7 @@ def read_path(repo: Path, path: str, at: str | None) -> str:
     ref = at or 'HEAD'
     path = path.strip('/')
     if not path or git(repo, 'cat-file', '-t', f'{ref}:{path}').strip() == 'tree':
-        return git(repo, 'ls-tree', ref, f'{path}/' if path else '')
+        return git(repo, 'ls-tree', ref, *([f'{path}/'] if path else []))
     return git(repo, 'show', f'{ref}:{path}')
 
 
@@ -594,6 +595,42 @@ async def bb_raw(request: Request):
         return PlainTextResponse(read_path(repo, path, request.query_params.get('at')))
     except FileNotFoundError:
         return _bb_404(f'The path "{path}"')
+
+
+def browse_json(repo: Path, path: str, at: str | None) -> dict:
+    """REST /browse, как у Bitbucket DC: файл — строки `lines`, каталог — `children.values`."""
+    ref = at or 'HEAD'
+    path = path.strip('/')
+    if path and git(repo, 'cat-file', '-t', f'{ref}:{path}').strip() != 'tree':
+        lines = git(repo, 'show', f'{ref}:{path}').splitlines()
+        return {'lines': [{'text': t} for t in lines], 'start': 0, 'size': len(lines), 'isLastPage': True}
+    values = []
+    for row in git(repo, 'ls-tree', '-l', ref, *([f'{path}/'] if path else [])).splitlines():
+        meta, full = row.split('\t', 1)
+        _, kind, sha, size = meta.split()
+        name = full.rsplit('/', 1)[-1]
+        values.append({'path': {'components': [name], 'name': name, 'toString': name}, 'contentId': sha,
+                       'type': 'DIRECTORY' if kind == 'tree' else 'FILE',
+                       **({} if size == '-' else {'size': int(size)})})
+    return {'path': {'components': path.split('/') if path else [], 'toString': path}, 'revision': ref,
+            'children': {'size': len(values), 'limit': len(values), 'start': 0, 'isLastPage': True,
+                         'values': values}}
+
+
+async def bb_browse_json(request: Request):
+    key, slug, repo = _repo(request)
+    if not repo:
+        return _bb_404(f'Repository {key}/{slug}')
+    path = request.path_params.get('path', '')
+    try:
+        return JSONResponse(browse_json(repo, path, request.query_params.get('at')))
+    except FileNotFoundError:
+        return _bb_404(f'The path "{path}"')
+
+
+async def bb_app_props(request: Request):
+    return JSONResponse({'version': '8.19.0', 'buildNumber': '8019000', 'buildDate': '1700000000000',
+                         'displayName': 'Bitbucket'})
 
 
 async def bb_branches(request: Request):
@@ -746,24 +783,32 @@ JIRA_ROUTES = [
     Route('/rest/api/2/issueLinkType', jira_link_types),
 ]
 
-_BB_REPO = '/rest/api/latest/projects/{key}/repos/{slug}'
+def _bb_rest(api: str) -> list[Route]:
+    """REST Bitbucket DC отвечает и под latest, и под 1.0: форк mcp-atlassian ходит в 1.0."""
+    repo = api + '/projects/{key}/repos/{slug}'
+    return [
+        Route(api + '/application-properties', bb_app_props),
+        Route(api + '/projects', bb_projects),
+        Route(api + '/projects/{key}', bb_project),
+        Route(api + '/projects/{key}/repos', bb_repos),
+        Route(api + '/repos', bb_repos),
+        Route(repo, bb_repo),
+        Route(repo + '/raw/{path:path}', bb_raw),
+        Route(repo + '/browse', bb_browse_json),
+        Route(repo + '/browse/{path:path}', bb_browse_json),
+        Route(repo + '/branches', bb_branches),
+        Route(repo + '/commits', bb_commits),
+        Route(repo + '/pull-requests', bb_empty_page),
+        Route(api + '/dashboard/pull-requests', bb_empty_page),
+        Route(api + '/inbox/pull-requests', bb_empty_page),
+        Route(api + '/users', bb_users),
+        Route(api + '/users/{slug}', bb_users),
+    ]
+
+
 BITBUCKET_ROUTES = [
-    Route('/rest/api/latest/projects', bb_projects),
-    Route('/rest/api/latest/projects/{key}', bb_project),
-    Route('/rest/api/latest/projects/{key}/repos', bb_repos),
-    Route('/rest/api/latest/repos', bb_repos),
-    Route(_BB_REPO, bb_repo),
-    Route(_BB_REPO + '/raw/{path:path}', bb_raw),
-    Route(_BB_REPO + '/browse', bb_raw),
-    Route(_BB_REPO + '/browse/{path:path}', bb_raw),
-    Route(_BB_REPO + '/branches', bb_branches),
-    Route(_BB_REPO + '/commits', bb_commits),
-    Route(_BB_REPO + '/pull-requests', bb_empty_page),
-    Route('/rest/api/latest/dashboard/pull-requests', bb_empty_page),
-    Route('/rest/api/1.0/dashboard/pull-requests', bb_empty_page),
-    Route('/rest/api/latest/inbox/pull-requests', bb_empty_page),
-    Route('/rest/api/latest/users', bb_users),
-    Route('/rest/api/latest/users/{slug}', bb_users),
+    *_bb_rest('/rest/api/latest'),
+    *_bb_rest('/rest/api/1.0'),
     Route('/rest/search/latest/search', bb_search, methods=['POST']),
     Route('/projects/{key}/repos/{slug}/browse', bb_browse),
     Route('/projects/{key}/repos/{slug}/browse/{path:path}', bb_browse),

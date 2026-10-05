@@ -1,5 +1,5 @@
 # 🪣 S3-инструменты — служебные DAG'и альфы
-*2026-09-24 11:16 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 12:18 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Инструменты для администрирования и отладки. Все DAG'и запускаются вручную (`schedule=None`).
 
@@ -22,6 +22,3 @@
 > Каталог назывался `tools/`; 24.09.2026 переименован в `s3_tools/`, а `tools/` стал
 > каталогом служебных дагов (раньше `check/`) — как на сигме. Туда же ушёл `dummy.py`.
 
----
-
-## dummy — пример Markdown

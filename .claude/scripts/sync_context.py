@@ -76,16 +76,17 @@ def sync_tree(kind: str) -> tuple[int, int]:
     """Копирует .claude/<kind>/* в ~/.claude/<kind>/, убирая свои устаревшие копии."""
     src_root = REPO / '.claude' / kind
     dst_root = HOME_CLAUDE / kind
-    if not src_root.is_dir():
+    # Каталога в репозитории нет (у commands — с переходом на SberPowers) — копировать нечего,
+    # но свои прежние копии из ~/.claude всё равно убрать
+    src_items = [p for p in src_root.iterdir() if p.is_dir()] if src_root.is_dir() else []
+    if not src_items and not dst_root.is_dir():
         return 0, 0
     dst_root.mkdir(parents=True, exist_ok=True)
 
-    ours = {p.name for p in src_root.iterdir() if p.is_dir()}
+    ours = {p.name for p in src_items}
     copied = removed = 0
 
-    for item in src_root.iterdir():
-        if not item.is_dir():
-            continue
+    for item in src_items:
         dst = dst_root / item.name
         if dst.exists():
             shutil.rmtree(dst)
@@ -109,7 +110,7 @@ def freshness_table() -> str:
     for folder_name, capability in sorted(PROJECTS.items()):
         folder = REPO / folder_name
         readme = readme_of(folder)
-        spec = REPO / 'openspec' / 'specs' / capability / 'spec.md'
+        spec = REPO / 'docs' / 'sberpowers' / 'specs' / f'{capability}-baseline.md'
         code_ts = last_commit(f'{folder_name}/*.py') or last_commit(folder_name)
 
         def age(path: Path | None) -> str:
@@ -125,7 +126,7 @@ def freshness_table() -> str:
         rows.append(
             f"| `{folder_name}/` | "
             f"{'`' + str(readme.relative_to(REPO)) + '`' if readme else 'шапки модулей' if folder_name in DOCSTRING_DOCS else '—'} | {age(readme)} | "
-            f"{'`openspec/specs/' + capability + '/spec.md`' if spec.exists() else '—'} | {age(spec)} | "
+            f"{'`docs/sberpowers/specs/' + capability + '-baseline.md`' if spec.exists() else '—'} | {age(spec)} | "
             f"{code_ts:%Y-%m-%d}" + " |" if code_ts else "— |")
 
     # Справочники: спеки нет и не будет, поэтому вместо неё — откуда снят снимок.
@@ -166,8 +167,8 @@ def write_context_md() -> None:
 |---|---|---|
 | **Правила работы** (rules) | `CLAUDE.md` в корне | человек |
 | **Как устроено** | `<каталог>/readme.md` (у `plugins/` — шапки модулей) | человек |
-| **Что обязано работать** (SDD) | `openspec/specs/<capability>/spec.md`, общий контекст — `openspec/project.md` | человек, через `/opsx:propose` |
-| **Навыки и команды агента** | `.claude/skills/`, `.claude/commands/` | генерирует `openspec init`, правит человек |
+| **Что обязано работать** (SDD) | `docs/sberpowers/specs/<возможность>-baseline.md` и дельты рядом, планы — `docs/sberpowers/plans/`, общий контекст — `openspec/project.md` | человек, через навыки SberPowers (`specify` → `learn`) |
+| **Навыки агента** | `.claude/skills/` | набор SberPowers без правок, обновляется заменой каталогов |
 
 Память агента (`~/.claude/projects/*/memory/`) в репозиторий не входит: она про
 конкретного человека и его прошлые сессии, а не про проект.

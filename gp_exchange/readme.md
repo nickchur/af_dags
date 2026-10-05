@@ -1,12 +1,12 @@
 # 📥 Приём универсального обмена из ПКАП
-*2026-09-14 06:53 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-04 12:07 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Файлы с JSON-пакетами приезжают через ТФС в S3, загружаются в ClickHouse, разбираются по
 потокам и раскладываются по целевым таблицам. Пакет собирает Greenplum (`pr_exchange` из
 репозитория `HR_Data`), поэтому формат файла и содержимое контрольных записей — общий
 договор двух сторон.
 
-Требования — в [`openspec/specs/gp-exchange/spec.md`](../openspec/specs/gp-exchange/spec.md).
+Требования — в [`docs/sberpowers/specs/gp-exchange-baseline.md`](../docs/sberpowers/specs/gp-exchange-baseline.md).
 
 ## Файлы
 

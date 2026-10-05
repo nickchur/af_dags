@@ -1,9 +1,10 @@
-CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_chk_cnt_delta(srs text, keys text, dcol text, pct numeric, raise_exc boolean, fdate text DEFAULT NULL::text, lcol text DEFAULT NULL::text, lmt integer DEFAULT 10)
+CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_chk_cnt_delta(srs text, keys text, dcol text, pct numeric, raise_exc boolean, fdate text DEFAULT NULL::text, lcol text DEFAULT NULL::text, lmt integer DEFAULT 10) 
 	RETURNS json
 	LANGUAGE plpgsql
 	SECURITY DEFINER
 	VOLATILE
 as $body$
+
 
 -- pr_chk_cnt_delta(srs, keys, dcol, pct, raise_exc, fdate, lcol, lmt) -> json
 -- 2026-08-04 17:53 MSK, v1.0, Чуркин Николай
@@ -106,6 +107,7 @@ exception when OTHERS then
     end if;
     raise exception using ERRCODE = sqlstate, MESSAGE = sqlerrm, DETAIL = exe;
 end;
+
 
 $body$
 EXECUTE ON ANY;
