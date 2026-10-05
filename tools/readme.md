@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-04 12:07 MSK · v1.74 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-05 22:00 MSK · v1.75 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -100,15 +100,30 @@ Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp
 **Что покрывается** (по группам)
 
 - `to_s3` — `PostgresToS3(List)`, `Clickhouse{Table,Query}ToS3`, `ClickNativeToS3(List)`:
-  все сжатия (`gzip`/`zip`/`tar.gz`/`None`), `xstream_sanitize`, массивы, NULL, спецсимволы.
+  все сжатия (`gzip`/`zip`/`tar.gz`/`None`), массивы, NULL, спецсимволы.
   Каждый оператор с `post_file_check=True` сам перечитывает файл и сверяет хэш.
-- `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count.
+- `xstream_sanitize` — `pg_to_s3_list_sanitize` и `ch_native_to_s3_sanitize` (с `sanitize_array`);
+  `v_*_sanitize` читает файл и сверяет строку со спецсимволами с литералом
+  `SANITIZED_SPECIAL`: вырезаны `;`, таб, перенос и обратный слеш, массив очищен. Литерал, а не
+  регулярка ядра — проверка не доверяет проверяемому коду. До ядра 1.2.7 флаг не чистил
+  ничего, поэтому на старом ядре эти проверки красные, и в карантин они не спрятаны.
+- `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count;
+  `S3ToPostgresOperator2` — выгрузка `pg_to_s3_gzip` в инкарнационный таргет
+  (`copy_csv_quote='"'`: файл — родной CSV Postgres); `S3ToClickhouseTransformed` — очищенная
+  выгрузка CH с `include_file_name` (TSV без экранирования, табы в значениях ему противопоказаны).
 - `db_to_db` — `PostgresToPostgres`, `ClickhouseToPostgres`, `PostgresToClickhouse`,
-  `*Incarnation*`: прямые переливки, сверка count и содержимого.
+  `ClickhouseToClickhouse`, `*Incarnation*`: прямые переливки, сверка count и содержимого.
 - `s3_utils` — `S3ToS3`, `S3Archive`, `CheckS3FileHash`, `PostgresDDL`: перепаковка сжатий,
   ZIP-архив, сверка MD5, генерация DDL.
 - `viewers` — `S3ListKeys`, `S3FileRead`, `S3BucketViewer`: листинг ключей/бакетов, чтение строк.
 - `cluster` — `ClickHouseClusterOperator`: DDL на ноды кластера (за флагом `run_known_broken`).
+
+**Типы колонок** (`COLUMNS`, единый источник для PG и CH): integer, bigint, double, numeric,
+boolean, date, timestamp, timestamptz/`DateTime64(3, 'UTC')`, uuid, jsonb, `text[]`/`integer[]`,
+`Array(Nullable(String))` с NULL внутри, `LowCardinality(String)`. Строка 3 — NULL во всех
+nullable-колонках.
+
+**Не покрыт**: `ClickhouseToIdpOperator` — нужна IDP, на стенде её нет.
 
 **Инфраструктура**
 - Postgres: таблицы в `airflowdb` (схема `public`); на таблицу и каждую колонку ставится
@@ -131,16 +146,25 @@ Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp
   Каждая проверка гейтуется по всем задействованным ею системам (**AND**): `pg→s3` идёт только
   при `test_pg И test_s3`, `s3→ch` — при `test_s3 И test_ch`, `ch→pg` — при `test_ch И test_pg`.
   Выключение системы уводит все её проверки (в т.ч. кросс-системные) в ☮️ skipped.
-- `run_known_broken` (по умолчанию `False`) — «карантин» поверх системных флагов для проверок,
-  пока не проходящих на текущей сборке пакета / требующих кластера `datalab`: `pg_to_s3_list`,
-  `ch_native_list`, `ch_table_query_s3`, `s3_to_ch_tsv`, `pg_incarnation`, `cluster`.
+- `run_known_broken` (по умолчанию `False`) — «карантин» для дефектов пакета, исправленных в
+  ядре 1.2.7: `pg_to_s3_list` (`prepare_row`), `s3_to_ch_tsv` (зависит от него),
+  `ch_native_list` (Decimal в JSON), `pg_incarnation` (`insert_incarnation`). После выкладки
+  1.2.7 на контуры карантин снимается.
+- `run_cluster` (по умолчанию `False`) — проверки, которым нужен кластер ClickHouse `datalab`:
+  `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `ch_cluster_ddl`. В сводке — строка «кластер datalab».
 - `run_cleanup` (по умолчанию `True`) — операционный флаг: `False` оставляет таблицы/S3-ключи
   для отладки упавшего прогона.
 
 Примечание: `max_active_runs=1` — имена таблиц фиксированы, параллельные прогоны не поддержаны.
 `ClickhouseTableToS3`/`ClickhouseQueryToS3` считают строки через `clusterAllReplicas(datalab,
 system.query_log)` — в окружении без кластера `datalab` они не работают, поэтому держатся за
-`run_known_broken`.
+`run_cluster`.
+
+**Не-DEV стенды**: таблицы предсозданы, стенд их только очищает. С v1.12 (05.10.2026) у
+источника и таргетов новые колонки, появились таблицы `hrp_s3_to_pg_0/_1` + `hrp_s3_to_pg_inc_seq`
+(без колонки `incarnation`), `technical.hrp_s3_to_ch_tr` (первая колонка `file_name String`) и
+`technical.hrp_ch_to_ch` (типы как у источника) — их DDL печатают `_pg_create_sql` /
+`_ch_create_sql` при `IS_DEV=True`, пересоздать до прогона.
 
 ### [db_cleanup.py](db_cleanup.py)
 **Очистка метадаты Airflow (`tools_db_cleanup`).**
