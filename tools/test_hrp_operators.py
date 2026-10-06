@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-06 14:57 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 18:06 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
@@ -1108,11 +1108,12 @@ def test_hrp_operators_dag():
         logger.info("%s | %s", headline, " · ".join(sys_status))
 
         # Ран краснеет через этот таск: он лист дага (см. связи внизу). XCom — до исключения,
-        # иначе DPM не узнает, что именно упало
-        from importlib.metadata import version
+        # иначе DPM не узнает, что именно упало. Версию — через core_version: на сигме пакет
+        # собран pyinstaller'ом без метаданных, importlib.metadata.version там падает
+        from sber_app_dataplatform_etl_core.build_info import core_version
         context["ti"].xcom_push(key="verdict", value={
             "passed": passed, "ok": ok, "failed": failed_ids, "skipped": skip,
-            "unavailable": unavailable, "core": version("sber_app_dataplatform_etl_core"),
+            "unavailable": unavailable, "core": core_version(),
         })
         if not passed:
             raise AirflowFailException(
