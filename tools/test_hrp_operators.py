@@ -355,7 +355,7 @@ def _ch_insert_sql(table: str) -> str:
         # xstream_sanitize до 1.2.7 не чистил ничего, а выгрузки ЕР на него полагаются.
         "run_known_broken": Param(default=False, type="boolean", description="Карантин: проверки дефектов пакета, исправленных в ядре 1.2.7"),
         # Не дефект, а окружение: Table/Query→S3 считают строки через clusterAllReplicas(datalab,
-        # system.query_log), ClusterOperator — DDL ON CLUSTER datalab.
+        # system.query_log), ClusterOperator — узлы из system.clusters (datalab), на каждый ходит подключением click-dlab-<узел>.
         "run_cluster": Param(default=False, type="boolean", description="Проверки, которым нужен кластер ClickHouse datalab: ch_table/ch_query → S3 и ch_cluster_ddl"),
         # На время отладки: False оставляет все PG/CH таблицы и S3-ключи, чтобы можно было
         # переразобрать/перезапустить отдельный упавший таск (иначе cleanup сносит всё).
