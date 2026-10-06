@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-06 11:35 MSK · v1.78 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 12:37 MSK · v1.79 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -127,10 +127,13 @@ nullable-колонках.
 **Не покрыт**: `ClickhouseToIdpOperator` — нужна IDP, на стенде её нет.
 
 **Инфраструктура**
-- Postgres: таблицы в `airflowdb` (схема `main`, параметр `pg_schema`); на таблицу и каждую колонку ставится
+- Postgres: таблицы в `airflowdb.main` (параметр `pg` — `conn_id.схема`); на таблицу и каждую колонку ставится
   `COMMENT` (требование Quality Gate).
-- ClickHouse: таблицы в схеме `technical` (параметр `ch_schema`), имена по имени теста.
-- S3: connection `s3-archive`, бакет `test-operators` (в задаче — `test_operators`, но `_` в имени бакета S3 недопустим), префикс `hrp_tests/`.
+- ClickHouse: таблицы в `dlab-click.technical` (параметр `ch` — `conn_id.база`), имена по имени теста.
+- S3: параметр `s3` — `conn_id://бакет/папка`, по умолчанию папка `test-operators` в бакете логов
+  (подключение и бакет из `[logging]`, `log_bucket_path()`; на альфе
+  `s3-archive://dataplatform-monitoring/test-operators`). Папка обязательна: setup и cleanup
+  очищают её целиком.
 
 **Методология**
 1. **Setup** — DROP/CREATE источников и таргетов (PG + CH) с данными (NULL, спецсимволы, массивы);
@@ -165,7 +168,7 @@ nullable-колонках.
 
 **Сохранение формы**: галочка `save_params` пишет форму в Variable
 `tools_test_hrp_operators_params`, на разборе она становится значениями по умолчанию.
-Подключения, бакет и схемы (`pg_schema`, `ch_schema`) операторы получают литералами на
+Поля `pg`, `ch` и `s3` операторы получают литералами на
 разборе: часть операторов не шаблонизирует `conn_id`. Поэтому таск `params` роняет запуск,
 если эти поля формы расходятся с разбором: «сохраните и запустите ещё раз». Иначе setup
 создал бы таблицы по форме, а операторы пошли бы по старым значениям.

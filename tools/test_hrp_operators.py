@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-06 12:17 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 12:37 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
@@ -77,11 +77,13 @@ from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
 
 try:
     from plugins.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
+        TOOLS_POOL, add_note, ensure_pool, env_stand, log_bucket_path, on_callback, saved_params,
+        store_params,
     )
 except ImportError:
     from CI06932748.tools.utils import (  # type: ignore
-        TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback, saved_params, store_params,
+        TOOLS_POOL, add_note, ensure_pool, env_stand, log_bucket_path, on_callback, saved_params,
+        store_params,
     )
 
 logger = getLogger("airflow.task")
@@ -95,23 +97,24 @@ ensure_pool(TOOLS_POOL)
 PARAMS_VAR = "tools_test_hrp_operators_params"
 SAVED = saved_params(PARAMS_VAR)
 
-DEFAULT_PG_CONN = SAVED.get("pg_conn_id", "airflowdb")
-DEFAULT_CH_CONN = SAVED.get("ch_conn_id", "dlab-click")
-DEFAULT_S3_CONN = SAVED.get("s3_conn_id", "s3-archive")
-# В тикете HRPDATALAB-14479 — test_operators, но «_» в имени бакета S3 недопустим (MinIO стенда
-# отказывает: «Bucket name contains invalid characters»)
-DEFAULT_S3_BUCKET = SAVED.get("s3_bucket", "test-operators")
-S3_PREFIX = "hrp_tests/"
-
-PG_SCHEMA = SAVED.get("pg_schema", "main")
-CH_SCHEMA = SAVED.get("ch_schema", "technical")
+# Подключение и схема — одним полем «conn_id.схема», S3 — «conn_id://бакет/папка». Папка в S3
+# по умолчанию — test-operators в бакете логов (подключение и бакет из [logging]); без S3-логов —
+# альфовый s3-archive://dataplatform-monitoring. Папка обязательна: setup и cleanup чистят её целиком
+PG = SAVED.get("pg", "airflowdb.main")
+CH = SAVED.get("ch", "dlab-click.technical")
+S3 = SAVED.get("s3", log_bucket_path("test-operators") or "s3-archive://dataplatform-monitoring/test-operators")
+DEFAULT_PG_CONN, _, PG_SCHEMA = PG.rpartition(".")
+DEFAULT_CH_CONN, _, CH_SCHEMA = CH.rpartition(".")
+DEFAULT_S3_CONN, _, _rest = S3.partition("://")
+DEFAULT_S3_BUCKET, _, _folder = _rest.partition("/")
+S3_PREFIX = _folder.strip("/") + "/"
 
 # Эти значения операторы получают литералами на разборе (см. test_hrp_operators_dag), поэтому
 # форма их на лету не меняет: другое значение в запуске таск params останавливает
-PARSED = {"pg_conn_id": DEFAULT_PG_CONN, "ch_conn_id": DEFAULT_CH_CONN, "s3_conn_id": DEFAULT_S3_CONN,
-          "s3_bucket": DEFAULT_S3_BUCKET, "pg_schema": PG_SCHEMA, "ch_schema": CH_SCHEMA}
-# Имя схемы подставляется в SQL — Param проверяет его шаблоном до запуска
-IDENT = "^[A-Za-z_][A-Za-z0-9_]*$"
+PARSED = {"pg": PG, "ch": CH, "s3": S3}
+# Схема подставляется в SQL, папкой S3 чистится бакет — Param проверяет шаблоном до запуска
+DB_PATTERN = r"^\S+\.[A-Za-z_][A-Za-z0-9_]*$"
+S3_PATTERN = r"^[^\s:/]+://[a-z0-9][a-z0-9.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?$"
 
 # Стенд — env_stand(): ENV_STAND, при её отсутствии ENVIRONMENT, как во всём tools/ (до
 # 29.09.2026 читалась одна ENVIRONMENT). Только на DEV стенд владеет схемой и управляет DDL
@@ -358,15 +361,14 @@ def _ch_insert_sql(table: str) -> str:
         "on_skipped_callback": on_callback,
     },
     params={
-        "pg_conn_id": Param(DEFAULT_PG_CONN, type="string", description="Postgres для тестовых таблиц"),
-        "pg_schema": Param(PG_SCHEMA, type="string", pattern=IDENT, description="Схема Postgres для тестовых таблиц"),
-        "ch_conn_id": Param(DEFAULT_CH_CONN, type="string", description="ClickHouse для тестовых таблиц"),
-        "ch_schema": Param(CH_SCHEMA, type="string", pattern=IDENT, description="Схема (база) ClickHouse для тестовых таблиц"),
-        "s3_conn_id": Param(DEFAULT_S3_CONN, type="string", description="S3-подключение для тестовых файлов"),
-        "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string", description="Бакет для тестовых файлов (префикс hrp_tests/)"),
+        "pg": Param(PG, type="string", pattern=DB_PATTERN, description="Postgres для тестовых таблиц: conn_id.схема"),
+        "ch": Param(CH, type="string", pattern=DB_PATTERN, description="ClickHouse для тестовых таблиц: conn_id.база"),
+        "s3": Param(S3, type="string", pattern=S3_PATTERN,
+                    description="Тестовые файлы: conn_id://бакет/папка; папка очищается целиком. "
+                                "По умолчанию — test-operators в бакете логов"),
         "save_params": Param(False, type="boolean",
                              description=f"Сохранить форму в Variable {PARAMS_VAR} как значения по умолчанию. "
-                                         "Подключения, бакет и схемы операторы получают на разборе дага: "
+                                         "Подключения, папку S3 и схемы операторы получают на разборе дага: "
                                          "после их смены запустите даг ещё раз"),
         # Флаги систем: каждая проверка гейтуется по системам, которые она задействует (AND).
         # Кросс-системные проверки идут только при включённых ОБЕИХ системах: pg→s3 требует
@@ -441,7 +443,7 @@ def test_hrp_operators_dag():
         # реальный fail (сигнал регрессии не маскируется).
         if not params.get("test_pg"):
             raise AirflowSkipException("test_pg=False — PG-проверки отключены, setup_pg пропущен")
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         # Проба прав: create/insert/drop временного объекта. SELECT 1 недостаточно — коннект
         # может пройти, но не быть прав на создание/запись; тогда это «недоступность», а не fail.
         probe = f"{PG_SCHEMA}.{PROBE}"
@@ -459,7 +461,7 @@ def test_hrp_operators_dag():
         except Exception as e:
             reason = "PG недоступен / нет прав на create/write" if IS_DEV else "PG недоступен"
             _skip_or_retry("PG", f"{reason} "
-                           f"({params['pg_conn_id']!r}): {e} — PG-проверки пропущены", e, context)
+                           f"({DEFAULT_PG_CONN!r}): {e} — PG-проверки пропущены", e, context)
         ddl = "\n".join([
             _pg_create_sql(SRC),
             _pg_create_sql(T_PG_TO_PG),
@@ -491,7 +493,7 @@ def test_hrp_operators_dag():
         # реальный fail (сигнал регрессии не маскируется).
         if not params.get("test_ch"):
             raise AirflowSkipException("test_ch=False — CH-проверки отключены, setup_ch пропущен")
-        ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
+        ch = ClickHouseHook(clickhouse_conn_id=DEFAULT_CH_CONN)
         # Проба прав: create/insert/drop временной таблицы. SELECT 1 недостаточно — коннект
         # может пройти, но не быть прав на создание/запись; тогда это «недоступность», а не fail.
         probe = f"{CH_SCHEMA}.{PROBE}"
@@ -507,7 +509,7 @@ def test_hrp_operators_dag():
         except Exception as e:
             reason = "CH недоступен / нет прав на create/write" if IS_DEV else "CH недоступен"
             _skip_or_retry("CH", f"{reason} "
-                           f"({params['ch_conn_id']!r}): {e} — CH-проверки пропущены", e, context)
+                           f"({DEFAULT_CH_CONN!r}): {e} — CH-проверки пропущены", e, context)
         ddl = [_ch_create_sql(t, typed=True) for t in (SRC, T_CH_TO_CH)]
         ddl += [_ch_create_sql(t, typed=False) for t in (T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST)]
         ddl.append(_ch_create_sql(T_S3_TO_CH_TR, typed=False, lead="file_name String"))
@@ -528,8 +530,8 @@ def test_hrp_operators_dag():
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("test_s3"):
             raise AirflowSkipException("test_s3=False — S3-проверки отключены, setup_s3 пропущен")
-        bucket = params["s3_bucket"]
-        s3 = S3Hook(aws_conn_id=params["s3_conn_id"])
+        bucket = DEFAULT_S3_BUCKET
+        s3 = S3Hook(aws_conn_id=DEFAULT_S3_CONN)
         # Проба прав: существование бакета + put/delete временного ключа. check_for_bucket
         # проверяет только доступ на чтение — записи прав может не быть; тогда это «недоступность».
         probe_key = f"{S3_PREFIX}{PROBE}"
@@ -540,10 +542,10 @@ def test_hrp_operators_dag():
                 s3.delete_objects(bucket=bucket, keys=[probe_key])
         except Exception as e:
             _skip_or_retry("S3", f"S3 недоступен / нет прав на запись "
-                           f"({params['s3_conn_id']!r}): {e} — S3-проверки пропущены", e, context)
+                           f"({DEFAULT_S3_CONN!r}): {e} — S3-проверки пропущены", e, context)
         if not available:
             _skip_setup("S3", f"S3 бакет {bucket!r} недоступен "
-                        f"(conn={params['s3_conn_id']!r}) — S3-проверки пропущены", context)
+                        f"(conn={DEFAULT_S3_CONN!r}) — S3-проверки пропущены", context)
         removed = _s3_purge_prefix(s3, bucket)
         purged = "листинг недоступен" if removed < 0 else f"удалено {removed} стейл-ключей"
         logger.info("S3 setup complete: бакет %s доступен, %s под %s", bucket, purged, S3_PREFIX)
@@ -552,7 +554,7 @@ def test_hrp_operators_dag():
     @task
     def validate_ch_count(table: str, expected: int = EXPECTED_ROWS, params=None):
         """Сверяет число строк в таблице ClickHouse с ожидаемым."""
-        ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
+        ch = ClickHouseHook(clickhouse_conn_id=DEFAULT_CH_CONN)
         cnt = ch.execute(f"SELECT count() FROM {CH_SCHEMA}.{table}")[0][0]
         if cnt != expected:
             raise AirflowFailException(f"{CH_SCHEMA}.{table}: ожидалось {expected} строк, получено {cnt}")
@@ -561,7 +563,7 @@ def test_hrp_operators_dag():
     @task
     def validate_pg_to_pg(params=None):
         """Сверка PG → PG: содержимое таргета совпадает с источником построчно (EXCEPT в обе стороны)."""
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         src, tgt = f"{PG_SCHEMA}.{SRC}", f"{PG_SCHEMA}.{T_PG_TO_PG}"
         a = pg.get_first(f"SELECT count(*) FROM (SELECT * FROM {src} EXCEPT SELECT * FROM {tgt}) d")[0]
         b = pg.get_first(f"SELECT count(*) FROM (SELECT * FROM {tgt} EXCEPT SELECT * FROM {src}) d")[0]
@@ -572,7 +574,7 @@ def test_hrp_operators_dag():
     @task
     def validate_ch_to_pg(params=None):
         """Сверка CH → PG: число строк и сумма id в таргете."""
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         cnt, sid = pg.get_first(f"SELECT count(*), coalesce(sum(id),0) FROM {PG_SCHEMA}.{T_CH_TO_PG}")
         if cnt != EXPECTED_ROWS or sid != 6:
             raise AirflowFailException(f"ch_to_pg: count={cnt} (ждём {EXPECTED_ROWS}), sum(id)={sid} (ждём 6)")
@@ -584,7 +586,7 @@ def test_hrp_operators_dag():
         from contextlib import closing
 
         from sber_app_dataplatform_etl_core.hrp_operators.utils.pg_utils import current_incarnation
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         with closing(pg.get_conn()) as conn:
             active = current_incarnation(conn, PG_SCHEMA, table)
         cnt = pg.get_first(f"SELECT count(*) FROM {PG_SCHEMA}.{table}_{active}")[0]
@@ -599,7 +601,7 @@ def test_hrp_operators_dag():
         import gzip
 
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-        raw = S3Hook(aws_conn_id=params["s3_conn_id"]).get_key(key, params["s3_bucket"]).get()["Body"].read()
+        raw = S3Hook(aws_conn_id=DEFAULT_S3_CONN).get_key(key, DEFAULT_S3_BUCKET).get()["Body"].read()
         # Формат выгрузок по умолчанию: TSV, QUOTE_NONE, экранирование обратным слешем, заголовок
         rows = list(csv.reader(io.StringIO(gzip.decompress(raw).decode()), delimiter="\t",
                                quoting=csv.QUOTE_NONE, escapechar="\\"))
@@ -1125,7 +1127,7 @@ def test_hrp_operators_dag():
         if not params.get("run_cleanup", True):
             logger.info("run_cleanup=False — пропускаем удаление (отладка: таблицы/ключи оставлены)")
             return
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         pg_objects = [SRC, T_PG_TO_PG, T_CH_TO_PG]
         if IS_DEV:
             drops = [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t} CASCADE;" for t in pg_objects]
@@ -1142,15 +1144,15 @@ def test_hrp_operators_dag():
                            f"TRUNCATE TABLE {PG_SCHEMA}.{t}_1;"]
             pg.run("\n".join(truncs))
 
-        ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
+        ch = ClickHouseHook(clickhouse_conn_id=DEFAULT_CH_CONN)
         for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, T_S3_TO_CH_TR, T_CH_TO_CH, "hrp_cluster_probe"):
             if IS_DEV:
                 ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{t}")
             else:
                 ch.execute(f"TRUNCATE TABLE IF EXISTS {CH_SCHEMA}.{t}")
 
-        s3 = S3Hook(aws_conn_id=params["s3_conn_id"])
-        _s3_purge_prefix(s3, params["s3_bucket"])
+        s3 = S3Hook(aws_conn_id=DEFAULT_S3_CONN)
+        _s3_purge_prefix(s3, DEFAULT_S3_BUCKET)
         logger.info("Cleanup complete")
 
     # Все рабочие таски → report → cleanup (оба ALL_DONE). Включаем КАЖДЫЙ таск как прямой
