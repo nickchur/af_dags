@@ -1,5 +1,5 @@
 # Движок srv_wf и отчёты CTL на стенде (PostgreSQL)
-*2026-10-05 13:06 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 10:22 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Настоящий движок загрузок (`pr_swf_start_ctl` и его журналы) и отчёты CTL (`pr_mail_*`,
 `pr_check_*`) в базе `adb_dev_comm` тестового стенда. Зачем: стенд работает постоянно в тестовом
@@ -34,7 +34,7 @@ bash testbed/gp_engine/deploy.sh
 | `pr_mail_ctl_alerts` | «no new alerts», пока у потоков нет `wf_alert` |
 | `pr_check_ctl` / `pr_check_etl` | развёрнуты: без них `pc1080.check_sberchat` в `test_real` падал бы с `-7` |
 | `pr_mail_ctl_report`, `_work_load_report`, `_ztest_report`, `_informatica_report`, `_sdpue_report` | HTML всех разделов; разделы с данными только GP (перекос, размеры, Informatica) пустые |
-| `pr_check_bd4ds` | группа `all` в `tb_bd4ds` из `90_fixtures.sql` — свежесть `tb_log_ctl` (не старше вчера); без неё SQL пустой и `syntax error at or near order` |
+| `pr_check_bd4ds` | развёрнут; без конфигурации в `tb_bd4ds` проверять нечего |
 
 Потоки-отчёты эмулятора — `testbed/ctl_worker/workflows_extra.json` (в снимке с боя их нет),
 все `pc1080.mail_*`, расписание строит Airflow (`scheduled: false`, режим `mixed`), статистики
