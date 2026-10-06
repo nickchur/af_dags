@@ -1,10 +1,13 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-05 22:39 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 10:02 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
 содержимого → сводка ✅/❌/☮️ в заметке → cleanup. Запуск вручную (`@once`), параллельные
 прогоны не поддержаны.
+
+Вердикт (гейт релиза в DPM): ран `failed`, если есть ❌ или включённая флагом система
+недоступна; детали — XCom `verdict` таска `report`.
 
 Подробно: [tools/readme.md — test_hrp_operators](../../_plugin_dag_docs/?doc=tools/readme.md#test_hrp_operatorspytest_hrp_operatorspy)
 """
@@ -938,9 +941,10 @@ def test_hrp_operators_dag():
                   "gate_cluster", upstream=setup_ch_t)
 
     # ──────────────────────────── report ──────────────────────────────────────
-    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
+    # retries=0: провал вердикта — итог, а не сбой, перезапуск ничего не изменит
+    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE, retries=0)
     def report(**context):
-        """Собирает статусы тасков прогона в заметку рана: упавшие первыми, успешные одной строкой."""
+        """Вердикт прогона: сводка в заметке рана, XCom `verdict`; есть ❌ или недоступная система — падает."""
         # Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
         # недоступна (setup пропущен по ошибке соединения) или активна.
         dag_run = context["dag_run"]
@@ -975,7 +979,7 @@ def test_hrp_operators_dag():
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
         params = context["params"]
-        sys_status = []
+        sys_status, unavailable = [], []
         for label, flag, setup_id in (("PG", "test_pg", "setup_pg"),
                                       ("CH", "test_ch", "setup_ch"),
                                       ("S3", "test_s3", "setup_s3")):
@@ -983,7 +987,9 @@ def test_hrp_operators_dag():
             if not params.get(flag):
                 sys_status.append(f"{label} ⛔ отключена (`{flag}`=False)")
             elif st == "skipped":
-                sys_status.append(f"{label} ⚠️ недоступна (setup пропущен)")
+                # Включена, но не проверялась: для гейта релиза это провал, а не ☮️
+                sys_status.append(f"{label} ❌ недоступна (setup пропущен)")
+                unavailable.append(label)
             elif st == "success":
                 sys_status.append(f"{label} ✅ активна")
             else:
@@ -991,7 +997,10 @@ def test_hrp_operators_dag():
         sys_status.append("кластер datalab " + ("✅ включён" if params.get("run_cluster") else "⛔ выключен (`run_cluster`)"))
         sys_line = "**Системы:** " + " · ".join(sys_status)
 
-        headline = f"🧪 HRP operators: ✅ {ok} / ❌ {fail} / ☮️ {skip}"
+        failed_ids = [row.split("`")[1] for rank, row in sorted(rows) if rank == 0]
+        passed = not (failed_ids or unavailable)
+        headline = (f"🧪 HRP operators {'✅ пройден' if passed else '❌ провален'}: "
+                    f"✅ {ok} / ❌ {fail} / ☮️ {skip}")
         # Без таблицы: в 1000 символов заметки она вытесняла строки. Упавшие и пропущенные —
         # строкой на таск, успешные — одной строкой в конце: её и режет лимит
         lines = [row for rank, row in sorted(rows) if rank < 3]
@@ -999,6 +1008,19 @@ def test_hrp_operators_dag():
         lines += [f"✅ ({len(ok_ids)}): " + ", ".join(ok_ids)] if ok_ids else []
         add_note(sys_line + "\n\n" + "\n".join(lines), context, level="DAG", title=headline)
         logger.info("%s | %s", headline, " · ".join(sys_status))
+
+        # Ран краснеет через этот таск: он лист дага (см. связи внизу). XCom — до исключения,
+        # иначе DPM не узнает, что именно упало
+        from importlib.metadata import version
+        context["ti"].xcom_push(key="verdict", value={
+            "passed": passed, "ok": ok, "failed": failed_ids, "skipped": skip,
+            "unavailable": unavailable, "core": version("sber_app_dataplatform_etl_core"),
+        })
+        if not passed:
+            raise AirflowFailException(
+                "регресс операторов провален: "
+                + "; ".join(filter(None, [f"упали {', '.join(failed_ids)}" if failed_ids else "",
+                                          f"недоступны {', '.join(unavailable)}" if unavailable else ""])))
 
     # ──────────────────────────── cleanup ─────────────────────────────────────
     @task(task_id="cleanup", trigger_rule=TriggerRule.ALL_DONE)
@@ -1057,7 +1079,10 @@ def test_hrp_operators_dag():
     # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream report — branch
     # принудительно скипает все прямые downstream вне своего списка, перебивая
     # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому report всё дожидается.
-    all_tasks >> report_t >> cleanup_t
+    # report и cleanup — оба листья: Airflow выводит состояние рана из листьев. При цепочке
+    # report >> cleanup лист был один cleanup, и ран с 13 ❌ оставался success (стенд, 05.10.2026)
+    all_tasks >> report_t
+    all_tasks >> cleanup_t
 
 
 test_hrp_operators_dag()

@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-05 22:39 MSK · v1.75 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 10:02 MSK · v1.76 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -138,7 +138,8 @@ nullable-колонках.
    недоступности системы: ошибка соединения гасит флаг (проверки уходят в ☮️, а не ❌ каскадом).
 2. **Execution** — операторы под тестом во всех поддерживаемых сжатиях.
 3. **Validation** — сверка row count и (где формат детерминирован) содержимого.
-4. **Summary** — строка на таск `✅/❌/☮️` в заметке рана, упавшие первыми (как в `test_connections`).
+4. **Summary и вердикт** — строка на таск `✅/❌/☮️` в заметке рана, упавшие первыми (как в
+   `test_connections`); `report` падает, если регресс провален (см. «Вердикт для DPM»).
 5. **Cleanup** — гарантированное удаление таблиц и S3-ключей (`trigger_rule=ALL_DONE`).
 
 **Флаги выбора проверок**
@@ -159,6 +160,19 @@ nullable-колонках.
 `ClickhouseTableToS3`/`ClickhouseQueryToS3` считают строки через `clusterAllReplicas(datalab,
 system.query_log)` — в окружении без кластера `datalab` они не работают, поэтому держатся за
 `run_cluster`.
+
+**Вердикт для DPM** (гейт релиза и хотфикса):
+- запуск — `POST /api/v1/dags/test_hrp_operators/dagRuns`, флаги в `conf` (имена как у `params`);
+- итог — `state` рана: `success` — пройден, `failed` — провален. Провал — любой ❌ или система,
+  включённая флагом, но недоступная (`setup_*` пропущен по ошибке соединения или прав). ☮️ по
+  флагам — `run_known_broken`, `run_cluster`, выключенные `test_*` — провалом не считаются;
+- детали — XCom `verdict` таска `report`:
+  `GET …/dagRuns/{run_id}/taskInstances/report/xcomEntries/verdict?stringify=false` (без
+  параметра `value` приходит строкой Python-repr, а не JSON) →
+  `{"passed", "ok", "failed": [task_id…], "skipped", "unavailable": ["PG"…], "core": "<версия ядра>"}`;
+- `report` и `cleanup` — оба листья: состояние рана Airflow выводит из листьев, и при цепочке
+  `report >> cleanup` ран с 13 ❌ оставался `success` (стенд, 05.10.2026);
+- `max_active_runs=1`: второй запуск встаёт в очередь, `dagrun_timeout` — 2 ч.
 
 **Не-DEV стенды**: таблицы предсозданы, стенд их только очищает. С v1.12 (05.10.2026) у
 источника и таргетов новые колонки, появились таблицы `hrp_s3_to_pg_0/_1` + `hrp_s3_to_pg_inc_seq`
