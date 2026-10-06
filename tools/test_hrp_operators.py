@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-06 11:35 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 12:17 MSK · v1.17 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
@@ -1073,7 +1073,7 @@ def test_hrp_operators_dag():
                                       ("S3", "test_s3", "setup_s3")):
             st = states.get(setup_id, "no_status")
             if not params.get(flag):
-                sys_status.append(f"{label} ⛔ отключена (`{flag}`=False)")
+                sys_status.append(f"{label} ⛔ отключена ({flag}=False)")
             elif st == "skipped":
                 # Включена, но не проверялась: для гейта релиза это провал, а не ☮️
                 sys_status.append(f"{label} ❌ недоступна (setup пропущен)")
@@ -1082,17 +1082,17 @@ def test_hrp_operators_dag():
                 sys_status.append(f"{label} ✅ активна")
             else:
                 sys_status.append(f"{label} ❌ ошибка setup ({st})")
-        sys_status.append("CH по HTTP " + ("✅ включён" if params.get("run_ch_http") else "⛔ выключен (`run_ch_http`)"))
-        sys_status.append("кластер datalab " + ("✅ включён" if params.get("run_cluster") else "⛔ выключен (`run_cluster`)"))
-        sys_line = "**Системы:** " + " · ".join(sys_status)
+        sys_status.append("CH по HTTP " + ("✅ включён" if params.get("run_ch_http") else "⛔ выключен (run_ch_http)"))
+        sys_status.append("кластер datalab " + ("✅ включён" if params.get("run_cluster") else "⛔ выключен (run_cluster)"))
+        sys_line = "Системы: " + " · ".join(sys_status)
 
         rows.sort()
         failed_ids = [tid for rank, tid, _ in rows if rank == 0]
         passed = not (failed_ids or unavailable)
         headline = (f"🧪 HRP operators {'✅ пройден' if passed else '❌ провален'}: "
                     f"✅ {ok} / ❌ {fail} / ☮️ {skip}")
-        # Без таблицы и без `code` у task_id: в 1000 символов заметки таблица вытесняла
-        # строки, а `code` заметка рвала на три строки. Упавшие — строкой на таск с
+        # Без таблицы и без выделения: в 1000 символов заметки таблица вытесняла
+        # строки, а `code` и выделение заметка рвёт на три строки. Упавшие — строкой на таск с
         # названием из doc_md («Название: описание»), пропущенные и успешные — по строке
         lines = [f"❌ {(dag.get_task(tid).doc_md or tid).split(':')[0]} — {state} ({tid})"
                  for rank, tid, state in rows if rank == 0]
