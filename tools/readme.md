@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-06 11:05 MSK · v1.77 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 11:35 MSK · v1.78 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -155,6 +155,11 @@ nullable-колонках.
   1.2.7 на контуры карантин снимается.
 - `run_cluster` (по умолчанию `False`) — проверки, которым нужен кластер ClickHouse `datalab`:
   `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `ch_cluster_ddl`. В сводке — строка «кластер datalab».
+- `run_ch_http` (по умолчанию `True`) — проверки операторов, которые ходят в ClickHouse по HTTP:
+  `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `s3_to_ch_*`, `pg_to_ch`, `ch_to_ch`. HTTP-клиент
+  ядра берёт из подключения только хост (порт 8123 без TLS); на альфе DEV HTTP у ClickHouse
+  закрыт — флаг выключается там сохранением формы. `ch_native_list_*` (JSON идёт по HTTP при
+  `transport=auto`) без HTTP проверяется на `transport=native`.
 - `run_cleanup` (по умолчанию `True`) — операционный флаг: `False` оставляет таблицы/S3-ключи
   для отладки упавшего прогона.
 
@@ -174,7 +179,7 @@ system.query_log)` — в окружении без кластера `datalab` �
 - запуск — `POST /api/v1/dags/test_hrp_operators/dagRuns`, флаги в `conf` (имена как у `params`);
 - итог — `state` рана: `success` — пройден, `failed` — провален. Провал — любой ❌ или система,
   включённая флагом, но недоступная (`setup_*` пропущен по ошибке соединения или прав). ☮️ по
-  флагам — `run_known_broken`, `run_cluster`, выключенные `test_*` — провалом не считаются;
+  флагам — `run_known_broken`, `run_cluster`, `run_ch_http`, выключенные `test_*` — провалом не считаются;
 - детали — XCom `verdict` таска `report`:
   `GET …/dagRuns/{run_id}/taskInstances/report/xcomEntries/verdict?stringify=false` (без
   параметра `value` приходит строкой Python-repr, а не JSON) →

@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-06 11:05 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 11:35 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
@@ -386,6 +386,10 @@ def _ch_insert_sql(table: str) -> str:
         "run_known_broken": Param(default=SAVED.get("run_known_broken", False), type="boolean", description="Карантин: проверки дефектов пакета, исправленных в ядре 1.2.7"),
         # Не дефект, а окружение: Table/Query→S3 считают строки через clusterAllReplicas(datalab,
         # system.query_log), ClusterOperator — узлы из system.clusters (datalab), на каждый ходит подключением click-dlab-<узел>.
+        # Окружение: HTTP-клиент ядра (ClickHouseMixin._get_client, clickhouse_to_s3) берёт из
+        # подключения только хост — порт 8123 без TLS. На альфе DEV HTTP у ClickHouse закрыт:
+        # Connection reset by peer на первом запросе (06.10.2026), чинить в ядре нечего.
+        "run_ch_http": Param(default=SAVED.get("run_ch_http", True), type="boolean", description="Проверки операторов, которые ходят в ClickHouse по HTTP: ch_table/ch_query → S3, s3 → ch, pg_to_ch, ch_to_ch. Выкл. — окружение без HTTP у ClickHouse (альфа)"),
         "run_cluster": Param(default=SAVED.get("run_cluster", False), type="boolean", description="Проверки, которым нужен кластер ClickHouse datalab: ch_table/ch_query → S3 и ch_cluster_ddl"),
         # На время отладки: False оставляет все PG/CH таблицы и S3-ключи, чтобы можно было
         # переразобрать/перезапустить отдельный упавший таск (иначе cleanup сносит всё).
@@ -734,6 +738,8 @@ def test_hrp_operators_dag():
                 s3_bucket=BUCKET, s3_key=s3key("ch_native_list", c, ext=".json"),
                 clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
                 compression=c, replace=True, post_file_check=True, fmt="JSON",
+                # JSON при auto идёт по HTTP; без HTTP у ClickHouse проверяем нативный путь
+                transport="{{ 'auto' if params.run_ch_http else 'native' }}",
             )
             [setup_ch_t, setup_s3_t] >> op
             exports.append(op)
@@ -769,7 +775,8 @@ def test_hrp_operators_dag():
         make_gate(gate_cond("run_known_broken", "test_pg", "test_s3"), pg_to_s3_list_ops, "gate_pg_to_s3_list")
         make_gate(gate_cond("test_ch", "test_s3"), ch_native_ops, "gate_ch_native")
         make_gate(gate_cond("run_known_broken", "test_ch", "test_s3"), ch_native_list_ops, "gate_ch_native_list")
-        make_gate(gate_cond("run_cluster", "test_ch", "test_s3"), ch_table_query_ops, "gate_ch_table_query")
+        make_gate(gate_cond("run_cluster", "run_ch_http", "test_ch", "test_s3"), ch_table_query_ops,
+                  "gate_ch_table_query")
         make_gate(gate_cond("test_pg", "test_s3"), [pg_to_s3_sanitize], "gate_pg_to_s3_sanitize")
         make_gate(gate_cond("test_ch", "test_s3"), [ch_native_sanitize], "gate_ch_native_sanitize")
 
@@ -803,8 +810,9 @@ def test_hrp_operators_dag():
         [setup_ch_t, pg_to_s3_gzip] >> s3_to_ch_csv >> v_s3_csv
         [setup_ch_t, pg_to_s3_list_gzip] >> s3_to_ch_tsv >> v_s3_tsv
 
-        make_gate(gate_cond("test_s3", "test_ch"), [s3_to_ch_csv], "gate_s3_to_ch_csv")
-        make_gate(gate_cond("run_known_broken", "test_s3", "test_ch"), [s3_to_ch_tsv], "gate_s3_to_ch_tsv")
+        make_gate(gate_cond("run_ch_http", "test_s3", "test_ch"), [s3_to_ch_csv], "gate_s3_to_ch_csv")
+        make_gate(gate_cond("run_known_broken", "run_ch_http", "test_s3", "test_ch"), [s3_to_ch_tsv],
+                  "gate_s3_to_ch_tsv")
 
         # S3ToPostgres2 копирует файл через COPY … CSV QUOTE <copy_csv_quote>. Выгрузка
         # PostgresToS3 — родной CSV Postgres (кавычки "), поэтому ровно его и отдаём.
@@ -833,7 +841,7 @@ def test_hrp_operators_dag():
         [setup_ch_t, ch_native_sanitize] >> s3_to_ch_tr >> v_s3_to_ch_tr
 
         make_gate(gate_cond("test_s3", "test_pg"), [s3_to_pg], "gate_s3_to_pg")
-        make_gate(gate_cond("test_s3", "test_ch"), [s3_to_ch_tr], "gate_s3_to_ch_transformed")
+        make_gate(gate_cond("run_ch_http", "test_s3", "test_ch"), [s3_to_ch_tr], "gate_s3_to_ch_transformed")
 
     # ──────────────────────────── db_to_db ────────────────────────────────────
     with TaskGroup(group_id="db_to_db", prefix_group_id=False):
@@ -898,8 +906,9 @@ def test_hrp_operators_dag():
 
         # pg_to_pg — чисто PG; остальные три переливки кросс-системны (PG↔CH) → разные условия.
         make_gate(gate_cond("test_pg"), [pg_to_pg], "gate_pg_to_pg")
-        make_gate(gate_cond("test_ch"), [ch_to_ch], "gate_ch_to_ch")
-        make_gate(gate_cond("test_pg", "test_ch"), [ch_to_pg, pg_to_ch, ch_to_pg_inc], "gate_db_cross")
+        make_gate(gate_cond("run_ch_http", "test_ch"), [ch_to_ch], "gate_ch_to_ch")
+        make_gate(gate_cond("test_pg", "test_ch"), [ch_to_pg, ch_to_pg_inc], "gate_db_cross")
+        make_gate(gate_cond("run_ch_http", "test_pg", "test_ch"), [pg_to_ch], "gate_pg_to_ch")
         # pg_incarnation в карантине: падает на баге insert_incarnation (sql.Literal вместо sql.SQL)
         # до пересборки пакета — держим за run_known_broken, чтобы не гасить остальной db_to_db.
         make_gate(gate_cond("run_known_broken", "test_pg"), [pg_inc], "gate_pg_incarnation")
@@ -1073,6 +1082,7 @@ def test_hrp_operators_dag():
                 sys_status.append(f"{label} ✅ активна")
             else:
                 sys_status.append(f"{label} ❌ ошибка setup ({st})")
+        sys_status.append("CH по HTTP " + ("✅ включён" if params.get("run_ch_http") else "⛔ выключен (`run_ch_http`)"))
         sys_status.append("кластер datalab " + ("✅ включён" if params.get("run_cluster") else "⛔ выключен (`run_cluster`)"))
         sys_line = "**Системы:** " + " · ".join(sys_status)
 
