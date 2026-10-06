@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-06 12:37 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 12:51 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
@@ -382,7 +382,8 @@ def _ch_insert_sql(table: str) -> str:
         #   pg_to_s3_list  — prepare_row без флагов: next(list) → TypeError;
         #   s3_to_ch_tsv   — зависит от pg_to_s3_list;
         #   ch_native_list — JSON-путь NativeClickhouseStream не сериализует Decimal;
-        #   pg_incarnation — insert_incarnation: sql.Literal вместо sql.SQL.
+        #   pg_incarnation — insert_incarnation: sql.Literal вместо sql.SQL;
+        #   ch_to_ch       — типизированный insert строк JSON: на Date TypeError (str - date).
         # Санитизацию (pg_to_s3_list_sanitize, ch_native_to_s3_sanitize) сюда не прячем: флаг
         # xstream_sanitize до 1.2.7 не чистил ничего, а выгрузки ЕР на него полагаются.
         "run_known_broken": Param(default=SAVED.get("run_known_broken", False), type="boolean", description="Карантин: проверки дефектов пакета, исправленных в ядре 1.2.7"),
@@ -830,6 +831,8 @@ def test_hrp_operators_dag():
 
         # Transformed читает TSV без экранирования (формат пакетной выгрузки в ПКАП): табы и
         # переводы строк внутри значений ему противопоказаны — берём очищенную выгрузку CH.
+        # Ждёт сверку очистки, а не саму выгрузку: на ядре без очистки (до 1.2.7) он уходит в
+        # upstream_failed (в сводке ☮️), а не падает вторым ❌ с ошибкой разбора ClickHouse (сигма, 06.10.2026)
         s3_to_ch_tr = HrpS3ToClickhouseTransformedOperator(
             task_id="s3_to_ch_transformed",
             doc_md="S3 → CH с именем файла: загрузка очищенной выгрузки CH, имя файла первой колонкой",
@@ -840,7 +843,7 @@ def test_hrp_operators_dag():
             include_file_name=True, file_name_position=0,
         )
         v_s3_to_ch_tr = validate_ch_count.override(task_id="v_s3_to_ch_transformed", doc_md="Сверка S3 → CH с именем файла: число строк")(T_S3_TO_CH_TR)
-        [setup_ch_t, ch_native_sanitize] >> s3_to_ch_tr >> v_s3_to_ch_tr
+        [setup_ch_t, v_ch_sanitize] >> s3_to_ch_tr >> v_s3_to_ch_tr
 
         make_gate(gate_cond("test_s3", "test_pg"), [s3_to_pg], "gate_s3_to_pg")
         make_gate(gate_cond("run_ch_http", "test_s3", "test_ch"), [s3_to_ch_tr], "gate_s3_to_ch_transformed")
@@ -908,7 +911,7 @@ def test_hrp_operators_dag():
 
         # pg_to_pg — чисто PG; остальные три переливки кросс-системны (PG↔CH) → разные условия.
         make_gate(gate_cond("test_pg"), [pg_to_pg], "gate_pg_to_pg")
-        make_gate(gate_cond("run_ch_http", "test_ch"), [ch_to_ch], "gate_ch_to_ch")
+        make_gate(gate_cond("run_known_broken", "run_ch_http", "test_ch"), [ch_to_ch], "gate_ch_to_ch")
         make_gate(gate_cond("test_pg", "test_ch"), [ch_to_pg, ch_to_pg_inc], "gate_db_cross")
         make_gate(gate_cond("run_ch_http", "test_pg", "test_ch"), [pg_to_ch], "gate_pg_to_ch")
         # pg_incarnation в карантине: падает на баге insert_incarnation (sql.Literal вместо sql.SQL)

@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-06 12:37 MSK · v1.79 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 12:51 MSK · v1.80 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -108,6 +108,8 @@ Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp
   `SANITIZED_SPECIAL`: вырезаны `;`, таб, перенос и обратный слеш, массив очищен. Литерал, а не
   регулярка ядра — проверка не доверяет проверяемому коду. До ядра 1.2.7 флаг не чистил
   ничего, поэтому на старом ядре эти проверки красные, и в карантин они не спрятаны.
+  `s3_to_ch_transformed` грузит очищенную выгрузку CH и ждёт `v_ch_native_sanitize`: на старом
+  ядре он `upstream_failed` (в сводке ☮️), а не второй ❌ с ошибкой разбора ClickHouse.
 - `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count;
   `S3ToPostgresOperator2` — выгрузка `pg_to_s3_gzip` в инкарнационный таргет
   (`copy_csv_quote='"'`: файл — родной CSV Postgres); `S3ToClickhouseTransformed` — очищенная
@@ -154,7 +156,7 @@ nullable-колонках.
   Выключение системы уводит все её проверки (в т.ч. кросс-системные) в ☮️ skipped.
 - `run_known_broken` (по умолчанию `False`) — «карантин» для дефектов пакета, исправленных в
   ядре 1.2.7: `pg_to_s3_list` (`prepare_row`), `s3_to_ch_tsv` (зависит от него),
-  `ch_native_list` (Decimal в JSON), `pg_incarnation` (`insert_incarnation`). После выкладки
+  `ch_native_list` (Decimal в JSON), `pg_incarnation` (`insert_incarnation`), `ch_to_ch` (Date строкой в типизированный insert). После выкладки
   1.2.7 на контуры карантин снимается.
 - `run_cluster` (по умолчанию `False`) — проверки, которым нужен кластер ClickHouse `datalab`:
   `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `ch_cluster_ddl`. В сводке — строка «кластер datalab».
