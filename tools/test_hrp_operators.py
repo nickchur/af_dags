@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-06 12:51 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 14:57 MSK · v1.20 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
@@ -100,7 +100,7 @@ SAVED = saved_params(PARAMS_VAR)
 # Подключение и схема — одним полем «conn_id.схема», S3 — «conn_id://бакет/папка». Папка в S3
 # по умолчанию — test-operators в бакете логов (подключение и бакет из [logging]); без S3-логов —
 # альфовый s3-archive://dataplatform-monitoring. Папка обязательна: setup и cleanup чистят её целиком
-PG = SAVED.get("pg", "airflowdb.main")
+PG = SAVED.get("pg", "airflowdb.hrp_test")
 CH = SAVED.get("ch", "dlab-click.technical")
 S3 = SAVED.get("s3", log_bucket_path("test-operators") or "s3-archive://dataplatform-monitoring/test-operators")
 DEFAULT_PG_CONN, _, PG_SCHEMA = PG.rpartition(".")

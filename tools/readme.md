@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-06 13:31 MSK · v1.81 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 14:57 MSK · v1.82 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -129,8 +129,9 @@ nullable-колонках.
 **Не покрыт**: `ClickhouseToIdpOperator` — нужна IDP, на стенде её нет.
 
 **Инфраструктура**
-- Postgres: таблицы в `airflowdb.main` (параметр `pg` — `conn_id.схема`). На сигме учётка тасков
-  в `main` таблиц не создаёт — там `airflowdb.hrp_test` (схема из liquibase метабазы, ядро 1.2.7); на таблицу и каждую колонку ставится
+- Postgres: таблицы в `airflowdb.hrp_test` (параметр `pg` — `conn_id.схема`), отдельно от таблиц
+  Airflow в `main`; учётке тасков в схеме нужно право CREATE. На сигме схему заводит liquibase
+  метабазы (ядро 1.2.7), на альфе и стенде — администратор БД руками; на таблицу и каждую колонку ставится
   `COMMENT` (требование Quality Gate).
 - ClickHouse: таблицы в `dlab-click.technical` (параметр `ch` — `conn_id.база`), имена по имени теста.
 - S3: параметр `s3` — `conn_id://бакет/папка`, по умолчанию папка `test-operators` в бакете логов
