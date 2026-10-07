@@ -1,8 +1,9 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-01 22:37 MSK · v3.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 13:53 MSK · v3.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
-(и обновляет Variable `local_connections`), mapped `check` — по экземпляру на подключение,
+(и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
+mapped `check` — по экземпляру на подключение, подписан «группа · conn_id · хост:порт»,
 `report` — таблица ✅/❌/☮️ в заметке. Упало важное (`critical`) — ❌, ран красный;
 вспомогательное — ⚠️, ран зелёный.
 
@@ -112,6 +113,39 @@ def _group(conn_id: str, conn_type: str) -> str:
     if chk == "KerberosHttp":
         return "ctl"
     return conn_type if chk is not None and conn_type in GROUPS else "other"
+
+
+# Ключи extra, где лежит адрес, когда хост подключения пуст: S3 — endpoint_url, Kafka —
+# bootstrap.servers (так их кладёт secret backend). Порядок — приоритет
+ADDR_EXTRA_KEYS = ("endpoint_url", "bootstrap.servers")
+
+
+def _conn_addr(host: Optional[str], port: Optional[int], extra: dict) -> tuple[Optional[str], Optional[int]]:
+    """Адрес подключения: хост и порт.
+
+    Хост заполнен — как есть. Пуст — первый непустой ключ extra из ADDR_EXTRA_KEYS: без запятой
+    раскладывается на хост и порт (`схема://хост:порт` или `хост:порт`), с запятой — хосты без
+    портов через запятую и порт первого. Тот же вид `h1,h2` + порт первого secret backend сам
+    строит для Postgres с несколькими хостами. Адреса нет — (None, None).
+    """
+    from urllib.parse import urlsplit
+
+    if host:
+        return host, port
+    raw = next((str(extra[k]) for k in ADDR_EXTRA_KEYS if extra.get(k)), "")
+    if not raw:
+        return None, None
+    parts = [urlsplit(p if "//" in p else f"//{p}") for p in (s.strip() for s in raw.split(","))]
+    try:
+        first_port = parts[0].port
+    except ValueError:  # порт не число — показываем без порта, а не роняем сбор списка
+        first_port = None
+    return ",".join(p.hostname or "" for p in parts), first_port
+
+
+def _label(item: dict) -> str:
+    """Подпись экземпляра check и строки сводки: «группа · conn_id · хост:порт»."""
+    return f"{item.get('group', '?')} · {item['conn_id']} · {item.get('host') or '—'}:{item.get('port') or '—'}"
 
 
 # ---------------------------------------------------------------------------
@@ -330,14 +364,26 @@ def tools_test_connections():  # noqa: PLR0915
         by_type = defaultdict(list)
         items = []
         for cid, conn in sorted(conns.items()):
+            host, port = _conn_addr(conn.host, conn.port, conn.extra_dejson)
             by_type["clickhouse" if conn.conn_type == "sqlite" else conn.conn_type].append({
-                "conn_id": cid, "host": conn.host, "port": conn.port, "schema": conn.schema,
+                "conn_id": cid, "host": host, "port": port, "schema": conn.schema,
                 "description": conn.description or "No description",
             })
-            items.append({"group": _group(cid, conn.conn_type), "conn_id": cid, "conn_type": conn.conn_type})
+            items.append({"group": _group(cid, conn.conn_type), "conn_id": cid, "conn_type": conn.conn_type,
+                          "host": host, "port": port})
         Variable.set("local_connections", dict(by_type), serialize_json=True)
+        # Тот же словарь — в XCom под своим ключом, как его отдавал прежний аудит подключений;
+        # return_value занят списком для expand
+        context["ti"].xcom_push(key="connections", value=dict(by_type))
 
-        # Строка на тип, без таблицы: хосты и описания — в Variable local_connections
+        # Полная таблица — в лог: в заметку (1000 символов) сотня строк не влезает
+        headers = ("conn_type", "conn_id", "host", "port", "schema", "description")
+        table = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
+        table += ["| " + " | ".join(str(c[h] if h != "conn_type" else ctype) for h in headers) + " |"
+                  for ctype, rows in sorted(by_type.items()) for c in rows]
+        logger.info("Подключения:\n%s", "\n".join(table))
+
+        # Строка на тип, без таблицы: адреса — в логе, в подписях check и в report
         lines = [f"`{ctype}` ({len(rows)}): " + ", ".join(c["conn_id"] for c in rows)
                  for ctype, rows in sorted(by_type.items(), key=lambda kv: -len(kv[1]))]
         Feed(context, "🔌 collect").done(f"подключений {len(conns)} в {len(by_type)} типах", keep=lines)
@@ -345,14 +391,14 @@ def tools_test_connections():  # noqa: PLR0915
 
     @task(task_id="check", map_index_template="{{ conn_label }}")
     def check(item: dict):
-        """Проверка одного подключения; в сетке экземпляр подписан «группа · conn_id»."""
+        """Проверка одного подключения; в сетке экземпляр подписан «группа · conn_id · хост:порт»."""
         # item, а не conn: conn — ключ контекста Airflow
         from airflow.operators.python import get_current_context
 
         from airflow.exceptions import AirflowSkipException
 
         context = get_current_context()
-        context["conn_label"] = f"{item['group']} · {item['conn_id']}"
+        context["conn_label"] = _label(item)
         if context["params"].get(f"skip_{item['group']}"):
             try:
                 from plugins.utils import add_note  # type: ignore
@@ -458,7 +504,7 @@ def tools_test_connections():  # noqa: PLR0915
             # Выводим только ошибки и скипы; строка — группа и conn_id экземпляра
             item = listed[ti.map_index] if ti.map_index < len(listed) else {}
             conn_id = item.get("conn_id", f"check[{ti.map_index}]")
-            name = f"{item.get('group', '?')} · {conn_id}"
+            name = _label({**item, "conn_id": conn_id})
             vital = any(fnmatch(conn_id, pat) for pat in critical)
             if icon == "❌":
                 (failed_vital if vital else failed_aux).append(conn_id)

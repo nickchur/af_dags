@@ -5,16 +5,18 @@ description: tools_test_connections — ночная проверка каждо
 
 # `tools_test_connections` — доступность подключений
 
-*2026-10-01 22:37 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 13:53 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и `health_warn` / `health_errors` — навык **`tools`**. Список
 подключений снимает первый таск `collect` этого же рана (заметка — строка на тип; Variable
-`local_connections` для выпадающих списков, через MCP закрыта). До 29.09.2026 — отдельный даг
-`tools_show_connections`, в старых ранах — таски по подключениям без `collect`.
+`local_connections` для выпадающих списков, через MCP закрыта; адреса — в XCom `connections`
+таска `collect` и таблицей в его логе). До 29.09.2026 — отдельный даг `tools_show_connections`,
+в старых ранах — таски по подключениям без `collect`.
 
 **Таски:** `params`; `collect` → mapped-таск `check`, экземпляр на подключение, подписан
-«группа · `conn_id`» (группы `tfs`, `postgres`, `s3`, `ctl`, `clickhouse`, `kafka`, `trino`,
-`redis`, `other`) → `report` (таблица ✅/❌/☮️, ⭐ — важное) →
+«группа · `conn_id` · хост:порт» (группы `tfs`, `postgres`, `s3`, `ctl`, `clickhouse`, `kafka`,
+`trino`, `redis`, `other`) — по адресу видно, куда не достучались; у S3 и Kafka он из extra
+(`endpoint_url`, `bootstrap.servers`) → `report` (таблица ✅/❌/☮️, ⭐ — важное) →
 `health_warn` / `health_errors`. Раз в сутки в 23:15 MSK. Упал `collect` — список не снят, проверок нет, ❌ `health_errors`
 (`connections_critical` называет `collect`).
 

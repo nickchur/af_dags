@@ -1,5 +1,5 @@
 # 🧰 Тестовый стенд
-*2026-10-02 13:16 MSK · v1.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 13:53 MSK · v1.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 То, что нужно, чтобы гонять DAG'и репозитория живьём на стенде (`ssh testsrv`,
 `/opt/aftest`): эмуляторы внешних систем, схемы, фикстуры, скрипты разворачивания. Здесь нет
@@ -19,6 +19,7 @@ DAG'ов, и на контуры это не нужно.
 | [`monitoring/`](monitoring/README.md) | Prometheus опрашивает `/admin/metrics` вебсервера, как на сигме |
 | [`gp_exchange/`](gp_exchange/README.md) | Greenplum на PostgreSQL: пакет обмена собирается по-настоящему и проезжает весь путь до `gp_vw_*` |
 | [`vault/`](vault/make_vault.py) | `make_vault.py` — эмуляция `/vault/secrets/application`: payload в формате боевого sigma DEV, секреты только из переменных окружения |
+| [`check_conn_addr.py`](check_conn_addr.py) | Проверка правила адреса подключения `tools_test_connections`: хост из подключения или из extra, разбор списка хостов |
 | [`check_status_contract.py`](check_status_contract.py) | Линтер контракта `(status, payload)`: находит вызовы решателей `ctl_chk_*`, результат которых не разобран |
 | [`sql_standardize.py`](sql_standardize.py) | Разбивает монолитный `.sql` задачи на структуру папок SQL-репозитория |
 
