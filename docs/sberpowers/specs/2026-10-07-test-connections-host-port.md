@@ -1,7 +1,7 @@
 # Delta-спека: хосты и порты подключений в проверке доступности
 
 - Дата: 2026-10-07
-- Статус: подтверждена
+- Статус: реализована
 - Baseline: docs/sberpowers/specs/tools-baseline.md
 - Источник: grill 2026-10-07 — docs/sberpowers/discovery/2026-10-07-test-connections-host-port-decisions.md
 
@@ -101,9 +101,9 @@
 
 | REQ-ID | Задачи плана | Тесты | Статус |
 |---|---|---|---|
-| REQ-tools-42 | 1.1 | — | не начато |
-| REQ-tools-01 | 1.1 | — | не начато |
-| REQ-tools-02 | 1.1 | — | не начато |
+| REQ-tools-42 | 1.1 | `testbed/check_conn_addr.py` (`_conn_addr`, 24 случая), стенд | реализовано |
+| REQ-tools-01 | 1.1 | `testbed/check_conn_addr.py`, стенд | реализовано |
+| REQ-tools-02 | 1.1 | `testbed/check_conn_addr.py` (`_label`), стенд | реализовано |
 
 ## Задачи
 
