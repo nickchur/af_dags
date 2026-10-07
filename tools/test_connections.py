@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-07 14:32 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 14:45 MSK · v3.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -161,18 +161,29 @@ def _conn_addr(
 
     try:
         parts = [urlsplit(p if "//" in p else f"//{p}") for p in (s.strip() for s in raw.split(","))]
-        if any(not p.hostname for p in parts):
-            logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "пустой хост")
+    except ValueError:
+        logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "не разбирается как адрес")
+        return None, None
+
+    if any(not p.hostname for p in parts):
+        logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "пустой хост")
+        return None, None
+
+    first_port = None
+    for i, p in enumerate(parts):
+        try:
+            port_val = p.port
+        except ValueError as e:
+            reason = "порт вне диапазона" if "out of range" in str(e).lower() else "порт не число"
+            logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, reason)
             return None, None
-        first_port = parts[0].port
-        if first_port is not None and not (1 <= first_port <= 65535):
+        if port_val is not None and not (1 <= port_val <= 65535):
             logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "порт вне диапазона")
             return None, None
-        hosts = ",".join(p.hostname for p in parts)
-        return hosts, first_port
-    except ValueError as e:
-        logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, e)
-        return None, None
+        if i == 0:
+            first_port = port_val
+
+    return ",".join(p.hostname for p in parts), first_port
 
 
 def _label(item: dict) -> str:

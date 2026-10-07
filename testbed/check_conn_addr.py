@@ -1,5 +1,5 @@
 """### 🔎 Проверка правила адреса подключения
-*2026-10-07 14:32 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 14:45 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Правило адреса `_conn_addr` и подпись `_label` из `tools/test_connections.py` (REQ-tools-42, REQ-tools-02):
 хост из подключения, иначе первый непустой строковый ключ extra (`endpoint_url`, `bootstrap.servers`);
@@ -15,6 +15,15 @@ from pathlib import Path
 from typing import Optional
 
 SRC = Path(__file__).resolve().parent.parent / "tools" / "test_connections.py"
+
+ALLOWED_REASONS = {
+    "не объект",
+    "не строка",
+    "не разбирается как адрес",
+    "порт не число",
+    "порт вне диапазона",
+    "пустой хост",
+}
 
 
 class WarnLogger:
@@ -61,6 +70,7 @@ CASES = [
     (("", None, {"endpoint_url": "http://s3:9000", "bootstrap.servers": "k1:9093"}), ("s3", 9000), False),
     ((None, None, {"endpoint_url": "", "bootstrap.servers": "k1:9093"}), ("k1", 9093), False),
     ((None, None, {"endpoint_url": "  ", "bootstrap.servers": "k1:9093"}), ("k1", 9093), False),
+    ((None, None, {"endpoint_url": None, "bootstrap.servers": "k1:9093"}), ("k1", 9093), False),
     ((None, None, {"region_name": "ru", "password": "x"}), (None, None), False),
     ((None, None, {}), (None, None), False),
 
@@ -74,6 +84,7 @@ CASES = [
     ((None, None, {"bootstrap.servers": ["k1:9093"]}), (None, None), True),
     ((None, None, {"bootstrap.servers": ["k1:9093"], "endpoint_url": None}), (None, None), True),
     ((None, None, [1]), (None, None), True),
+    ((None, None, {"bootstrap.servers": "k1,k2:abc"}), (None, None), True),
 ]
 
 
@@ -82,7 +93,7 @@ def main():
     bad = 0
     for args, want, want_warn in CASES:
         mock_logger.warnings.clear()
-        got = conn_addr(*args)
+        got = conn_addr(*args, conn_id="c1")
         warn_count = len(mock_logger.warnings)
         if got != want:
             bad += 1
@@ -93,6 +104,29 @@ def main():
         elif not want_warn and warn_count != 0:
             bad += 1
             print(f"FAIL {args} → лишнее предупреждение ({warn_count})")
+        elif want_warn:
+            fmt, fmt_args = mock_logger.warnings[0]
+            if not fmt_args or fmt_args[0] != "c1":
+                bad += 1
+                print(f"FAIL {args} → первый аргумент warning {fmt_args[0] if fmt_args else None!r}, ждали 'c1'")
+            reason = fmt_args[2] if len(fmt_args) >= 3 else None
+            if reason not in ALLOWED_REASONS:
+                bad += 1
+                print(f"FAIL {args} → причина {reason!r} не в ALLOWED_REASONS")
+            extra_val = args[2]
+            if isinstance(extra_val, dict):
+                for val in extra_val.values():
+                    if isinstance(val, str):
+                        parts_to_check = {val} if len(val) >= 3 else set()
+                        for p in val.replace(":", ",").split(","):
+                            p = p.strip()
+                            if len(p) >= 3:
+                                parts_to_check.add(p)
+                        for part in parts_to_check:
+                            for arg_val in fmt_args[2:]:
+                                if part in str(arg_val):
+                                    bad += 1
+                                    print(f"FAIL {args} → аргумент warning {arg_val!r} содержит фрагмент {part!r}")
 
     # Проверка передачи conn_id и формата предупреждения
     mock_logger.warnings.clear()
