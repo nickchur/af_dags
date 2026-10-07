@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-07 14:12 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 14:32 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -124,34 +124,54 @@ LABEL_MAX = 250
 ADDR_EXTRA_KEYS = ("endpoint_url", "bootstrap.servers")
 
 
-def _conn_addr(host: Optional[str], port: Optional[int], extra: dict) -> tuple[Optional[str], Optional[int]]:
+def _conn_addr(
+    host: Optional[str],
+    port: Optional[int],
+    extra: dict,
+    conn_id: str = "",
+) -> tuple[Optional[str], Optional[int]]:
     """Адрес подключения: хост и порт.
 
     Хост заполнен — как есть. Пуст — первый непустой ключ extra из ADDR_EXTRA_KEYS: без запятой
     раскладывается на хост и порт (`схема://хост:порт` или `хост:порт`), с запятой — хосты без
     портов через запятую и порт первого. Тот же вид `h1,h2` + порт первого secret backend сам
-    строит для Postgres с несколькими хостами. Адреса нет — (None, None).
+    строит для Postgres с несколькими хостами. Непригодный адрес из extra даёт (None, None) и
+    одно предупреждение в логе с conn_id, ключом extra и причиной без значения.
     """
     from urllib.parse import urlsplit
 
     if host:
         return host, port
     if not isinstance(extra, dict):
+        logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", "extra", "не объект")
         return None, None
-    target = next(((k, v) for k in ADDR_EXTRA_KEYS if isinstance(v := extra.get(k), str) and v.strip()), None)
-    if not target:
+    for key in ADDR_EXTRA_KEYS:
+        val = extra.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        if not isinstance(val, str):
+            logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "не строка")
+            return None, None
+        raw = val.strip()
+        break
+    else:
         return None, None
-    key, raw = target
+
     try:
         parts = [urlsplit(p if "//" in p else f"//{p}") for p in (s.strip() for s in raw.split(","))]
-        hosts = ",".join(p.hostname or "" for p in parts)
-        try:
-            first_port = parts[0].port
-        except ValueError:
-            first_port = None
+        if any(not p.hostname for p in parts):
+            logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "пустой хост")
+            return None, None
+        first_port = parts[0].port
+        if first_port is not None and not (1 <= first_port <= 65535):
+            logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, "порт вне диапазона")
+            return None, None
+        hosts = ",".join(p.hostname for p in parts)
         return hosts, first_port
-    except ValueError:
-        logger.warning("Не удалось разобрать адрес подключения из extra-ключа %s", key)
+    except ValueError as e:
+        logger.warning("Адрес подключения %s не разобран: ключ %s — %s", conn_id or "?", key, e)
         return None, None
 
 
@@ -377,7 +397,7 @@ def tools_test_connections():  # noqa: PLR0915
         by_type = defaultdict(list)
         items = []
         for cid, conn in sorted(conns.items()):
-            host, port = _conn_addr(conn.host, conn.port, conn.extra_dejson)
+            host, port = _conn_addr(conn.host, conn.port, conn.extra_dejson, conn_id=cid)
             by_type["clickhouse" if conn.conn_type == "sqlite" else conn.conn_type].append({
                 "conn_id": cid, "host": host, "port": port, "schema": conn.schema,
                 "description": conn.description or "No description",
