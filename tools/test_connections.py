@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-07 13:53 MSK · v3.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 14:12 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -115,6 +115,10 @@ def _group(conn_id: str, conn_type: str) -> str:
     return conn_type if chk is not None and conn_type in GROUPS else "other"
 
 
+# Предельная длина подписи экземпляра: колонка task_instance.rendered_map_index в метабазе
+# Airflow — String(250), длиннее — падение сохранения TI на Postgres
+LABEL_MAX = 250
+
 # Ключи extra, где лежит адрес, когда хост подключения пуст: S3 — endpoint_url, Kafka —
 # bootstrap.servers (так их кладёт secret backend). Порядок — приоритет
 ADDR_EXTRA_KEYS = ("endpoint_url", "bootstrap.servers")
@@ -132,20 +136,29 @@ def _conn_addr(host: Optional[str], port: Optional[int], extra: dict) -> tuple[O
 
     if host:
         return host, port
-    raw = next((str(extra[k]) for k in ADDR_EXTRA_KEYS if extra.get(k)), "")
-    if not raw:
+    if not isinstance(extra, dict):
         return None, None
-    parts = [urlsplit(p if "//" in p else f"//{p}") for p in (s.strip() for s in raw.split(","))]
+    target = next(((k, v) for k in ADDR_EXTRA_KEYS if isinstance(v := extra.get(k), str) and v.strip()), None)
+    if not target:
+        return None, None
+    key, raw = target
     try:
-        first_port = parts[0].port
-    except ValueError:  # порт не число — показываем без порта, а не роняем сбор списка
-        first_port = None
-    return ",".join(p.hostname or "" for p in parts), first_port
+        parts = [urlsplit(p if "//" in p else f"//{p}") for p in (s.strip() for s in raw.split(","))]
+        hosts = ",".join(p.hostname or "" for p in parts)
+        try:
+            first_port = parts[0].port
+        except ValueError:
+            first_port = None
+        return hosts, first_port
+    except ValueError:
+        logger.warning("Не удалось разобрать адрес подключения из extra-ключа %s", key)
+        return None, None
 
 
 def _label(item: dict) -> str:
     """Подпись экземпляра check и строки сводки: «группа · conn_id · хост:порт»."""
-    return f"{item.get('group', '?')} · {item['conn_id']} · {item.get('host') or '—'}:{item.get('port') or '—'}"
+    s = f"{item.get('group', '?')} · {item['conn_id']} · {item.get('host') or '—'}:{item.get('port') or '—'}"
+    return s if len(s) <= LABEL_MAX else f"{s[:LABEL_MAX - 1]}…"
 
 
 # ---------------------------------------------------------------------------
@@ -501,7 +514,7 @@ def tools_test_connections():  # noqa: PLR0915
             if ti.duration:
                 durations.append(ti.duration)
 
-            # Выводим только ошибки и скипы; строка — группа и conn_id экземпляра
+            # Выводим только ошибки и скипы; строка — подпись экземпляра
             item = listed[ti.map_index] if ti.map_index < len(listed) else {}
             conn_id = item.get("conn_id", f"check[{ti.map_index}]")
             name = _label({**item, "conn_id": conn_id})
