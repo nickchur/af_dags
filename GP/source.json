@@ -4,7 +4,7 @@
   "checkout": "~/HR_Data",
   "source_root": "sql/create",
   "branch": "E360-6367",
-  "rev": "79e36b0baf0b4d1fa3ca16b44f72fa33fd5895ba",
+  "rev": "73b8c19d50b7a059ed4df3b1499aec8ca277fde6",
   "copied": "2026-10-08",
   "schemas": {
     "srv_wf": "s_grnplm_vd_hr_edp_srv_wf",

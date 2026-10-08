@@ -5,7 +5,7 @@ CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(grp text DEFAULT NU
 as $body$
 
 -- E360-6367. SLA алерты потоков CTL.
--- 2026-10-08 11:44 MSK, v1.20, Чуркин Николай
+-- 2026-10-08 13:20 MSK, v1.21, Чуркин Николай
 --
 -- Механизм общий: правило вешается на любой поток CTL. Тикет пришёл от Пакетной
 -- выгрузки, но ни функция, ни таблица к ней не привязаны - не сужайте описание обратно.
@@ -27,10 +27,10 @@ as $body$
 --   Отсюда три режима:
 --     1. дедлайн + данные  - есть wf_alert_data: к дедлайну нужны данные не старше
 --                            "дедлайн - lag";
---     2. дедлайн + событие - wf_alert_data нет: к дедлайну поток должен был отдать
---                            статистику, бизнес-дату не смотрим;
---     3. от прошлого запуска - every/kind интервалом: календаря нет, считаем от последней
---                            статистики; wf_alert_data здесь не смотрится.
+--     2. дедлайн + событие - wf_alert_data нет: к дедлайну поток должен был успешно
+--                            отработать (или отдать statval stat), бизнес-дату не смотрим;
+--     3. от прошлого запуска - every/kind интервалом: календаря нет, считаем от последнего
+--                            успешного запуска (или statval stat); wf_alert_data здесь не смотрится.
 --
 --   wf_alert. kind и every - синонимы: слово или интервал.
 --     {"every":"daily",     "at":"09:00"}               -- каждый день
@@ -47,12 +47,13 @@ as $body$
 --     Слова нет вовсе - вид складывается из полей: {"at":"09:00"} - каждый день,
 --     {"dow":[1,3,5]}, {"day":"last"}, {"month":[3,6,9,12], "day":"last"}.
 --     dow, day и month - число или массив, условия через И, уточняют календарь слова.
---     stat задаёт статистику для режима события, по умолчанию 2. При интервале dow, day и
+--     stat не задан - поток отработал = загрузка alive COMPLETED и status SUCCESS, время end_dttm;
+--     stat задан - публикация statval этого номера. При интервале dow, day и
 --     month не смотрятся. Неизвестное слово - правило пропускается (skipped).
 --     Интервал с at (от суток) - отсчёт от дня последнего запуска: отработал 3-го в любое время,
 --     every "2 day", at "09:00" - к 5-му 09:00 обязан отработать снова. Не отрабатывал
 --     никогда - алерт сразу. every без at -
---     скользящее окно: с прошлой статистики прошло не больше every.
+--     скользящее окно: с прошлого запуска (или statval stat) прошло не больше every.
 --
 --   wf_alert_data:
 --     {"lag":"1 day",        "obj":"stg.tb_incidentsm1"}      -- короткая схема
@@ -153,6 +154,7 @@ declare
     r_month int4[];
     r_last boolean;
     r_key text;
+    r_src text;
     r_obj text;
     r_msg text;
 
@@ -228,6 +230,13 @@ begin
             wf_id bigint, alert_key text
         ) on commit drop distributed randomly;
 
+        -- Текущий ключ каждого проверенного правила. По нему гасятся открытые строки потока
+        -- со старым ключом: правило переписали или сменился формат ключа - иначе их закрыть нечем.
+        drop table if exists tmp_alert_cur;
+        create temp table tmp_alert_cur (
+            wf_id bigint, alert_key text
+        ) on commit drop distributed randomly;
+
         for r in select wf_id, wf_name, rule_txt, data_txt, alert_grp from tmp_alert_rule order by wf_name loop
             -- Каждое правило - в своём блоке. Правило, на котором падает запрос (obj ссылается на
             -- удалённую таблицу, lag или at не приводятся к типу, expr с ошибкой), раньше роняло
@@ -250,37 +259,55 @@ begin
                     r_kind = '1 hour';
                 end if;
 
-                if r_kind ~ '^ *[0-9]' then
-                    r_every = r_kind::interval;
-
+                -- Когда поток отработал последний раз. stat не задан - по успешно закрытой
+                -- загрузке: alive COMPLETED и status SUCCESS, момент - end_dttm. Незакрытая
+                -- загрузка не в счёт, даже в SUCCESS: пока она висит, следующая не стартует.
+                -- ERROR данных не дал, хоть загрузку и закрывают как COMPLETED. stat задан -
+                -- по публикации statval этого номера. Режим данных перезапишет last_dt своим замером.
+                if (r_jsn->>'stat') is null then
+                    r_src = 'run';
+                    select max(l.end_dttm) into last_dt
+                    from vw_log_ctl_loading l
+                    where l.wf_id = r.wf_id
+                      and l.alive = 'COMPLETED'
+                      and l.status = 'SUCCESS';
+                else
+                    r_src = 'stat ' || (r_jsn->>'stat');
                     select max(a.ts) into last_dt
                     from tb_log_ctl a
                     join vw_log_ctl_loading l on l.id = a.id
                     where a.obj = 'statval'
-                      and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 2)
+                      and (a.msg->>'stat_id')::int4 = (r_jsn->>'stat')::int4
                       and l.wf_id = r.wf_id;
+                end if;
+
+                if r_kind ~ '^ *[0-9]' then
+                    r_every = r_kind::interval;
 
                     if nullif(r_jsn->>'at', '') is null or r_every < interval '1 day' then
                         -- Без at (и для интервалов короче суток, где at смысла не имеет) -
                         -- скользящее окно. Окно хартбита прибито к сетке, иначе период "плыл" бы от вызова к вызову.
                         per_ts = to_timestamp(floor(extract(epoch from now()) / extract(epoch from r_every))
                                               * extract(epoch from r_every))::timestamp;
-                        r_key = format('stat %s / %s', coalesce(r_jsn->>'stat', '2'), r_every);
+                        r_key = format('%s / %s', r_src, r_every);
                         r_at = null;
                     else
                         -- С at дедлайн - день последнего срабатывания плюс every, к часу at.
                         -- Период - сам дедлайн: он не меняется, пока поток снова не отработает.
                         r_at = (r_jsn->>'at')::time;
                         per_ts = coalesce((last_dt + r_every)::date + r_at, current_date::timestamp);
-                        r_key = format('stat %s / %s at %s', coalesce(r_jsn->>'stat', '2'), r_every, r_at);
+                        r_key = format('%s / %s at %s', r_src, r_every, r_at);
                     end if;
 
                     if last_dt is null
                        or (r_at is null and last_dt < now() - r_every)
                        or (r_at is not null and per_ts <= now()) then
-                        r_msg = format('нет статистики %s за %s, последняя %s'
-                            , coalesce(r_jsn->>'stat', '2'), r_every
-                            , coalesce(left(last_dt::text, 19), 'никогда'));
+                        r_msg = case when (r_jsn->>'stat') is null
+                            then format('нет успешного запуска за %s, последний %s'
+                                , r_every, coalesce(left(last_dt::text, 19), 'никогда'))
+                            else format('нет статистики %s за %s, последняя %s'
+                                , r_jsn->>'stat', r_every, coalesce(left(last_dt::text, 19), 'никогда'))
+                            end;
                         insert into tmp_alert_new
                         values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
                               , json_build_object('rule', r_jsn, 'last', left(last_dt::text, 19)));
@@ -354,18 +381,14 @@ begin
                         -- дедлайна (субботний у правила "по ПН", повтор после прошлого дедлайна)
                         -- не считается. Дедлайн в 00:00 относится к прошлому дню - минус секунда.
                         -- Параметра wf_alert_data нет - и проверять в данных нечего.
-                        select max(a.ts) into last_dt
-                        from tb_log_ctl a
-                        join vw_log_ctl_loading l on l.id = a.id
-                        where a.obj = 'statval'
-                          and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 2)
-                          and l.wf_id = r.wf_id;
-
-                        r_key = format('%s %s event stat %s', r_kind, r_at, coalesce(r_jsn->>'stat', '2'));
+                        r_key = format('%s %s event %s', r_kind, r_at, r_src);
                         if last_dt is null or last_dt::date < (per_ts - interval '1 second')::date then
-                            r_msg = format('к %s поток не отдал статистику %s, последняя %s'
-                                , left(per_ts::text, 16), coalesce(r_jsn->>'stat', '2')
-                                , coalesce(left(last_dt::text, 19), 'никогда'));
+                            r_msg = case when (r_jsn->>'stat') is null
+                                then format('к %s поток не отработал успешно, последний успех %s'
+                                    , left(per_ts::text, 16), coalesce(left(last_dt::text, 19), 'никогда'))
+                                else format('к %s поток не отдал статистику %s, последняя %s'
+                                    , left(per_ts::text, 16), r_jsn->>'stat', coalesce(left(last_dt::text, 19), 'никогда'))
+                                end;
                             insert into tmp_alert_new
                             values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
                                   , json_build_object('rule', r_jsn, 'since', left(prev_ts::text, 16)
@@ -414,9 +437,10 @@ begin
                     end if;
                 end if;
 
-                -- Правило проверено (алерт по данным или нет - неважно): оно исправно, и его
-                -- прошлые "rule error" гасятся.
-                insert into tmp_alert_ok values (r.wf_id, 'rule error');
+                -- Правило проверено (алерт по данным или нет - неважно): запоминаем его текущий
+                -- ключ. По нему гасятся открытые строки потока с другим ключом, в том числе
+                -- прошлые "rule error" и строки до правки правила.
+                insert into tmp_alert_cur values (r.wf_id, r_key);
             exception when OTHERS then
                 get stacked diagnostics r_msg = MESSAGE_TEXT;
                 insert into tmp_alert_new
@@ -446,17 +470,20 @@ begin
         );
         get diagnostics new_cnt = ROW_COUNT;
 
-        -- Правило отработало чисто - гасим его активные алерты, иначе строка висела бы в
-        -- отчёте до конца окна hist и продолжала бы повторяться. Ключ закрытия - (wf_id,
-        -- alert_key), период в нём не участвует: закрываем и прошлые периоды. Правило
-        -- переписали - alert_key стал другим, и его старые строки закрыть уже нечем.
+        -- Закрываем открытые строки двумя путями, период в ключе не участвует - гасятся и прошлые
+        -- периоды. 1) Правило отработало чисто - его строки с тем же ключом (tmp_alert_ok), иначе
+        -- строка висела бы в отчёте до конца окна hist и продолжала бы повторяться. 2) Правило
+        -- проверено - строки его потока с другим ключом (tmp_alert_cur): правило переписали,
+        -- сменился формат ключа или прошёл "rule error".
         -- Update здесь один на вызов и только по открытым строкам: в GP он держит их до
         -- конца транзакции, поэтому колонка и заполняется одним заходом, а не по алерту.
         update tb_ctl_alerts a
         set close_ts = clock_timestamp()
         where a.close_ts is null
-          and exists (select 1 from tmp_alert_ok o
-                      where o.wf_id = a.wf_id and o.alert_key = a.alert_key);
+          and (exists (select 1 from tmp_alert_ok o
+                       where o.wf_id = a.wf_id and o.alert_key = a.alert_key)
+               or exists (select 1 from tmp_alert_cur c
+                          where c.wf_id = a.wf_id and c.alert_key <> a.alert_key));
         get diagnostics closed_cnt = ROW_COUNT;
 
         if new_cnt > 0 then
@@ -515,7 +542,7 @@ begin
         -- Порядок веток здесь и есть приоритет:
         --   closed   - закрытое событие красим целиком, чтобы живое от снятого отделялось
         --              сразу; поэтому ветка первая и перебивает остальные;
-        --   никогда  - данных по объекту нет вовсе или поток ни разу не отдавал статистику.
+        --   никогда  - данных по объекту нет вовсе или у потока нет ни одного успешного запуска (statval stat).
         --              Это почти всегда ошибка в самом правиле (не тот obj, не тот stat), а
         --              не сбой тракта, и чинить надо правило;
         --   period   - насколько просрочен дедлайн, шкала как у key_date в общем стиле;
@@ -573,4 +600,4 @@ $body$
 EXECUTE ON ANY;
 
 -- DEFAULT в сигнатуре COMMENT ON недопустим, как и в DROP FUNCTION — только типы.
-COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.20, 2026-10-08';
+COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.21, 2026-10-08';
