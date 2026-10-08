@@ -5,7 +5,7 @@ CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(grp text DEFAULT NU
 as $body$
 
 -- E360-6367. SLA алерты потоков CTL.
--- 2026-10-08 13:20 MSK, v1.21, Чуркин Николай
+-- 2026-10-08 13:59 MSK, v1.22, Чуркин Николай
 --
 -- Механизм общий: правило вешается на любой поток CTL. Тикет пришёл от Пакетной
 -- выгрузки, но ни функция, ни таблица к ней не привязаны - не сужайте описание обратно.
@@ -222,16 +222,9 @@ begin
             period_ts timestamp, msg text, jsn json
         ) on commit drop distributed randomly;
 
-        -- Правила, отработавшие в этом вызове чисто: замер сделан, претензий нет. Ими
-        -- гасятся активные алерты. Пропущенные правила (битый JSON, неизвестный вид,
-        -- кривой obj) сюда не попадают - непроверенное правило ничего не закрывает.
-        drop table if exists tmp_alert_ok;
-        create temp table tmp_alert_ok (
-            wf_id bigint, alert_key text
-        ) on commit drop distributed randomly;
-
-        -- Текущий ключ каждого проверенного правила. По нему гасятся открытые строки потока
-        -- со старым ключом: правило переписали или сменился формат ключа - иначе их закрыть нечем.
+        -- Текущий ключ каждого проверенного правила: замер сделан (алерт по нему или нет).
+        -- Пропущенные правила (битый JSON, неизвестный вид, кривой obj, ошибка правила) сюда не
+        -- попадают - непроверенное правило ничего не закрывает.
         drop table if exists tmp_alert_cur;
         create temp table tmp_alert_cur (
             wf_id bigint, alert_key text
@@ -242,7 +235,7 @@ begin
             -- удалённую таблицу, lag или at не приводятся к типу, expr с ошибкой), раньше роняло
             -- весь вызов: отчёт уходил с -9, и алертов не было видно ни по одному потоку.
             -- Теперь такое правило само становится алертом с ключом rule error: владелец видит
-            -- его в письме своей группы. В tmp_alert_ok оно не попадает - непроверенное правило
+            -- его в письме своей группы. В tmp_alert_cur оно не попадает - непроверенное правило
             -- ничего не закрывает. Блок с exception в GP - подтранзакция на правило; правил
             -- десятки, это дёшево.
             begin
@@ -263,7 +256,10 @@ begin
                 -- загрузке: alive COMPLETED и status SUCCESS, момент - end_dttm. Незакрытая
                 -- загрузка не в счёт, даже в SUCCESS: пока она висит, следующая не стартует.
                 -- ERROR данных не дал, хоть загрузку и закрывают как COMPLETED. stat задан -
-                -- по публикации statval этого номера. Режим данных перезапишет last_dt своим замером.
+                -- по публикации statval этого номера.
+                -- В режиме данных (календарь + wf_alert_data) замер не нужен: там меряется бизнес-дата,
+                -- и stat не читается вовсе - кривой stat не должен ронять правило.
+                if r.data_txt is null or r_kind ~ '^ *[0-9]' then
                 if (r_jsn->>'stat') is null then
                     r_src = 'run';
                     select max(l.end_dttm) into last_dt
@@ -279,6 +275,7 @@ begin
                     where a.obj = 'statval'
                       and (a.msg->>'stat_id')::int4 = (r_jsn->>'stat')::int4
                       and l.wf_id = r.wf_id;
+                end if;
                 end if;
 
                 if r_kind ~ '^ *[0-9]' then
@@ -311,8 +308,6 @@ begin
                         insert into tmp_alert_new
                         values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
                               , json_build_object('rule', r_jsn, 'last', left(last_dt::text, 19)));
-                    else
-                        insert into tmp_alert_ok values (r.wf_id, r_key);
                     end if;
                 else
                     r_at = coalesce(nullif(r_jsn->>'at', ''), '23:59:59')::time;
@@ -393,8 +388,6 @@ begin
                             values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
                                   , json_build_object('rule', r_jsn, 'since', left(prev_ts::text, 16)
                                                     , 'last', left(last_dt::text, 19)));
-                        else
-                            insert into tmp_alert_ok values (r.wf_id, r_key);
                         end if;
                     else
                         -- Режим данных: что именно сверять, лежит в wf_alert_data.
@@ -431,8 +424,6 @@ begin
                             values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
                                   , json_build_object('rule', r_jsn, 'data', d_jsn, 'obj', r_obj
                                                     , 'need', need_dt, 'last', left(last_dt::text, 19)));
-                        else
-                            insert into tmp_alert_ok values (r.wf_id, r_key);
                         end if;
                     end if;
                 end if;
@@ -470,20 +461,19 @@ begin
         );
         get diagnostics new_cnt = ROW_COUNT;
 
-        -- Закрываем открытые строки двумя путями, период в ключе не участвует - гасятся и прошлые
-        -- периоды. 1) Правило отработало чисто - его строки с тем же ключом (tmp_alert_ok), иначе
-        -- строка висела бы в отчёте до конца окна hist и продолжала бы повторяться. 2) Правило
-        -- проверено - строки его потока с другим ключом (tmp_alert_cur): правило переписали,
-        -- сменился формат ключа или прошёл "rule error".
+        -- Правило потока проверено - гасим все его открытые строки, кроме той, по чьему ключу
+        -- алерт заведён прямо сейчас. Так закрываются и строки чисто отработавшего правила (иначе
+        -- висели бы в отчёте до конца окна hist и повторялись), и строки со старым ключом: правило
+        -- переписали, сменился формат ключа или прошёл "rule error". Период не участвует -
+        -- гасятся и прошлые периоды.
         -- Update здесь один на вызов и только по открытым строкам: в GP он держит их до
         -- конца транзакции, поэтому колонка и заполняется одним заходом, а не по алерту.
         update tb_ctl_alerts a
         set close_ts = clock_timestamp()
         where a.close_ts is null
-          and (exists (select 1 from tmp_alert_ok o
-                       where o.wf_id = a.wf_id and o.alert_key = a.alert_key)
-               or exists (select 1 from tmp_alert_cur c
-                          where c.wf_id = a.wf_id and c.alert_key <> a.alert_key));
+          and exists (select 1 from tmp_alert_cur c where c.wf_id = a.wf_id)
+          and not exists (select 1 from tmp_alert_new n
+                          where n.wf_id = a.wf_id and n.alert_key = a.alert_key);
         get diagnostics closed_cnt = ROW_COUNT;
 
         if new_cnt > 0 then
@@ -542,7 +532,7 @@ begin
         -- Порядок веток здесь и есть приоритет:
         --   closed   - закрытое событие красим целиком, чтобы живое от снятого отделялось
         --              сразу; поэтому ветка первая и перебивает остальные;
-        --   никогда  - данных по объекту нет вовсе или у потока нет ни одного успешного запуска (statval stat).
+        --   никогда  - данных по объекту нет вовсе или у потока нет ни одного успешного запуска (или statval stat).
         --              Это почти всегда ошибка в самом правиле (не тот obj, не тот stat), а
         --              не сбой тракта, и чинить надо правило;
         --   period   - насколько просрочен дедлайн, шкала как у key_date в общем стиле;
@@ -600,4 +590,4 @@ $body$
 EXECUTE ON ANY;
 
 -- DEFAULT в сигнатуре COMMENT ON недопустим, как и в DROP FUNCTION — только типы.
-COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.21, 2026-10-08';
+COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.22, 2026-10-08';
