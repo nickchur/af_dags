@@ -5,10 +5,10 @@ description: tools_test_connections — ночная проверка каждо
 
 # `tools_test_connections` — доступность подключений
 
-*2026-09-29 15:22 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Общее про служебные даги и `health_warn` / `health_errors` — навык **`tools`**. Список
-подключений снимает первый таск `collect` этого же рана (заметка — таблица по типам; Variable
+подключений снимает первый таск `collect` этого же рана (заметка — строка на тип; Variable
 `local_connections` для выпадающих списков, через MCP закрыта). До 29.09.2026 — отдельный даг
 `tools_show_connections`, в старых ранах — таски по подключениям без `collect`.
 

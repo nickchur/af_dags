@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-01 18:18 MSK · v3.8 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v3.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), mapped `check` — по экземпляру на подключение,
@@ -315,9 +315,9 @@ def tools_test_connections():  # noqa: PLR0915
         from airflow.models import Variable
 
         try:
-            from plugins.utils import add_note  # type: ignore
+            from plugins.utils import Feed  # type: ignore
         except ImportError:
-            from CI06932748.tools.utils import add_note  # type: ignore
+            from CI06932748.tools.utils import Feed  # type: ignore
 
         backend = get_custom_secret_backend()
         if not hasattr(backend, "_local_connections"):
@@ -337,11 +337,10 @@ def tools_test_connections():  # noqa: PLR0915
             items.append({"group": _group(cid, conn.conn_type), "conn_id": cid, "conn_type": conn.conn_type})
         Variable.set("local_connections", dict(by_type), serialize_json=True)
 
-        headers = ["conn_type", "conn_id", "host", "port", "schema", "description"]
-        table = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
-        for ctype, rows in sorted(by_type.items()):
-            table += ["| " + " | ".join(str({"conn_type": ctype, **c}[h]) for h in headers) + " |" for c in rows]
-        add_note("\n".join(table), context, level="task", title=f"Connections: {len(conns)} в {len(by_type)} типах")
+        # Строка на тип, без таблицы: хосты и описания — в Variable local_connections
+        lines = [f"`{ctype}` ({len(rows)}): " + ", ".join(c["conn_id"] for c in rows)
+                 for ctype, rows in sorted(by_type.items(), key=lambda kv: -len(kv[1]))]
+        Feed(context, "🔌 collect").done(f"подключений {len(conns)} в {len(by_type)} типах", keep=lines)
         return sorted(items, key=lambda i: (GROUPS.index(i["group"]), i["conn_id"]))
 
     @task(task_id="check", map_index_template="{{ conn_label }}")
@@ -432,7 +431,7 @@ def tools_test_connections():  # noqa: PLR0915
             raw_note = notes_map.get((ti.task_id, ti.map_index), "")
             non_empty_lines = [ln.strip() for ln in raw_note.splitlines() if ln.strip()] if raw_note else []
             first_line = non_empty_lines[2] if len(non_empty_lines) > 2 else ""
-            reason = first_line[:120].replace("|", "\\|") or "—"
+            reason = first_line[:120] or "—"
 
             if state == "success":
                 icon = "✅"
@@ -464,7 +463,9 @@ def tools_test_connections():  # noqa: PLR0915
             if icon == "❌":
                 (failed_vital if vital else failed_aux).append(conn_id)
             if state != "success":
-                all_rows.append(f"| `{name}` | {'⭐' if vital else ''} | {icon} {state or 'not_started'} | {reason} |")
+                # Сначала упавшие важные, потом упавшие, потом остальное — заметка режется по хвосту
+                all_rows.append(((icon != "❌", not vital), f"{icon}{'⭐' if vital else ''} `{name}` — "
+                                 f"{state or 'not_started'} · {reason}"))
 
         avg_time = sum(durations) / len(durations) if durations else 0
         graph = "".join(icons)
@@ -473,8 +474,8 @@ def tools_test_connections():  # noqa: PLR0915
             counts += f" / 🔘 {none_count}"
         headline = f"{graph}\n\n{counts} | 🕒 Avg: {avg_time:.2f}s"
 
-        table = "| Соединение | Важное | Статус | Причина |\n|---|---|---|---|\n" + "\n".join(all_rows)
-        add_note(table, context, level="DAG", title=headline)
+        add_note("\n".join(row for _, row in sorted(all_rows)) or "все проверки прошли", context, level="DAG",
+                 title=headline)
         logger.info("report: %s", headline)
         # Упавшие подключения таск не роняют: важное — error (ран красный через health_errors),
         # вспомогательное — warn (ран зелёный, ⚠️ в health_warn)

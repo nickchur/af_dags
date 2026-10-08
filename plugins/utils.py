@@ -1,11 +1,12 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-01 19:13 MSK · v1.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-02 15:08 MSK · v1.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
 | Функция | Описание |
 |---|---|
-| `add_note()` | Структурированные заметки в Airflow UI (DAG/Task) |
+| `add_note()` | Структурированные заметки в Airflow UI (DAG/Task), новое сверху, строка под `FOR UPDATE` |
+| `Feed` | Заметка таска без таблиц: строки хода снизу (`line`), итог сверху (`done`), предел 1000 знаков |
 | `add_xcom()` | Запись в XCom с обрезкой коллекций до `MAX_XCOM` элементов |
 | `on_callback()` | Обработчик событий success/failure/retry |
 | `pool_slots()` | Размер пула — только из сторожа подключений (`test_conn`) |
@@ -303,6 +304,52 @@ def add_note(msg, context=None, level='task', add=True, title='', compact=False)
             session.close()
     except Exception as e:
         logger.warning(f"Failed to update note: {e}")
+
+# Заметке — 1000 символов (колонка метабазы AF 2); запас на заголовок
+NOTE_BUDGET = 900
+
+
+class Feed:
+    """Заметка таска одним проходом, без таблиц: строки хода сверху вниз, в конце итог над ними.
+
+    В 1000 символов заметки широкая таблица вытесняла строки (сигма dev 01.10.2026 — reindex
+    на 116 индексов обрывался на десятом). Не влезает — в ходе видны последние строки, в итоге
+    те, что переданы в done(keep=…), и «ещё N». done(dag=True) пишет итог строкой и в заметку рана.
+    """
+
+    def __init__(self, context, title):
+        self.context, self.title, self.lines = context, title, []
+
+    def line(self, text, replace_last=False):
+        if replace_last and self.lines:
+            self.lines[-1] = text
+        else:
+            self.lines.append(text)
+        self._write('', self.lines, tail=True)
+
+    def done(self, summary, keep=None, rest='', dag=False):
+        self._write(summary, self.lines if keep is None else keep, tail=False, rest=rest)
+        if dag:
+            add_note(summary, context=self.context, level='DAG', title=self.title)
+
+    def _write(self, head, lines, tail, rest=''):
+        budget = NOTE_BUDGET - len(self.title) - len(head) - len(rest) - 40
+        picked, size = [], 0
+        for ln in (reversed(lines) if tail else lines):
+            # +3: перенос и два пробела жёсткого переноса от add_note
+            if size + len(ln) + 3 > budget:
+                break
+            picked.append(ln)
+            size += len(ln) + 3
+        if tail:
+            picked.reverse()
+        cut = len(lines) - len(picked)
+        more = f'… ещё {cut}' if cut else ''
+        body = [head] if head else []
+        body += ([more] if tail and more else []) + picked + ([more] if not tail and more else [])
+        body += [rest] if rest else []
+        add_note('\n'.join(body), context=self.context, level='Task', add=False, title=self.title)
+
 
 def add_xcom(key, value, context=None):
     """Кладёт значение в XCom, обрезая коллекции до MAX_XCOM элементов.
@@ -996,12 +1043,12 @@ def report_health(checks, context=None, ttl_sec=7200):
             for name, c in checks.items()
         },
     }
-    text = json.dumps(report, ensure_ascii=False, default=str)
+    text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     if len(text.encode()) > HEALTH_MAX_BYTES:
         # Статусы и строки важнее подробностей: без data отчёт core ещё прочтёт
         for c in report['checks'].values():
             c['data'] = {'dropped': 'отчёт больше 256 КБ'}
-        text = json.dumps(report, ensure_ascii=False, default=str)
+        text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     try:
         bucket = conf.get('logging', 'remote_base_log_folder').split('://', 1)[1].split('/', 1)[0]
         S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')).load_string(

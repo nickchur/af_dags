@@ -1,5 +1,5 @@
 """###🛠️ Обслуживание бакета логов
-*2026-10-01 18:18 MSK · v2.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v2.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки обслуживает весь бакет логов (`[logging] remote_base_log_folder`): создаёт его,
 если нет, ставит один срок хранения на весь бакет, удаляет старое обходом и считает
@@ -363,7 +363,7 @@ def tools_log_cleanup():
 
     @task
     def report(swept: dict, **context):
-        """📋 Таблица по папкам в заметку, сводка — в XCom."""
+        """📋 Строка на папку в заметку, сводка — в XCom."""
         # Важное первым: заметка режется по MAX_NOTE_LEN, и в хвост должны уходить самые
         # мелкие папки, а не итог.
         folders = swept['folders']
@@ -376,14 +376,12 @@ def tools_log_cleanup():
             f"`{swept['bucket']}`: {readable_size(total_bytes)}, объектов {readable_size(total_objects, 1000)}, "
             f"срок {swept.get('days')} дн., удалено {deleted}" + (" (сухой прогон)" if swept.get('dry_run') else ""),
             "",
-            "| Папка | Объектов | Объём | Старейший | Удалено |",
-            "|---|---|---|---|---|",
         ]
+        # Строка на папку, без таблицы: таблица вытесняла строки из 1000 символов заметки
         for name, row in sorted(folders.items(), key=lambda item: -item[1]['objects']):
             oldest = (row['oldest'] or '')[:10]
-            lines.append(
-                f"| `{name}` | {row['objects']} | {readable_size(row['bytes'])} | {oldest} | {row['deleted']} |"
-            )
+            lines.append(f"`{name}`: {readable_size(row['objects'], 1000)} объектов, {readable_size(row['bytes'])}"
+                         + (f", с {oldest}" if oldest else '') + (f", удалено {row['deleted']}" if row['deleted'] else ''))
         if swept.get('partial'):
             lines.insert(1, "⚠️ обход не закончен: данные неполные, поднимите `max_minutes` или разберитесь, "
                             "почему листинг медленный")

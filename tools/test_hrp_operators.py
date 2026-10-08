@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-01 19:05 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-01 22:37 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
 S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
@@ -817,7 +817,7 @@ def test_hrp_operators_dag():
     # ──────────────────────────── report ──────────────────────────────────────
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
     def report(**context):
-        """Собирает статусы всех тасков прогона в markdown-таблицу (как в test_connections)."""
+        """Собирает статусы тасков прогона в заметку рана: упавшие первыми, успешные одной строкой."""
         # Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
         # недоступна (setup пропущен по ошибке соединения) или активна.
         dag_run = context["dag_run"]
@@ -847,7 +847,7 @@ def test_hrp_operators_dag():
                         ti.note = f"☮️ SKIPPED — {state} (отключено флагом системы или зависимостью)"
                 else:
                     icon, fail = "❌", fail + 1
-                rows.append(f"| {icon} | `{ti.task_id}` | {state} |")
+                rows.append(("❌☮️✅".index(icon[0]), f"{icon} `{ti.task_id}`" + (f" — {state}" if icon != "✅" else "")))
             session.commit()  # фиксируем до-записанные заметки скипнутых тасков
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
@@ -868,8 +868,12 @@ def test_hrp_operators_dag():
         sys_line = "**Системы:** " + " · ".join(sys_status)
 
         headline = f"🧪 HRP operators: ✅ {ok} / ❌ {fail} / ☮️ {skip}"
-        table = "| Статус | Таск | State |\n|---|---|---|\n" + "\n".join(rows)
-        add_note(sys_line + "\n\n" + table, context, level="DAG", title=headline)
+        # Без таблицы: в 1000 символов заметки она вытесняла строки. Упавшие и пропущенные —
+        # строкой на таск, успешные — одной строкой в конце: её и режет лимит
+        lines = [row for rank, row in sorted(rows) if rank < 3]
+        ok_ids = [row[2:] for rank, row in sorted(rows) if rank == 3]
+        lines += [f"✅ ({len(ok_ids)}): " + ", ".join(ok_ids)] if ok_ids else []
+        add_note(sys_line + "\n\n" + "\n".join(lines), context, level="DAG", title=headline)
         logger.info("%s | %s", headline, " · ".join(sys_status))
 
     # ──────────────────────────── cleanup ─────────────────────────────────────
