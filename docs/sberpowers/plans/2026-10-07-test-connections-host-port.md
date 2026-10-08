@@ -235,8 +235,8 @@ def _label(item: dict) -> str:
   куда не достучались; у S3 и Kafka он из extra (`endpoint_url`, `bootstrap.servers`)».
 
 - [ ] `testbed/README.md`: в таблицу скриптов (рядом со строкой `check_status_contract.py`)
-  добавь `| [`check_conn_addr.py`](check_conn_addr.py) | Проверка правила адреса подключения
-  `tools_test_connections`: хост из подключения или из extra, разбор списка хостов |`;
+  добавь строку: ссылка на `check_conn_addr.py` (путь от `testbed/`) и описание «Проверка правила адреса
+  подключения `tools_test_connections`: хост из подключения или из extra, разбор списка хостов»;
   подними версию файла, если у него есть строка версии.
 
 - [ ] Проверь: `python3 testbed/check_conn_addr.py` → `12/12 ok`;
