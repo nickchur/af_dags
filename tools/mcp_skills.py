@@ -1,5 +1,5 @@
 """### 🧭 DAG: Навыки агента для MCP-эндпоинта
-*2026-10-02 07:26 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-09 00:36 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 30 минут публикует для вебсервера то, чего у него нет: навыки агента
 (`*/skill/*.md`) — в Variables `mcp_skill__<имя>` для MCP-ресурсов `airflow://skill/<имя>`,
@@ -60,7 +60,7 @@ DOCS_ROOT = 'docs'
 DOC_REFRESH_DAYS = 7
 #: Файлы для агента, а не для людей: правила репозитория и собранная карта.
 DOC_SKIP_FILES = {'CLAUDE.md', 'CONTEXT.md'}
-DOC_SKIP_DIRS = {'testbed', 'openspec', 'skill', '__pycache__'}
+DOC_SKIP_DIRS = {'testbed', 'openspec', 'docs', 'skill', '__pycache__'}
 
 ensure_pool(TOOLS_POOL)
 

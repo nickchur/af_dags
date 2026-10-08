@@ -5,7 +5,7 @@ description: Разбор загрузок CTL на Airflow альфы — да�
 
 # Загрузки CTL на альфе
 
-*2026-09-26 21:10 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-02 13:51 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Навык для агента GigaCode с MCP-сервером Airflow альфы (`af-alpha-*`). Он дополняет навык
 `airflow-health`: тот видит Airflow целиком, этот объясняет, что стоит за дагами `CTL.*`.
@@ -313,6 +313,55 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 | `run_exe` failed «Повтор N: …» | заметка задачи, лог попытки 1 | раздел 3: исход прошлой попытки неизвестен |
 | у потока нет дага `CTL.*` | «⚠️ Потоки вне присмотра» у загрузчика | не `HR_Data` + `dummy` и не в категории UE (раздел 5а) |
 
+## 9а. Таблицы GP: описание в Confluence
+
+Что лежит в таблице, которую грузит поток (колонки, ключи, источник, смысл полей), описано не
+здесь, а в корпоративном Confluence — пространство **HRData** на `confluence.delta.sbrf.ru`:
+
+- корень — «HR Data»: https://confluence.delta.sbrf.ru/display/HRData/HR+Data
+  (https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=1774392110);
+- описания таблиц — в ветке «[1] ПКАП1080 (CI02750757)» → «ПКАП1080 (Схемы)»
+  (https://confluence.delta.sbrf.ru/pages/viewpage.action?pageId=16079355940): под ней страница
+  на каждую схему (`s_grnplm_vd_hr_edp_stg`, `…_dds`, `…_srv_wf` и т. д.), под схемой —
+  страница на таблицу или вьюху. Название страницы — голое имя таблицы, без схемы;
+- страница таблицы, например: https://confluence.delta.sbrf.ru/display/HRData/ue_circle_of_contacts
+
+**Когда открывать:** вопрос про содержимое таблицы — «что значит поле X», «почему пусто Y»,
+«какие данные приносит поток». Состояние загрузки по-прежнему смотри в Airflow: Confluence
+описывает таблицу, а не загрузку.
+
+**Как:** через MCP к `confluence.delta.sbrf.ru`. Имена инструментов зависят от MCP — смотри,
+какие подключены:
+
+- корпоративный MCP Confluence — `search_content(space_key="HRData", title="<имя таблицы>")`,
+  по id — `get_content_by_id(id="<id>")`; не нашлась — `search_content_cql` с CQL
+  `space = HRData AND title ~ "<имя таблицы>"`; все таблицы схемы — `get_children` у страницы схемы;
+- `mcp-atlassian` — `confluence_get_page(space_key="HRData", title="<имя таблицы>")`,
+  `confluence_search`, `confluence_get_page_children`.
+
+**Нет такого MCP** — скажи DE подключить его (`MCP_DE.md`, раздел 4 «Confluence и Jira»), а о
+колонках не гадай.
+
+## 9б. DDL таблиц и функций GP: Bitbucket
+
+Confluence описывает смысл, а точное определение — колонки, типы, сигнатуры функций движка —
+лежит в репозитории HR_Data на `stash.delta.sbrf.ru`:
+https://stash.delta.sbrf.ru/projects/BIGDATA/repos/hr_data/browse/sql/create/s_grnplm_vd_hr_edp_<схема>
+(под схемой — `tables`, `views`, `functions`; файл — `<имя>.sql`).
+
+**Когда открывать:** `run_exe` упал с ошибкой GP про колонку, тип или функцию —
+`column … does not exist`, `function … does not exist`, несовпадение типов. Сверь текст ошибки с
+DDL и назови файл и коммит, после которого разошлось.
+
+**Как:** через MCP Bitbucket к `stash.delta.sbrf.ru` —
+`bitbucket_getFileContent(projectKey="BIGDATA", repositorySlug="hr_data",
+path="sql/create/s_grnplm_vd_hr_edp_<схема>/tables/<таблица>.sql")`; путь каталога даёт листинг.
+Кто и когда менял — `bitbucket_getCommits(..., path=…)`. Инструменты записи не вызывай.
+
+**Нет такого MCP** — скажи DE подключить его (`MCP_DE.md`, раздел 4 «Bitbucket»); о колонках и
+типах не гадай. Помни: в репозитории — то, что задумано, а на сервере может быть иначе, если
+DDL не выкатили.
+
 ## 10. Чего не советовать
 
 - **Не `clear` и не перезапуск `run_prm`** у ручных и расписанных ранов: задача создаёт
@@ -335,6 +384,9 @@ CTL.<профиль>.loader (5 мин)          CTL.<профиль>.sensor (1 �
 - **CTL**: карточка загрузки — статус, лог статуса (`WAIT-AF`, `NEW-AF`, `RUN …`, `END …`),
   настройки повторов воркфлоу, `wf_timeout`.
 - Ошибка внутри SQL воркфлоу (`res -4…-9`) — владелец воркфлоу, не платформа.
+- Ошибка самого вызова CTL из инструментов (`ctl_*` вернул 5xx, 401, таймаут, ошибку заголовка
+  или Kerberos) — платформа: подключение `ctl` или сервис CTL. О потоке она ничего не говорит —
+  состояние загрузки тогда смотри по рану и заметкам в Airflow.
 - **SLA-алерты**, Greenplum: `tb_ctl_alerts` (все заведённые, `close_ts` пустой — открыт),
   дата данных объекта — `tb_log_workflow_stat` (`wf_obj`, `data_max`). Правило потока —
   параметры `wf_alert` / `wf_alert_data` / `wf_alert_group` в CTL.
