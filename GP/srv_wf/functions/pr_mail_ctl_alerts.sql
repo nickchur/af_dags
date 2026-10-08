@@ -5,7 +5,7 @@ CREATE FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(grp text DEFAULT NU
 as $body$
 
 -- E360-6367. SLA алерты потоков CTL.
--- 2026-09-26 23:10 MSK, v1.18, Чуркин Николай
+-- 2026-10-08 11:44 MSK, v1.20, Чуркин Николай
 --
 -- Механизм общий: правило вешается на любой поток CTL. Тикет пришёл от Пакетной
 -- выгрузки, но ни функция, ни таблица к ней не привязаны - не сужайте описание обратно.
@@ -29,19 +29,30 @@ as $body$
 --                            "дедлайн - lag";
 --     2. дедлайн + событие - wf_alert_data нет: к дедлайну поток должен был отдать
 --                            статистику, бизнес-дату не смотрим;
---     3. хартбит           - kind heartbeat: статистика приходит не реже чем раз в every,
---                            календаря нет вовсе; wf_alert_data здесь не смотрится.
+--     3. от прошлого запуска - every/kind интервалом: календаря нет, считаем от последней
+--                            статистики; wf_alert_data здесь не смотрится.
 --
---   wf_alert:
---     {"kind":"daily",     "at":"09:00"}
---     {"kind":"workdays",  "at":"13:00"}                      -- ПН-ПТ
---     {"kind":"weekly",    "at":"09:00", "dow":1}             -- 1 = понедельник
---     {"kind":"monthly",   "day":20}
---     {"kind":"yearly",    "month":12, "day":16}
---     {"kind":"quarterly", "day":"last"}
---     {"kind":"heartbeat", "stat":1,  "every":"1 hour"}       -- изменение данных
---     {"kind":"heartbeat", "stat":12, "every":"1 day"}        -- 12 статистика
---     stat в календарных видах задаёт статистику для режима события, по умолчанию 1.
+--   wf_alert. kind и every - синонимы: слово или интервал.
+--     {"every":"daily",     "at":"09:00"}               -- каждый день
+--     {"every":"workdays",  "at":"13:00"}               -- ПН-ПТ
+--     {"every":"weekly",    "at":"09:00"}               -- по ПН (dow по умолчанию 1)
+--     {"every":"weekly",    "at":"09:00", "dow":[1,3,5]}  -- ПН, СР, ПТ; 7 = воскресенье
+--     {"every":"monthly",   "day":20}
+--     {"every":"quarterly"}                             -- последнее число квартала
+--     {"every":"yearly",    "month":12, "day":16}
+--     {"every":"hourly"}                                -- = "1 hour", скользящее окно
+--     {"every":"2 day",     "at":"09:00"}               -- через 2 дня после прошлого запуска
+--     {"every":"1 day",     "stat":12}                  -- скользящее окно по 12 статистике
+--     {"kind":"heartbeat",  "every":"1 hour"}           -- старая запись, работает
+--     Слова нет вовсе - вид складывается из полей: {"at":"09:00"} - каждый день,
+--     {"dow":[1,3,5]}, {"day":"last"}, {"month":[3,6,9,12], "day":"last"}.
+--     dow, day и month - число или массив, условия через И, уточняют календарь слова.
+--     stat задаёт статистику для режима события, по умолчанию 2. При интервале dow, day и
+--     month не смотрятся. Неизвестное слово - правило пропускается (skipped).
+--     Интервал с at (от суток) - отсчёт от дня последнего запуска: отработал 3-го в любое время,
+--     every "2 day", at "09:00" - к 5-му 09:00 обязан отработать снова. Не отрабатывал
+--     никогда - алерт сразу. every без at -
+--     скользящее окно: с прошлой статистики прошло не больше every.
 --
 --   wf_alert_data:
 --     {"lag":"1 day",        "obj":"stg.tb_incidentsm1"}      -- короткая схема
@@ -60,13 +71,19 @@ as $body$
 --   Проверка данных считается так:
 --       need  = дедлайн - lag              -- дата, за которую данные обязаны быть
 --       алерт = последняя бизнес-дата объекта < need
---   Пример: wf_alert {"kind":"daily","at":"09:00"} и wf_alert_data {"lag":"1 day",...} -
+--   Пример: wf_alert {"at":"09:00"} и wf_alert_data {"lag":"1 day",...} -
 --   сегодня в 09:00 обязаны быть данные за вчера; лежат за позавчера - алерт.
---   lag НЕ задаёт, как часто проверять: частоту задаёт kind, дедлайн - at/day/month/dow.
+--   lag НЕ задаёт, как часто проверять: это делают every/kind, dow/day/month и at.
 --
---   Режим события: статистика с номером stat должна была прийти после ПРОШЛОГО дедлайна.
---   Пришла в 09:30 при дедлайне 09:00 - молчим: период закрыт, как и в режиме данных, где
---   не важно, когда именно данные подъехали.
+--   at по умолчанию - 23:59:59, конец дня дедлайна: "по ПН" без at - до конца понедельника,
+--   day 31 - до конца 31-го.
+--
+--   Режим события: дедлайн закрывает запуск в ДЕНЬ дедлайна или позже. Раньше - не
+--   считается: у правила "по ПН" запуск в субботу ничего не закрывает, и повторный
+--   запуск во вторник следующий понедельник тоже не закроет. Ежедневно к 09:00: запуск в
+--   10:00 - опоздание, алерт гаснет; к завтрашним 09:00 нужен запуск завтра. Пропустил
+--   день и отработал назавтра утром - старый алерт гаснет тоже, событие новее дедлайна.
+--   Дедлайн ровно в 00:00 - конец прошлого дня: запуск накануне его закрывает.
 --
 --   Осторожно с месячными и квартальными объектами. Если бизнес-дата у них - метка периода
 --   (первое число месяца), сравнение идёт с меткой, а не с днём загрузки, и lag надо
@@ -131,6 +148,10 @@ declare
     r_at time;
     r_lag interval;
     r_every interval;
+    r_dow int4[];
+    r_day int4[];
+    r_month int4[];
+    r_last boolean;
     r_key text;
     r_obj text;
     r_msg text;
@@ -218,26 +239,47 @@ begin
             begin
                 sql = null;         -- в jsn ошибки должен попасть запрос этого правила
                 r_jsn = r.rule_txt::json;
-                r_kind = coalesce(nullif(r_jsn->>'kind', ''), 'daily');
                 last_dt = null;
-
+                -- kind и every - синонимы. Значение - слово (daily, weekly, ...) или интервал
+                -- ("2 day", "1 hour"). Старая запись {"kind":"heartbeat","every":"1 hour"}
+                -- задаёт оба поля: heartbeat значит "смотри интервал", по умолчанию сутки.
+                r_kind = lower(coalesce(nullif(r_jsn->>'kind', ''), nullif(r_jsn->>'every', ''), ''));
                 if r_kind = 'heartbeat' then
-                    r_every = coalesce(nullif(r_jsn->>'every', ''), '1 day')::interval;
-                    -- Окно хартбита прибито к сетке, иначе период "плыл" бы от вызова к вызову.
-                    per_ts = to_timestamp(floor(extract(epoch from now()) / extract(epoch from r_every))
-                                          * extract(epoch from r_every))::timestamp;
+                    r_kind = coalesce(nullif(r_jsn->>'every', ''), '1 day');
+                elsif r_kind = 'hourly' then
+                    r_kind = '1 hour';
+                end if;
+
+                if r_kind ~ '^ *[0-9]' then
+                    r_every = r_kind::interval;
 
                     select max(a.ts) into last_dt
                     from tb_log_ctl a
                     join vw_log_ctl_loading l on l.id = a.id
                     where a.obj = 'statval'
-                      and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 1)
+                      and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 2)
                       and l.wf_id = r.wf_id;
 
-                    r_key = format('stat %s / %s', coalesce(r_jsn->>'stat', '1'), r_every);
-                    if last_dt is null or last_dt < now() - r_every then
+                    if nullif(r_jsn->>'at', '') is null or r_every < interval '1 day' then
+                        -- Без at (и для интервалов короче суток, где at смысла не имеет) -
+                        -- скользящее окно. Окно хартбита прибито к сетке, иначе период "плыл" бы от вызова к вызову.
+                        per_ts = to_timestamp(floor(extract(epoch from now()) / extract(epoch from r_every))
+                                              * extract(epoch from r_every))::timestamp;
+                        r_key = format('stat %s / %s', coalesce(r_jsn->>'stat', '2'), r_every);
+                        r_at = null;
+                    else
+                        -- С at дедлайн - день последнего срабатывания плюс every, к часу at.
+                        -- Период - сам дедлайн: он не меняется, пока поток снова не отработает.
+                        r_at = (r_jsn->>'at')::time;
+                        per_ts = coalesce((last_dt + r_every)::date + r_at, current_date::timestamp);
+                        r_key = format('stat %s / %s at %s', coalesce(r_jsn->>'stat', '2'), r_every, r_at);
+                    end if;
+
+                    if last_dt is null
+                       or (r_at is null and last_dt < now() - r_every)
+                       or (r_at is not null and per_ts <= now()) then
                         r_msg = format('нет статистики %s за %s, последняя %s'
-                            , coalesce(r_jsn->>'stat', '1'), r_every
+                            , coalesce(r_jsn->>'stat', '2'), r_every
                             , coalesce(left(last_dt::text, 19), 'никогда'));
                         insert into tmp_alert_new
                         values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
@@ -246,7 +288,44 @@ begin
                         insert into tmp_alert_ok values (r.wf_id, r_key);
                     end if;
                 else
-                    r_at = coalesce(nullif(r_jsn->>'at', ''), '00:00')::time;
+                    r_at = coalesce(nullif(r_jsn->>'at', ''), '23:59:59')::time;
+                    -- dow, day, month - число или массив; поля нет - условия нет. dow по isodow:
+                    -- 1 = ПН ... 7 = ВС. day "last" - последнее число месяца.
+                    r_last = coalesce((r_jsn->>'day') = 'last', false);
+                    r_dow = case when (r_jsn->'dow') is null then null
+                                 when json_typeof(r_jsn->'dow') = 'array'
+                                 then array(select json_array_elements_text(r_jsn->'dow')::int4)
+                                 else array[(r_jsn->>'dow')::int4] end;
+                    r_day = case when (r_jsn->'day') is null or r_last then null
+                                 when json_typeof(r_jsn->'day') = 'array'
+                                 then array(select json_array_elements_text(r_jsn->'day')::int4)
+                                 else array[(r_jsn->>'day')::int4] end;
+                    r_month = case when (r_jsn->'month') is null then null
+                                   when json_typeof(r_jsn->'month') = 'array'
+                                   then array(select json_array_elements_text(r_jsn->'month')::int4)
+                                   else array[(r_jsn->>'month')::int4] end;
+                    -- Слово задаёт календарь по умолчанию, явные dow/day/month его уточняют.
+                    -- Слова нет - вид складывается из самих полей, метка нужна только для
+                    -- alert_key: ключи заведённых алертов не меняются.
+                    if r_kind = '' then
+                        r_kind = case when r_month is not null then 'yearly'
+                                      when r_day is not null or r_last then 'monthly'
+                                      when r_dow is not null then 'weekly'
+                                      else 'daily' end;
+                    elsif r_kind = 'workdays' then
+                        r_dow = coalesce(r_dow, '{1,2,3,4,5}');
+                    elsif r_kind = 'weekly' then
+                        r_dow = coalesce(r_dow, '{1}');
+                    elsif r_kind in ('monthly', 'yearly') then
+                        if r_day is null and not r_last then r_day = '{1}'; end if;
+                        if r_kind = 'yearly' then r_month = coalesce(r_month, '{1}'); end if;
+                    elsif r_kind = 'quarterly' then
+                        r_month = coalesce(r_month, '{3,6,9,12}');
+                        r_last = r_last or r_day is null;
+                    elsif r_kind <> 'daily' then
+                        bad_cnt = bad_cnt + 1;   -- слово неизвестно
+                        continue;
+                    end if;
 
                     -- Последний наступивший дедлайн и предыдущий. Перебором по календарю: так
                     -- все виды, включая "последнее число квартала", считаются одной формулой.
@@ -256,38 +335,36 @@ begin
                     from (
                         select d + r_at as dl, row_number() over (order by d desc) as rn
                         from generate_series(current_date - 800, current_date, '1 day'::interval) d
-                        where ( r_kind = 'daily'
-                             or (r_kind = 'workdays'  and extract(dow from d) between 1 and 5)
-                             or (r_kind = 'weekly'    and extract(dow from d) = coalesce((r_jsn->>'dow')::int4, 1))
-                             or (r_kind = 'monthly'   and extract(day from d) = coalesce((r_jsn->>'day')::int4, 1))
-                             or (r_kind = 'yearly'    and extract(month from d) = coalesce((r_jsn->>'month')::int4, 1)
-                                                      and extract(day from d) = coalesce((r_jsn->>'day')::int4, 1))
-                             or (r_kind = 'quarterly' and d::date = (date_trunc('quarter', d) + interval '3 month' - interval '1 day')::date)
-                              )
+                        where (r_dow   is null or extract(isodow from d)::int4 = any(r_dow))
+                          and (r_day   is null or extract(day    from d)::int4 = any(r_day))
+                          and (r_month is null or extract(month  from d)::int4 = any(r_month))
+                          and (not r_last or d::date = (date_trunc('month', d) + interval '1 month' - interval '1 day')::date)
                           and d + r_at <= now()
                     ) a
                     where rn <= 2;
 
                     if per_ts is null then
-                        bad_cnt = bad_cnt + 1;   -- вид правила неизвестен
+                        bad_cnt = bad_cnt + 1;   -- поля не дают ни одного дедлайна (31 февраля)
                         continue;
                     end if;
 
                     if r.data_txt is null then
                         -- Режим события: дедлайн есть, бизнес-дату не смотрим. Спрашиваем только,
-                        -- отдавал ли поток статистику в текущем периоде, то есть после прошлого
-                        -- дедлайна. Параметра wf_alert_data нет - и проверять в данных нечего.
+                        -- был ли запуск в день текущего дедлайна или позже. Запуск раньше дня
+                        -- дедлайна (субботний у правила "по ПН", повтор после прошлого дедлайна)
+                        -- не считается. Дедлайн в 00:00 относится к прошлому дню - минус секунда.
+                        -- Параметра wf_alert_data нет - и проверять в данных нечего.
                         select max(a.ts) into last_dt
                         from tb_log_ctl a
                         join vw_log_ctl_loading l on l.id = a.id
                         where a.obj = 'statval'
-                          and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 1)
+                          and (a.msg->>'stat_id')::int4 = coalesce((r_jsn->>'stat')::int4, 2)
                           and l.wf_id = r.wf_id;
 
-                        r_key = format('%s %s event stat %s', r_kind, r_at, coalesce(r_jsn->>'stat', '1'));
-                        if last_dt is null or (prev_ts is not null and last_dt <= prev_ts) then
+                        r_key = format('%s %s event stat %s', r_kind, r_at, coalesce(r_jsn->>'stat', '2'));
+                        if last_dt is null or last_dt::date < (per_ts - interval '1 second')::date then
                             r_msg = format('к %s поток не отдал статистику %s, последняя %s'
-                                , left(per_ts::text, 16), coalesce(r_jsn->>'stat', '1')
+                                , left(per_ts::text, 16), coalesce(r_jsn->>'stat', '2')
                                 , coalesce(left(last_dt::text, 19), 'никогда'));
                             insert into tmp_alert_new
                             values (r.wf_id, r.wf_name, r.alert_grp, r_key, per_ts, r_msg
@@ -496,4 +573,4 @@ $body$
 EXECUTE ON ANY;
 
 -- DEFAULT в сигнатуре COMMENT ON недопустим, как и в DROP FUNCTION — только типы.
-COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.18, 2026-09-26';
+COMMENT ON FUNCTION s_grnplm_vd_hr_edp_srv_wf.pr_mail_ctl_alerts(text, time without time zone, interval) IS 'SLA алерты потоков CTL. v1.20, 2026-10-08';
