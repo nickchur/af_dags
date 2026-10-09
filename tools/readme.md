@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-04 12:07 MSK · v1.74 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-07 13:53 MSK · v1.83 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -21,7 +21,8 @@
 `purge`, `terminate`, `sweep`, `layout`, `publish`, `save`) → `report` → у плагинов здоровья
 `health_warn` / `health_errors`. `params` — через общий
 `store_params_task` у всех дагов с расписанием; без него — `dummy` (нечего сохранять), ручные
-`test_kafka_*` и `@once` `test_hrp_operators`: сохранять им нечего.
+`test_kafka_*`: сохранять им нечего. У `@once` `test_hrp_operators` таск `params` свой — он
+ещё сверяет форму с разбором дага.
 
 **Даг-проверка находками не падает.** Сбор и сводка кладут вердикты в XCom `health`
 (`push_health`), итог подводят два последних таска из `health_tasks` (`plugins/utils.py`),
@@ -63,16 +64,21 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 
 DAG автоматически обнаруживает все подключения и проверяет их доступность.
 *   **Список в том же ране**: первый таск `collect` снимает подключения из secret backend
-    (заметка — строка на тип) и пишет Variable `local_connections` — из неё строят выпадающие
-    списки kafka-подключений `test_kafka` и `ctl_tfs`. Разбор файла Variable не читает. До
-    29.09.2026 список снимал отдельный даг `show_connections`.
+    (заметка — строка на тип; полная таблица `conn_type, conn_id, host, port, schema, description` — в логе; тот же словарь, что в Variable, — в XCom `collect` под ключом `connections`)
+    и пишет Variable `local_connections` — из неё строят выпадающие списки kafka-подключений
+    `test_kafka` и `ctl_tfs`. Разбор файла Variable не читает. До 29.09.2026 список снимал
+    отдельный даг `show_connections`.
 *   **Один mapped-таск `check`** по списку рана, экземпляр на подключение подписан «группа ·
-    `conn_id`» (`tfs`, `postgres`, `s3`, `ctl`, `clickhouse`, `kafka`, `trino`, `redis`,
-    `other`). Упал `collect` — ❌ `health_errors`.
+    `conn_id` · хост:порт» (`tfs`, `postgres`, `s3`, `ctl`, `clickhouse`, `kafka`, `trino`,
+    `redis`, `other`). Упал `collect` — ❌ `health_errors`.
+    *   **Адрес**: хост и порт подключения; хост пуст — первый непустой из extra `endpoint_url`,
+        `bootstrap.servers`: без запятой — хост и порт, с запятой — хосты без портов и порт первого
+        (как secret backend строит Postgres с несколькими хостами). Тот же адрес — в строках
+        `report`.
 *   **`skip_<группа>`** (`skip_tfs`, `skip_kafka`, …; секция формы «Пропуск групп») —
     подключения группы не проверяются (☮️, не ошибка); сохраняются с `save_params`.
 *   **Стандартизация**: Статус пропущенных проверок помечается символом `☮️`.
-*   **Отчетность**: таск `report` — строка на непрошедшую проверку ✅/❌/☮️ (⭐ — важное) в заметке рана, упавшие важные первыми.
+*   **Отчетность**: таск `report` — строка на непрошедшую проверку ✅/❌/☮️ (⭐ — важное) с подписью экземпляра в заметке рана, упавшие важные первыми.
 *   **Важные подключения** — параметр `critical` (шаблоны `conn_id`, fnmatch; по умолчанию
     `airflowdb`, `ctl`, `s3` и подключение бакета логов). Упавшее подключение роняет свой таск,
     но ран краснеет (`health_errors`) только из-за важного; вспомогательное — ⚠️ `health_warn`.
@@ -100,21 +106,43 @@ Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp
 **Что покрывается** (по группам)
 
 - `to_s3` — `PostgresToS3(List)`, `Clickhouse{Table,Query}ToS3`, `ClickNativeToS3(List)`:
-  все сжатия (`gzip`/`zip`/`tar.gz`/`None`), `xstream_sanitize`, массивы, NULL, спецсимволы.
+  все сжатия (`gzip`/`zip`/`tar.gz`/`None`), массивы, NULL, спецсимволы.
   Каждый оператор с `post_file_check=True` сам перечитывает файл и сверяет хэш.
-- `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count.
+- `xstream_sanitize` — `pg_to_s3_list_sanitize` и `ch_native_to_s3_sanitize` (с `sanitize_array`);
+  `v_*_sanitize` читает файл и сверяет строку со спецсимволами с литералом
+  `SANITIZED_SPECIAL`: вырезаны `;`, таб, перенос и обратный слеш, массив очищен. Литерал, а не
+  регулярка ядра — проверка не доверяет проверяемому коду. До ядра 1.2.7 флаг не чистил
+  ничего, поэтому на старом ядре эти проверки красные, и в карантин они не спрятаны.
+  `s3_to_ch_transformed` грузит очищенную выгрузку CH и ждёт `v_ch_native_sanitize`: на старом
+  ядре он `upstream_failed` (в сводке ☮️), а не второй ❌ с ошибкой разбора ClickHouse.
+- `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count;
+  `S3ToPostgresOperator2` — выгрузка `pg_to_s3_gzip` в инкарнационный таргет
+  (`copy_csv_quote='"'`: файл — родной CSV Postgres); `S3ToClickhouseTransformed` — очищенная
+  выгрузка CH с `include_file_name` (TSV без экранирования, табы в значениях ему противопоказаны).
 - `db_to_db` — `PostgresToPostgres`, `ClickhouseToPostgres`, `PostgresToClickhouse`,
-  `*Incarnation*`: прямые переливки, сверка count и содержимого.
+  `ClickhouseToClickhouse`, `*Incarnation*`: прямые переливки, сверка count и содержимого.
 - `s3_utils` — `S3ToS3`, `S3Archive`, `CheckS3FileHash`, `PostgresDDL`: перепаковка сжатий,
   ZIP-архив, сверка MD5, генерация DDL.
 - `viewers` — `S3ListKeys`, `S3FileRead`, `S3BucketViewer`: листинг ключей/бакетов, чтение строк.
 - `cluster` — `ClickHouseClusterOperator`: DDL на ноды кластера (за флагом `run_known_broken`).
 
+**Типы колонок** (`COLUMNS`, единый источник для PG и CH): integer, bigint, double, numeric,
+boolean, date, timestamp, timestamptz/`DateTime64(3, 'UTC')`, uuid, jsonb, `text[]`/`integer[]`,
+`Array(Nullable(String))` с NULL внутри, `LowCardinality(String)`. Строка 3 — NULL во всех
+nullable-колонках.
+
+**Не покрыт**: `ClickhouseToIdpOperator` — нужна IDP, на стенде её нет.
+
 **Инфраструктура**
-- Postgres: таблицы в `airflowdb` (схема `public`); на таблицу и каждую колонку ставится
+- Postgres: таблицы в `airflowdb.hrp_test` (параметр `pg` — `conn_id.схема`), отдельно от таблиц
+  Airflow в `main`; учётке тасков в схеме нужно право CREATE. На сигме схему заводит liquibase
+  метабазы (ядро 1.2.7), на альфе и стенде — администратор БД руками; на таблицу и каждую колонку ставится
   `COMMENT` (требование Quality Gate).
-- ClickHouse: таблицы в схеме `technical`, имена по имени теста.
-- S3: connection `s3-archive`, бакет `test_operators`, префикс `hrp_tests/`.
+- ClickHouse: таблицы в `dlab-click.technical` (параметр `ch` — `conn_id.база`), имена по имени теста.
+- S3: параметр `s3` — `conn_id://бакет/папка`, по умолчанию папка `test-operators` в бакете логов
+  (подключение и бакет из `[logging]`, `log_bucket_path()`; на альфе
+  `s3-archive://dataplatform-monitoring/test-operators`). Папка обязательна: setup и cleanup
+  очищают её целиком.
 
 **Методология**
 1. **Setup** — DROP/CREATE источников и таргетов (PG + CH) с данными (NULL, спецсимволы, массивы);
@@ -123,7 +151,9 @@ Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp
    недоступности системы: ошибка соединения гасит флаг (проверки уходят в ☮️, а не ❌ каскадом).
 2. **Execution** — операторы под тестом во всех поддерживаемых сжатиях.
 3. **Validation** — сверка row count и (где формат детерминирован) содержимого.
-4. **Summary** — строка на таск `✅/❌/☮️` в заметке рана, упавшие первыми (как в `test_connections`).
+4. **Summary и вердикт** — в заметке рана упавшие построчно с названием из `doc_md` таска
+   («Название: описание», в сводку идёт часть до двоеточия), пропущенные и успешные — по
+   строке списком task_id; `report` падает, если регресс провален (см. «Вердикт для DPM»).
 5. **Cleanup** — гарантированное удаление таблиц и S3-ключей (`trigger_rule=ALL_DONE`).
 
 **Флаги выбора проверок**
@@ -131,16 +161,50 @@ Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp
   Каждая проверка гейтуется по всем задействованным ею системам (**AND**): `pg→s3` идёт только
   при `test_pg И test_s3`, `s3→ch` — при `test_s3 И test_ch`, `ch→pg` — при `test_ch И test_pg`.
   Выключение системы уводит все её проверки (в т.ч. кросс-системные) в ☮️ skipped.
-- `run_known_broken` (по умолчанию `False`) — «карантин» поверх системных флагов для проверок,
-  пока не проходящих на текущей сборке пакета / требующих кластера `datalab`: `pg_to_s3_list`,
-  `ch_native_list`, `ch_table_query_s3`, `s3_to_ch_tsv`, `pg_incarnation`, `cluster`.
+- `run_known_broken` (по умолчанию `False`) — «карантин» для дефектов пакета, исправленных в
+  ядре 1.2.7: `pg_to_s3_list` (`prepare_row`), `s3_to_ch_tsv` (зависит от него),
+  `ch_native_list` (Decimal в JSON), `pg_incarnation` (`insert_incarnation`), `ch_to_ch` (Date строкой в типизированный insert). После выкладки
+  1.2.7 на контуры карантин снимается.
+- `run_cluster` (по умолчанию `False`) — проверки, которым нужен кластер ClickHouse `datalab`:
+  `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `ch_cluster_ddl`. В сводке — строка «кластер datalab».
+- `run_ch_http` (по умолчанию `True`) — проверки операторов, которые ходят в ClickHouse по HTTP:
+  `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `s3_to_ch_*`, `pg_to_ch`, `ch_to_ch`. HTTP-клиент
+  ядра берёт из подключения только хост (порт 8123 без TLS); на альфе DEV HTTP у ClickHouse
+  закрыт — флаг выключается там сохранением формы. `ch_native_list_*` (JSON идёт по HTTP при
+  `transport=auto`) без HTTP проверяется на `transport=native`.
 - `run_cleanup` (по умолчанию `True`) — операционный флаг: `False` оставляет таблицы/S3-ключи
   для отладки упавшего прогона.
+
+**Сохранение формы**: галочка `save_params` пишет форму в Variable
+`tools_test_hrp_operators_params`, на разборе она становится значениями по умолчанию.
+Поля `pg`, `ch` и `s3` операторы получают литералами на
+разборе: часть операторов не шаблонизирует `conn_id`. Поэтому таск `params` роняет запуск,
+если эти поля формы расходятся с разбором: «сохраните и запустите ещё раз». Иначе setup
+создал бы таблицы по форме, а операторы пошли бы по старым значениям.
 
 Примечание: `max_active_runs=1` — имена таблиц фиксированы, параллельные прогоны не поддержаны.
 `ClickhouseTableToS3`/`ClickhouseQueryToS3` считают строки через `clusterAllReplicas(datalab,
 system.query_log)` — в окружении без кластера `datalab` они не работают, поэтому держатся за
-`run_known_broken`.
+`run_cluster`.
+
+**Вердикт для DPM** (гейт релиза и хотфикса):
+- запуск — `POST /api/v1/dags/test_hrp_operators/dagRuns`, флаги в `conf` (имена как у `params`);
+- итог — `state` рана: `success` — пройден, `failed` — провален. Провал — любой ❌ или система,
+  включённая флагом, но недоступная (`setup_*` пропущен по ошибке соединения или прав). ☮️ по
+  флагам — `run_known_broken`, `run_cluster`, `run_ch_http`, выключенные `test_*` — провалом не считаются;
+- детали — XCom `verdict` таска `report`:
+  `GET …/dagRuns/{run_id}/taskInstances/report/xcomEntries/verdict?stringify=false` (без
+  параметра `value` приходит строкой Python-repr, а не JSON) →
+  `{"passed", "ok", "failed": [task_id…], "skipped", "unavailable": ["PG"…], "core": "<версия ядра>"}`;
+- `report` и `cleanup` — оба листья: состояние рана Airflow выводит из листьев, и при цепочке
+  `report >> cleanup` ран с 13 ❌ оставался `success` (стенд, 05.10.2026);
+- `max_active_runs=1`: второй запуск встаёт в очередь, `dagrun_timeout` — 2 ч.
+
+**Не-DEV стенды**: таблицы предсозданы, стенд их только очищает. С v1.12 (05.10.2026) у
+источника и таргетов новые колонки, появились таблицы `hrp_s3_to_pg_0/_1` + `hrp_s3_to_pg_inc_seq`
+(без колонки `incarnation`), `technical.hrp_s3_to_ch_tr` (первая колонка `file_name String`) и
+`technical.hrp_ch_to_ch` (типы как у источника) — их DDL печатают `_pg_create_sql` /
+`_ch_create_sql` при `IS_DEV=True`, пересоздать до прогона.
 
 ### [db_cleanup.py](db_cleanup.py)
 **Очистка метадаты Airflow (`tools_db_cleanup`).**
