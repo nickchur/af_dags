@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-10-01 22:26 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-13 18:12 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Asset`, `Cron`, `AssetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -910,8 +910,9 @@ def build_worker_dag(w):
         # получает statement_timeout по параметрам загрузки. Расходятся они, только если
         # wf_timeout поменяли в CTL между разбором и запуском — разбор идёт каждые минуты.
         # Сам запрос execution_timeout не прерывает: сигнал таймаута срабатывает только когда
-        # psycopg2 вернёт управление (стенд 29.09.2026: лимит 20 с, pg_sleep(90) — таск упал
-        # на 90-й секунде, запрос дожил до конца). Обрывает запрос statement_timeout, поэтому
+        # драйвер вернёт управление (psycopg2 на стенде 29.09.2026: лимит 20 с, pg_sleep(90) —
+        # таск упал на 90-й секунде, запрос дожил до конца). psycopg 3 отпускает таск сразу, и
+        # запрос тогда отменяет gp_exe (cancel_on_abort). Штатно же обрывает запрос statement_timeout, поэтому
         # он обязан быть ниже execution_timeout — лестница timeout_ladder это держит.
         @task(pool='gp_pool', retries=1, execution_timeout=exe_timeout + EXE_MARGIN)
         def run_exe(wf, **context):

@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-09 00:36 MSK · v1.23 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-13 17:02 MSK · v1.24 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -412,9 +412,15 @@ def _on_callback(context, level=None):
 def query_to_dict(gp_hook, sql, timeout=300):
     with gp_hook.get_conn() as conn:
         with conn.cursor() as cursor:
+            # SET отдельным execute: в psycopg 3 (его берёт PostgresHook в Airflow 3) после
+            # «SET …; SELECT …» description — от первого оператора, то есть None. Не SET LOCAL:
+            # при autocommit он не действует, а сессия не переживает with — psycopg 3 закрывает
+            # соединение на выходе, пула нет
             if timeout:
-                sql = f"SET statement_timeout TO {timeout*1000}; " + sql
+                cursor.execute(f"SET statement_timeout TO {int(timeout * 1000)}")
             cursor.execute(sql)
+            if cursor.description is None:  # DDL/DML без результата
+                return []
             cols = [desc[0] for desc in cursor.description]
             rows = cursor.fetchall()
     return [dict(zip(cols, row)) for row in rows]
@@ -820,7 +826,7 @@ def safe_eval(expr):
 
 
 # Опции libpq, которые имеет смысл пропускать из DB_EXTRA_1 в extra коннекта;
-# всё остальное (ключи в стиле S3/ClickHouse и т.п.) psycopg2 отверг бы с
+# всё остальное (ключи в стиле S3/ClickHouse и т.п.) libpq отверг бы с
 # "invalid connection option".
 _LIBPQ_OPTS = {
     'connect_timeout', 'application_name', 'options', 'target_session_attrs',

@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-09-30 09:26 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-13 18:53 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -41,7 +41,10 @@ import time
 from datetime import timedelta, datetime
 from zoneinfo import ZoneInfo
 from pprint import PrettyPrinter
-from psycopg2 import OperationalError, InterfaceError, DatabaseError
+# psycopg 3: его берёт PostgresHook в Airflow 3 (провайдер postgres 7.x при SQLAlchemy 2), и
+# исключения psycopg2 его ошибок не ловят — повтор и перевод в fail не срабатывали бы
+from contextlib import contextmanager
+from psycopg import ClientCursor, OperationalError, InterfaceError, DatabaseError, pq
 
 from plugins.utils import query_to_dict, add_note, readable_size, pool_size # type: ignore #, on_callback
 from plugins import af_meta  # type: ignore
@@ -326,6 +329,27 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
     return out
 
 
+@contextmanager
+def cancel_on_abort(conn):
+    """Отменяет запрос в GP, если выполнение прервали на полпути (execution_timeout, kill таска).
+
+    psycopg 3 ждёт ответа в Python, и сигнал таймаута Airflow прерывает его сразу, а не после
+    конца запроса, как было в psycopg2. Сам драйвер шлёт cancel только на KeyboardInterrupt, а
+    закрытие соединения GP запрос не останавливает — без отмены задача падала, а загрузка в GP
+    продолжалась, и повтор мог пойти поверх неё (стенд 13.10.2026: SIGALRM посреди pg_sleep).
+    """
+    try:
+        yield
+    except BaseException:
+        if conn.info.transaction_status == pq.TransactionStatus.ACTIVE:
+            try:
+                conn.cancel_safe(timeout=10)
+                logger.warning("🛑 Запрос в GP прерван на клиенте — отправлена отмена на сервер")
+            except Exception as e:
+                logger.error(f"🛑 Отмена запроса в GP не прошла: {e}")
+        raise
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=2, min=5, max=30),
@@ -356,9 +380,11 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
         
     ts_start = time.time()
     try:
-        with gp_hook.get_conn() as conn:
+        with gp_hook.get_conn() as conn, cancel_on_abort(conn):
             conn.autocommit = autocommit
-            with conn.cursor() as cur:
+            # ClientCursor: параметры подставляются на клиенте, как в psycopg2. Серверная
+            # привязка psycopg 3 на GP6 (основа PG 9.4) меняла бы вывод типов параметров
+            with ClientCursor(conn) as cur:
                 # Установка таймаута на уровне сессии GP
                 cur.execute(f"set statement_timeout = {timeout}; set search_path to {gp_schema}")
                 if ti: 
@@ -526,6 +552,10 @@ def gp_upload_s3_csv(table, key, options=None, gp_schema=None, truncate=False, t
             gp_from_stream(gp_hook, csv_stream, table, options, gp_schema, truncate, timeout )
 
 
+#: Порция чтения потока для COPY FROM STDIN, байт
+COPY_CHUNK = 1024 * 1024
+
+
 def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, truncate=False, timeout=None):
     """Выполняет COPY gp_schema.table FROM STDIN из file-like объекта csv_stream.
 
@@ -534,9 +564,9 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
     """
     ts_start = time.time()
     try:
-        with gp_hook.get_conn() as conn:
+        with gp_hook.get_conn() as conn, cancel_on_abort(conn):
             conn.autocommit = True
-            with conn.cursor() as cur:
+            with ClientCursor(conn) as cur:
                 cur.execute(f"SET statement_timeout = {timeout};")
                 
                 if truncate:
@@ -547,8 +577,11 @@ def gp_from_stream(gp_hook, csv_stream, table, options=None, gp_schema=None, tru
                 sql_copy = f"COPY {gp_schema}.{table} FROM STDIN WITH {options}"
                 
                 add_note(f"🚀 Начинаю загрузку в {gp_schema}.{table}", level='Task')
-                cur.copy_expert(sql_copy, csv_stream)
-                
+                # copy_expert в psycopg 3 нет: пишем в COPY порциями; rowcount — после блока
+                with cur.copy(sql_copy) as copy:
+                    while chunk := csv_stream.read(COPY_CHUNK):
+                        copy.write(chunk)
+
                 rows = readable_size(cur.rowcount,1000)
                 
                 duration = time.time() - ts_start

@@ -1,5 +1,5 @@
 """### 🧹 Очистка метадаты Airflow
-*2026-10-02 07:26 MSK · v2.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-13 18:11 MSK · v2.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки удаляет из метабазы записи старше `retention_days`: порциями, ребёнок раньше
 родителя по внешним ключам. По галкам — VACUUM ANALYZE, переиндексация по одному индексу,
@@ -181,7 +181,7 @@ _KEEP_LAST_FILTER = {'dag_run': "run_type <> 'manual'"}
 
 
 def _af_connect(conn_id):
-    """Сырой коннект psycopg2 с search_path метабазы на всю сессию (af_meta.search_path)."""
+    """Сырой коннект psycopg 3 (его даёт PostgresHook в Airflow 3) с search_path метабазы на всю сессию (af_meta.search_path)."""
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     conn = PostgresHook(postgres_conn_id=conn_id).get_conn()
@@ -290,12 +290,13 @@ def db_vacuum(table, conn_id, full=False, timeout=3600):
     conn = _af_connect(conn_id)
     try:
         conn.autocommit = True
+        notices = []
+        # conn.notices в psycopg 3 нет — замечания сервера собирает обработчик
+        conn.add_notice_handler(lambda d: notices.append(f"{d.severity}: {d.message_primary}"))
         with conn.cursor() as cur:
             cur.execute(f"SET statement_timeout = '{timeout}s'")
             logger.info(f"🔧 VACUUM: {sql} (conn={conn_id})")
-            del conn.notices[:]
             cur.execute(sql)
-            notices = list(conn.notices)
     finally:
         conn.close()
 
@@ -578,7 +579,7 @@ def reindex_one_by_one(budget_sec=REINDEX_BUDGET_SEC, on_step=None):
     конце; остальные индексы той же таблицы после отказа не начинаются (в left).
     """
     import re
-    from psycopg2 import sql as psql
+    from psycopg import sql as psql
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     rows = _catalog(f"""
@@ -671,7 +672,7 @@ def drop_leftovers(names):
     в итоге, а не падение.
     """
     import re
-    from psycopg2 import errors as pg_errors, sql as psql
+    from psycopg import errors as pg_errors, sql as psql
     from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
 
     valid = {r['idx'] for r in _catalog("""

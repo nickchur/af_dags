@@ -1,5 +1,5 @@
 """### 🗄️ Метабаза Airflow без ORM (`plugins/af_meta.py`)
-*2026-09-25 14:48 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-13 18:12 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 В Airflow 3 у задачи и у разбора DAG-файла нет ORM-доступа к метабазе: `create_session`
 бросает «Direct database access via the ORM is not allowed in Airflow 3.0». Всё, что даги
@@ -74,7 +74,7 @@ def sql(query, params=None, timeout=STATEMENT_TIMEOUT_SEC, conn_id=None):
     """Выполняет SQL в метабазе одной транзакцией и возвращает строки списком словарей.
 
     Запрос без результата (UPDATE/INSERT без RETURNING) даёт пустой список. Без `params`
-    psycopg2 строку не форматирует, поэтому `%` в `LIKE '%x%'` можно писать как есть; с
+    драйвер строку не форматирует, поэтому `%` в `LIKE '%x%'` можно писать как есть; с
     `params` его надо удваивать. `conn_id` — другое подключение к той же базе (например,
     владельца таблиц из `utils.get_af_conn()` для чистки и `pg_terminate_backend`).
     """
