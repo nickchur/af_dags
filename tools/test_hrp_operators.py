@@ -1,16 +1,20 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-01 22:37 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 18:06 MSK · v1.21 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регрессионный стенд операторов `hrp_operators` на каждый релиз: выгрузки в S3, загрузки из
-S3, переливки между БД, утилиты S3, просмотрщики. Цикл setup → операторы → сверка строк и
-содержимого → сводка ✅/❌/☮️ в заметке → cleanup. Запуск вручную (`@once`), параллельные
-прогоны не поддержаны.
+S3, переливки между БД, утилиты S3, просмотрщики. Цикл params (галочка `save_params` —
+сохранить форму) → setup → операторы → сверка строк и содержимого → сводка ✅/❌/☮️ в
+заметке → cleanup. Запуск вручную (`@once`), параллельные прогоны не поддержаны.
+
+Вердикт (гейт релиза в DPM): ран `failed`, если есть ❌ или включённая флагом система
+недоступна; детали — XCom `verdict` таска `report`.
 
 Подробно: [tools/readme.md — test_hrp_operators](../../_plugin_dag_docs/?doc=tools/readme.md#test_hrp_operatorspytest_hrp_operatorspy)
 """
 
 # ruff: noqa: E402  — операторные импорты идут после sys.path-бутстрапа для локальной разработки.
 import datetime as dt
+import io
 import os
 import sys
 from decimal import Decimal
@@ -33,6 +37,7 @@ from airflow.utils.task_group import TaskGroup
 from airflow.utils.trigger_rule import TriggerRule
 from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
 
+from sber_app_dataplatform_etl_core.hrp_operators.click_to_click import HrpClickhouseToClickhouseOperator
 from sber_app_dataplatform_etl_core.hrp_operators.clickhouse_cluster_operator import HrpClickHouseClusterOperator
 
 # Операторы под тестом — импортируем из конкретных модулей (не через deprecated __getattr__).
@@ -58,7 +63,11 @@ from sber_app_dataplatform_etl_core.hrp_operators.postgres_to_s3 import (
 )
 from sber_app_dataplatform_etl_core.hrp_operators.s3_archive import HrpS3ArchiveOperator
 from sber_app_dataplatform_etl_core.hrp_operators.s3_file_hash import HrpCheckS3FileHash
-from sber_app_dataplatform_etl_core.hrp_operators.s3_to_clickhouse import HrpS3ToClickhouseTableOperator
+from sber_app_dataplatform_etl_core.hrp_operators.s3_to_clickhouse import (
+    HrpS3ToClickhouseTableOperator,
+    HrpS3ToClickhouseTransformedOperator,
+)
+from sber_app_dataplatform_etl_core.hrp_operators.s3_to_postgres import HrpS3ToPostgresOperator2
 from sber_app_dataplatform_etl_core.hrp_operators.s3_to_s3 import HrpS3ToS3Operator
 from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
     HrpS3BucketViewerOperator,
@@ -67,9 +76,15 @@ from sber_app_dataplatform_etl_core.hrp_operators.s3_viewer_operator import (
 )
 
 try:
-    from plugins.utils import TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback  # type: ignore
+    from plugins.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, env_stand, log_bucket_path, on_callback, saved_params,
+        store_params,
+    )
 except ImportError:
-    from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, env_stand, on_callback  # type: ignore
+    from CI06932748.tools.utils import (  # type: ignore
+        TOOLS_POOL, add_note, ensure_pool, env_stand, log_bucket_path, on_callback, saved_params,
+        store_params,
+    )
 
 logger = getLogger("airflow.task")
 
@@ -77,14 +92,29 @@ logger = getLogger("airflow.task")
 ensure_pool(TOOLS_POOL)
 
 # ───────────────────────────────── Настройки ──────────────────────────────────
-DEFAULT_PG_CONN = "airflowdb"
-DEFAULT_CH_CONN = "dlab-click"
-DEFAULT_S3_CONN = "s3-archive"
-DEFAULT_S3_BUCKET = "dataplatform-monitoring"
-S3_PREFIX = "hrp_tests/"
+# Форма запуска сохраняется галочкой save_params в эту переменную и на разборе становится
+# значениями по умолчанию. Битая или недоступная переменная разбор не роняет — будет пусто
+PARAMS_VAR = "tools_test_hrp_operators_params"
+SAVED = saved_params(PARAMS_VAR)
 
-PG_SCHEMA = "main"
-CH_SCHEMA = "technical"
+# Подключение и схема — одним полем «conn_id.схема», S3 — «conn_id://бакет/папка». Папка в S3
+# по умолчанию — test-operators в бакете логов (подключение и бакет из [logging]); без S3-логов —
+# альфовый s3-archive://dataplatform-monitoring. Папка обязательна: setup и cleanup чистят её целиком
+PG = SAVED.get("pg", "airflowdb.hrp_test")
+CH = SAVED.get("ch", "dlab-click.technical")
+S3 = SAVED.get("s3", log_bucket_path("test-operators") or "s3-archive://dataplatform-monitoring/test-operators")
+DEFAULT_PG_CONN, _, PG_SCHEMA = PG.rpartition(".")
+DEFAULT_CH_CONN, _, CH_SCHEMA = CH.rpartition(".")
+DEFAULT_S3_CONN, _, _rest = S3.partition("://")
+DEFAULT_S3_BUCKET, _, _folder = _rest.partition("/")
+S3_PREFIX = _folder.strip("/") + "/"
+
+# Эти значения операторы получают литералами на разборе (см. test_hrp_operators_dag), поэтому
+# форма их на лету не меняет: другое значение в запуске таск params останавливает
+PARSED = {"pg": PG, "ch": CH, "s3": S3}
+# Схема подставляется в SQL, папкой S3 чистится бакет — Param проверяет шаблоном до запуска
+DB_PATTERN = r"^\S+\.[A-Za-z_][A-Za-z0-9_]*$"
+S3_PATTERN = r"^[^\s:/]+://[a-z0-9][a-z0-9.-]+/[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)*/?$"
 
 # Стенд — env_stand(): ENV_STAND, при её отсутствии ENVIRONMENT, как во всём tools/ (до
 # 29.09.2026 читалась одна ENVIRONMENT). Только на DEV стенд владеет схемой и управляет DDL
@@ -102,6 +132,9 @@ T_S3_TO_CH = "hrp_s3_to_ch"      # landing PG→S3→CH (CSV, all-String)
 T_S3_TO_CH_LIST = "hrp_s3_to_ch_list"  # landing PG→S3List→CH (TSV, all-String)
 T_PG_INC = "hrp_pg_inc"          # таргет PostgresIncarnationInsert (_0/_1 + seq)
 T_CH_TO_PG_INC = "hrp_ch_to_pg_inc"    # таргет ClickhouseToPostgresIncarnation (_0/_1 + seq)
+T_S3_TO_PG = "hrp_s3_to_pg"      # таргет S3ToPostgres2 (_0/_1 + seq, без колонки incarnation)
+T_S3_TO_CH_TR = "hrp_s3_to_ch_tr"  # landing S3ToClickhouseTransformed (file_name + all-String)
+T_CH_TO_CH = "hrp_ch_to_ch"      # таргет ClickhouseToClickhouse (типы как у источника)
 PROBE = "hrp_setup_probe"        # временный объект setup-пробы прав (create/write/drop)
 
 # Сжатия и их расширения / метки для task_id
@@ -113,6 +146,11 @@ _COMP_EXT = {"gzip": ".gz", "zip": ".zip", "tar.gz": ".tar.gz", None: ""}
 
 def clabel(c):
     return _CLABEL[c]
+
+
+def cname(c):
+    """Сжатие для названия таска: «gzip», «без сжатия»."""
+    return c or "без сжатия"
 
 
 def s3key(name, c, ext=".csv"):
@@ -178,6 +216,11 @@ COLUMNS = [
     ("arr_text",    "text[]",           "Array(String)",            "String", "Массив строк"),
     ("val_date",    "date",             "Nullable(Date)",           "String", "Календарная дата, nullable"),
     ("val_ts",      "timestamp",        "Nullable(DateTime)",       "String", "Отметка времени, nullable"),
+    ("val_tstz",    "timestamptz",      "Nullable(DateTime64(3, 'UTC'))", "String", "Отметка времени с поясом и миллисекундами, nullable"),
+    ("val_uuid",    "uuid",             "Nullable(UUID)",           "String", "UUID, nullable"),
+    ("val_json",    "jsonb",            "Nullable(String)",         "String", "JSON-документ, nullable"),
+    ("arr_null",    "text[]",           "Array(Nullable(String))",  "String", "Массив строк с NULL внутри"),
+    ("val_lc",      "text",             "LowCardinality(String)",   "String", "Строка-справочник (LowCardinality в CH)"),
 ]
 COL_NAMES = [c[0] for c in COLUMNS]
 
@@ -186,12 +229,20 @@ _SPECIAL = 'Спец: "кавычки", запятая, ; точка-с-запя
 # Три строки: обычная, со спецсимволами/массивами, полностью NULL (кроме id).
 ROWS = [
     (1, "Normal row", "ascii-only text", 123, 1234567890123, 1.23, Decimal("1.2300"),
-     True, [1, 2, 3], ["a", "b", "c"], dt.date(2023, 1, 1), dt.datetime(2023, 1, 1, 12, 0, 0)),
+     True, [1, 2, 3], ["a", "b", "c"], dt.date(2023, 1, 1), dt.datetime(2023, 1, 1, 12, 0, 0),
+     dt.datetime(2023, 1, 1, 12, 0, 0, 123000, tzinfo=dt.timezone.utc), "0b0f5bb4-5a3e-4c1e-9d6b-1f2a3b4c5d6e",
+     '{"k": [1, 2], "s": "a"}', ["x", None], "alpha"),
     (2, "Special row", _SPECIAL, 456, None, 4.56, Decimal("4.5600"),
-     False, [4, 5, 6], ["спец", "b,c", "d-e"], dt.date(2023, 1, 2), dt.datetime(2023, 1, 2, 13, 30, 0)),
+     False, [4, 5, 6], ["спец", "b,c", "x;y"], dt.date(2023, 1, 2), dt.datetime(2023, 1, 2, 13, 30, 0),
+     dt.datetime(2023, 1, 2, 13, 30, 0, 456000, tzinfo=dt.timezone.utc), "c3d4e5f6-0000-4000-8000-000000000002",
+     '{"q": "спец; \\"кавычки\\""}', [None, "b,c"], "beta"),
+    # LowCardinality(String) в CH не nullable — пустая строка, а не NULL
     (3, "Nulls row", "", None, None, None, None,
-     None, [], [], None, None),
+     None, [], [], None, None, None, None, None, [], ""),
 ]
+# Строка 2 после xstream_sanitize (XSTREAM_CLEAN ядра): вырезаны «;», таб, перенос и обратный слеш.
+# Литерал, а не вызов регулярки ядра: проверка не должна доверять проверяемому коду
+SANITIZED_SPECIAL = 'Спец: "кавычки", запятая,  точка-с-запятой,таб,перенос,  бэкслеш, №42'
 EXPECTED_ROWS = len(ROWS)
 
 
@@ -206,7 +257,9 @@ def _ch_lit(v) -> str:
     if isinstance(v, float):
         return repr(v)
     if isinstance(v, dt.datetime):
-        return "'" + v.strftime("%Y-%m-%d %H:%M:%S") + "'"
+        # с поясом — DateTime64(3): миллисекунды; без — DateTime: до секунд
+        fmt = "%Y-%m-%d %H:%M:%S.%f" if v.tzinfo else "%Y-%m-%d %H:%M:%S"
+        return "'" + v.strftime(fmt)[:23] + "'"
     if isinstance(v, dt.date):
         return "'" + v.strftime("%Y-%m-%d") + "'"
     if isinstance(v, (list, tuple)):
@@ -216,10 +269,11 @@ def _ch_lit(v) -> str:
     return "'" + s + "'"
 
 
-def _pg_create_sql(table: str, incarnation: bool = False) -> str:
+def _pg_create_sql(table: str, incarnation: bool = False, inc_col: bool = True) -> str:
     """CREATE TABLE + COMMENT (таблица и каждая колонка) для Quality Gate.
 
-    incarnation=True добавляет ведущую колонку incarnation и создаёт _0/_1 + последовательность.
+    incarnation=True создаёт _0/_1 + последовательность; inc_col — с ведущей колонкой
+    incarnation (её пишут Incarnation-операторы; S3ToPostgres2 копирует файл как есть — без неё).
     """
     full = f"{PG_SCHEMA}.{table}"
     if not IS_DEV:
@@ -229,7 +283,7 @@ def _pg_create_sql(table: str, incarnation: bool = False) -> str:
         return f"TRUNCATE TABLE {full};"
     cols = []
     comments = []
-    if incarnation:
+    if incarnation and inc_col:
         cols.append("incarnation integer")
         comments.append("COMMENT ON COLUMN {tbl}.incarnation IS 'Номер инкарнации (0/1)';")
     for name, pg_type, *_rest, comment in COLUMNS:
@@ -258,14 +312,17 @@ def _pg_create_sql(table: str, incarnation: bool = False) -> str:
     return "\n".join(stmts)
 
 
-def _ch_create_sql(table: str, typed: bool) -> str:
-    """CREATE TABLE для ClickHouse. typed=True — реальные типы (Array/Nullable), иначе all-String."""
+def _ch_create_sql(table: str, typed: bool, lead: str = "") -> str:
+    """CREATE TABLE для ClickHouse. typed=True — реальные типы (Array/Nullable), иначе all-String.
+
+    lead — колонки перед колонками источника (S3ToClickhouseTransformed вставляет file_name первой).
+    """
     full = f"{CH_SCHEMA}.{table}"
     if not IS_DEV:
         # Не-DEV: таблица предсоздана — только очищаем.
         return f"TRUNCATE TABLE {full};"
     idx = 1 if typed else 2  # позиция типа в COLUMNS
-    cols = ",\n    ".join(f"{c[0]} {c[idx + 1]}" for c in COLUMNS)
+    cols = ",\n    ".join([lead] * bool(lead) + [f"{c[0]} {c[idx + 1]}" for c in COLUMNS])
     order = "id" if typed else "tuple()"
     return (f"DROP TABLE IF EXISTS {full};\n"
             f"CREATE TABLE {full} (\n    {cols}\n) ENGINE = MergeTree() ORDER BY {order};")
@@ -304,29 +361,42 @@ def _ch_insert_sql(table: str) -> str:
         "on_skipped_callback": on_callback,
     },
     params={
-        "pg_conn_id": Param(DEFAULT_PG_CONN, type="string", description="Postgres для тестовых таблиц (схема public)"),
-        "ch_conn_id": Param(DEFAULT_CH_CONN, type="string", description="ClickHouse для тестовых таблиц (схема technical)"),
-        "s3_conn_id": Param(DEFAULT_S3_CONN, type="string", description="S3-подключение для тестовых файлов"),
-        "s3_bucket": Param(DEFAULT_S3_BUCKET, type="string", description="Бакет для тестовых файлов (префикс hrp_tests/)"),
+        "pg": Param(PG, type="string", pattern=DB_PATTERN, description="Postgres для тестовых таблиц: conn_id.схема"),
+        "ch": Param(CH, type="string", pattern=DB_PATTERN, description="ClickHouse для тестовых таблиц: conn_id.база"),
+        "s3": Param(S3, type="string", pattern=S3_PATTERN,
+                    description="Тестовые файлы: conn_id://бакет/папка; папка очищается целиком. "
+                                "По умолчанию — test-operators в бакете логов"),
+        "save_params": Param(False, type="boolean",
+                             description=f"Сохранить форму в Variable {PARAMS_VAR} как значения по умолчанию. "
+                                         "Подключения, папку S3 и схемы операторы получают на разборе дага: "
+                                         "после их смены запустите даг ещё раз"),
         # Флаги систем: каждая проверка гейтуется по системам, которые она задействует (AND).
         # Кросс-системные проверки идут только при включённых ОБЕИХ системах: pg→s3 требует
         # test_pg И test_s3, s3→ch — test_s3 И test_ch, ch→pg — test_ch И test_pg и т.д.
         # Выключение системы уводит все её проверки (в т.ч. кросс) в ☮️ skipped.
-        "test_pg": Param(default=True, type="boolean", description="Проверки с Postgres; кросс-системные идут, только если включены обе системы"),
-        "test_ch": Param(default=True, type="boolean", description="Проверки с ClickHouse"),
-        "test_s3": Param(default=True, type="boolean", description="Проверки с S3"),
-        # Отдельный «карантин» поверх системных флагов: проверки, пока не проходящие на текущей
-        # сборке пакета / требующие кластера datalab. По умолчанию False (☮️ skipped):
-        #   pg_to_s3_list     — баг prepare_row в HrpPostgresToS3ListOperator (до пересборки пакета);
-        #   s3_to_ch_tsv      — зависит от pg_to_s3_list;
-        #   ch_native_list    — JSON-путь NativeClickhouseStream не сериализует Decimal (до пересборки);
-        #   pg_incarnation    — баг insert_incarnation (sql.Literal вместо sql.SQL) (до пересборки);
-        #   ch_table_query_s3 — требует clusterAllReplicas(datalab, system.query_log);
-        #   cluster           — требует system.clusters('datalab').
-        "run_known_broken": Param(default=False, type="boolean", description="Карантин: проверки, не проходящие на текущей сборке или требующие кластера datalab"),
+        "test_pg": Param(default=SAVED.get("test_pg", True), type="boolean", description="Проверки с Postgres; кросс-системные идут, только если включены обе системы"),
+        "test_ch": Param(default=SAVED.get("test_ch", True), type="boolean", description="Проверки с ClickHouse"),
+        "test_s3": Param(default=SAVED.get("test_s3", True), type="boolean", description="Проверки с S3"),
+        # «Карантин» поверх системных флагов — только дефекты пакета, исправленные в ядре 1.2.7.
+        # По умолчанию False (☮️ skipped); после выкладки 1.2.7 на контуры флаг снимается:
+        #   pg_to_s3_list  — prepare_row без флагов: next(list) → TypeError;
+        #   s3_to_ch_tsv   — зависит от pg_to_s3_list;
+        #   ch_native_list — JSON-путь NativeClickhouseStream не сериализует Decimal;
+        #   pg_incarnation — insert_incarnation: sql.Literal вместо sql.SQL;
+        #   ch_to_ch       — типизированный insert строк JSON: на Date TypeError (str - date).
+        # Санитизацию (pg_to_s3_list_sanitize, ch_native_to_s3_sanitize) сюда не прячем: флаг
+        # xstream_sanitize до 1.2.7 не чистил ничего, а выгрузки ЕР на него полагаются.
+        "run_known_broken": Param(default=SAVED.get("run_known_broken", False), type="boolean", description="Карантин: проверки дефектов пакета, исправленных в ядре 1.2.7"),
+        # Не дефект, а окружение: Table/Query→S3 считают строки через clusterAllReplicas(datalab,
+        # system.query_log), ClusterOperator — узлы из system.clusters (datalab), на каждый ходит подключением click-dlab-<узел>.
+        # Окружение: HTTP-клиент ядра (ClickHouseMixin._get_client, clickhouse_to_s3) берёт из
+        # подключения только хост — порт 8123 без TLS. На альфе DEV HTTP у ClickHouse закрыт:
+        # Connection reset by peer на первом запросе (06.10.2026), чинить в ядре нечего.
+        "run_ch_http": Param(default=SAVED.get("run_ch_http", True), type="boolean", description="Проверки операторов, которые ходят в ClickHouse по HTTP: ch_table/ch_query → S3, s3 → ch, pg_to_ch, ch_to_ch. Выкл. — окружение без HTTP у ClickHouse (альфа)"),
+        "run_cluster": Param(default=SAVED.get("run_cluster", False), type="boolean", description="Проверки, которым нужен кластер ClickHouse datalab: ch_table/ch_query → S3 и ch_cluster_ddl"),
         # На время отладки: False оставляет все PG/CH таблицы и S3-ключи, чтобы можно было
         # переразобрать/перезапустить отдельный упавший таск (иначе cleanup сносит всё).
-        "run_cleanup": Param(default=True, type="boolean", description="Удалить тестовые таблицы и ключи S3 после прогона; выкл. — оставить для отладки"),
+        "run_cleanup": Param(default=SAVED.get("run_cleanup", True), type="boolean", description="Удалить тестовые таблицы и ключи S3 после прогона; выкл. — оставить для отладки"),
     },
     doc_md=__doc__,
     description='Регрессионный стенд операторов hrp_operators: pg, ch, s3',
@@ -343,17 +413,38 @@ def test_hrp_operators_dag():
     S3_CONN = DEFAULT_S3_CONN  # noqa: N806
     BUCKET = DEFAULT_S3_BUCKET  # noqa: N806
 
+    # ─────────────────────────────── params ───────────────────────────────────
+    @task(task_id="params", retries=0)
+    def save_params(**context):
+        """Сохранение параметров: галочка save_params пишет форму в Variable, сверяет её с разбором."""
+        status, msg = store_params(PARAMS_VAR, SAVED, context)
+        if status == "fail":
+            raise AirflowFailException(msg)
+        if status == "ok":
+            add_note(msg, context, level="task")
+        # Иначе setup создал бы таблицы по форме, а операторы пошли бы по значениям разбора
+        diff = [f"{k}={context['params'][k]!r} (в даге {v!r})" for k, v in PARSED.items()
+                if context["params"][k] != v]
+        if diff:
+            raise AirflowFailException(
+                "форма расходится с разбором дага: " + ", ".join(diff) + ". "
+                + ("Сохранено — запустите ещё раз после разбора" if status == "ok"
+                   else "Запустите с save_params, затем ещё раз"))
+        if status == "skip":
+            raise AirflowSkipException(msg)
+
     # ─────────────────────────────── setup ────────────────────────────────────
-    @task
+    # NONE_FAILED: params штатно пропускает себя, а пропуск не должен гасить setup
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
     def setup_pg(params=None, **context):
-        """Создаёт PG-источник и все PG-таргеты (с комментами) + наполняет источник."""
+        """Подготовка PG: создаёт источник и таргеты с комментариями, наполняет источник."""
         # Скипается при test_pg=False, либо если PG недоступен / нет прав на create/write (проба
         # гасит test_pg, причина пишется в заметку таска через add_note; проверки уходят в ☮️
         # вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
         # реальный fail (сигнал регрессии не маскируется).
         if not params.get("test_pg"):
             raise AirflowSkipException("test_pg=False — PG-проверки отключены, setup_pg пропущен")
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         # Проба прав: create/insert/drop временного объекта. SELECT 1 недостаточно — коннект
         # может пройти, но не быть прав на создание/запись; тогда это «недоступность», а не fail.
         probe = f"{PG_SCHEMA}.{PROBE}"
@@ -371,13 +462,14 @@ def test_hrp_operators_dag():
         except Exception as e:
             reason = "PG недоступен / нет прав на create/write" if IS_DEV else "PG недоступен"
             _skip_or_retry("PG", f"{reason} "
-                           f"({params['pg_conn_id']!r}): {e} — PG-проверки пропущены", e, context)
+                           f"({DEFAULT_PG_CONN!r}): {e} — PG-проверки пропущены", e, context)
         ddl = "\n".join([
             _pg_create_sql(SRC),
             _pg_create_sql(T_PG_TO_PG),
             _pg_create_sql(T_CH_TO_PG),
             _pg_create_sql(T_PG_INC, incarnation=True),
             _pg_create_sql(T_CH_TO_PG_INC, incarnation=True),
+            _pg_create_sql(T_S3_TO_PG, incarnation=True, inc_col=False),
         ])
         pg.run(ddl)
 
@@ -393,16 +485,16 @@ def test_hrp_operators_dag():
             conn.close()
         logger.info("Postgres setup complete: %d rows in %s.%s", EXPECTED_ROWS, PG_SCHEMA, SRC)
 
-    @task
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
     def setup_ch(params=None, **context):
-        """Создаёт CH-источник (typed) и landing-таблицы (all-String) + наполняет источник."""
+        """Подготовка CH: создаёт типизированный источник и строковые таблицы-приёмники, наполняет источник."""
         # Скипается при test_ch=False, либо если CH недоступен / нет прав на create/write (проба
         # гасит test_ch, причина пишется в заметку таска через add_note; проверки уходят в ☮️
         # вместо каскада падений). Ошибка настоящего DDL/insert стенда ПОСЛЕ успешной пробы —
         # реальный fail (сигнал регрессии не маскируется).
         if not params.get("test_ch"):
             raise AirflowSkipException("test_ch=False — CH-проверки отключены, setup_ch пропущен")
-        ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
+        ch = ClickHouseHook(clickhouse_conn_id=DEFAULT_CH_CONN)
         # Проба прав: create/insert/drop временной таблицы. SELECT 1 недостаточно — коннект
         # может пройти, но не быть прав на создание/запись; тогда это «недоступность», а не fail.
         probe = f"{CH_SCHEMA}.{PROBE}"
@@ -418,20 +510,19 @@ def test_hrp_operators_dag():
         except Exception as e:
             reason = "CH недоступен / нет прав на create/write" if IS_DEV else "CH недоступен"
             _skip_or_retry("CH", f"{reason} "
-                           f"({params['ch_conn_id']!r}): {e} — CH-проверки пропущены", e, context)
-        for stmt in _ch_create_sql(SRC, typed=True).split(";"):
+                           f"({DEFAULT_CH_CONN!r}): {e} — CH-проверки пропущены", e, context)
+        ddl = [_ch_create_sql(t, typed=True) for t in (SRC, T_CH_TO_CH)]
+        ddl += [_ch_create_sql(t, typed=False) for t in (T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST)]
+        ddl.append(_ch_create_sql(T_S3_TO_CH_TR, typed=False, lead="file_name String"))
+        for stmt in ";".join(ddl).split(";"):
             if stmt.strip():
                 ch.execute(stmt)
-        for table in (T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST):
-            for stmt in _ch_create_sql(table, typed=False).split(";"):
-                if stmt.strip():
-                    ch.execute(stmt)
         ch.execute(_ch_insert_sql(SRC))
         logger.info("ClickHouse setup complete: %d rows in %s.%s", EXPECTED_ROWS, CH_SCHEMA, SRC)
 
-    @task
+    @task(trigger_rule=TriggerRule.NONE_FAILED)
     def setup_s3(params=None, **context):
-        """Проверяет S3-соединение и существование бакета + чистит префикс от прошлых прогонов."""
+        """Подготовка S3: проверяет бакет и права на запись, чистит префикс прошлых прогонов."""
         # Аналог DROP→CREATE у setup_pg/setup_ch: делает S3 идемпотентным, чтобы стейл-ключи
         # (например после прогона с run_cleanup=False) не искажали s3_list_keys/bucket_viewer.
         # Скипается при test_s3=False, либо если S3 недоступен / нет бакета / нет прав на запись
@@ -440,8 +531,8 @@ def test_hrp_operators_dag():
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("test_s3"):
             raise AirflowSkipException("test_s3=False — S3-проверки отключены, setup_s3 пропущен")
-        bucket = params["s3_bucket"]
-        s3 = S3Hook(aws_conn_id=params["s3_conn_id"])
+        bucket = DEFAULT_S3_BUCKET
+        s3 = S3Hook(aws_conn_id=DEFAULT_S3_CONN)
         # Проба прав: существование бакета + put/delete временного ключа. check_for_bucket
         # проверяет только доступ на чтение — записи прав может не быть; тогда это «недоступность».
         probe_key = f"{S3_PREFIX}{PROBE}"
@@ -452,10 +543,10 @@ def test_hrp_operators_dag():
                 s3.delete_objects(bucket=bucket, keys=[probe_key])
         except Exception as e:
             _skip_or_retry("S3", f"S3 недоступен / нет прав на запись "
-                           f"({params['s3_conn_id']!r}): {e} — S3-проверки пропущены", e, context)
+                           f"({DEFAULT_S3_CONN!r}): {e} — S3-проверки пропущены", e, context)
         if not available:
             _skip_setup("S3", f"S3 бакет {bucket!r} недоступен "
-                        f"(conn={params['s3_conn_id']!r}) — S3-проверки пропущены", context)
+                        f"(conn={DEFAULT_S3_CONN!r}) — S3-проверки пропущены", context)
         removed = _s3_purge_prefix(s3, bucket)
         purged = "листинг недоступен" if removed < 0 else f"удалено {removed} стейл-ключей"
         logger.info("S3 setup complete: бакет %s доступен, %s под %s", bucket, purged, S3_PREFIX)
@@ -464,7 +555,7 @@ def test_hrp_operators_dag():
     @task
     def validate_ch_count(table: str, expected: int = EXPECTED_ROWS, params=None):
         """Сверяет число строк в таблице ClickHouse с ожидаемым."""
-        ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
+        ch = ClickHouseHook(clickhouse_conn_id=DEFAULT_CH_CONN)
         cnt = ch.execute(f"SELECT count() FROM {CH_SCHEMA}.{table}")[0][0]
         if cnt != expected:
             raise AirflowFailException(f"{CH_SCHEMA}.{table}: ожидалось {expected} строк, получено {cnt}")
@@ -472,8 +563,8 @@ def test_hrp_operators_dag():
 
     @task
     def validate_pg_to_pg(params=None):
-        """Полная сверка содержимого: симметричный EXCEPT должен быть пуст."""
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        """Сверка PG → PG: содержимое таргета совпадает с источником построчно (EXCEPT в обе стороны)."""
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         src, tgt = f"{PG_SCHEMA}.{SRC}", f"{PG_SCHEMA}.{T_PG_TO_PG}"
         a = pg.get_first(f"SELECT count(*) FROM (SELECT * FROM {src} EXCEPT SELECT * FROM {tgt}) d")[0]
         b = pg.get_first(f"SELECT count(*) FROM (SELECT * FROM {tgt} EXCEPT SELECT * FROM {src}) d")[0]
@@ -483,8 +574,8 @@ def test_hrp_operators_dag():
 
     @task
     def validate_ch_to_pg(params=None):
-        """Сверка count и инварианта sum(id) для ClickhouseToPostgres."""
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        """Сверка CH → PG: число строк и сумма id в таргете."""
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         cnt, sid = pg.get_first(f"SELECT count(*), coalesce(sum(id),0) FROM {PG_SCHEMA}.{T_CH_TO_PG}")
         if cnt != EXPECTED_ROWS or sid != 6:
             raise AirflowFailException(f"ch_to_pg: count={cnt} (ждём {EXPECTED_ROWS}), sum(id)={sid} (ждём 6)")
@@ -496,7 +587,7 @@ def test_hrp_operators_dag():
         from contextlib import closing
 
         from sber_app_dataplatform_etl_core.hrp_operators.utils.pg_utils import current_incarnation
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         with closing(pg.get_conn()) as conn:
             active = current_incarnation(conn, PG_SCHEMA, table)
         cnt = pg.get_first(f"SELECT count(*) FROM {PG_SCHEMA}.{table}_{active}")[0]
@@ -504,14 +595,40 @@ def test_hrp_operators_dag():
             raise AirflowFailException(f"{table}: активная инкарнация {active} содержит {cnt} строк")
         logger.info("OK: %s активная инкарнация %s = %d строк", table, active, cnt)
 
+    @task
+    def validate_sanitized(key: str, params=None):
+        """Сверяет выгрузку с xstream_sanitize: строка 2 очищена, массивы тоже, строк столько же."""
+        import csv
+        import gzip
+
+        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+        raw = S3Hook(aws_conn_id=DEFAULT_S3_CONN).get_key(key, DEFAULT_S3_BUCKET).get()["Body"].read()
+        # Формат выгрузок по умолчанию: TSV, QUOTE_NONE, экранирование обратным слешем, заголовок
+        rows = list(csv.reader(io.StringIO(gzip.decompress(raw).decode()), delimiter="\t",
+                               quoting=csv.QUOTE_NONE, escapechar="\\"))
+        header, data = rows[0], rows[1:]
+        if len(data) != EXPECTED_ROWS:
+            raise AirflowFailException(f"{key}: {len(data)} строк, ждём {EXPECTED_ROWS}")
+        row = dict(zip(header, next(r for r in data if r[0] == "2")))
+        errors = []
+        if row["s_special"] != SANITIZED_SPECIAL:
+            errors.append(f"s_special={row['s_special']!r}, ждём {SANITIZED_SPECIAL!r}")
+        if "x;y" in row["arr_text"] or "xy" not in row["arr_text"]:
+            errors.append(f"arr_text не очищен (sanitize_array): {row['arr_text']!r}")
+        if errors:
+            raise AirflowFailException(f"{key}: " + "; ".join(errors))
+        logger.info("OK: %s очищен, %d строк", key, len(data))
+
     # TaskGroup'ы используем с prefix_group_id=False: task_id остаются прежними (их
     # используют XCom-pull'ы, ветки-гейты и report), меняется лишь группировка в UI.
 
     # ─────────────────────────────── setup ────────────────────────────────────
     with TaskGroup(group_id="setup", prefix_group_id=False):
+        save_params_t = save_params()
         setup_pg_t = setup_pg()
         setup_ch_t = setup_ch()
         setup_s3_t = setup_s3()
+        save_params_t >> [setup_pg_t, setup_ch_t, setup_s3_t]
 
     exports = []
 
@@ -530,7 +647,7 @@ def test_hrp_operators_dag():
 
         @task.branch(task_id=gate_id)  # gate_id всегда с префиксом "gate_" (report их исключает)
         def _gate(params=None):
-            """Пропускает группу проверок, если её флаг в параметрах выключен."""
+            """Гейт группы: пропускает проверки, если флаг их системы выключен."""
             return ids if cond(params) else []
 
         g = _gate()
@@ -551,6 +668,7 @@ def test_hrp_operators_dag():
         for c in COMPRESSIONS_PG_BASE:
             op = HrpPostgresToS3Operator(
                 task_id=f"pg_to_s3_{clabel(c)}",
+                doc_md=f"PG → S3, {cname(c)}: выгрузка таблицы в один файл, оператор сверяет хэш",
                 table_name=SRC, schema=PG_SCHEMA,
                 s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", c),
                 postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
@@ -563,19 +681,49 @@ def test_hrp_operators_dag():
         for c in COMPRESSIONS_FULL:
             op = HrpPostgresToS3ListOperator(
                 task_id=f"pg_to_s3_list_{clabel(c)}",
+                doc_md=f"PG → S3 частями, {cname(c)}: выгрузка таблицы с заголовком, оператор сверяет хэш",
                 table_name=SRC, schema=PG_SCHEMA,
                 s3_bucket=BUCKET, s3_key=s3key("pg_to_s3_list", c),
                 postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
-                compression=c, replace=True, post_file_check=True,
-                header=True, xstream_sanitize=True, sanitize_array=True,
+                compression=c, replace=True, post_file_check=True, header=True,
             )
             [setup_pg_t, setup_s3_t] >> op
             exports.append(op)
             pg_to_s3_list_ops.append(op)
 
+        # xstream_sanitize: тот же источник, но строка 2 и её массив обязаны выйти очищенными
+        pg_to_s3_sanitize = HrpPostgresToS3ListOperator(
+            task_id="pg_to_s3_list_sanitize",
+            doc_md="PG → S3 с очисткой: xstream_sanitize и sanitize_array чистят спецсимволы",
+            table_name=SRC, schema=PG_SCHEMA,
+            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3_sanitize", "gzip"),
+            postgres_conn_id=PG_CONN, aws_conn_id=S3_CONN,
+            compression="gzip", replace=True, post_file_check=True, header=True,
+            xstream_sanitize=True, sanitize_array=True,
+        )
+        v_pg_sanitize = validate_sanitized.override(task_id="v_pg_to_s3_sanitize", doc_md="Сверка очистки PG → S3: спецсимволы строки 2 и массив очищены")(
+            "{{ ti.xcom_pull(task_ids='pg_to_s3_list_sanitize', key='s3_key_list')[0] }}")
+        [setup_pg_t, setup_s3_t] >> pg_to_s3_sanitize >> v_pg_sanitize
+        exports.append(pg_to_s3_sanitize)
+
+        ch_native_sanitize = HrpClickNativeToS3Operator(
+            task_id="ch_native_to_s3_sanitize",
+            doc_md="CH → S3 с очисткой: xstream_sanitize и sanitize_array чистят спецсимволы",
+            sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
+            s3_bucket=BUCKET, s3_key=s3key("ch_native_sanitize", "gzip"),
+            clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+            compression="gzip", replace=True, post_file_check=True, fmt="CSV",
+            xstream_sanitize=True, sanitize_array=True,
+        )
+        v_ch_sanitize = validate_sanitized.override(task_id="v_ch_native_sanitize", doc_md="Сверка очистки CH → S3: спецсимволы строки 2 и массив очищены")(
+            s3key("ch_native_sanitize", "gzip"))
+        [setup_ch_t, setup_s3_t] >> ch_native_sanitize >> v_ch_sanitize
+        exports.append(ch_native_sanitize)
+
         for c in COMPRESSIONS_FULL:
             op = HrpClickNativeToS3Operator(
                 task_id=f"ch_native_to_s3_{clabel(c)}",
+                doc_md=f"CH → S3, {cname(c)}: выгрузка запроса в CSV, оператор сверяет хэш",
                 sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
                 s3_bucket=BUCKET, s3_key=s3key("ch_native", c),
                 clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
@@ -588,10 +736,13 @@ def test_hrp_operators_dag():
         for c in COMPRESSIONS_FULL:
             op = HrpClickNativeToS3ListOperator(
                 task_id=f"ch_native_list_{clabel(c)}",
+                doc_md=f"CH → S3 частями, {cname(c)}: выгрузка запроса в JSON, оператор сверяет хэш",
                 sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
                 s3_bucket=BUCKET, s3_key=s3key("ch_native_list", c, ext=".json"),
                 clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
                 compression=c, replace=True, post_file_check=True, fmt="JSON",
+                # JSON при auto идёт по HTTP; без HTTP у ClickHouse проверяем нативный путь
+                transport="{{ 'auto' if params.run_ch_http else 'native' }}",
             )
             [setup_ch_t, setup_s3_t] >> op
             exports.append(op)
@@ -601,6 +752,7 @@ def test_hrp_operators_dag():
         for c in COMPRESSIONS_FULL:
             op = HrpClickhouseTableToS3Operator(
                 task_id=f"ch_table_to_s3_{clabel(c)}",
+                doc_md=f"Таблица CH → S3, {cname(c)}: строки считаются по журналу запросов кластера datalab",
                 table_name=SRC, schema=CH_SCHEMA,
                 s3_bucket=BUCKET, s3_key=s3key("ch_table", c),
                 clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
@@ -612,6 +764,7 @@ def test_hrp_operators_dag():
 
         ch_query_to_s3 = HrpClickhouseQueryToS3Operator(
             task_id="ch_query_to_s3_gzip",
+            doc_md="Запрос CH → S3, gzip: строки считаются по журналу запросов кластера datalab",
             sql=f"SELECT id, name FROM {CH_SCHEMA}.{SRC} WHERE id > 1",
             s3_bucket=BUCKET, s3_key=s3key("ch_query", "gzip"),
             clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
@@ -625,7 +778,10 @@ def test_hrp_operators_dag():
         make_gate(gate_cond("run_known_broken", "test_pg", "test_s3"), pg_to_s3_list_ops, "gate_pg_to_s3_list")
         make_gate(gate_cond("test_ch", "test_s3"), ch_native_ops, "gate_ch_native")
         make_gate(gate_cond("run_known_broken", "test_ch", "test_s3"), ch_native_list_ops, "gate_ch_native_list")
-        make_gate(gate_cond("run_known_broken", "test_ch", "test_s3"), ch_table_query_ops, "gate_ch_table_query")
+        make_gate(gate_cond("run_cluster", "run_ch_http", "test_ch", "test_s3"), ch_table_query_ops,
+                  "gate_ch_table_query")
+        make_gate(gate_cond("test_pg", "test_s3"), [pg_to_s3_sanitize], "gate_pg_to_s3_sanitize")
+        make_gate(gate_cond("test_ch", "test_s3"), [ch_native_sanitize], "gate_ch_native_sanitize")
 
     # ───────────────────────── s3_to_db (end-to-end) ──────────────────────────
     # Перезаливаем gzip-выгрузки обратно в CH и сверяем row count.
@@ -635,6 +791,7 @@ def test_hrp_operators_dag():
     with TaskGroup(group_id="s3_to_db", prefix_group_id=False):
         s3_to_ch_csv = HrpS3ToClickhouseTableOperator(
             task_id="s3_to_ch_csv",
+            doc_md="S3 → CH из CSV: загрузка gzip-выгрузки PG в таблицу CH",
             s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
             clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
             table_name=T_S3_TO_CH, schema=CH_SCHEMA,
@@ -644,24 +801,58 @@ def test_hrp_operators_dag():
         # поэтому берём фактический ключ из XCom (s3_key_list), а не вычисляем литерально.
         s3_to_ch_tsv = HrpS3ToClickhouseTableOperator(
             task_id="s3_to_ch_tsv",
+            doc_md="S3 → CH из TSV: загрузка выгрузки PG частями (с заголовком) в таблицу CH",
             s3_bucket=BUCKET,
             s3_key="{{ ti.xcom_pull(task_ids='pg_to_s3_list_gzip', key='s3_key_list')[0] }}",
             clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
             table_name=T_S3_TO_CH_LIST, schema=CH_SCHEMA,
             fmt="TSVWithNames", compression="gzip", truncate=True,
         )
-        v_s3_csv = validate_ch_count.override(task_id="v_s3_to_ch_csv")(T_S3_TO_CH)
-        v_s3_tsv = validate_ch_count.override(task_id="v_s3_to_ch_tsv")(T_S3_TO_CH_LIST)
+        v_s3_csv = validate_ch_count.override(task_id="v_s3_to_ch_csv", doc_md="Сверка S3 → CH из CSV: число строк")(T_S3_TO_CH)
+        v_s3_tsv = validate_ch_count.override(task_id="v_s3_to_ch_tsv", doc_md="Сверка S3 → CH из TSV: число строк")(T_S3_TO_CH_LIST)
         [setup_ch_t, pg_to_s3_gzip] >> s3_to_ch_csv >> v_s3_csv
         [setup_ch_t, pg_to_s3_list_gzip] >> s3_to_ch_tsv >> v_s3_tsv
 
-        make_gate(gate_cond("test_s3", "test_ch"), [s3_to_ch_csv], "gate_s3_to_ch_csv")
-        make_gate(gate_cond("run_known_broken", "test_s3", "test_ch"), [s3_to_ch_tsv], "gate_s3_to_ch_tsv")
+        make_gate(gate_cond("run_ch_http", "test_s3", "test_ch"), [s3_to_ch_csv], "gate_s3_to_ch_csv")
+        make_gate(gate_cond("run_known_broken", "run_ch_http", "test_s3", "test_ch"), [s3_to_ch_tsv],
+                  "gate_s3_to_ch_tsv")
+
+        # S3ToPostgres2 копирует файл через COPY … CSV QUOTE <copy_csv_quote>. Выгрузка
+        # PostgresToS3 — родной CSV Postgres (кавычки "), поэтому ровно его и отдаём.
+        s3_to_pg = HrpS3ToPostgresOperator2(
+            task_id="s3_to_pg",
+            doc_md="S3 → PG: COPY gzip-выгрузки PG в инкарнационную таблицу",
+            s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"), aws_conn_id=S3_CONN,
+            target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_S3_TO_PG,
+            compression="gzip", copy_csv_quote='"',
+        )
+        v_s3_to_pg = validate_incarnation.override(task_id="v_s3_to_pg", doc_md="Сверка S3 → PG: число строк в активной инкарнации")(T_S3_TO_PG)
+        [setup_pg_t, pg_to_s3_gzip] >> s3_to_pg >> v_s3_to_pg
+
+        # Transformed читает TSV без экранирования (формат пакетной выгрузки в ПКАП): табы и
+        # переводы строк внутри значений ему противопоказаны — берём очищенную выгрузку CH.
+        # Ждёт сверку очистки, а не саму выгрузку: на ядре без очистки (до 1.2.7) он уходит в
+        # upstream_failed (в сводке ☮️), а не падает вторым ❌ с ошибкой разбора ClickHouse (сигма, 06.10.2026)
+        s3_to_ch_tr = HrpS3ToClickhouseTransformedOperator(
+            task_id="s3_to_ch_transformed",
+            doc_md="S3 → CH с именем файла: загрузка очищенной выгрузки CH, имя файла первой колонкой",
+            s3_bucket=BUCKET, s3_key=s3key("ch_native_sanitize", "gzip"),
+            clickhouse_conn_id=CH_CONN, aws_conn_id=S3_CONN,
+            table_name=T_S3_TO_CH_TR, schema=CH_SCHEMA,
+            fmt="TabSeparatedWithNames", compression="gzip", truncate=True,
+            include_file_name=True, file_name_position=0,
+        )
+        v_s3_to_ch_tr = validate_ch_count.override(task_id="v_s3_to_ch_transformed", doc_md="Сверка S3 → CH с именем файла: число строк")(T_S3_TO_CH_TR)
+        [setup_ch_t, v_ch_sanitize] >> s3_to_ch_tr >> v_s3_to_ch_tr
+
+        make_gate(gate_cond("test_s3", "test_pg"), [s3_to_pg], "gate_s3_to_pg")
+        make_gate(gate_cond("run_ch_http", "test_s3", "test_ch"), [s3_to_ch_tr], "gate_s3_to_ch_transformed")
 
     # ──────────────────────────── db_to_db ────────────────────────────────────
     with TaskGroup(group_id="db_to_db", prefix_group_id=False):
         pg_to_pg = HrpPostgresToPostgresOperator(
             task_id="pg_to_pg",
+            doc_md="PG → PG: перелив таблицы с проверкой числа строк",
             source_conn_id=PG_CONN, source_schema=PG_SCHEMA, source_table=SRC,
             target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_PG_TO_PG,
             truncate=True, post_count_check=True,
@@ -671,6 +862,7 @@ def test_hrp_operators_dag():
 
         ch_to_pg = HrpClickhouseToPostgresOperator(
             task_id="ch_to_pg",
+            doc_md="CH → PG: перелив результата запроса в таблицу PG",
             clickhouse_conn_id=CH_CONN, sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
             target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_CH_TO_PG,
             truncate=True,
@@ -680,32 +872,48 @@ def test_hrp_operators_dag():
 
         pg_to_ch = HrpPostgresToClickhouseOperator(
             task_id="pg_to_ch",
+            doc_md="PG → CH: перелив таблицы в CH через CSV",
             source_conn_id=PG_CONN, source_schema=PG_SCHEMA, source_table=SRC,
             target_conn_id=CH_CONN, target_schema=CH_SCHEMA, target_table=T_PG_TO_CH,
             target_truncate=True, target_fmt="CSV",
         )
-        v_pg_to_ch = validate_ch_count.override(task_id="v_pg_to_ch")(T_PG_TO_CH)
+        v_pg_to_ch = validate_ch_count.override(task_id="v_pg_to_ch", doc_md="Сверка PG → CH: число строк")(T_PG_TO_CH)
         [setup_pg_t, setup_ch_t] >> pg_to_ch >> v_pg_to_ch
 
         pg_inc = HrpPostgresIncarnationInsertOperator(
             task_id="pg_incarnation_insert",
+            doc_md="PG → PG в инкарнацию: вставка запросом в неактивную копию и переключение",
             conn_id=PG_CONN, select_query=f"SELECT * FROM {PG_SCHEMA}.{SRC}",
             target_schema=PG_SCHEMA, target_table=T_PG_INC,
         )
-        v_pg_inc = validate_incarnation.override(task_id="v_pg_inc")(T_PG_INC)
+        v_pg_inc = validate_incarnation.override(task_id="v_pg_inc", doc_md="Сверка PG → PG в инкарнацию: число строк в активной копии")(T_PG_INC)
         setup_pg_t >> pg_inc >> v_pg_inc
 
         ch_to_pg_inc = HrpClickhouseToPostgresIncarnationOperator(
             task_id="ch_to_pg_incarnation",
+            doc_md="CH → PG в инкарнацию: перелив запроса в неактивную копию и переключение",
             clickhouse_conn_id=CH_CONN, sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
             target_conn_id=PG_CONN, target_schema=PG_SCHEMA, target_table=T_CH_TO_PG_INC,
         )
-        v_ch_to_pg_inc = validate_incarnation.override(task_id="v_ch_to_pg_inc")(T_CH_TO_PG_INC)
+        v_ch_to_pg_inc = validate_incarnation.override(task_id="v_ch_to_pg_inc", doc_md="Сверка CH → PG в инкарнацию: число строк в активной копии")(T_CH_TO_PG_INC)
         [setup_pg_t, setup_ch_t] >> ch_to_pg_inc >> v_ch_to_pg_inc
+
+        # Источник и цель — одно подключение; heimdall_conn_id не нужен при clickhouse_source_conn_id
+        ch_to_ch = HrpClickhouseToClickhouseOperator(
+            task_id="ch_to_ch",
+            doc_md="CH → CH: перелив запроса в типизированную таблицу CH",
+            source_sql=f"SELECT * FROM {CH_SCHEMA}.{SRC}",
+            clickhouse_source_conn_id=CH_CONN, clickhouse_target_conn_id=CH_CONN,
+            heimdall_conn_id=None, target_table=f"{CH_SCHEMA}.{T_CH_TO_CH}", truncate_target=True,
+        )
+        v_ch_to_ch = validate_ch_count.override(task_id="v_ch_to_ch", doc_md="Сверка CH → CH: число строк")(T_CH_TO_CH)
+        setup_ch_t >> ch_to_ch >> v_ch_to_ch
 
         # pg_to_pg — чисто PG; остальные три переливки кросс-системны (PG↔CH) → разные условия.
         make_gate(gate_cond("test_pg"), [pg_to_pg], "gate_pg_to_pg")
-        make_gate(gate_cond("test_pg", "test_ch"), [ch_to_pg, pg_to_ch, ch_to_pg_inc], "gate_db_cross")
+        make_gate(gate_cond("run_known_broken", "run_ch_http", "test_ch"), [ch_to_ch], "gate_ch_to_ch")
+        make_gate(gate_cond("test_pg", "test_ch"), [ch_to_pg, ch_to_pg_inc], "gate_db_cross")
+        make_gate(gate_cond("run_ch_http", "test_pg", "test_ch"), [pg_to_ch], "gate_pg_to_ch")
         # pg_incarnation в карантине: падает на баге insert_incarnation (sql.Literal вместо sql.SQL)
         # до пересборки пакета — держим за run_known_broken, чтобы не гасить остальной db_to_db.
         make_gate(gate_cond("run_known_broken", "test_pg"), [pg_inc], "gate_pg_incarnation")
@@ -719,6 +927,7 @@ def test_hrp_operators_dag():
         for c in COMPRESSIONS_FULL:
             s3s3 = HrpS3ToS3Operator(
                 task_id=f"s3_to_s3_{clabel(c)}",
+                doc_md=f"S3 → S3, {cname(c)}: перепаковка несжатого файла, оператор сверяет хэш",
                 s3_bucket_source=BUCKET, s3_key_source=s3key("pg_to_s3", None),
                 aws_conn_id_source=S3_CONN, compression_source=None,
                 s3_bucket=BUCKET, s3_key=s3key("s3_to_s3", c),
@@ -729,6 +938,7 @@ def test_hrp_operators_dag():
 
         s3_archive = HrpS3ArchiveOperator(
             task_id="s3_archive",
+            doc_md="Архив S3: два файла упаковываются в один zip",
             s3_keys_source=[s3key("pg_to_s3", None), s3key("ch_native", None)],
             s3_bucket_source=BUCKET, aws_conn_id_source=S3_CONN,
             s3_bucket=BUCKET, s3_key=f"{S3_PREFIX}archive/bundle.zip",
@@ -739,6 +949,7 @@ def test_hrp_operators_dag():
         # CheckS3FileHash: сверяем хэш gzip-выгрузки PostgresToS3 с тем, что оператор положил в XCom.
         check_hash = HrpCheckS3FileHash(
             task_id="check_s3_file_hash",
+            doc_md="Хэш файла S3: совпадает с тем, что посчитала выгрузка PG → S3",
             s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
             aws_conn_id=S3_CONN, compression="gzip",
             checksum="{{ ti.xcom_pull(task_ids='pg_to_s3_gzip', key='checksum') }}",
@@ -746,13 +957,14 @@ def test_hrp_operators_dag():
         pg_to_s3_gzip >> check_hash
 
         pg_ddl = HrpPostgresDDL(
-            task_id="pg_ddl", table_name=SRC, schema=PG_SCHEMA, postgres_conn_id=PG_CONN,
+            task_id="pg_ddl", doc_md="DDL таблицы PG: оператор восстанавливает CREATE TABLE источника",
+            table_name=SRC, schema=PG_SCHEMA, postgres_conn_id=PG_CONN,
         )
         setup_pg_t >> pg_ddl
 
         @task
         def validate_pg_ddl(**context):
-            """Проверяет, что `pg_ddl` вернул DDL с `CREATE TABLE`."""
+            """Сверка DDL таблицы PG: оператор вернул текст с CREATE TABLE."""
             ddl = context["ti"].xcom_pull(task_ids="pg_ddl")
             if not ddl or "CREATE TABLE" not in ddl:
                 raise AirflowFailException(f"pg_ddl вернул некорректный DDL: {ddl!r}")
@@ -770,18 +982,22 @@ def test_hrp_operators_dag():
     # ──────────────────────────── viewers ─────────────────────────────────────
     with TaskGroup(group_id="viewers", prefix_group_id=False):
         list_keys = HrpS3ListKeysOperator(
-            task_id="s3_list_keys", bucket=BUCKET, prefix=S3_PREFIX, aws_conn_id=S3_CONN,
+            task_id="s3_list_keys", doc_md="Список ключей S3: ключи тестового префикса",
+            bucket=BUCKET, prefix=S3_PREFIX, aws_conn_id=S3_CONN,
         )
         file_read = HrpS3FileReadOperator(
             task_id="s3_file_read",
+            doc_md="Чтение файла S3: первые 10 строк gzip-выгрузки",
             s3_bucket=BUCKET, s3_key=s3key("pg_to_s3", "gzip"),
             aws_conn_id=S3_CONN, compression="gzip", rows=10,
         )
-        bucket_viewer = HrpS3BucketViewerOperator(task_id="s3_bucket_viewer", aws_conn_id=S3_CONN)
+        bucket_viewer = HrpS3BucketViewerOperator(
+            task_id="s3_bucket_viewer", doc_md="Обзор бакетов S3: список бакетов подключения",
+            aws_conn_id=S3_CONN)
 
         @task
         def validate_list_keys(**context):
-            """Проверяет, что `s3_list_keys` нашёл ключи тестового префикса."""
+            """Сверка списка ключей S3: в нём есть файлы тестового префикса."""
             keys = context["ti"].xcom_pull(task_ids="s3_list_keys") or []
             names = [k.get("Key") if isinstance(k, dict) else k for k in keys]
             if not any(str(n).startswith(S3_PREFIX) for n in names):
@@ -797,7 +1013,7 @@ def test_hrp_operators_dag():
                   "gate_viewers", upstream=[pg_to_s3_gzip, setup_pg_t])
 
     # ──────────────────────────── cluster ─────────────────────────────────────
-    # ⚠ Требует system.clusters('datalab') и conn click-dlab-*. По умолчанию выключено.
+    # ⚠ Требует system.clusters('datalab') и conn click-dlab-*. По умолчанию выключено (run_cluster).
     with TaskGroup(group_id="cluster", prefix_group_id=False):
         # DEV создаёт probe-таблицу; на прочих стендах она предсоздана — оператор
         # прогоняем на TRUNCATE (тоже cluster-DDL), не создавая объектов.
@@ -808,16 +1024,18 @@ def test_hrp_operators_dag():
         )
         cluster_op = HrpClickHouseClusterOperator(
             task_id="ch_cluster_ddl",
+            doc_md="DDL на кластере CH: команда выполняется на каждом узле datalab",
             sql=cluster_sql,
             clickhouse_conn_id=CH_CONN,
         )
-        make_gate(gate_cond("run_known_broken", "test_ch"), [cluster_op],
+        make_gate(gate_cond("run_cluster", "test_ch"), [cluster_op],
                   "gate_cluster", upstream=setup_ch_t)
 
     # ──────────────────────────── report ──────────────────────────────────────
-    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE)
+    # retries=0: провал вердикта — итог, а не сбой, перезапуск ничего не изменит
+    @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE, retries=0)
     def report(**context):
-        """Собирает статусы тасков прогона в заметку рана: упавшие первыми, успешные одной строкой."""
+        """Вердикт прогона: сводка в заметке рана, XCom `verdict`; есть ❌ или недоступная система — падает."""
         # Дополнительно выводит строку статуса систем PG/CH/S3: отключена флагом,
         # недоступна (setup пропущен по ошибке соединения) или активна.
         dag_run = context["dag_run"]
@@ -829,11 +1047,13 @@ def test_hrp_operators_dag():
                 .all()
             )
             states = {ti.task_id: (ti.state or "no_status") for ti in tis}
+            dag = context["dag"]
             rows, ok, fail, skip = [], 0, 0, 0
             for ti in tis:
                 # служебные таски не относятся к покрытию операторов: report/cleanup
                 # и гейты-ветки (все с префиксом gate_) — их скип это норма
-                if ti.task_id in ("report", "cleanup") or ti.task_id.startswith("gate_"):
+                if (ti.task_id in ("report", "cleanup") or ti.task_id.startswith("gate_")
+                        or (ti.task_id == "params" and ti.state != "failed")):
                     continue
                 state = ti.state or "no_status"
                 if state == "success":
@@ -847,50 +1067,75 @@ def test_hrp_operators_dag():
                         ti.note = f"☮️ SKIPPED — {state} (отключено флагом системы или зависимостью)"
                 else:
                     icon, fail = "❌", fail + 1
-                rows.append(("❌☮️✅".index(icon[0]), f"{icon} `{ti.task_id}`" + (f" — {state}" if icon != "✅" else "")))
+                rows.append(("❌☮️✅".index(icon[0]), ti.task_id, state))
             session.commit()  # фиксируем до-записанные заметки скипнутых тасков
 
         # Статус систем: отключена флагом / недоступна (setup пропущен по ошибке) / активна.
         params = context["params"]
-        sys_status = []
+        sys_status, unavailable = [], []
         for label, flag, setup_id in (("PG", "test_pg", "setup_pg"),
                                       ("CH", "test_ch", "setup_ch"),
                                       ("S3", "test_s3", "setup_s3")):
             st = states.get(setup_id, "no_status")
             if not params.get(flag):
-                sys_status.append(f"{label} ⛔ отключена (`{flag}`=False)")
+                sys_status.append(f"{label} ⛔ отключена ({flag}=False)")
             elif st == "skipped":
-                sys_status.append(f"{label} ⚠️ недоступна (setup пропущен)")
+                # Включена, но не проверялась: для гейта релиза это провал, а не ☮️
+                sys_status.append(f"{label} ❌ недоступна (setup пропущен)")
+                unavailable.append(label)
             elif st == "success":
                 sys_status.append(f"{label} ✅ активна")
             else:
                 sys_status.append(f"{label} ❌ ошибка setup ({st})")
-        sys_line = "**Системы:** " + " · ".join(sys_status)
+        sys_status.append("CH по HTTP " + ("✅ включён" if params.get("run_ch_http") else "⛔ выключен (run_ch_http)"))
+        sys_status.append("кластер datalab " + ("✅ включён" if params.get("run_cluster") else "⛔ выключен (run_cluster)"))
+        sys_line = "Системы: " + " · ".join(sys_status)
 
-        headline = f"🧪 HRP operators: ✅ {ok} / ❌ {fail} / ☮️ {skip}"
-        # Без таблицы: в 1000 символов заметки она вытесняла строки. Упавшие и пропущенные —
-        # строкой на таск, успешные — одной строкой в конце: её и режет лимит
-        lines = [row for rank, row in sorted(rows) if rank < 3]
-        ok_ids = [row[2:] for rank, row in sorted(rows) if rank == 3]
-        lines += [f"✅ ({len(ok_ids)}): " + ", ".join(ok_ids)] if ok_ids else []
+        rows.sort()
+        failed_ids = [tid for rank, tid, _ in rows if rank == 0]
+        passed = not (failed_ids or unavailable)
+        headline = (f"🧪 HRP operators {'✅ пройден' if passed else '❌ провален'}: "
+                    f"✅ {ok} / ❌ {fail} / ☮️ {skip}")
+        # Без таблицы и без выделения: в 1000 символов заметки таблица вытесняла
+        # строки, а `code` и выделение заметка рвёт на три строки. Упавшие — строкой на таск с
+        # названием из doc_md («Название: описание»), пропущенные и успешные — по строке
+        lines = [f"❌ {(dag.get_task(tid).doc_md or tid).split(':')[0]} — {state} ({tid})"
+                 for rank, tid, state in rows if rank == 0]
+        for rank, icon in ((1, "☮️"), (3, "✅")):
+            ids = [tid for r, tid, _ in rows if r == rank]
+            lines += [f"{icon} ({len(ids)}): " + ", ".join(ids)] if ids else []
         add_note(sys_line + "\n\n" + "\n".join(lines), context, level="DAG", title=headline)
         logger.info("%s | %s", headline, " · ".join(sys_status))
+
+        # Ран краснеет через этот таск: он лист дага (см. связи внизу). XCom — до исключения,
+        # иначе DPM не узнает, что именно упало. Версию — через core_version: на сигме пакет
+        # собран pyinstaller'ом без метаданных, importlib.metadata.version там падает
+        from sber_app_dataplatform_etl_core.build_info import core_version
+        context["ti"].xcom_push(key="verdict", value={
+            "passed": passed, "ok": ok, "failed": failed_ids, "skipped": skip,
+            "unavailable": unavailable, "core": core_version(),
+        })
+        if not passed:
+            raise AirflowFailException(
+                "регресс операторов провален: "
+                + "; ".join(filter(None, [f"упали {', '.join(failed_ids)}" if failed_ids else "",
+                                          f"недоступны {', '.join(unavailable)}" if unavailable else ""])))
 
     # ──────────────────────────── cleanup ─────────────────────────────────────
     @task(task_id="cleanup", trigger_rule=TriggerRule.ALL_DONE)
     def cleanup(params=None):
-        """Очищает PG/CH таблицы и S3-ключи (отрабатывает при любом исходе)."""
+        """Уборка: удаляет или очищает таблицы PG/CH и ключи S3 при любом исходе прогона."""
         # DEV — DROP таблиц/последовательностей (стенд владеет схемой);
         # прочие стенды — только TRUNCATE (таблицы предсозданы, не удаляем).
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         if not params.get("run_cleanup", True):
             logger.info("run_cleanup=False — пропускаем удаление (отладка: таблицы/ключи оставлены)")
             return
-        pg = PostgresHook(postgres_conn_id=params["pg_conn_id"])
+        pg = PostgresHook(postgres_conn_id=DEFAULT_PG_CONN)
         pg_objects = [SRC, T_PG_TO_PG, T_CH_TO_PG]
         if IS_DEV:
             drops = [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t} CASCADE;" for t in pg_objects]
-            for t in (T_PG_INC, T_CH_TO_PG_INC):
+            for t in (T_PG_INC, T_CH_TO_PG_INC, T_S3_TO_PG):
                 drops += [f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t}_0 CASCADE;",
                           f"DROP TABLE IF EXISTS {PG_SCHEMA}.{t}_1 CASCADE;",
                           f"DROP SEQUENCE IF EXISTS {PG_SCHEMA}.{t}_inc_seq;"]
@@ -898,20 +1143,20 @@ def test_hrp_operators_dag():
         else:
             # Не-DEV: таблицы предсозданы — не удаляем, только очищаем (последовательности инкарнаций оставляем).
             truncs = [f"TRUNCATE TABLE {PG_SCHEMA}.{t};" for t in pg_objects]
-            for t in (T_PG_INC, T_CH_TO_PG_INC):
+            for t in (T_PG_INC, T_CH_TO_PG_INC, T_S3_TO_PG):
                 truncs += [f"TRUNCATE TABLE {PG_SCHEMA}.{t}_0;",
                            f"TRUNCATE TABLE {PG_SCHEMA}.{t}_1;"]
             pg.run("\n".join(truncs))
 
-        ch = ClickHouseHook(clickhouse_conn_id=params["ch_conn_id"])
-        for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, "hrp_cluster_probe"):
+        ch = ClickHouseHook(clickhouse_conn_id=DEFAULT_CH_CONN)
+        for t in (SRC, T_PG_TO_CH, T_S3_TO_CH, T_S3_TO_CH_LIST, T_S3_TO_CH_TR, T_CH_TO_CH, "hrp_cluster_probe"):
             if IS_DEV:
                 ch.execute(f"DROP TABLE IF EXISTS {CH_SCHEMA}.{t}")
             else:
                 ch.execute(f"TRUNCATE TABLE IF EXISTS {CH_SCHEMA}.{t}")
 
-        s3 = S3Hook(aws_conn_id=params["s3_conn_id"])
-        _s3_purge_prefix(s3, params["s3_bucket"])
+        s3 = S3Hook(aws_conn_id=DEFAULT_S3_CONN)
+        _s3_purge_prefix(s3, DEFAULT_S3_BUCKET)
         logger.info("Cleanup complete")
 
     # Все рабочие таски → report → cleanup (оба ALL_DONE). Включаем КАЖДЫЙ таск как прямой
@@ -919,11 +1164,13 @@ def test_hrp_operators_dag():
     report_t = report()
     cleanup_t = cleanup()
     all_tasks = [
-        setup_pg_t, setup_ch_t, setup_s3_t,
+        save_params_t, setup_pg_t, setup_ch_t, setup_s3_t,
         *exports, *s3s3_ops,
+        v_pg_sanitize, v_ch_sanitize,
         s3_to_ch_csv, s3_to_ch_tsv, v_s3_csv, v_s3_tsv,
+        s3_to_pg, v_s3_to_pg, s3_to_ch_tr, v_s3_to_ch_tr,
         pg_to_pg, v_pg_to_pg, ch_to_pg, v_ch_to_pg, pg_to_ch, v_pg_to_ch,
-        pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc,
+        pg_inc, v_pg_inc, ch_to_pg_inc, v_ch_to_pg_inc, ch_to_ch, v_ch_to_ch,
         s3_archive, check_hash, pg_ddl, v_pg_ddl,
         list_keys, v_list_keys, file_read, bucket_viewer,
         cluster_op,
@@ -931,7 +1178,10 @@ def test_hrp_operators_dag():
     # ВАЖНО: гейты (@task.branch) НЕ должны быть прямым upstream report — branch
     # принудительно скипает все прямые downstream вне своего списка, перебивая
     # ALL_DONE. Их подопечные ops и так в all_tasks, поэтому report всё дожидается.
-    all_tasks >> report_t >> cleanup_t
+    # report и cleanup — оба листья: Airflow выводит состояние рана из листьев. При цепочке
+    # report >> cleanup лист был один cleanup, и ран с 13 ❌ оставался success (стенд, 05.10.2026)
+    all_tasks >> report_t
+    all_tasks >> cleanup_t
 
 
 test_hrp_operators_dag()
