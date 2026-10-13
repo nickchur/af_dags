@@ -1,0 +1,5 @@
+# Что Airflow не разбирает. Синтаксис по [core] dag_ignore_file_syntax: в Airflow 3 по умолчанию
+# glob (альфа его не задаёт), на стенде AF3 — regexp; «tests/» отсекает каталог в обоих.
+#
+# tests/ — pytest-тесты дагов, не даги: без pytest в образе висели ошибкой импорта.
+tests/
