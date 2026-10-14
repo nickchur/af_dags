@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-10-14 16:01 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 17:01 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -140,7 +140,7 @@ config = {
 }
 
 if not conf:
-    ctl = get_conn('ctl')
+    ctl = get_conn(config['conns']['ctl']['conn_id'])
     config['conns']['ctl']['url'] = f"{ctl.get('schema', 'https')}://{ctl.get('host')}:{ctl.get('port','9080')}"
     Variable.set('ctl_config', config, serialize_json=True, description=str(pendulum.now(config['tz']))[:19])
 
