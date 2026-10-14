@@ -1,5 +1,5 @@
 # CTL — Change Tracking & Loading
-*2026-10-04 12:07 MSK · v1.18 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-14 15:18 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Система автоматизированного управления ETL-процессами на базе **Apache Airflow** с интеграцией в **CTL API** и выполнением SQL-логики в **Greenplum**.
 
@@ -111,7 +111,7 @@ EVENT-WAIT ──→ RUNNING
 | Система | Connector ID | Тип |
 |---------|-------------|-----|
 | CTL API | `ctl` | KerberosHttp |
-| Greenplum | `alpha-adb_dev_comm-read` | Postgres |
+| Greenplum | `gp_etl` (без него — `alpha-*-read`) | Postgres |
 | S3 | `s3` | S3 |
 | Airflow DB | `airflowdb` | Postgres |
 
