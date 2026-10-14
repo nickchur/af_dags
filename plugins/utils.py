@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-02 15:08 MSK · v1.23 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-06 12:37 MSK · v1.24 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -26,6 +26,7 @@
 | `env_stand()` | Контур из `ENV_STAND`, запасное имя — `ENVIRONMENT` |
 | `env_platform()` | Платформа: `alpha`, `sigma` или пустая строка |
 | `get_af_conn()` / `af_admin_available()` | Коннект к метабазе под админской учёткой из Vault; есть ли она (на разборе файла) |
+| `log_bucket_path()` | `conn_id://бакет/папка` в бакете логов (подключение и бакет из `[logging]`) |
 | `report_health()` | Отчёт дага-плагина здоровья в бакет логов (`system_health/checks/<dag_id>.json`) |
 """
 
@@ -762,6 +763,20 @@ def store_params_task(var_name, saved, context=None, one_shot=(), flag='save_par
     return msg
 
 
+def log_bucket_path(folder='') -> str:
+    """🪣 Путь `conn_id://бакет/папка` в бакете логов: подключение и бакет — из [logging].
+
+    remote_base_log_folder приходит как 's3://bucket/prefix', где 's3' — протокол, а не
+    conn_id, поэтому схему подменяем на remote_log_conn_id; префикс логов отбрасываем.
+    Пустая строка — логи не в S3. Только конфиг, без сети: годится на разборе.
+    """
+    from airflow.configuration import conf
+
+    conn_id = conf.get('logging', 'remote_log_conn_id', fallback='')
+    bucket = conf.get('logging', 'remote_base_log_folder', fallback='').split('://', 1)[-1].split('/', 1)[0]
+    return f'{conn_id}://{bucket}/{folder}' if conn_id and bucket else ''
+
+
 def saved_params(var_name) -> dict:
     """📥 Сохранённые значения по умолчанию из переменной Airflow.
 
@@ -1050,8 +1065,9 @@ def report_health(checks, context=None, ttl_sec=7200):
             c['data'] = {'dropped': 'отчёт больше 256 КБ'}
         text = json.dumps(report, ensure_ascii=False, indent=2, default=str)
     try:
-        bucket = conf.get('logging', 'remote_base_log_folder').split('://', 1)[1].split('/', 1)[0]
-        S3Hook(aws_conn_id=conf.get('logging', 'remote_log_conn_id')).load_string(
+        conn_id, _, rest = log_bucket_path().partition('://')
+        bucket = rest.rstrip('/')
+        S3Hook(aws_conn_id=conn_id).load_string(
             text, key, bucket_name=bucket, replace=True,
             encrypt=conf.getboolean('logging', 'encrypt_s3_logs', fallback=False))
     except Exception:
