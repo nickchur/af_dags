@@ -1,5 +1,5 @@
 """### 🩺 DAG: Состояние контура раз в час
-*2026-10-01 18:18 MSK · v3.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-14 16:01 MSK · v3.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час — «почему задачи не идут»: бакет логов (`s3_logs`), пулы, разбор файлов, раны и
 `scheduled`, сторож отчётов остальных плагинов здоровья. Сетка DAG'а — лента здоровья
@@ -292,8 +292,10 @@ def _beacon_workers() -> dict | None:
         # Протухший снимок отдельно не ловим: summarize_pods сам не считает живым под, чья
         # отбивка старше трёх интервалов, — такой снимок даёт alive 0 и уходит в broadcast
         pods = hb.summarize_pods(hb.read_snapshot(_log_hook(), conf.get("logging", "REMOTE_BASE_LOG_FOLDER")))
-    except Exception:
-        logger.info("celery: отбивок нет, опрашиваем брокер", exc_info=True)
+    except Exception as exc:
+        # запасной путь штатный — трейсбек только в debug
+        logger.info("celery: отбивок нет (%s), опрашиваем брокер", _short_reason(exc))
+        logger.debug("celery: отбивки не прочитаны", exc_info=True)
         return None
     return pods if pods.get("alive") else None
 
