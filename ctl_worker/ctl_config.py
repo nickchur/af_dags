@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-10-14 15:17 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 15:53 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -53,10 +53,10 @@ conns = {
     },
     'gp': {
         'type': 'Postgres',
-        # gp_etl — имя из vault (USER_AIRFLOW_READ_CONN_ID тенанта, etl-core 1.3.1), одно на всех контурах.
+        # cap_gp_etl — имя из vault (<сервис>_<USER_AIRFLOW_READ_CONN_ID> тенанта, etl-core 1.3.1), одно на всех контурах.
         # Без него — прежнее угадывание alpha-*-read: контур с ещё не обновлённым vault не ломается
         'conn_id': conf.get('conns', {}).get('gp', {}).get('conn_id') or (
-            'gp_etl' if 'gp_etl' in _pg_conns else
+            'cap_gp_etl' if 'cap_gp_etl' in _pg_conns else
             next((c for c in _pg_conns if c.startswith('alpha-') and c.endswith('-read')), 'alpha-capgp2-read')),
         'pool_slots': 20,
         'timeout': 300, # in seconds
