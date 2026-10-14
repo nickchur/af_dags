@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-10-13 18:53 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 16:00 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -402,15 +402,15 @@ def gp_exe(sql, val=None, ti=None, autocommit=True, timeout=None):
                 return res[0] if res else None
 
     except (OperationalError, InterfaceError) as e:
-        # Эти ошибки перехватит tenacity и сделает retry
-        logger.error(f"📡 Сетевая ошибка Greenplum: {str(e)}")
+        # Эти ошибки перехватит tenacity и сделает retry — поэтому warning, итог скажет задача
+        logger.warning(f"📡 Сетевая ошибка Greenplum: {str(e)}")
         raise e
     except DatabaseError as e:
         # Ошибки синтаксиса или прав (SQL Error) — ретрай тут не поможет
         logger.error(f"❌ Критическая ошибка SQL (ретрай пропущен): {str(e)}")
         raise AirflowFailException(f"GP SQL Error: {e}")
     except Exception as e:
-        logger.error(f"💥 Непредвиденная ошибка в gp_exe: {str(e)}")
+        logger.exception(f"💥 Непредвиденная ошибка в gp_exe: {str(e)}")
         raise
 
 

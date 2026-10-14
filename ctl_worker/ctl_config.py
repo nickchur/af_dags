@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-10-14 15:53 MSK · v1.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 16:00 MSK · v1.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -10,7 +10,6 @@ from airflow.sdk import DAG, Param, Variable, task
 
 from plugins.utils import on_callback, add_note, default_args, str2timedelta, get_conns_by_type, get_conn  # type: ignore
 from plugins.s3_utils import s3_set_ttl, s3_create_bucket  # type: ignore
-import os
 import base64
 import json
 import pendulum
@@ -249,10 +248,7 @@ with DAG(f'CTL.{config["profile"]}.config',
             ctl_obj_save('ctl_config', config, var=True)
             
             msg = "✅ Configuration successfully saved to Variable 'ctl_config'"
-            
-            for e in os.environ:
-                if e.startswith('AIRFLOW__'):
-                    logger.info("⚠️{}: {}".format(e, os.getenv(e)))
+
         else:
             msg = "⚠️ Save skipped: 'CTL_PIN' is False}"
         

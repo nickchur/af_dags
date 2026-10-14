@@ -1,5 +1,5 @@
 """### 🛠️ Ядро логики CTL (`ctl_worker/ctl_core.py`)
-*2026-10-01 22:26 MSK · v1.12 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 16:00 MSK · v1.13 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Центральные функции бизнес-логики, используемые всеми DAG'ами CTL.
 
@@ -775,8 +775,8 @@ def ctl_wf_norm(wf, connectedEntities=None):
     if not events and wf['params'].get('wf_event_sched'):
         try:
             events = ast.literal_eval(wf['params'].get('wf_event_sched','[]'))
-        except:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ wf {wf.get('id')}: wf_event_sched не разобран, событий нет: {e}")
     
     if events and type(events) is list:
         # wf['params']['wf_event_type'] = wf.get('eventAwaitStrategy','or')

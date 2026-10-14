@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-13 23:04 MSK · v1.25 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 16:00 MSK · v1.26 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -124,7 +124,7 @@ def pool_slots(pool_name, slots):
     slots = max(slots, 0)
 
     if af_meta.pool_set_slots(pool_name, slots, 'CTL_worker'):
-        logger.warning(f'Pool {pool_name} created')
+        logger.info(f'Pool {pool_name} created')
 
     if slots > 0:
         logger.info(f'Pool {pool_name} set to {slots} slots')
@@ -164,7 +164,7 @@ def ensure_pool(pool_name, slots=TOOLS_POOL_SLOTS, description='DataLab tools'):
 
     try:
         if af_meta.pool_create_if_missing(pool_name, slots, description):
-            logger.warning(f'Pool {pool_name} created with {slots} slots')
+            logger.info(f'Pool {pool_name} created with {slots} slots')
         _ensured_pools.add(pool_name)
     except Exception:
         logger.warning(f'Не удалось проверить пул {pool_name}', exc_info=True)
