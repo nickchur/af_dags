@@ -1,5 +1,5 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-15 13:59 MSK · v0.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 14:17 MSK · v0.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
@@ -413,6 +413,25 @@ def tools_test_pg_stream():
                 assert count(tt) == 3 and count(traw) == 2, (count(tt), count(traw))
                 assert q(f"select distinct file_name from {traw}") == [(kbad,)]
                 ok("REQ-28 tmp_table: приёмник = файл, сырьё очищено; сбой второй транзакции — сырьё осталось")
+
+                # REQ-28: загрузки с одной tmp_table — по очереди: занята → предупреждение и ожидание.
+                # Оператор — в главном потоке (ExecutorSafeguard Airflow не даёт execute из другого),
+                # чужой сеанс снимает блокировку из фонового через 3 с.
+                with closing(pg.get_conn()) as other:
+                    other.autocommit = True
+                    oc = other.cursor()
+                    oc.execute("select pg_advisory_lock(%s::regclass::oid::bigint)", (traw,))
+                    th = threading.Timer(3, oc.execute, ("select pg_advisory_unlock(%s::regclass::oid::bigint)", (traw,)))
+                    th.start()
+                    started = time.monotonic()
+                    try:
+                        res, log = run("tmp-table-wait", kt, tt, truncate="hard", tmp_table=traw)
+                    finally:
+                        th.join(10)
+                    took = time.monotonic() - started
+                assert took >= 2.5 and log.has("занята другой загрузкой") and res["rows_loaded"] == 3, (took, log.lines)
+                assert count(tt) == 3 and count(traw) == 0
+                ok("REQ-28 одна tmp_table у двух загрузок — вторая ждёт с предупреждением")
 
                 tx = mk("raw_bad", "x int")
                 try:      # объекта в S3 нет: ошибка состава должна прийти раньше обращения к нему

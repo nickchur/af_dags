@@ -1,5 +1,5 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 13:59 MSK · v0.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 14:15 MSK · v0.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Усечение приёмника —
@@ -12,6 +12,7 @@
 `file_name_column` — ключ S3 в каждой строке.
 `tmp_table` (json/jsonl) — постоянная таблица сырья `(item jsonb, file_name text)`: COPY из S3
 коммитится отдельно, приёмник меняется второй, короткой транзакцией; её сбой оставляет сырьё.
+Загрузки с одной `tmp_table` идут по очереди (advisory-блокировка на обе транзакции).
 Самопроверка: `python3 plugins/pg_stream.py`.
 """
 from __future__ import annotations
@@ -511,14 +512,22 @@ class HrpS3ToPgStreamOperator(BaseOperator):
                     res = self._tx(conn, lambda: self._one_tx(cur, conn, key, tbl))
                 else:
                     raw = parse_table(self.tmp_table)
-                    # 1: сырьё из S3 в tmp_table — долгая часть, приёмник не тронут
-                    ctx = self._tx(conn, lambda: self._raw_tx(cur, conn, key, tbl, raw))
-                    # 2: приёмник — только SQL внутри базы; сбой оставляет сырьё для разбора
+                    lock = self._tx(conn, lambda: self._lock_raw(cur, raw))
                     try:
-                        res = self._tx(conn, lambda: self._target_tx(cur, ctx, tbl, raw))
-                    except BaseException:
-                        self.log.error("приёмник %s не изменён, сырьё файла — в %s", self.table, self.tmp_table)
-                        raise
+                        # 1: сырьё из S3 в tmp_table — долгая часть, приёмник не тронут
+                        ctx = self._tx(conn, lambda: self._raw_tx(cur, conn, key, tbl, raw))
+                        # 2: приёмник — только SQL внутри базы; сбой оставляет сырьё для разбора
+                        try:
+                            res = self._tx(conn, lambda: self._target_tx(cur, ctx, tbl, raw))
+                        except BaseException:
+                            self.log.error("приёмник %s не изменён, сырьё файла — в %s", self.table, self.tmp_table)
+                            raise
+                    finally:
+                        try:
+                            cur.execute("select pg_advisory_unlock(%s)", (lock,))
+                            conn.commit()
+                        except Exception as exc:    # сеанс оборван — блокировка ушла вместе с ним
+                            self.log.warning("⚠️ блокировка %s не снята явно: %s", self.tmp_table, exc)
 
         self.log.info("прочитано %s, загружено %s в %s", res["rows_source"], res["rows_loaded"], self.table)
         if res["rows_rejected"]:
@@ -575,6 +584,20 @@ class HrpS3ToPgStreamOperator(BaseOperator):
         if ctx.raw is not None:
             ctx.loaded += self._insert_from_raw(cur, ctx, tbl, ctx.raw)
         return self._result(ctx)
+
+    def _lock_raw(self, cur, raw):
+        """Сеансовая блокировка tmp_table на обе транзакции: между ними таблица открыта, и чужая
+        загрузка с той же tmp_table очистила бы её и подложила свой файл — приёмник получил бы
+        чужие строки без ошибки. Ключ — oid таблицы: `raw` и `public.raw` — одна блокировка.
+        Занята — предупреждение и ожидание в пределах statement_timeout."""
+        self._set_timeout(cur)
+        cur.execute(sql.SQL("select {}::regclass::oid::bigint").format(sql.Literal(self.tmp_table)))
+        lock = cur.fetchone()[0]
+        cur.execute("select pg_try_advisory_lock(%s)", (lock,))
+        if not cur.fetchone()[0]:
+            self.log.warning("⚠️ tmp_table %s занята другой загрузкой — ждём её окончания", self.tmp_table)
+            cur.execute("select pg_advisory_lock(%s)", (lock,))
+        return lock
 
     def _raw_tx(self, cur, conn, key, tbl, raw):
         """Транзакция 1 с tmp_table: проверка её состава до S3, очистка, COPY сырья."""

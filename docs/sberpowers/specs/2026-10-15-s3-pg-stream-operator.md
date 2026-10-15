@@ -94,7 +94,9 @@
   (`item`) из S3 в `tmp_table`, commit. Вторая: усечение приёмника по `truncate`, `insert` в приёмник
   из `tmp_table` (раскладка по REQ-23…27), `truncate tmp_table`, commit. Сбой второй транзакции
   оставляет приёмник прежним, а сырьё — в `tmp_table`. Только для `json` и `jsonl`; с `format='csv'` —
-  ошибка в конструкторе; при `auto` CSV-файл с `tmp_table` — ошибка до загрузки. Без `tmp_table`
+  ошибка в конструкторе; при `auto` CSV-файл с `tmp_table` — ошибка до загрузки. Загрузки с одной
+  `tmp_table` идут по очереди: блокировка держится на обе транзакции, занята — предупреждение в лог и
+  ожидание в пределах `statement_timeout`. Без `tmp_table`
   сырьё идёт во временную `tmp_stream_raw … on commit drop` в той же транзакции.
 
 ## MODIFIED — изменённое поведение
@@ -158,7 +160,7 @@
 | REQ-plugins-25 | Колонка `date`, значение `"31.12.2026"` → таск красный, в ошибке значение и тип, строк 0 |
 | REQ-plugins-26 | `file_name_column='src'` → у всех строк `src` = ключ S3 (для csv, json, jsonl) |
 | REQ-plugins-27 | Колонка `load_dttm default now()` не в файле → заполнена временем загрузки |
-| REQ-plugins-28 | `tmp_table` с jsonl, `truncate='hard'`: после рана приёмник = строки файла, `tmp_table` пуста; неприводимое значение → приёмник прежний, в `tmp_table` сырьё файла; `tmp_table` не `(item jsonb, file_name text)` → ошибка до S3; `format='csv'` с `tmp_table` → ValueError |
+| REQ-plugins-28 | `tmp_table` с jsonl, `truncate='hard'`: после рана приёмник = строки файла, `tmp_table` пуста; неприводимое значение → приёмник прежний, в `tmp_table` сырьё файла; `tmp_table` не `(item jsonb, file_name text)` → ошибка до S3; `format='csv'` с `tmp_table` → ValueError; при чужой блокировке той же `tmp_table` — в логе «занята другой загрузкой», загрузка ждёт и завершается после её снятия |
 
 ## Traceability
 
