@@ -77,7 +77,7 @@ PG оператором `HrpS3ToPgStreamOperator` — потоково, одно
     `description` (имена как у `srv_wf.pr_get_format_type`: `int4`, `varchar`, `timestamp`).
 
 **Шаги:**
-- [ ] Самопроверка (в `if __name__ == "__main__":` модуля) — пишется первой:
+- [x] Самопроверка (в `if __name__ == "__main__":` модуля) — пишется первой:
 ```python
 def _selfcheck():
     for bad in ("a;b", "a.b.c", "", "1t"):
@@ -102,10 +102,10 @@ def _selfcheck():
         raise AssertionError("truncate=yes")
     print("selfcheck ok")
 ```
-- [ ] Запусти на стенде `scp` модуля, затем
+- [x] Запусти на стенде `scp` модуля, затем
   `ssh testsrv 'cd /opt/aftest/home/dags && /opt/aftest/venv/bin/python plugins/pg_stream.py' </dev/null`
   — ожидай FAIL (`NameError` / нет модуля).
-- [ ] Реализуй:
+- [x] Реализуй:
 ```python
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$")
 _EXT = {".csv": "csv", ".json": "json", ".jsonl": "jsonl", ".ndjson": "jsonl"}
@@ -157,7 +157,7 @@ def _truncate(cur, tbl, mode):
   для CSV с `HEADER` в `options` первая строка файла (разбор `csv.reader` по разделителю из `options`,
   по умолчанию `,`) → `{имя: "text"}`, иначе `{}`; `unmapped=[]`, `defaulted=[]`. Любое исключение — `conn.rollback()` (даёт `closing` + явный
   rollback в `except`), исключение пробрасывается.
-- [ ] Даг `tools/test_pg_stream.py` (`tools_test_pg_stream`, schedule=None, теги `DataTools`, `tools`,
+- [x] Даг `tools/test_pg_stream.py` (`tools_test_pg_stream`, schedule=None, теги `DataTools`, `tools`,
   `AutoQA`; параметры `conn_id` (по умолчанию `cap_gp_etl`, examples `gp6-stand`), `bucket`
   (по умолчанию `edpetl-ctl`), `prefix` (`test/pg_stream/`), `schema` (`public`)). Таск `scenarios`:
   кладёт фикстуры в S3 (`S3Hook.load_bytes`), создаёт таблицы `<schema>.pg_stream_t_*` (на GP —
@@ -178,11 +178,11 @@ def _truncate(cur, tbl, mode):
   - только на GP (`select version()` содержит `Greenplum`): 5 записей, одна с битой датой,
     `options="CSV HEADER LOG ERRORS SEGMENT REJECT LIMIT 10 ROWS"` → `rows_source` 5, `rows_loaded` 4,
     `rows_rejected` 1 (REQ-11); на PG сценарий пропускается с записью в лог.
-- [ ] Выложи (`scp` + md5) и запусти даг на `cap_gp_etl` и на `gp6-stand`
+- [x] Выложи (`scp` + md5) и запусти даг на `cap_gp_etl` и на `gp6-stand`
   (`airflow dags trigger tools_test_pg_stream -c '{"conn_id": "gp6-stand"}'`), жди в фоне.
   Ожидай: оба рана `success`, в логе «selfcheck ok» не нужен — сценарии.
-- [ ] `ruff check plugins/pg_stream.py tools/test_pg_stream.py` — чисто.
-- [ ] Commit: `feat(plugins): HrpS3ToPgStreamOperator — CSV одной транзакцией, усечение soft/hard/auto (REQ-plugins-07…19)`
+- [x] `ruff check plugins/pg_stream.py tools/test_pg_stream.py` — чисто.
+- [x] Commit: `feat(plugins): HrpS3ToPgStreamOperator — CSV одной транзакцией, усечение soft/hard/auto (REQ-plugins-07…19)`
 
 **Критерии выхода:**
 - Самопроверка на стенде печатает `selfcheck ok`.
