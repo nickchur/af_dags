@@ -88,6 +88,9 @@ Tests: tools_test_pg_stream (cap_gp_etl, gp6-stand) → success; python3 plugins
 - «GP6 не определит тип `%s` в `insert … select *, %s`» — CSV с `file_name_column` зелёный на `gp6-stand`
   под psycopg 3.
 - «Пустой массив oid при таблице без колонок» — приёмник без колонок не сценарий.
+- «SQL-инъекция через `options`» — параметр не шаблонный (`template_fields`: `s3_key`, `table`, `bucket`),
+  его задаёт автор дага, у которого и так есть любой SQL.
+- «Тип `any(%s)` не определится при серверной привязке» — сценарии сверяют `target`, на AF3 зелёные.
 
 Отложено:
 - Безусловный `import psycopg2`: в образах Airflow 3 его тянет провайдер postgres; при уходе — импорт через
