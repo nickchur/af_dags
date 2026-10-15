@@ -89,7 +89,7 @@
 ### Таблица сырья
 
 - **REQ-plugins-28** — **Сырьё JSON в tmp_table, приёмник — второй транзакцией.** `tmp_table` (по умолчанию `None`) — имя
-  постоянной таблицы `(j jsonb, f text)`; создаёт её владелец, состав сверяется до обращения к S3
+  постоянной таблицы `(item jsonb, file_name text)`; создаёт её владелец, состав сверяется до обращения к S3
   (иначе — ошибка с ожидаемым составом). Первая транзакция: `truncate tmp_table`, COPY элементов
   (`item`) из S3 в `tmp_table`, commit. Вторая: усечение приёмника по `truncate`, `insert` в приёмник
   из `tmp_table` (раскладка по REQ-23…27), `truncate tmp_table`, commit. Сбой второй транзакции
@@ -158,7 +158,7 @@
 | REQ-plugins-25 | Колонка `date`, значение `"31.12.2026"` → таск красный, в ошибке значение и тип, строк 0 |
 | REQ-plugins-26 | `file_name_column='src'` → у всех строк `src` = ключ S3 (для csv, json, jsonl) |
 | REQ-plugins-27 | Колонка `load_dttm default now()` не в файле → заполнена временем загрузки |
-| REQ-plugins-28 | `tmp_table` с jsonl, `truncate='hard'`: после рана приёмник = строки файла, `tmp_table` пуста; неприводимое значение → приёмник прежний, в `tmp_table` сырьё файла; `tmp_table` не `(j jsonb, f text)` → ошибка до S3; `format='csv'` с `tmp_table` → ValueError |
+| REQ-plugins-28 | `tmp_table` с jsonl, `truncate='hard'`: после рана приёмник = строки файла, `tmp_table` пуста; неприводимое значение → приёмник прежний, в `tmp_table` сырьё файла; `tmp_table` не `(item jsonb, file_name text)` → ошибка до S3; `format='csv'` с `tmp_table` → ValueError |
 
 ## Traceability
 

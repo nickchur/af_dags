@@ -11,7 +11,7 @@ PG оператором `HrpS3ToPgStreamOperator` — потоково, одно
 **Архитектура:** один модуль `plugins/pg_stream.py`: чистые функции разбора (stdlib) + оператор на
 `BaseOperator`. Байты из S3 → (gzip | stream_unzip) → строки COPY → `s3_IterStream` (из
 `plugins/s3_utils`) → одна `copy_expert` на файл. JSON-раскладка — COPY во временную таблицу
-`(j jsonb)` и `insert … select … from tmp, jsonb_populate_record(null::<приёмник>, tmp.j) r`.
+`(item jsonb, file_name text)` и `insert … select … from tmp, jsonb_populate_record(null::<приёмник>, tmp.item) r`.
 Проверка — самопроверка модуля (`python3 plugins/pg_stream.py`, на стенде) и даг
 `tools_test_pg_stream`, который гоняет оператор по сценариям спеки на `cap_gp_etl` (PG16 стенда)
 и `gp6-stand` (Greenplum 6.25.4 стенда).
@@ -335,14 +335,14 @@ def iter_jsonl(chunks):
 ```
 - [ ] Самопроверка на стенде — ожидай FAIL (`NameError: KeyMap`).
 - [ ] Реализуй раскладку в `execute`:
-  - временная таблица: `create temp table tmp_stream_raw (j jsonb, f text) on commit drop`
+  - временная таблица: `create temp table tmp_stream_raw (item jsonb, file_name text) on commit drop`
     (+ ` distributed randomly`, если `select version()` содержит `Greenplum`);
   - COPY строк `_copy_line(km.map(pick(el, path, n), n))[:-1] + b"\x02" + имя_файла + b"\n"` в
-    `tmp_stream_raw (j, f)` с `(format csv, quote e'\x01', delimiter e'\x02')`;
+    `tmp_stream_raw (item, file_name)` с `(format csv, quote e'\x01', delimiter e'\x02')`;
   - после COPY: `cols = [c for c in columns if c in km.seen]`, плюс `file_name_column` →
 ```sql
 insert into {tbl} ({cols}[, {fcol}])
-select r.{c1}, r.{c2}…[, t.f] from tmp_stream_raw t, jsonb_populate_record(null::{tbl}, t.j) r
+select r.{c1}, r.{c2}…[, t.file_name] from tmp_stream_raw t, jsonb_populate_record(null::{tbl}, t.item) r
 ```
     `rows_loaded = cur.rowcount`, `rows_source` — число элементов; `km.extra` непусто → один `log.warning` со списком (до 50 имён).
     XCom: `unmapped = sorted(km.extra)`, `defaulted = [c for c in columns if c not in km.seen and
@@ -375,7 +375,7 @@ select r.{c1}, r.{c2}…[, t.f] from tmp_stream_raw t, jsonb_populate_record(nul
 **model-hint:** frontier
 **Blocked by:** задача 3.1
 
-**Контекст:** без `tmp_table` сырьё идёт во временную `tmp_stream_raw (j jsonb, f text) on commit drop`
+**Контекст:** без `tmp_table` сырьё идёт во временную `tmp_stream_raw (item jsonb, file_name text) on commit drop`
 и всё — одна транзакция. `tmp_table` — постоянная таблица того же состава: COPY из S3 коммитится
 отдельно, приёмник меняется второй, короткой транзакцией (только SQL в базе). Временная таблица
 транзакцию разделить не может — живёт до commit.
@@ -387,7 +387,7 @@ select r.{c1}, r.{c2}…[, t.f] from tmp_stream_raw t, jsonb_populate_record(nul
 - Потребляет: COPY сырья и `insert … jsonb_populate_record` из 3.1 (вынести в функции с именем
   таблицы сырья параметром: `_copy_raw(cur, raw, …)`, `_insert_from_raw(cur, tbl, raw, …)`).
 - Производит: параметр `tmp_table=None`; `_check_raw(cur, raw)` — состав `select * limit 0` =
-  `[("j", 3802), ("f", 25)]`, иначе ValueError «tmp_table <имя>: ждём (j jsonb, f text)».
+  `[("item", 3802), ("file_name", 25)]`, иначе ValueError «tmp_table <имя>: ждём (item jsonb, file_name text)».
 
 **Шаги:**
 - [ ] Самопроверка: `HrpS3ToPgStreamOperator(..., format="csv", tmp_table="x")` → ValueError.
