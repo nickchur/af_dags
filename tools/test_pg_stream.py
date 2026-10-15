@@ -1,5 +1,5 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-15 14:17 MSK · v0.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 14:39 MSK · v0.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
@@ -28,6 +28,7 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
 from airflow.decorators import dag, task
+from airflow.exceptions import AirflowFailException
 from airflow.models.param import Param
 
 try:
@@ -247,6 +248,11 @@ def tools_test_pg_stream():
                 assert (res["rows_source"], res["rows_loaded"], res["rows_rejected"]) == (2, 2, 0), res
                 ok("REQ-11 rows_source считает запись с переводом строки одной")
 
+                # BOM выгрузок Windows: без заголовка лёг бы в первое значение (id int — ошибка)
+                res, _ = run("bom", put("bom.csv", b"\xef\xbb\xbf1,a\n2,b\n"), t, truncate="hard", options="CSV")
+                assert res["rows_loaded"] == 2 and q(f"select id from {t} order by 1") == [(1,), (2,)], res
+                ok("CSV с UTF-8 BOM: BOM отброшен")
+
                 # REQ-16, 17: ошибки параметров — до S3 и базы
                 try:
                     HrpS3ToPgStreamOperator(task_id="bad_trunc", s3_key=k3, table=t, truncate="yes")
@@ -260,7 +266,13 @@ def tools_test_pg_stream():
                     assert "nothing.txt" in str(e), e
                 else:
                     raise AssertionError(".txt без format принят")
-                ok("REQ-16/17 ошибки параметров до S3 и базы")
+                try:
+                    run("missing", prefix + "missing.csv", t)
+                except AirflowFailException as e:
+                    assert "missing.csv" in str(e), e
+                else:
+                    raise AssertionError("нет объекта в S3 — без ошибки")
+                ok("REQ-16/17 ошибки параметров до S3 и базы; нет объекта — AirflowFailException")
 
                 # REQ-20, 22, 23: конверт {"data": [...]} → root, item; приёмник с одной jsonb-колонкой
                 tj = mk("json", "j jsonb")
@@ -284,7 +296,7 @@ def tools_test_pg_stream():
                         run(name, key, tj, **kw)
                     except Exception as e:
                         logger.info("ожидаемая ошибка: %r", e)
-                        assert want in str(e), e
+                        assert isinstance(e, ValueError) and want in str(e), e    # не QueryCanceled
                     else:
                         raise AssertionError(f"{name} загрузился")
                     assert count(tj) == 4, count(tj)
@@ -307,7 +319,7 @@ def tools_test_pg_stream():
                 try:
                     run("jsonl-bad", put("bad.jsonl", b'{"a":1}\n{bad\n{"a":3}\n'), tj, truncate="hard")
                 except Exception as e:
-                    assert "строка 2" in str(e), e
+                    assert isinstance(e, ValueError) and "строка 2" in str(e), e
                 else:
                     raise AssertionError("битая строка jsonl загрузилась")
                 assert count(tj) == 3, count(tj)
@@ -446,7 +458,23 @@ def tools_test_pg_stream():
                     pass
                 else:
                     raise AssertionError("format='csv' с tmp_table принят")
-                ok("REQ-28 tmp_table не (item jsonb, file_name text) — ошибка до S3; csv — ValueError")
+                try:
+                    run("tmp-table-absent", prefix + "absent.jsonl", tt, tmp_table=f"{schema}.pg_stream_t_absent")
+                except ValueError as e:
+                    assert "таблицы нет" in str(e), e
+                else:
+                    raise AssertionError("несуществующая tmp_table принята")
+                ok("REQ-28 tmp_table не (item jsonb, file_name text) или её нет — ошибка до S3; csv — ValueError")
+
+                # REQ-28: имя tmp_table с заглавными — блокировка по тому же имени, что и запись (кавычки)
+                q(f'drop table if exists {schema}."Pg_Stream_T_Raw"')
+                q(f'create table {schema}."Pg_Stream_T_Raw" (item jsonb, file_name text){dist}')
+                try:
+                    res, _ = run("tmp-table-case", kt, tt, truncate="hard", tmp_table=f"{schema}.Pg_Stream_T_Raw")
+                    assert res["rows_loaded"] == 3 and count(tt) == 3, res
+                finally:
+                    q(f'drop table {schema}."Pg_Stream_T_Raw"')
+                ok("REQ-28 tmp_table с заглавными в имени")
 
                 # REQ-11 на GP: отбраковка LOG ERRORS — rows_rejected и предупреждение
                 if gp:

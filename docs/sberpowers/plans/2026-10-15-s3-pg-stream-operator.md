@@ -420,7 +420,7 @@ select r.{c1}, r.{c2}…[, t.file_name] from tmp_stream_raw t, jsonb_populate_re
   (Traceability: тесты)
 
 **Шаги:**
-- [ ] Шапка модуля: назначение, параметры оператора таблицей, пример дага:
+- [x] Шапка модуля: назначение, параметры оператора таблицей, пример дага:
 ```python
 HrpS3ToPgStreamOperator(
     task_id="load", conn_id="cap_gp_etl", bucket="tfs-in",
@@ -430,9 +430,9 @@ HrpS3ToPgStreamOperator(
 ```
   и ограничения: на сигме — только после переноса в etl-core и строки в `allowed_operators.txt`;
   CSV без `file_name_column` идёт прямо в приёмник — колонки файла = колонки таблицы.
-- [ ] Ревью двумя независимыми ревьюерами в фоне; находки — `docs/sberpowers/reviews/2026-10-15-s3-pg-stream-operator.md`.
-- [ ] Принятые находки — исправить, перепрогнать даг на обоих подключениях.
-- [ ] Commit: `docs(plugins): HrpS3ToPgStreamOperator — шапка модуля, tools/readme, ревью`
+- [x] Ревью двумя независимыми ревьюерами в фоне; находки — `docs/sberpowers/reviews/2026-10-15-s3-pg-stream-operator.md`.
+- [x] Принятые находки — исправить, перепрогнать даг на обоих подключениях.
+- [x] Commit: `docs(plugins): HrpS3ToPgStreamOperator — шапка модуля, tools/readme, ревью`
 
 **Критерии выхода:**
 - Файл ревью с вердиктами `Axis-A`, `Axis-B`, `Tests: tools_test_pg_stream (cap_gp_etl, gp6-stand) → success`.

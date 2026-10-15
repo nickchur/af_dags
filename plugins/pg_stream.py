@@ -1,19 +1,55 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 14:15 MSK · v0.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 14:41 MSK · v0.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
-потоково, одной транзакцией, одной командой COPY на файл. Усечение приёмника —
-`truncate` = None | soft | hard | auto. Итог (строки источника и загруженные, типы
-колонок приёмника) — в XCom `return_value`.
+потоково, одной транзакцией, одной командой COPY на файл. Для баз, где длинная транзакция
+допустима: память воркера не зависит от размера файла. Итог — в XCom `return_value`.
 
-Форматы: CSV (опции COPY), JSON-массив (`root`), JSON Lines; `item` — путь к объекту в элементе.
-Приёмник из одной колонки json/jsonb — объект целиком в неё, иначе раскладка по колонкам
-(`jsonb_populate_record`, ключи без учёта регистра). Сжатие `.gz`, `.zip` (все файлы архива);
-`file_name_column` — ключ S3 в каждой строке.
-`tmp_table` (json/jsonl) — постоянная таблица сырья `(item jsonb, file_name text)`: COPY из S3
-коммитится отдельно, приёмник меняется второй, короткой транзакцией; её сбой оставляет сырьё.
-Загрузки с одной `tmp_table` идут по очереди (advisory-блокировка на обе транзакции).
-Самопроверка: `python3 plugins/pg_stream.py`.
+| Параметр | По умолчанию | Что делает |
+|---|---|---|
+| `s3_key` | — | ключ объекта; `.gz` — поток gzip, `.zip` — все файлы архива одной транзакцией |
+| `table` | — | приёмник `схема.таблица` |
+| `bucket` / `s3_conn_id` | `None` / `s3` | бакет (без него — из подключения) |
+| `conn_id` | `cap_gp_etl` | подключение GP/PG; прав на приёмник у него должно хватать |
+| `format` | `auto` | `csv` / `json` (массив) / `jsonl`; `auto` — по расширению (`.csv`, `.json`, `.jsonl`, `.ndjson`) |
+| `root` | `None` | ключ массива в конверте `{"data": [...]}` (json) |
+| `item` | `None` | путь к объекту внутри элемента через точку (`payload`, `a.b`) |
+| `options` | `CSV HEADER DELIMITER ','` | опции COPY для csv (в т. ч. `LOG ERRORS SEGMENT REJECT LIMIT` на GP) |
+| `truncate` | `None` | `hard` — truncate, `soft` — delete, `auto` — truncate, если приёмник не занят, иначе delete |
+| `file_name_column` | `None` | колонка приёмника для ключа S3 (имени файла в архиве) |
+| `statement_timeout` | `240` | минуты; `0` — без ограничения |
+| `tmp_table` | `None` | json/jsonl: постоянная таблица сырья `(item jsonb, file_name text)`, см. ниже |
+
+Приёмник из одной колонки json/jsonb получает объект целиком, иначе — раскладка по колонкам
+(`select * limit 0`, `jsonb_populate_record`, ключи без учёта регистра; лишние ключи — в лог и
+`unmapped`; колонки, не встреченные ни в одном элементе, — `default` из DDL, а встреченная колонка
+заполняется во всех строках: где ключа нет — NULL). CSV без `file_name_column` идёт прямо в
+приёмник: колонки файла = колонки таблицы.
+
+`tmp_table`: COPY из S3 коммитится в сырьё отдельно, приёмник меняется второй, короткой
+транзакцией; её сбой оставляет сырьё до повтора задачи (повтор очищает `tmp_table` и
+перечитывает файл из S3). Сырьё — элементы после раскладки: ключи уже названы колонками
+приёмника, лишние отброшены (они — в логе и `unmapped`). Загрузки с одной `tmp_table` идут по очереди
+(advisory-блокировка на обе транзакции, ожидание — с предупреждением в логе).
+Без `tmp_table` сырьё json — во временной `tmp_stream_raw` той же транзакции.
+
+Итог: `rows_source`, `rows_loaded`, `rows_rejected`, `files`, `target` и `source` (типы колонок
+приёмника и полей источника), `unmapped`, `defaulted`[, `source_truncated`].
+
+```python
+HrpS3ToPgStreamOperator(
+    task_id="load", conn_id="cap_gp_etl", bucket="tfs-in",
+    s3_key="{{ params.key }}", table="s_grnplm_vd_hr_edp_dia.tb_scpl",
+    root="data", item="payload", truncate="auto", file_name_column="src_file",
+)
+```
+
+Ограничения: на сигме — только после переноса в etl-core и строки в `allowed_operators.txt`.
+Внутри `.zip` сжатые файлы не поддерживаются. Элемент JSON (строка jsonl) длиннее 64 млн
+символов считается битым. Ошибка разбора (битый JSON, кодировка, gzip)
+поднимается исходной — `ValueError` и т. п., а не `QueryCanceled` от COPY; нет объекта в S3 —
+`AirflowFailException` без повторов.
+Самопроверка: `python3 plugins/pg_stream.py`; сценарии — даг `tools_test_pg_stream`.
 """
 from __future__ import annotations
 
@@ -29,6 +65,7 @@ from contextlib import closing
 
 import psycopg2
 import psycopg2.errors
+from botocore.exceptions import ClientError
 from psycopg2 import sql
 
 from airflow.exceptions import AirflowFailException
@@ -45,7 +82,7 @@ CHUNK = 1 << 20     # байт за одно чтение из S3 и за одн
 
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)?$")
 _EXT = {".csv": "csv", ".json": "json", ".jsonl": "jsonl", ".ndjson": "jsonl"}
-_GP_REJECTED = re.compile(r"found (\d+) data formatting errors")
+_GP_REJECTED = re.compile(r"found (\d+) data formatting errors", re.I)
 _REJECT_LIMIT = re.compile(r"\bREJECT\s+LIMIT\b", re.I)
 _OPT_CHAR = r"\b{}\s+(?:AS\s+)?E?'((?:\\.|[^'])+)'"
 _JSON_TYPES = (114, 3802)   # oid json, jsonb
@@ -127,7 +164,10 @@ def iter_json_array(chunks, root: str = ""):
             try:
                 obj, end = dec.raw_decode(buf, pos)
             except json.JSONDecodeError as exc:
-                if len(buf) - pos > MAX_ITEM:
+                # Недочитанный элемент ломается у конца буфера (хвост литерала, \uXXXX — до 6
+                # знаков) или незакрытой строкой; ошибка раньше — элемент битый, буфер не копим.
+                if len(buf) - pos > MAX_ITEM or (exc.pos < len(buf) - 8
+                                                 and not exc.msg.startswith("Unterminated string")):
                     raise ValueError(f"битый элемент: {exc}") from exc
                 break                      # элемент не дочитан — ждём кусок
             if type(obj) in (int, float) and not set(buf[end:]) - _NUM:
@@ -153,6 +193,8 @@ def iter_jsonl(chunks):
         for line in lines:
             n += 1
             yield from _jsonl_line(line, n)
+        if len(buf) > MAX_ITEM:     # не JSON Lines (массив в одну строку) — падение, а не OOM
+            raise ValueError(f"строка {n + 1} длиннее {MAX_ITEM} символов")
     yield from _jsonl_line(buf, n + 1)
 
 
@@ -164,9 +206,22 @@ def _jsonl_line(line, n):
             raise ValueError(f"строка {n}: {exc}") from exc
 
 
+def _no_bom(chunks):
+    """Байты без UTF-8 BOM в начале (выгрузки Windows): в CSV он лёг бы в первое значение."""
+    it, head = iter(chunks), b""
+    for c in it:
+        head += c
+        if len(head) >= 3:
+            break
+    head = head[3:] if head.startswith(codecs.BOM_UTF8) else head
+    if head:            # пустой кусок s3_IterStream принимает за конец
+        yield head
+    yield from it
+
+
 def _text(chunks):
     """Текст из кусков байт; инкрементальный декодер не рвёт кириллицу на границе куска."""
-    utf8 = codecs.getincrementaldecoder("utf-8")()
+    utf8 = codecs.getincrementaldecoder("utf-8-sig")()     # BOM выгрузок Windows — отбросить
     for chunk in chunks:
         yield utf8.decode(chunk)
     yield utf8.decode(b"", final=True)
@@ -452,6 +507,8 @@ class HrpS3ToPgStreamOperator(BaseOperator):
             raise ValueError(f"truncate={truncate!r}: ждём None, 'soft', 'hard' или 'auto'")
         if format not in FORMATS:
             raise ValueError(f"format={format!r}: ждём csv, json, jsonl или auto")
+        if int(statement_timeout or 0) < 0:
+            raise ValueError(f"statement_timeout={statement_timeout!r}: минуты, 0 — без ограничения")
         if tmp_table:
             parse_table(tmp_table)
             if format == "csv":
@@ -478,7 +535,25 @@ class HrpS3ToPgStreamOperator(BaseOperator):
 
     def _copy(self, cur, conn, copy, chunks, options=""):
         """Одна команда COPY из потока; возвращает принятые строки (без отбраковки GP)."""
-        cur.copy_expert(copy.as_string(conn), s3_IterStream(chunks), size=CHUNK)
+        if _REJECT_LIMIT.search(options):   # число отбраковки приходит только NOTICE — не дать его отрезать
+            cur.execute("set local client_min_messages = notice")
+        failed = []
+
+        def guard():
+            # Исключение внутри read() psycopg2 отдаёт как QueryCanceled «error in .read() call»
+            # (тот же SQLSTATE, что у statement_timeout): исходное поднимаем сами.
+            try:
+                yield from chunks
+            except BaseException as exc:
+                failed.append(exc)
+                raise
+
+        try:
+            cur.copy_expert(copy.as_string(conn), s3_IterStream(guard()), size=CHUNK)
+        except psycopg2.Error:
+            if failed:
+                raise failed[0] from None
+            raise
         # GP 6.25 при SEGMENT REJECT LIMIT отвечает «COPY n» вместе с отбракованными
         # строками (стенд 6.25.4: COPY 3, в таблице 2); их число есть только в NOTICE.
         # NOTICE от COPY psycopg2 кладёт в conn.notices лишь после следующего запроса.
@@ -520,18 +595,27 @@ class HrpS3ToPgStreamOperator(BaseOperator):
                         try:
                             res = self._tx(conn, lambda: self._target_tx(cur, ctx, tbl, raw))
                         except BaseException:
-                            self.log.error("приёмник %s не изменён, сырьё файла — в %s", self.table, self.tmp_table)
+                            # при сбое самого commit исход неизвестен — «не изменён» не утверждаем
+                            self.log.error("вторая транзакция (приёмник %s) не прошла, сырьё файла — в %s до повтора задачи",
+                                           self.table, self.tmp_table)
                             raise
                     finally:
                         try:
                             cur.execute("select pg_advisory_unlock(%s)", (lock,))
+                            unlocked = cur.fetchone()[0]
                             conn.commit()
-                        except Exception as exc:    # сеанс оборван — блокировка ушла вместе с ним
+                        except psycopg2.Error as exc:    # сеанс оборван — блокировка ушла вместе с ним
                             self.log.warning("⚠️ блокировка %s не снята явно: %s", self.tmp_table, exc)
+                        else:
+                            if not unlocked:    # другой серверный сеанс (пулер транзакций): очередь не работала
+                                self.log.warning("⚠️ блокировка %s не найдена в сеансе при снятии", self.tmp_table)
 
         self.log.info("прочитано %s, загружено %s в %s", res["rows_source"], res["rows_loaded"], self.table)
-        if res["rows_rejected"]:
+        if res["rows_rejected"] > 0:
             self.log.warning("⚠️ не загружено строк: %s (отбраковка COPY)", res["rows_rejected"])
+        elif res["rows_rejected"] < 0:     # счёт csv по кавычкам не видит ESCAPE, пустых строк, кодировок
+            self.log.warning("⚠️ загружено больше, чем насчитано в источнике (%s): счёт строк csv "
+                             "разошёлся с COPY", -res["rows_rejected"])
         return res
 
     def _tx(self, conn, body):
@@ -541,8 +625,11 @@ class HrpS3ToPgStreamOperator(BaseOperator):
             conn.commit()
             return out
         except BaseException:
-            conn.rollback()
-            self._log_notices(conn)
+            try:
+                conn.rollback()
+                self._log_notices(conn)
+            except psycopg2.Error as exc:   # сеанс оборван: ошибкой таска остаётся исходная
+                self.log.warning("⚠️ откат не выполнен: %s", exc)
             raise
 
     def _set_timeout(self, cur):
@@ -553,9 +640,12 @@ class HrpS3ToPgStreamOperator(BaseOperator):
     def _open(self):
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 
-        obj = S3Hook(aws_conn_id=self.s3_conn_id).get_key(self.s3_key, self.bucket)
-        if obj is None:
-            raise AirflowFailException(f"нет объекта s3://{self.bucket or ''}/{self.s3_key}")
+        try:
+            obj = S3Hook(aws_conn_id=self.s3_conn_id).get_key(self.s3_key, self.bucket)
+        except ClientError as exc:      # get_key не возвращает None: load() бросает 404
+            if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+                raise AirflowFailException(f"нет объекта s3://{self.bucket or ''}/{self.s3_key}") from exc
+            raise
         return closing(obj.get()["Body"])
 
     def _target(self, cur, tbl):
@@ -591,8 +681,11 @@ class HrpS3ToPgStreamOperator(BaseOperator):
         чужие строки без ошибки. Ключ — oid таблицы: `raw` и `public.raw` — одна блокировка.
         Занята — предупреждение и ожидание в пределах statement_timeout."""
         self._set_timeout(cur)
-        cur.execute(sql.SQL("select {}::regclass::oid::bigint").format(sql.Literal(self.tmp_table)))
+        # имя — как его кавычит parse_table: строка как есть свернула бы регистр (s.Raw → s.raw)
+        cur.execute("select to_regclass(%s)::oid::bigint", (raw.as_string(cur),))
         lock = cur.fetchone()[0]
+        if lock is None:
+            raise ValueError(f"tmp_table {self.tmp_table}: таблицы нет")
         cur.execute("select pg_try_advisory_lock(%s)", (lock,))
         if not cur.fetchone()[0]:
             self.log.warning("⚠️ tmp_table %s занята другой загрузкой — ждём её окончания", self.tmp_table)
@@ -634,7 +727,7 @@ class HrpS3ToPgStreamOperator(BaseOperator):
                     if self.tmp_table:
                         raise ValueError(f"{name}: tmp_table — только для json и jsonl")
                     counter = CsvCounter(self.options)
-                    stream = (counter.feed(c) for c in chunks)
+                    stream = (counter.feed(c) for c in _no_bom(chunks))
                     if not fcol:
                         ctx.loaded += self._copy(cur, conn, sql.SQL("copy {} from stdin with " + self.options)
                                                  .format(tbl), stream, self.options)
@@ -670,6 +763,8 @@ class HrpS3ToPgStreamOperator(BaseOperator):
                     copy = sql.SQL(_JSON_COPY).format(ctx.raw, sql.SQL("item, file_name"))
                     self._copy(cur, conn, copy, _batched(ctx.feed.lines(fmt, _text(chunks), _tail(name))))
                 ctx.rows += ctx.feed.n - n0
+        if not ctx.files:
+            self.log.warning("⚠️ в архиве %s нет файлов — загружать нечего", key)
 
     def _insert_from_raw(self, cur, ctx, tbl, raw):
         """insert в приёмник из сырья: объект целиком в json-колонку или раскладка jsonb_populate_record."""
@@ -788,6 +883,28 @@ def _selfcheck():
     text = json.dumps(data, ensure_ascii=False, indent=2)
     for n in (1, 3, 17, 4096):
         assert list(iter_json_array(text[i:i + n] for i in range(0, len(text), n))) == data, n
+    text = json.dumps(data)      # \uXXXX на границе куска — не «битый элемент»
+    for n in (1, 2, 5, 7):
+        assert list(iter_json_array(text[i:i + n] for i in range(0, len(text), n))) == data, n
+    try:
+        list(iter_json_array(['[{"a":1 x}, ' + '{"b": 2}, ' * 10, "never"]))
+    except ValueError as e:
+        assert "битый элемент" in str(e), e     # сразу, а не «файл оборван» в конце
+    else:
+        raise AssertionError("битый элемент в середине")
+    assert list(iter_json_array(_text([b"\xef\xbb\xbf[1]"]))) == [1]
+    assert list(_no_bom([b"\xef", b"\xbb", b"\xbfid\n", b"1\n"])) == [b"id\n", b"1\n"]
+    assert list(_no_bom([b"\xef\xbb\xbf"])) == [] and list(_no_bom([b"a", b"b"])) == [b"ab"]
+    old = MAX_ITEM
+    globals()["MAX_ITEM"] = 10
+    try:
+        list(iter_jsonl(["1\n", "2" * 6, "2" * 6]))
+    except ValueError as e:
+        assert "строка 2" in str(e), e
+    else:
+        raise AssertionError("длинная строка jsonl")
+    finally:
+        globals()["MAX_ITEM"] = old
     assert list(iter_jsonl(['{"a":1}\n{"a"', ':2}\n\n'])) == [{"a": 1}, {"a": 2}]
     assert list(iter_jsonl(['{"a":1}\r\n2'])) == [{"a": 1}, 2]
     try:
