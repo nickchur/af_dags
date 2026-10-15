@@ -454,7 +454,7 @@ HrpS3ToPgStreamOperator(
   в кавычках, `statement_timeout` — литералом.
 - [x] Стенд AF3 (ядро 3.0.1, psycopg 3): `tools_test_pg_stream` на `cap_gp_etl` и `gp6-stand` → success.
 - [x] Ревью правки драйверов двумя моделями и поиском молча проглоченных ошибок.
-- [ ] Та же правка в Airflow 2 (импорты `airflow.models` / `airflow.exceptions`), прогон на AF2 стенда.
+- [x] ~~Та же правка в Airflow 2~~ — отменено 15.10: AF2 остаётся на psycopg2, правка только в AF3.
 
 **Критерии выхода:**
 - `tools_test_pg_stream` success на AF3 и AF2, оба подключения.

@@ -199,7 +199,7 @@
 | REQ-plugins-26 | 3.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-27 | 1.1, 3.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-28 | 3.2 | tools_test_pg_stream | выполнено |
-| REQ-plugins-29 | 5.1 | tools_test_pg_stream | выполнено на AF3; AF2 — после переноса правки |
+| REQ-plugins-29 | 5.1 | tools_test_pg_stream | выполнено на AF3; в AF2 не переносится (AF2 остаётся на psycopg2) |
 
 ## Задачи
 
