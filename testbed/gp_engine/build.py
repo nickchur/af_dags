@@ -1,5 +1,5 @@
 """Движок srv_wf и отчёты CTL для стенда: GP/*.sql → PostgreSQL.
-*2026-09-26 20:36 MSK · v1.2 · Nick Churkin · NSChurkin@sber.ru*
+*2026-10-05 13:06 MSK · v1.3 · Nick Churkin · NSChurkin@sber.ru*
 
 Источник — снимок боевого SQL в `GP/srv_wf/` (его не правим). Сборщик берёт файлы как есть
 и механически убирает то, чего в PostgreSQL нет: `DISTRIBUTED …`, параметры хранения
@@ -9,7 +9,7 @@
 
     python3 testbed/gp_engine/build.py > /tmp/engine.sql   # или deploy.sh
 
-Порядок важен: таблицы, базовые функции, вьюхи, движок, вёрстка, отчёты.
+Порядок важен: таблицы, базовые функции, вьюхи, движок, вёрстка, отчёты, данные стенда (`90_fixtures.sql`).
 """
 
 import re
@@ -108,6 +108,8 @@ def build(post: bool = False) -> str:
     for name in (ORDER_POST if post else ORDER):
         parts.append(f'\n-- ==== GP/{name}.sql\n')
         parts.append(to_pg(point_fix(name, (ROOT / f'{name}.sql').read_text())))
+    if not post:
+        parts.append((HERE / '90_fixtures.sql').read_text())
     return ''.join(parts)
 
 
