@@ -320,7 +320,7 @@ def iter_jsonl(chunks):
     каталоги пропускаются, имя → `<key>/<имя в архиве>`; иначе `(key, body.iter_chunks())`.
 
 **Шаги:**
-- [ ] В `_selfcheck` добавь:
+- [x] В `_selfcheck` добавь:
 ```python
     km = KeyMap(["employeeid", "name", "src"])
     assert km.map({"employeeId": 1, "extra": 2}, 1) == {"employeeid": 1}
@@ -333,8 +333,8 @@ def iter_jsonl(chunks):
     srcs = list(iter_sources(_io.BytesIO(_gz.compress(b"x")), "k.csv.gz"))
     assert [(n, b"".join(c)) for n, c in srcs] == [("k.csv.gz", b"x")]
 ```
-- [ ] Самопроверка на стенде — ожидай FAIL (`NameError: KeyMap`).
-- [ ] Реализуй раскладку в `execute`:
+- [x] Самопроверка на стенде — ожидай FAIL (`NameError: KeyMap`).
+- [x] Реализуй раскладку в `execute`:
   - временная таблица: `create temp table tmp_stream_raw (item jsonb, file_name text) on commit drop`
     (+ ` distributed randomly`, если `select version()` содержит `Greenplum`);
   - COPY строк `_copy_line(km.map(pick(el, path, n), n))[:-1] + b"\x02" + имя_файла + b"\n"` в
@@ -353,16 +353,16 @@ select r.{c1}, r.{c2}…[, t.file_name] from tmp_stream_raw t, jsonb_populate_re
   - JSON в одну колонку с `file_name_column`: COPY `({col}, {fcol})` с `\x02`-разделителем.
   - `iter_sources` для `.gz`/`.zip`; формат каждого файла — `detect_format(имя без .gz/.zip, format)`;
     все файлы — в той же транзакции.
-- [ ] Сценарии в даге: приёмник `(employeeid int, name text, hired date, load_dttm timestamp default now())`:
+- [x] Сценарии в даге: приёмник `(employeeid int, name text, hired date, load_dttm timestamp default now())`:
   ключ `employeeId` → `employeeid`; `extra` → предупреждение в логе, ран зелёный; элемент без `name` →
   `NULL`; `load_dttm` заполнен (REQ-23, 24, 27); `{"a":1,"A":2}` → ошибка (REQ-24); `hired: "31.12.2026"`
   → ошибка базы с `31.12.2026`, строк 0 (REQ-25); `file_name_column='src'` для csv, json, jsonl — у всех
   строк ключ S3 (REQ-26); `.json.gz` и zip с двумя csv → строки обоих, у `src` имя внутри архива (REQ-18);
   REQ-09 на `jsonl.gz` 300 МБ; XCom: `unmapped == ["extra"]`, `"load_dttm" in defaulted`,
   `source["employeeId"] == "number"`, для zip `files` — два имени внутри архива (REQ-11).
-- [ ] Выложи, прогони даг на `cap_gp_etl` и `gp6-stand`.
-- [ ] `ruff check` — чисто.
-- [ ] Commit: `feat(plugins): HrpS3ToPgStreamOperator — раскладка по колонкам, file_name_column, gz/zip (REQ-plugins-18, 23…27)`
+- [x] Выложи, прогони даг на `cap_gp_etl` и `gp6-stand`.
+- [x] `ruff check` — чисто.
+- [x] Commit: `feat(plugins): HrpS3ToPgStreamOperator — раскладка по колонкам, file_name_column, gz/zip (REQ-plugins-18, 23…27)`
 
 **Критерии выхода:**
 - `selfcheck ok`; `tools_test_pg_stream` зелёный на обоих подключениях, все сценарии 1.1–3.1.

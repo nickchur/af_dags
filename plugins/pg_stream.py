@@ -1,19 +1,22 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 13:26 MSK · v0.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:34 MSK · v0.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Усечение приёмника —
 `truncate` = None | soft | hard | auto. Итог (строки источника и загруженные, типы
 колонок приёмника) — в XCom `return_value`.
 
-Сейчас — CSV и JSON / JSON Lines (`root`, `item`) в приёмник из одной колонки json/jsonb, без
-сжатия; раскладка по колонкам, gz/zip и `file_name_column` — дальше.
+Форматы: CSV (опции COPY), JSON-массив (`root`), JSON Lines; `item` — путь к объекту в элементе.
+Приёмник из одной колонки json/jsonb — объект целиком в неё, иначе раскладка по колонкам
+(`jsonb_populate_record`, ключи без учёта регистра). Сжатие `.gz`, `.zip` (все файлы архива);
+`file_name_column` — ключ S3 в каждой строке.
 Самопроверка: `python3 plugins/pg_stream.py`.
 """
 from __future__ import annotations
 
 import codecs
 import csv
+import gzip
 import io
 import json
 import os
@@ -157,10 +160,10 @@ def _jsonl_line(line, n):
             raise ValueError(f"строка {n}: {exc}") from exc
 
 
-def _text(body):
-    """Текст объекта S3 кусками; инкрементальный декодер не рвёт кириллицу на границе куска."""
+def _text(chunks):
+    """Текст из кусков байт; инкрементальный декодер не рвёт кириллицу на границе куска."""
     utf8 = codecs.getincrementaldecoder("utf-8")()
-    for chunk in body.iter_chunks(CHUNK):
+    for chunk in chunks:
         yield utf8.decode(chunk)
     yield utf8.decode(b"", final=True)
 
@@ -223,9 +226,9 @@ class SourceStats:
         return {k: "|".join(t for t in _TYPE_ORDER if t in ts) for k, ts in self.keys.items()}
 
 
-def _copy_line(obj):
+def _copy_line(obj, tail=b"\n"):
     # json.dumps экранирует управляющие символы, поэтому \x01 и \x02 из _JSON_COPY в строке не встретятся
-    return json.dumps(obj, ensure_ascii=False).encode() + b"\n"
+    return json.dumps(obj, ensure_ascii=False).encode() + tail
 
 
 def _batched(lines, size=CHUNK):
@@ -332,28 +335,104 @@ class CsvCounter:
         return next(csv.reader(io.StringIO(text), delimiter=self.delimiter, quotechar=self.quote), [])
 
 
-class _JsonFeed:
-    """Элементы JSON / JSON Lines → строки COPY объекта `item`; считает элементы и типы ключей."""
+class KeyMap:
+    """Ключи объекта → колонки приёмника без учёта регистра (REQ-24).
 
-    def __init__(self, fmt, root, path):
-        self.fmt, self.root, self.path = fmt, root or "", path
+    Переименование здесь, а не в SQL: jsonb_populate_record ищет ключ с точным именем колонки.
+    `seen` — колонки, встреченные хоть раз: только они идут в insert, остальные берут default
+    из DDL (REQ-27), а не NULL от jsonb_populate_record.
+    """
+
+    def __init__(self, columns):
+        self.cols = {c.lower(): c for c in columns}
+        self.extra, self.seen = set(), set()
+
+    def map(self, obj, n):
+        out, low = {}, {}
+        for k, v in obj.items():
+            lk = k.lower()
+            if lk in low:
+                raise ValueError(f"элемент {n}: ключи {low[lk]} и {k} различаются только регистром")
+            low[lk] = k
+            col = self.cols.get(lk)
+            if col is None:
+                self.extra.add(k)
+            else:
+                out[col] = v
+        self.seen.update(out)
+        return out
+
+
+def _plain(name):
+    """Имя без расширения сжатия: формат решает то, что под ним."""
+    return re.sub(r"\.(gz|zip)$", "", name, flags=re.I)
+
+
+def _zip_name(raw):
+    # Флаг UTF-8 stream_unzip не отдаёт: пробуем UTF-8, иначе cp866 (архиватор Windows, как s3_from_zip)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp866", errors="replace")
+
+
+def iter_sources(body, key):
+    """Пары (имя файла, куски байт): `.gz` распаковывается, `.zip` — каждый файл архива по очереди.
+
+    Куски файла из zip надо дочитать до следующего файла — COPY читает поток до конца.
+    """
+    def raw():
+        return iter(lambda: body.read(CHUNK), b"")
+
+    low = key.lower()
+    if low.endswith(".gz"):
+        gz = gzip.GzipFile(fileobj=body)
+        yield key, iter(lambda: gz.read(CHUNK), b"")
+    elif low.endswith(".zip"):
+        from stream_unzip import stream_unzip  # type: ignore
+        for name, _size, chunks in stream_unzip(raw()):
+            name = _zip_name(name)
+            if name.endswith("/"):
+                for _ in chunks:        # каталог: пусто, но поток архива надо промотать
+                    pass
+                continue
+            if re.search(r"\.(gz|zip)$", name, re.I):
+                raise ValueError(f"{key}/{name}: сжатие внутри архива не поддерживается")
+            yield f"{key}/{name}", chunks
+    else:
+        yield key, raw()
+
+
+class _JsonFeed:
+    """Элементы JSON / JSON Lines → строки COPY объекта `item`; считает элементы и типы ключей.
+
+    С KeyMap — раскладка: ключи переименованы в колонки, лишние отброшены.
+    """
+
+    def __init__(self, root, path, km=None):
+        self.root, self.path, self.km = root or "", path, km
         self.n = 0
         self.stats = SourceStats()
 
-    def lines(self, text):
-        items = iter_jsonl(text) if self.fmt == "jsonl" else iter_json_array(text, self.root)
+    def lines(self, fmt, text, tail=b"\n"):
+        items = iter_jsonl(text) if fmt == "jsonl" else iter_json_array(text, self.root)
         for el in items:
             self.n += 1
             obj = pick(el, self.path, self.n)
             if isinstance(obj, dict):
                 self.stats.add(obj)
-            yield _copy_line(obj)
+            if self.km is not None:
+                if not isinstance(obj, dict):
+                    raise ValueError(f"элемент {self.n}: не объект — по колонкам не разложить")
+                obj = self.km.map(obj, self.n)
+            yield _copy_line(obj, tail)
 
-    def rows(self):
-        return self.n
 
-    def source(self):
-        return self.stats.as_dict()
+def _tail(name):
+    """Хвост строки COPY с именем файла второй колонкой (разделитель \\x02 из _JSON_COPY)."""
+    if re.search(r"[\x00-\x1f]", name):
+        raise ValueError(f"управляющий символ в имени файла: {name!r}")
+    return b"\x02" + name.encode() + b"\n"
 
 
 class HrpS3ToPgStreamOperator(BaseOperator):
@@ -388,16 +467,31 @@ class HrpS3ToPgStreamOperator(BaseOperator):
                 rejected = (rejected or 0) + int(m.group(1))
         return len(notices), rejected
 
+    def _copy(self, cur, conn, copy, chunks, options=""):
+        """Одна команда COPY из потока; возвращает принятые строки (без отбраковки GP)."""
+        cur.copy_expert(copy.as_string(conn), s3_IterStream(chunks), size=CHUNK)
+        # GP 6.25 при SEGMENT REJECT LIMIT отвечает «COPY n» вместе с отбракованными
+        # строками (стенд 6.25.4: COPY 3, в таблице 2); их число есть только в NOTICE.
+        # NOTICE от COPY psycopg2 кладёт в conn.notices лишь после следующего запроса.
+        loaded = cur.rowcount
+        # Текст сверен только на стенде (английский); при другом языке сервера число
+        # не распознаётся — тогда предупреждение, а не молчаливый 0.
+        cur.execute("select 1")
+        seen, gp_rejected = self._log_notices(conn)
+        if gp_rejected is not None:
+            return loaded - gp_rejected
+        if seen and _REJECT_LIMIT.search(options):
+            self.log.warning("⚠️ уведомление сервера об отбраковке не распознано: "
+                             "rows_loaded может включать отбракованные строки")
+        return loaded
+
     def execute(self, context):
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-        key = self.s3_key
-        if re.search(r"\.(gz|zip)$", key, re.I):
-            raise NotImplementedError(f"{key}: сжатие gz/zip пока не поддерживается")
-        fmt = detect_format(key, self.format)
-        if self.file_name_column:
-            raise NotImplementedError("file_name_column пока не поддерживается")
+        key, fcol = self.s3_key, self.file_name_column
+        if not key.lower().endswith(".zip"):
+            detect_format(_plain(key), self.format)     # .txt без format — ошибка до S3
         tbl = parse_table(self.table)
         path = parse_item(self.item)
 
@@ -410,63 +504,111 @@ class HrpS3ToPgStreamOperator(BaseOperator):
             conn.autocommit = False
             try:
                 with conn.cursor() as cur:
-                    timeout = f"{self.statement_timeout}min" if self.statement_timeout > 0 else "0"
-                    cur.execute("set local statement_timeout = %s", (timeout,))
-                    self.log.info("statement_timeout %s", timeout)
-
-                    cur.execute(sql.SQL("select * from {} limit 0").format(tbl))
-                    desc = cur.description
-                    target = _target_types(cur, desc)
-                    if fmt != "csv" and (len(desc) != 1 or desc[0].type_code not in _JSON_TYPES):
-                        raise NotImplementedError(f"{self.table}: раскладка JSON по колонкам пока не "
-                                                  "поддерживается — нужна одна колонка json/jsonb")
-
-                    how = _truncate(cur, tbl, self.truncate)
-                    self.log.info("усечение: %s", how or "нет")
-
-                    with closing(obj.get()["Body"]) as body:
-                        if fmt == "csv":
-                            counter = CsvCounter(self.options)
-                            copy = sql.SQL("copy {} from stdin with " + self.options).format(tbl)
-                            # Пустой кусок s3_IterStream принимает за конец потока — отсеиваем.
-                            stream = (counter.feed(c) for c in body.iter_chunks(CHUNK) if c)
-                        else:
-                            counter = _JsonFeed(fmt, self.root, path)
-                            copy = sql.SQL(_JSON_COPY).format(tbl, sql.Identifier(desc[0].name))
-                            stream = _batched(counter.lines(_text(body)))
-                        cur.copy_expert(copy.as_string(conn), s3_IterStream(stream), size=CHUNK)
-                    # GP 6.25 при SEGMENT REJECT LIMIT отвечает «COPY n» вместе с отбракованными
-                    # строками (стенд 6.25.4: COPY 3, в таблице 2); их число есть только в NOTICE.
-                    # NOTICE от COPY psycopg2 кладёт в conn.notices лишь после следующего запроса.
-                    loaded = cur.rowcount
-                    # Текст сверен только на стенде (английский); при другом языке сервера число
-                    # не распознаётся — тогда предупреждение, а не молчаливый 0.
-                    cur.execute("select 1")
-                    seen, gp_rejected = self._log_notices(conn)
-                    if gp_rejected is not None:
-                        loaded -= gp_rejected
-                    elif seen and _REJECT_LIMIT.search(self.options):
-                        self.log.warning("⚠️ уведомление сервера об отбраковке не распознано: "
-                                         "rows_loaded может включать отбракованные строки")
+                    res = self._load(cur, conn, key, tbl, path, fcol, obj)
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 self._log_notices(conn)
                 raise
 
-        source_rows = counter.rows()
-        rejected = source_rows - loaded
-        self.log.info("прочитано %s, загружено %s в %s", source_rows, loaded, self.table)
-        if rejected:
-            self.log.warning("⚠️ не загружено строк: %s (отбраковка COPY)", rejected)
-        res = {
-            "rows_source": source_rows, "rows_loaded": loaded, "rows_rejected": rejected,
-            "files": [key], "target": target, "source": counter.source(),
-            "unmapped": [], "defaulted": [],
-        }
-        if isinstance(counter, _JsonFeed) and counter.stats.truncated:
-            res["source_truncated"] = True
+        self.log.info("прочитано %s, загружено %s в %s", res["rows_source"], res["rows_loaded"], self.table)
+        if res["rows_rejected"]:
+            self.log.warning("⚠️ не загружено строк: %s (отбраковка COPY)", res["rows_rejected"])
         return res
+
+    def _load(self, cur, conn, key, tbl, path, fcol, obj):
+        timeout = f"{self.statement_timeout}min" if self.statement_timeout > 0 else "0"
+        cur.execute("set local statement_timeout = %s", (timeout,))
+        self.log.info("statement_timeout %s", timeout)
+        cur.execute("select version()")
+        dist = " distributed randomly" if "greenplum" in cur.fetchone()[0].lower() else ""
+
+        cur.execute(sql.SQL("select * from {} limit 0").format(tbl))
+        desc = cur.description
+        target = _target_types(cur, desc)
+        if fcol and fcol not in target:
+            raise ValueError(f"file_name_column={fcol!r}: нет такой колонки в {self.table}")
+        data = [c for c in desc if c.name != fcol]
+        # REQ-23: одна json/jsonb-колонка — объект целиком в неё, иначе раскладка по колонкам
+        one_json = len(data) == 1 and data[0].type_code in _JSON_TYPES
+        km = None if one_json else KeyMap([c.name for c in data])
+        feed = _JsonFeed(self.root, path, km)
+        fid = sql.Identifier(fcol) if fcol else None
+
+        how = _truncate(cur, tbl, self.truncate)
+        self.log.info("усечение: %s", how or "нет")
+
+        files, rows, loaded, csv_source, raw, csv_tmp = [], 0, 0, {}, False, False
+        with closing(obj.get()["Body"]) as body:
+            for name, chunks in iter_sources(body, key):
+                fmt = detect_format(_plain(name), self.format)
+                files.append(name)
+                chunks = (c for c in chunks if c)   # пустой кусок s3_IterStream принимает за конец
+                if fmt == "csv":
+                    counter = CsvCounter(self.options)
+                    stream = (counter.feed(c) for c in chunks)
+                    if not fcol:
+                        loaded += self._copy(cur, conn, sql.SQL("copy {} from stdin with " + self.options)
+                                             .format(tbl), stream, self.options)
+                    else:
+                        # Колонки файла — все колонки приёмника без fcol: копия без неё, затем insert
+                        if not csv_tmp:
+                            cur.execute(sql.SQL("create temp table tmp_stream_csv (like {}) on commit drop"
+                                                + dist).format(tbl))
+                            cur.execute(sql.SQL("alter table tmp_stream_csv drop column {}").format(fid))
+                            csv_tmp = True
+                        self._copy(cur, conn, sql.SQL("copy tmp_stream_csv from stdin with " + self.options),
+                                   stream, self.options)
+                        cols = sql.SQL(", ").join(sql.Identifier(c.name) for c in data)
+                        cur.execute(sql.SQL("insert into {} ({}, {}) select *, %s from tmp_stream_csv")
+                                    .format(tbl, cols, fid), (name,))
+                        loaded += cur.rowcount
+                        cur.execute("truncate tmp_stream_csv")
+                    rows += counter.rows()
+                    csv_source = csv_source or counter.source()
+                    continue
+
+                n0 = feed.n
+                tail = _tail(name) if fcol or km else b"\n"
+                lines = _batched(feed.lines(fmt, _text(chunks), tail))
+                if one_json:
+                    cols = sql.SQL(", ").join(sql.Identifier(c) for c in [data[0].name] + ([fcol] if fcol else []))
+                    loaded += self._copy(cur, conn, sql.SQL(_JSON_COPY).format(tbl, cols), lines)
+                else:
+                    if not raw:
+                        cur.execute("create temp table tmp_stream_raw (item jsonb, file_name text) on commit drop"
+                                    + dist)
+                        raw = True
+                    self._copy(cur, conn, sql.SQL(_JSON_COPY).format(sql.Identifier("tmp_stream_raw"),
+                                                                    sql.SQL("item, file_name")), lines)
+                rows += feed.n - n0
+
+        unmapped, defaulted = [], []
+        if raw:
+            cols = [c.name for c in data if c.name in km.seen]
+            if not cols:
+                raise ValueError(f"{key}: ни один ключ не совпал с колонками {self.table}")
+            sel = [sql.SQL("r.{}").format(sql.Identifier(c)) for c in cols]
+            if fcol:
+                cols, sel = cols + [fcol], sel + [sql.SQL("t.file_name")]
+            cur.execute(sql.SQL("insert into {} ({}) select {} from tmp_stream_raw t, "
+                                "jsonb_populate_record(null::{}, t.item) r").format(
+                tbl, sql.SQL(", ").join(map(sql.Identifier, cols)), sql.SQL(", ").join(sel), tbl))
+            loaded += cur.rowcount
+            unmapped = sorted(km.extra)
+            defaulted = [c.name for c in data if c.name not in km.seen]
+            if unmapped:
+                self.log.warning("⚠️ ключи без колонки в %s отброшены (%s): %s", self.table, len(unmapped),
+                                 ", ".join(unmapped[:50]) + (" …" if len(unmapped) > 50 else ""))
+
+        out = {
+            "rows_source": rows, "rows_loaded": loaded, "rows_rejected": rows - loaded,
+            "files": files, "target": target, "source": {**csv_source, **feed.stats.as_dict()},
+            "unmapped": unmapped, "defaulted": defaulted,
+        }
+        if feed.stats.truncated:
+            out["source_truncated"] = True
+        return out
 
 
 def _selfcheck():
@@ -553,10 +695,50 @@ def _selfcheck():
     assert b"\x01" not in line and b"\x02" not in line and line.count(b"\n") == 1, line
     assert b"".join(_batched([b"ab", b"cd", b"e"], 3)) == b"abcde"
     assert list(_batched([b"ab", b"cd", b"e"], 3)) == [b"abcd", b"e"]
-    feed = _JsonFeed("json", "data", ["payload"])
-    out = list(feed.lines(['{"data": [{"schema": 1, "payload": {"x": "я"}}, {"payload": {"x": null}}]}']))
-    assert [json.loads(x) for x in out] == [{"x": "я"}, {"x": None}] and feed.rows() == 2
-    assert feed.source() == {"x": "string|null"}, feed.source()
+    feed = _JsonFeed("data", ["payload"])
+    out = list(feed.lines("json", ['{"data": [{"schema": 1, "payload": {"x": "я"}}, {"payload": {"x": null}}]}']))
+    assert [json.loads(x) for x in out] == [{"x": "я"}, {"x": None}] and feed.n == 2
+    assert feed.stats.as_dict() == {"x": "string|null"}, feed.stats.as_dict()
+
+    km = KeyMap(["employeeid", "name", "src"])
+    assert km.map({"employeeId": 1, "extra": 2}, 1) == {"employeeid": 1}
+    assert km.extra == {"extra"} and km.seen == {"employeeid"}
+    for obj in ({"a": 1, "A": 2}, {"Name": 1, "name": 2}):
+        try:
+            km.map(obj, 5)
+        except ValueError as e:
+            assert "элемент 5" in str(e), e
+        else:
+            raise AssertionError(obj)
+    feed = _JsonFeed("", [], KeyMap(["id", "name"]))
+    out = list(feed.lines("jsonl", ['{"ID": 1, "x": 2}\n'], _tail("k/a.jsonl")))
+    assert out == [b'{"id": 1}\x02k/a.jsonl\n'], out
+    assert feed.stats.as_dict() == {"ID": "number", "x": "number"} and feed.km.extra == {"x"}
+    try:
+        list(feed.lines("jsonl", ["[1]\n"]))
+    except ValueError as e:
+        assert "элемент 2" in str(e), e
+    else:
+        raise AssertionError("не объект при раскладке")
+    try:
+        _tail("a\nb")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("перевод строки в имени")
+    assert _plain("x/y.json.GZ") == "x/y.json" and _plain("y.zip") == "y"
+    srcs = list(iter_sources(io.BytesIO(gzip.compress(b"x" * (3 * CHUNK))), "k.csv.gz"))
+    assert [(n, b"".join(c)) for n, c in srcs] == [("k.csv.gz", b"x" * (3 * CHUNK))]
+    assert [(n, b"".join(c)) for n, c in iter_sources(io.BytesIO(b"ab"), "k.csv")] == [("k.csv", b"ab")]
+    import zipfile
+    zbuf = io.BytesIO()
+    with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("d/", b"")
+        z.writestr("d/а.csv", b"1\n")
+        z.writestr("b.jsonl", b"{}\n")
+    zbuf.seek(0)
+    assert [(n, b"".join(c)) for n, c in iter_sources(zbuf, "k.zip")] == [("k.zip/d/а.csv", b"1\n"),
+                                                                         ("k.zip/b.jsonl", b"{}\n")]
     print("selfcheck ok")
 
 

@@ -1,10 +1,10 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-15 13:26 MSK · v0.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:34 MSK · v0.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
 битой строке, опции COPY, счётчики строк, таймаут; JSON-массив в конверте (`root`, `item`),
-JSON Lines, память на файле 300 МБ; на Greenplum — отбраковка
+JSON Lines, раскладка по колонкам, `file_name_column`, gz и zip, память на jsonl.gz 300 МБ; на Greenplum — отбраковка
 `LOG ERRORS SEGMENT REJECT LIMIT`. В конце убирает таблицы и файлы.
 
 Таски: `scenarios` — все сценарии подряд, первый провал роняет таск.
@@ -13,6 +13,8 @@ JSON Lines, память на файле 300 МБ; на Greenplum — отбра
 """
 from __future__ import annotations
 
+import gzip
+import io
 import json
 import logging
 import os
@@ -20,6 +22,7 @@ import resource
 import tempfile
 import threading
 import time
+import zipfile
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 
@@ -309,25 +312,83 @@ def tools_test_pg_stream():
                 assert count(tj) == 3, count(tj)
                 ok("REQ-21 jsonl: 3 строки, битая 2-я → «строка 2», откат")
 
-                # REQ-09: jsonl 300 МБ — пик памяти процесса растёт меньше чем на 200 МБ.
+                # REQ-09, 18: jsonl.gz, 300 МБ после распаковки — пик памяти растёт меньше чем на 200 МБ.
                 # Файл пишется на диск и уходит в S3 multipart, чтобы сама фикстура не подняла пик.
                 line = json.dumps({"id": 0, "pad": "ж" * 140}, ensure_ascii=False).encode() + b"\n"
-                n300 = (300 << 20) // len(line)
-                with tempfile.NamedTemporaryFile(suffix=".jsonl") as f:
-                    for _ in range(n300 // 10_000):
-                        f.write(line * 10_000)
+                n300 = (300 << 20) // len(line) // 10_000 * 10_000
+                with tempfile.NamedTemporaryFile(suffix=".jsonl.gz") as f:
+                    with gzip.GzipFile(fileobj=f, mode="wb", compresslevel=1) as gz:
+                        for _ in range(n300 // 10_000):
+                            gz.write(line * 10_000)
                     f.flush()
-                    k300 = prefix + "big300.jsonl"
+                    k300 = prefix + "big300.jsonl.gz"
                     s3.load_file(f.name, k300, bucket, replace=True)
                     keys.append(k300)
                     size = os.path.getsize(f.name)
                 rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-                res, _ = run("jsonl-300", k300, tj, truncate="hard")
+                res, _ = run("jsonl-gz-300", k300, tj, truncate="hard")
                 grew = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) >> 10
                 # Пик процесса до загрузки уже включает Airflow; потоковая загрузка его не превышает
-                logger.info("REQ-09: файл %s МБ, пик RSS %s МБ, вырос на %s МБ", size >> 20, rss0 >> 10, grew)
-                assert res["rows_loaded"] == n300 // 10_000 * 10_000 and grew < 200, (res, grew)
-                ok(f"REQ-09 jsonl {size >> 20} МБ: пик RSS +{grew} МБ")
+                logger.info("REQ-09: gz %s МБ, распаковано %s МБ, пик RSS %s МБ, вырос на %s МБ",
+                            size >> 20, n300 * len(line) >> 20, rss0 >> 10, grew)
+                assert res["rows_loaded"] == n300 and grew < 200, (res, grew)
+                ok(f"REQ-09/18 jsonl.gz {n300 * len(line) >> 20} МБ: пик RSS +{grew} МБ")
+
+                # REQ-23, 24, 27, 11: раскладка по колонкам
+                tc = mk("cols", "employeeid int, name text, hired date, load_dttm timestamp default now(), src text")
+                emp = [{"employeeId": 1, "name": "Анна", "hired": "2026-01-01", "extra": {"x": 1}},
+                       {"employeeId": 2, "hired": "2026-01-02", "extra": {}}]
+                ke = put("emp.json", json.dumps(emp, ensure_ascii=False).encode())
+                res, log = run("cols", ke, tc)
+                assert (res["rows_source"], res["rows_loaded"], res["rows_rejected"]) == (2, 2, 0), res
+                assert res["unmapped"] == ["extra"] and "load_dttm" in res["defaulted"], res
+                assert res["source"] == {"employeeId": "number", "name": "string", "hired": "string",
+                                         "extra": "object"}, res["source"]
+                assert log.has("extra"), log.lines
+                assert q(f"select employeeid, name, hired::text, load_dttm is not null from {tc} order by 1") == \
+                    [(1, "Анна", "2026-01-01", True), (2, None, "2026-01-02", True)]
+                ok("REQ-23/24/27 раскладка: employeeId → employeeid, extra в лог, NULL, default now()")
+
+                # REQ-24: ключи, различающиеся регистром; REQ-25: неприводимое значение — откат
+                for name, body, want in (("case", b'{"employeeId": 3, "a": 1, "A": 2}\n', "регистром"),
+                                         ("cast", b'{"employeeId": 3, "hired": "31.12.2026"}\n', "31.12.2026")):
+                    try:
+                        run(name, put(f"{name}.jsonl", body), tc, truncate="hard")
+                    except Exception as e:
+                        logger.info("ожидаемая ошибка: %r", e)
+                        assert want in str(e), e
+                    else:
+                        raise AssertionError(f"{name} загрузился")
+                    assert count(tc) == 2, count(tc)
+                ok("REQ-24/25 регистр ключей и неприводимая дата → ошибка, приёмник прежний")
+
+                # REQ-26: file_name_column для csv, json, jsonl и для одной jsonb-колонки
+                tjs = mk("json_src", "j jsonb, src text")
+                kc = put("emp.csv", b"employeeid,name,hired,load_dttm\n5,c,2026-02-01,2026-02-01 10:00\n"
+                                    b"6,d,2026-02-02,2026-02-02 10:00\n")
+                kl2 = put("emp.jsonl", b'{"employeeid": 7}\n{"EmployeeID": 8}\n')
+                for name, key, table in (("src-csv", kc, tc), ("src-json", ke, tc), ("src-jsonl", kl2, tc),
+                                         ("src-jsonb", kl2, tjs)):
+                    res, _ = run(name, key, table, truncate="hard", file_name_column="src")
+                    assert res["rows_loaded"] == 2 and q(f"select distinct src from {table}") == [(key,)], (name, res)
+                ok("REQ-26 file_name_column для csv, json, jsonl и jsonb-колонки")
+
+                # REQ-18, 11: zip с двумя csv — строки обоих, src и files — имена внутри архива
+                zb = io.BytesIO()
+                with zipfile.ZipFile(zb, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.writestr("in/", b"")
+                    z.writestr("in/a.csv", b"employeeid,name,hired,load_dttm\n10,a,2026-03-01,2026-03-01 10:00\n")
+                    z.writestr("in/b.csv", b"employeeid,name,hired,load_dttm\n11,b,2026-03-02,2026-03-02 10:00\n"
+                                           b"12,c,2026-03-03,2026-03-03 10:00\n")
+                kz = put("two.zip", zb.getvalue())
+                res, _ = run("zip", kz, tc, truncate="hard", file_name_column="src")
+                names = [kz + "/in/a.csv", kz + "/in/b.csv"]
+                assert res["files"] == names and (res["rows_source"], res["rows_loaded"]) == (3, 3), res
+                assert q(f"select src, count(*) from {tc} group by 1 order by 1") == [(names[0], 1), (names[1], 2)]
+                kg = put("emp.json.gz", gzip.compress(json.dumps(emp).encode()))
+                res, _ = run("json-gz", kg, tc, truncate="hard")
+                assert res["rows_loaded"] == 2 and count(tc) == 2, res
+                ok("REQ-18 zip с двумя csv и .json.gz")
 
                 # REQ-11 на GP: отбраковка LOG ERRORS — rows_rejected и предупреждение
                 if gp:
