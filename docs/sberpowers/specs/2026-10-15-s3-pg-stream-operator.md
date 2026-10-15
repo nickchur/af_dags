@@ -185,7 +185,7 @@
 | REQ-plugins-25 | 3.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-26 | 3.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-27 | 1.1, 3.1 | tools_test_pg_stream | выполнено |
-| REQ-plugins-28 | 3.2 | — | не начато |
+| REQ-plugins-28 | 3.2 | tools_test_pg_stream | выполнено |
 
 ## Задачи
 

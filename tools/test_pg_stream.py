@@ -1,10 +1,11 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-15 13:34 MSK · v0.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:59 MSK · v0.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
 битой строке, опции COPY, счётчики строк, таймаут; JSON-массив в конверте (`root`, `item`),
-JSON Lines, раскладка по колонкам, `file_name_column`, gz и zip, память на jsonl.gz 300 МБ; на Greenplum — отбраковка
+JSON Lines, раскладка по колонкам, `file_name_column`, gz и zip, память на jsonl.gz 300 МБ,
+`tmp_table` (две транзакции); на Greenplum — отбраковка
 `LOG ERRORS SEGMENT REJECT LIMIT`. В конце убирает таблицы и файлы.
 
 Таски: `scenarios` — все сценарии подряд, первый провал роняет таск.
@@ -389,6 +390,44 @@ def tools_test_pg_stream():
                 res, _ = run("json-gz", kg, tc, truncate="hard")
                 assert res["rows_loaded"] == 2 and count(tc) == 2, res
                 ok("REQ-18 zip с двумя csv и .json.gz")
+
+                # REQ-28: tmp_table — сырьё отдельной транзакцией, приёмник второй
+                traw = mk("raw", "item jsonb, file_name text")
+                tt = mk("tt", "employeeid int, name text, hired date")
+                q(f"insert into {tt} values (100, 'old', '2020-01-01'), (101, 'old', '2020-01-01')")
+                kt = put("tt.jsonl", b'{"employeeId": 1, "hired": "2026-01-01"}\n{"employeeId": 2}\n'
+                                     b'{"employeeId": 3, "name": "c"}\n')
+                res, log = run("tmp-table", kt, tt, truncate="hard", tmp_table=traw)
+                assert (res["rows_source"], res["rows_loaded"]) == (3, 3) and res["defaulted"] == [], res
+                assert count(tt) == 3 and count(traw) == 0, (count(tt), count(traw))
+                res, _ = run("tmp-table-jsonb", kt, tj, truncate="hard", tmp_table=traw)
+                assert res["rows_loaded"] == 3 and count(tj) == 3 and count(traw) == 0, res
+                kbad = put("tt_bad.jsonl", b'{"employeeId": 4}\n{"employeeId": 5, "hired": "31.12.2026"}\n')
+                try:
+                    run("tmp-table-bad", kbad, tt, truncate="hard", tmp_table=traw)
+                except Exception as e:
+                    logger.info("ожидаемая ошибка: %r", e)
+                    assert "31.12.2026" in str(e), e
+                else:
+                    raise AssertionError("неприводимая дата загрузилась")
+                assert count(tt) == 3 and count(traw) == 2, (count(tt), count(traw))
+                assert q(f"select distinct file_name from {traw}") == [(kbad,)]
+                ok("REQ-28 tmp_table: приёмник = файл, сырьё очищено; сбой второй транзакции — сырьё осталось")
+
+                tx = mk("raw_bad", "x int")
+                try:      # объекта в S3 нет: ошибка состава должна прийти раньше обращения к нему
+                    run("tmp-table-shape", prefix + "absent.jsonl", tt, tmp_table=tx)
+                except ValueError as e:
+                    assert "item jsonb, file_name text" in str(e), e
+                else:
+                    raise AssertionError("tmp_table (x int) принята")
+                try:
+                    HrpS3ToPgStreamOperator(task_id="bad_tmp", s3_key=kt, table=tt, format="csv", tmp_table=traw)
+                except ValueError:
+                    pass
+                else:
+                    raise AssertionError("format='csv' с tmp_table принят")
+                ok("REQ-28 tmp_table не (item jsonb, file_name text) — ошибка до S3; csv — ValueError")
 
                 # REQ-11 на GP: отбраковка LOG ERRORS — rows_rejected и предупреждение
                 if gp:

@@ -390,18 +390,18 @@ select r.{c1}, r.{c2}…[, t.file_name] from tmp_stream_raw t, jsonb_populate_re
   `[("item", 3802), ("file_name", 25)]`, иначе ValueError «tmp_table <имя>: ждём (item jsonb, file_name text)».
 
 **Шаги:**
-- [ ] Самопроверка: `HrpS3ToPgStreamOperator(..., format="csv", tmp_table="x")` → ValueError.
-- [ ] `__init__`: `tmp_table` с `format='csv'` → ValueError; имя — `parse_table`.
-- [ ] `execute` при `tmp_table`: проверка формата файла (csv при `auto` → ValueError до S3);
+- [x] Самопроверка: `HrpS3ToPgStreamOperator(..., format="csv", tmp_table="x")` → ValueError.
+- [x] `__init__`: `tmp_table` с `format='csv'` → ValueError; имя — `parse_table`.
+- [x] `execute` при `tmp_table`: проверка формата файла (csv при `auto` → ValueError до S3);
   транзакция 1 — `_check_raw`, `truncate tmp_table`, COPY сырья, commit; транзакция 2 — тот же
   `statement_timeout`, `_truncate(приёмник)`, `_insert_from_raw`, `truncate tmp_table`, commit.
   Ошибка во второй — rollback, сырьё остаётся (лог: «сырьё в <tmp_table>»).
-- [ ] Сценарии: приёмник `(employeeid int, name text, hired date)`, `tmp_table` создаёт даг:
+- [x] Сценарии: приёмник `(employeeid int, name text, hired date)`, `tmp_table` создаёт даг:
   jsonl + `truncate='hard'` → строки файла, `tmp_table` пуста; `hired: "31.12.2026"` → ошибка,
   приёмник прежний, в `tmp_table` строки файла; `tmp_table (x int)` → ошибка до S3;
   `format='csv'` + `tmp_table` → ValueError.
-- [ ] Выложи, прогони даг на `cap_gp_etl` и `gp6-stand`; `ruff check` — чисто.
-- [ ] Commit: `feat(plugins): HrpS3ToPgStreamOperator — tmp_table, две транзакции (REQ-plugins-28)`
+- [x] Выложи, прогони даг на `cap_gp_etl` и `gp6-stand`; `ruff check` — чисто.
+- [x] Commit: `feat(plugins): HrpS3ToPgStreamOperator — tmp_table, две транзакции (REQ-plugins-28)`
 
 **Критерии выхода:**
 - `tools_test_pg_stream` зелёный на обоих подключениях, сценарии 1.1–3.2.

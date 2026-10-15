@@ -1,5 +1,5 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 13:34 MSK · v0.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:59 MSK · v0.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Усечение приёмника —
@@ -10,6 +10,8 @@
 Приёмник из одной колонки json/jsonb — объект целиком в неё, иначе раскладка по колонкам
 (`jsonb_populate_record`, ключи без учёта регистра). Сжатие `.gz`, `.zip` (все файлы архива);
 `file_name_column` — ключ S3 в каждой строке.
+`tmp_table` (json/jsonl) — постоянная таблица сырья `(item jsonb, file_name text)`: COPY из S3
+коммитится отдельно, приёмник меняется второй, короткой транзакцией; её сбой оставляет сырьё.
 Самопроверка: `python3 plugins/pg_stream.py`.
 """
 from __future__ import annotations
@@ -21,6 +23,7 @@ import io
 import json
 import os
 import re
+import types
 from contextlib import closing
 
 import psycopg2
@@ -442,12 +445,16 @@ class HrpS3ToPgStreamOperator(BaseOperator):
 
     def __init__(self, *, s3_key, table, bucket=None, s3_conn_id="s3", conn_id="cap_gp_etl",
                  format="auto", root=None, item=None, options="CSV HEADER DELIMITER ','",
-                 truncate=None, file_name_column=None, statement_timeout=240, **kwargs):
+                 truncate=None, file_name_column=None, statement_timeout=240, tmp_table=None, **kwargs):
         # Ошибка параметра — здесь, до S3 и базы: даг падает на разборе, а не посреди загрузки.
         if truncate not in TRUNCATE_MODES:
             raise ValueError(f"truncate={truncate!r}: ждём None, 'soft', 'hard' или 'auto'")
         if format not in FORMATS:
             raise ValueError(f"format={format!r}: ждём csv, json, jsonl или auto")
+        if tmp_table:
+            parse_table(tmp_table)
+            if format == "csv":
+                raise ValueError("tmp_table — только для json и jsonl")
         super().__init__(**kwargs)
         self.s3_key, self.table, self.bucket = s3_key, table, bucket
         self.s3_conn_id, self.conn_id = s3_conn_id, conn_id
@@ -455,6 +462,7 @@ class HrpS3ToPgStreamOperator(BaseOperator):
         self.options, self.truncate = options, truncate
         self.file_name_column = file_name_column
         self.statement_timeout = int(statement_timeout or 0)
+        self.tmp_table = tmp_table
 
     def _log_notices(self, conn):
         """Уведомления сервера — в лог; возвращает (их число, отбраковка GP из них или None)."""
@@ -486,129 +494,213 @@ class HrpS3ToPgStreamOperator(BaseOperator):
         return loaded
 
     def execute(self, context):
-        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
         from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-        key, fcol = self.s3_key, self.file_name_column
+        key = self.s3_key
         if not key.lower().endswith(".zip"):
-            detect_format(_plain(key), self.format)     # .txt без format — ошибка до S3
+            fmt = detect_format(_plain(key), self.format)     # .txt без format — ошибка до S3
+            if fmt == "csv" and self.tmp_table:
+                raise ValueError(f"{key}: tmp_table — только для json и jsonl")
         tbl = parse_table(self.table)
-        path = parse_item(self.item)
-
-        obj = S3Hook(aws_conn_id=self.s3_conn_id).get_key(key, self.bucket)
-        if obj is None:
-            raise AirflowFailException(f"нет объекта s3://{self.bucket or ''}/{key}")
 
         # closing — with по соединению psycopg2 закрывает транзакцию, а не соединение.
         with closing(PostgresHook(postgres_conn_id=self.conn_id).get_conn()) as conn:
             conn.autocommit = False
-            try:
-                with conn.cursor() as cur:
-                    res = self._load(cur, conn, key, tbl, path, fcol, obj)
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                self._log_notices(conn)
-                raise
+            with conn.cursor() as cur:
+                if not self.tmp_table:
+                    res = self._tx(conn, lambda: self._one_tx(cur, conn, key, tbl))
+                else:
+                    raw = parse_table(self.tmp_table)
+                    # 1: сырьё из S3 в tmp_table — долгая часть, приёмник не тронут
+                    ctx = self._tx(conn, lambda: self._raw_tx(cur, conn, key, tbl, raw))
+                    # 2: приёмник — только SQL внутри базы; сбой оставляет сырьё для разбора
+                    try:
+                        res = self._tx(conn, lambda: self._target_tx(cur, ctx, tbl, raw))
+                    except BaseException:
+                        self.log.error("приёмник %s не изменён, сырьё файла — в %s", self.table, self.tmp_table)
+                        raise
 
         self.log.info("прочитано %s, загружено %s в %s", res["rows_source"], res["rows_loaded"], self.table)
         if res["rows_rejected"]:
             self.log.warning("⚠️ не загружено строк: %s (отбраковка COPY)", res["rows_rejected"])
         return res
 
-    def _load(self, cur, conn, key, tbl, path, fcol, obj):
+    def _tx(self, conn, body):
+        """Транзакция: commit при успехе, rollback и уведомления сервера в лог при ошибке."""
+        try:
+            out = body()
+            conn.commit()
+            return out
+        except BaseException:
+            conn.rollback()
+            self._log_notices(conn)
+            raise
+
+    def _set_timeout(self, cur):
         timeout = f"{self.statement_timeout}min" if self.statement_timeout > 0 else "0"
         cur.execute("set local statement_timeout = %s", (timeout,))
         self.log.info("statement_timeout %s", timeout)
-        cur.execute("select version()")
-        dist = " distributed randomly" if "greenplum" in cur.fetchone()[0].lower() else ""
 
+    def _open(self):
+        from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+
+        obj = S3Hook(aws_conn_id=self.s3_conn_id).get_key(self.s3_key, self.bucket)
+        if obj is None:
+            raise AirflowFailException(f"нет объекта s3://{self.bucket or ''}/{self.s3_key}")
+        return closing(obj.get()["Body"])
+
+    def _target(self, cur, tbl):
+        """Состав приёмника (`select * limit 0`) и способ записи JSON (REQ-23)."""
+        fcol = self.file_name_column
         cur.execute(sql.SQL("select * from {} limit 0").format(tbl))
         desc = cur.description
         target = _target_types(cur, desc)
         if fcol and fcol not in target:
             raise ValueError(f"file_name_column={fcol!r}: нет такой колонки в {self.table}")
         data = [c for c in desc if c.name != fcol]
-        # REQ-23: одна json/jsonb-колонка — объект целиком в неё, иначе раскладка по колонкам
+        # одна json/jsonb-колонка — объект целиком в неё, иначе раскладка по колонкам
         one_json = len(data) == 1 and data[0].type_code in _JSON_TYPES
         km = None if one_json else KeyMap([c.name for c in data])
-        feed = _JsonFeed(self.root, path, km)
-        fid = sql.Identifier(fcol) if fcol else None
+        return types.SimpleNamespace(target=target, data=data, one_json=one_json, km=km, fcol=fcol,
+                                     feed=_JsonFeed(self.root, parse_item(self.item), km),
+                                     files=[], rows=0, loaded=0, csv_source={}, raw=None)
 
+    def _one_tx(self, cur, conn, key, tbl):
+        """Без tmp_table: всё одной транзакцией, сырьё JSON — во временной tmp_stream_raw."""
+        self._set_timeout(cur)
+        ctx = self._target(cur, tbl)
         how = _truncate(cur, tbl, self.truncate)
         self.log.info("усечение: %s", how or "нет")
+        self._fill(cur, conn, ctx, key, tbl)
+        if ctx.raw is not None:
+            ctx.loaded += self._insert_from_raw(cur, ctx, tbl, ctx.raw)
+        return self._result(ctx)
 
-        files, rows, loaded, csv_source, raw, csv_tmp = [], 0, 0, {}, False, False
-        with closing(obj.get()["Body"]) as body:
+    def _raw_tx(self, cur, conn, key, tbl, raw):
+        """Транзакция 1 с tmp_table: проверка её состава до S3, очистка, COPY сырья."""
+        self._set_timeout(cur)
+        _check_raw(cur, raw, self.tmp_table)
+        ctx = self._target(cur, tbl)
+        cur.execute(sql.SQL("truncate {}").format(raw))
+        ctx.raw = raw
+        self._fill(cur, conn, ctx, key, tbl)
+        return ctx
+
+    def _target_tx(self, cur, ctx, tbl, raw):
+        """Транзакция 2 с tmp_table: усечение приёмника, insert из сырья, очистка сырья."""
+        self._set_timeout(cur)
+        how = _truncate(cur, tbl, self.truncate)
+        self.log.info("усечение: %s", how or "нет")
+        ctx.loaded += self._insert_from_raw(cur, ctx, tbl, raw)
+        cur.execute(sql.SQL("truncate {}").format(raw))
+        return self._result(ctx)
+
+    def _fill(self, cur, conn, ctx, key, tbl):
+        """Файлы объекта S3 по очереди: csv — COPY в приёмник; json/jsonl — в приёмник с одной
+        json-колонкой напрямую или в таблицу сырья `ctx.raw` (item jsonb, file_name text):
+        tmp_table или временную tmp_stream_raw, она создаётся при первом файле JSON."""
+        fcol = ctx.fcol
+        fid = sql.Identifier(fcol) if fcol else None
+        csv_tmp = False
+        with self._open() as body:
             for name, chunks in iter_sources(body, key):
                 fmt = detect_format(_plain(name), self.format)
-                files.append(name)
+                ctx.files.append(name)
                 chunks = (c for c in chunks if c)   # пустой кусок s3_IterStream принимает за конец
                 if fmt == "csv":
+                    if self.tmp_table:
+                        raise ValueError(f"{name}: tmp_table — только для json и jsonl")
                     counter = CsvCounter(self.options)
                     stream = (counter.feed(c) for c in chunks)
                     if not fcol:
-                        loaded += self._copy(cur, conn, sql.SQL("copy {} from stdin with " + self.options)
-                                             .format(tbl), stream, self.options)
+                        ctx.loaded += self._copy(cur, conn, sql.SQL("copy {} from stdin with " + self.options)
+                                                 .format(tbl), stream, self.options)
                     else:
                         # Колонки файла — все колонки приёмника без fcol: копия без неё, затем insert
                         if not csv_tmp:
                             cur.execute(sql.SQL("create temp table tmp_stream_csv (like {}) on commit drop"
-                                                + dist).format(tbl))
+                                                + _dist(cur)).format(tbl))
                             cur.execute(sql.SQL("alter table tmp_stream_csv drop column {}").format(fid))
                             csv_tmp = True
                         self._copy(cur, conn, sql.SQL("copy tmp_stream_csv from stdin with " + self.options),
                                    stream, self.options)
-                        cols = sql.SQL(", ").join(sql.Identifier(c.name) for c in data)
+                        cols = sql.SQL(", ").join(sql.Identifier(c.name) for c in ctx.data)
                         cur.execute(sql.SQL("insert into {} ({}, {}) select *, %s from tmp_stream_csv")
                                     .format(tbl, cols, fid), (name,))
-                        loaded += cur.rowcount
+                        ctx.loaded += cur.rowcount
                         cur.execute("truncate tmp_stream_csv")
-                    rows += counter.rows()
-                    csv_source = csv_source or counter.source()
+                    ctx.rows += counter.rows()
+                    ctx.csv_source = ctx.csv_source or counter.source()
                     continue
 
-                n0 = feed.n
-                tail = _tail(name) if fcol or km else b"\n"
-                lines = _batched(feed.lines(fmt, _text(chunks), tail))
-                if one_json:
-                    cols = sql.SQL(", ").join(sql.Identifier(c) for c in [data[0].name] + ([fcol] if fcol else []))
-                    loaded += self._copy(cur, conn, sql.SQL(_JSON_COPY).format(tbl, cols), lines)
+                n0 = ctx.feed.n
+                if ctx.one_json and ctx.raw is None:     # одна json-колонка, без tmp_table: прямо в приёмник
+                    tail = _tail(name) if fcol else b"\n"
+                    cols = sql.SQL(", ").join(map(sql.Identifier, [ctx.data[0].name] + ([fcol] if fcol else [])))
+                    copy = sql.SQL(_JSON_COPY).format(tbl, cols)
+                    ctx.loaded += self._copy(cur, conn, copy, _batched(ctx.feed.lines(fmt, _text(chunks), tail)))
                 else:
-                    if not raw:
+                    if ctx.raw is None:
                         cur.execute("create temp table tmp_stream_raw (item jsonb, file_name text) on commit drop"
-                                    + dist)
-                        raw = True
-                    self._copy(cur, conn, sql.SQL(_JSON_COPY).format(sql.Identifier("tmp_stream_raw"),
-                                                                    sql.SQL("item, file_name")), lines)
-                rows += feed.n - n0
+                                    + _dist(cur))
+                        ctx.raw = sql.Identifier("tmp_stream_raw")
+                    copy = sql.SQL(_JSON_COPY).format(ctx.raw, sql.SQL("item, file_name"))
+                    self._copy(cur, conn, copy, _batched(ctx.feed.lines(fmt, _text(chunks), _tail(name))))
+                ctx.rows += ctx.feed.n - n0
 
-        unmapped, defaulted = [], []
-        if raw:
-            cols = [c.name for c in data if c.name in km.seen]
-            if not cols:
-                raise ValueError(f"{key}: ни один ключ не совпал с колонками {self.table}")
+    def _insert_from_raw(self, cur, ctx, tbl, raw):
+        """insert в приёмник из сырья: объект целиком в json-колонку или раскладка jsonb_populate_record."""
+        fcol = ctx.fcol
+        if ctx.one_json:
+            col = ctx.data[0]
+            cols = [col.name]
+            sel = [sql.SQL("t.item::json") if col.type_code == 114 else sql.SQL("t.item")]
+            src = sql.SQL("{} t").format(raw)
+        else:
+            km = ctx.km
+            cols = [c.name for c in ctx.data if c.name in km.seen]
+            if not cols and ctx.feed.n:
+                raise ValueError(f"{self.s3_key}: ни один ключ не совпал с колонками {self.table}")
             sel = [sql.SQL("r.{}").format(sql.Identifier(c)) for c in cols]
-            if fcol:
-                cols, sel = cols + [fcol], sel + [sql.SQL("t.file_name")]
-            cur.execute(sql.SQL("insert into {} ({}) select {} from tmp_stream_raw t, "
-                                "jsonb_populate_record(null::{}, t.item) r").format(
-                tbl, sql.SQL(", ").join(map(sql.Identifier, cols)), sql.SQL(", ").join(sel), tbl))
-            loaded += cur.rowcount
-            unmapped = sorted(km.extra)
-            defaulted = [c.name for c in data if c.name not in km.seen]
-            if unmapped:
-                self.log.warning("⚠️ ключи без колонки в %s отброшены (%s): %s", self.table, len(unmapped),
-                                 ", ".join(unmapped[:50]) + (" …" if len(unmapped) > 50 else ""))
+            src = sql.SQL("{} t, jsonb_populate_record(null::{}, t.item) r").format(raw, tbl)
+            if km.extra:
+                extra = sorted(km.extra)
+                self.log.warning("⚠️ ключи без колонки в %s отброшены (%s): %s", self.table, len(extra),
+                                 ", ".join(extra[:50]) + (" …" if len(extra) > 50 else ""))
+        if fcol:
+            cols, sel = cols + [fcol], sel + [sql.SQL("t.file_name")]
+        if not cols:
+            return 0
+        cur.execute(sql.SQL("insert into {} ({}) select {} from {}").format(
+            tbl, sql.SQL(", ").join(map(sql.Identifier, cols)), sql.SQL(", ").join(sel), src))
+        return cur.rowcount
 
+    def _result(self, ctx):
+        km = ctx.km
         out = {
-            "rows_source": rows, "rows_loaded": loaded, "rows_rejected": rows - loaded,
-            "files": files, "target": target, "source": {**csv_source, **feed.stats.as_dict()},
-            "unmapped": unmapped, "defaulted": defaulted,
+            "rows_source": ctx.rows, "rows_loaded": ctx.loaded, "rows_rejected": ctx.rows - ctx.loaded,
+            "files": ctx.files, "target": ctx.target,
+            "source": {**ctx.csv_source, **ctx.feed.stats.as_dict()},
+            "unmapped": sorted(km.extra) if km else [],
+            "defaulted": [c.name for c in ctx.data if c.name not in km.seen] if km and ctx.feed.n else [],
         }
-        if feed.stats.truncated:
+        if ctx.feed.stats.truncated:
             out["source_truncated"] = True
         return out
+
+
+def _dist(cur):
+    """Хвост create table: на Greenplum временные таблицы — distributed randomly."""
+    cur.execute("select version()")
+    return " distributed randomly" if "greenplum" in cur.fetchone()[0].lower() else ""
+
+
+def _check_raw(cur, raw, name):
+    """tmp_table обязана быть (item jsonb, file_name text) — иначе ошибка до S3."""
+    cur.execute(sql.SQL("select * from {} limit 0").format(raw))
+    got = [(c.name, c.type_code) for c in cur.description]
+    if got != [("item", 3802), ("file_name", 25)]:
+        raise ValueError(f"tmp_table {name}: ждём (item jsonb, file_name text)")
 
 
 def _selfcheck():
@@ -634,6 +726,13 @@ def _selfcheck():
         pass
     else:
         raise AssertionError("truncate=yes")
+    for kw in ({"format": "csv", "tmp_table": "s.raw"}, {"format": "json", "tmp_table": "a;b"}):
+        try:
+            HrpS3ToPgStreamOperator(task_id="t", s3_key="k", table="t", **kw)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(kw)
 
     data = b'id;name\r\n1;"a\nb"\r\n2;"x ""q"" \n\n y"\r\n3;z'
     for n in (1, 2, 5, 1000):
