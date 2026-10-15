@@ -101,8 +101,8 @@ KAFKA_RCV_TOPICS = ['TFS.HRPLT.OUT']
 RECEIPTS_TABLE   = 'export.tfs_receipts'    # квитанции из Kafka, общие для всех маршрутов
 SENT_FILES_TABLE = 'export.er_sent_files'   # очередь и реестр отправок ER
 
-# Соединение зеркала в Postgres. Нужно ЗАПИСЫВАЮЩЕЕ: alpha-adb_dev_comm-read по имени
-# только на чтение. Пусто — зеркало выключено.
+# Соединение зеркала в Postgres. Подходит и alpha-adb_dev_comm-read: вопреки имени он
+# пишет (всё, кроме ALTER и DROP); -write нужен только владельцу для DDL. Пусто — зеркало выключено.
 PG_CONN = ''
 
 # Префикс тракта внутри логового бакета.
