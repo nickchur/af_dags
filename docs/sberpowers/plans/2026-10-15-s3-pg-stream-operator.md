@@ -4,7 +4,7 @@
 > Шаги — чекбоксы `- [ ]`. Исполнитель этой фичи — диспетчер сам (код пишет сам, ревью — двумя
 > независимыми ревьюерами), поэтому задачи последовательны: все они правят один модуль.
 
-**Спека:** docs/sberpowers/specs/2026-10-15-s3-pg-stream-operator.md (REQ-plugins-07 … REQ-plugins-27)
+**Спека:** docs/sberpowers/specs/2026-10-15-s3-pg-stream-operator.md (REQ-plugins-07 … REQ-plugins-28)
 **Цель:** даг грузит объект S3 (csv, json-массив, jsonl; как есть, `.gz`, `.zip`) в таблицу GP или
 PG оператором `HrpS3ToPgStreamOperator` — потоково, одной транзакцией, с усечением `soft/hard/auto`
 и раскладкой JSON по колонкам приёмника.
@@ -36,14 +36,15 @@ PG оператором `HrpS3ToPgStreamOperator` — потоково, одно
 - Контракт оператора (из спеки):
   `HrpS3ToPgStreamOperator(s3_key, table, bucket=None, s3_conn_id='s3', conn_id='cap_gp_etl',
   format='auto', root=None, item=None, options="CSV HEADER DELIMITER ','", truncate=None,
-  file_name_column=None, statement_timeout=240, **kwargs)`; `template_fields = ('s3_key', 'table', 'bucket')`.
+  file_name_column=None, statement_timeout=240, tmp_table=None, **kwargs)`; `template_fields = ('s3_key', 'table', 'bucket')`.
 
 ## Волны
 
 - Волна 1: задача 1.1 — без блокеров.
 - Волна 2: задача 2.1 (blocked by 1.1).
 - Волна 3: задача 3.1 (blocked by 2.1).
-- Волна 4: задача 4.1 (blocked by 1.1, 2.1, 3.1).
+- Волна 3б: задача 3.2 (blocked by 3.1).
+- Волна 4: задача 4.1 (blocked by 1.1, 2.1, 3.1, 3.2).
 
 Задачи последовательны: все правят `plugins/pg_stream.py` и `tools/test_pg_stream.py`.
 
@@ -334,21 +335,21 @@ def iter_jsonl(chunks):
 ```
 - [ ] Самопроверка на стенде — ожидай FAIL (`NameError: KeyMap`).
 - [ ] Реализуй раскладку в `execute`:
-  - временная таблица: `create temp table pg_stream_raw (j jsonb, f text) on commit drop`
+  - временная таблица: `create temp table tmp_stream_raw (j jsonb, f text) on commit drop`
     (+ ` distributed randomly`, если `select version()` содержит `Greenplum`);
   - COPY строк `_copy_line(km.map(pick(el, path, n), n))[:-1] + b"\x02" + имя_файла + b"\n"` в
-    `pg_stream_raw (j, f)` с `(format csv, quote e'\x01', delimiter e'\x02')`;
+    `tmp_stream_raw (j, f)` с `(format csv, quote e'\x01', delimiter e'\x02')`;
   - после COPY: `cols = [c for c in columns if c in km.seen]`, плюс `file_name_column` →
 ```sql
 insert into {tbl} ({cols}[, {fcol}])
-select r.{c1}, r.{c2}…[, t.f] from pg_stream_raw t, jsonb_populate_record(null::{tbl}, t.j) r
+select r.{c1}, r.{c2}…[, t.f] from tmp_stream_raw t, jsonb_populate_record(null::{tbl}, t.j) r
 ```
     `rows_loaded = cur.rowcount`, `rows_source` — число элементов; `km.extra` непусто → один `log.warning` со списком (до 50 имён).
     XCom: `unmapped = sorted(km.extra)`, `defaulted = [c for c in columns if c not in km.seen and
     c != file_name_column]`, `files` — имена из `iter_sources` (для zip — `<key>/<имя в архиве>`).
-  - CSV с `file_name_column`: `create temp table pg_stream_csv (like {tbl}) on commit drop`
-    (+ distributed randomly на GP), `alter table pg_stream_csv drop column {fcol}`, COPY в неё с
-    `options`, затем `insert into {tbl} ({cols без fcol}, {fcol}) select *, %s from pg_stream_csv`.
+  - CSV с `file_name_column`: `create temp table tmp_stream_csv (like {tbl}) on commit drop`
+    (+ distributed randomly на GP), `alter table tmp_stream_csv drop column {fcol}`, COPY в неё с
+    `options`, затем `insert into {tbl} ({cols без fcol}, {fcol}) select *, %s from tmp_stream_csv`.
   - JSON в одну колонку с `file_name_column`: COPY `({col}, {fcol})` с `\x02`-разделителем.
   - `iter_sources` для `.gz`/`.zip`; формат каждого файла — `detect_format(имя без .gz/.zip, format)`;
     все файлы — в той же транзакции.
@@ -368,11 +369,50 @@ select r.{c1}, r.{c2}…[, t.f] from pg_stream_raw t, jsonb_populate_record(null
 
 ---
 
+### Задача 3.2: таблица сырья `tmp_table` — две транзакции для json/jsonl (волна 3б)
+
+**REQ:** REQ-plugins-28, 08 (ветка двух транзакций)
+**model-hint:** frontier
+**Blocked by:** задача 3.1
+
+**Контекст:** без `tmp_table` сырьё идёт во временную `tmp_stream_raw (j jsonb, f text) on commit drop`
+и всё — одна транзакция. `tmp_table` — постоянная таблица того же состава: COPY из S3 коммитится
+отдельно, приёмник меняется второй, короткой транзакцией (только SQL в базе). Временная таблица
+транзакцию разделить не может — живёт до commit.
+
+**Файлы:**
+- Изменить: `plugins/pg_stream.py`, `tools/test_pg_stream.py`
+
+**Интерфейсы:**
+- Потребляет: COPY сырья и `insert … jsonb_populate_record` из 3.1 (вынести в функции с именем
+  таблицы сырья параметром: `_copy_raw(cur, raw, …)`, `_insert_from_raw(cur, tbl, raw, …)`).
+- Производит: параметр `tmp_table=None`; `_check_raw(cur, raw)` — состав `select * limit 0` =
+  `[("j", 3802), ("f", 25)]`, иначе ValueError «tmp_table <имя>: ждём (j jsonb, f text)».
+
+**Шаги:**
+- [ ] Самопроверка: `HrpS3ToPgStreamOperator(..., format="csv", tmp_table="x")` → ValueError.
+- [ ] `__init__`: `tmp_table` с `format='csv'` → ValueError; имя — `parse_table`.
+- [ ] `execute` при `tmp_table`: проверка формата файла (csv при `auto` → ValueError до S3);
+  транзакция 1 — `_check_raw`, `truncate tmp_table`, COPY сырья, commit; транзакция 2 — тот же
+  `statement_timeout`, `_truncate(приёмник)`, `_insert_from_raw`, `truncate tmp_table`, commit.
+  Ошибка во второй — rollback, сырьё остаётся (лог: «сырьё в <tmp_table>»).
+- [ ] Сценарии: приёмник `(employeeid int, name text, hired date)`, `tmp_table` создаёт даг:
+  jsonl + `truncate='hard'` → строки файла, `tmp_table` пуста; `hired: "31.12.2026"` → ошибка,
+  приёмник прежний, в `tmp_table` строки файла; `tmp_table (x int)` → ошибка до S3;
+  `format='csv'` + `tmp_table` → ValueError.
+- [ ] Выложи, прогони даг на `cap_gp_etl` и `gp6-stand`; `ruff check` — чисто.
+- [ ] Commit: `feat(plugins): HrpS3ToPgStreamOperator — tmp_table, две транзакции (REQ-plugins-28)`
+
+**Критерии выхода:**
+- `tools_test_pg_stream` зелёный на обоих подключениях, сценарии 1.1–3.2.
+
+---
+
 ### Задача 4.1: документация и ревью (волна 4)
 
-**REQ:** все REQ-plugins-07…27 (сверка)
+**REQ:** все REQ-plugins-07…28 (сверка)
 **model-hint:** any
-**Blocked by:** задачи 1.1, 2.1, 3.1
+**Blocked by:** задачи 1.1, 2.1, 3.1, 3.2
 
 **Файлы:**
 - Изменить: `plugins/pg_stream.py` (шапка-таблица, как у `s3_utils.py`), `tools/readme.md`
