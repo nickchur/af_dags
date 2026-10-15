@@ -1,18 +1,21 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 13:04 MSK · v0.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:26 MSK · v0.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Усечение приёмника —
 `truncate` = None | soft | hard | auto. Итог (строки источника и загруженные, типы
 колонок приёмника) — в XCom `return_value`.
 
-Сейчас — CSV без сжатия; JSON, раскладка по колонкам, gz/zip и `file_name_column` — дальше.
+Сейчас — CSV и JSON / JSON Lines (`root`, `item`) в приёмник из одной колонки json/jsonb, без
+сжатия; раскладка по колонкам, gz/zip и `file_name_column` — дальше.
 Самопроверка: `python3 plugins/pg_stream.py`.
 """
 from __future__ import annotations
 
+import codecs
 import csv
 import io
+import json
 import os
 import re
 from contextlib import closing
@@ -38,6 +41,11 @@ _EXT = {".csv": "csv", ".json": "json", ".jsonl": "jsonl", ".ndjson": "jsonl"}
 _GP_REJECTED = re.compile(r"found (\d+) data formatting errors")
 _REJECT_LIMIT = re.compile(r"\bREJECT\s+LIMIT\b", re.I)
 _OPT_CHAR = r"\b{}\s+(?:AS\s+)?E?'((?:\\.|[^'])+)'"
+_JSON_TYPES = (114, 3802)   # oid json, jsonb
+# Текстовый формат COPY съедает обратные слэши (\" и \n внутри JSON ломаются), поэтому csv
+# с кавычкой и разделителем, которых в JSON не бывает: строка уходит в колонку как есть.
+_JSON_COPY = "copy {} ({}) from stdin with (format csv, quote e'\\x01', delimiter e'\\x02')"
+MAX_KEYS = 500              # ключей в итоге `source`: сверх — source_truncated
 
 
 def parse_table(table):
@@ -57,6 +65,179 @@ def detect_format(name, fmt):
     if ext not in _EXT:
         raise ValueError(f"формат не определён по имени {name}: задайте format")
     return _EXT[ext]
+
+
+_WS = " \t\r\n"
+_NUM = set("0123456789.eE+-")
+MAX_ITEM = 64 << 20  # символов: дольше элемент не дочитывается — значит, он битый
+
+
+def iter_json_array(chunks, root: str = ""):
+    """Потоково отдаёт элементы JSON-массива из кусков текста.
+
+    root — массив лежит в объекте под этим ключом, и ключ в объекте единственный:
+    `{"data": [...]}` (конверт Kafka Connect у файлов ТФС → GP). Пусто — массив и есть файл.
+
+    Память — один элемент плюс кусок, а не весь файл: json.load на гигабайтном массиве
+    кладёт воркер по OOM. ijson не взят — его нет в образах, а новая зависимость на
+    контурах идёт через МПР. Синтаксис строгий: запятая ровно между элементами, после `]`
+    только пробелы — иначе ValueError, а не молча урезанная загрузка.
+    """
+    # [obj → key → colon →] start → first → item ⇄ sep → [close →] end
+    dec, buf, state = json.JSONDecoder(), "", "obj" if root else "start"
+    for chunk in chunks:
+        buf += chunk
+        pos = 0
+        while True:
+            while pos < len(buf) and buf[pos] in _WS:
+                pos += 1
+            if pos == len(buf):
+                break
+            ch = buf[pos]
+            if state == "end":
+                raise ValueError(f"данные после конца массива: {buf[pos:pos + 40]!r}")
+            if state in ("obj", "colon", "close"):
+                want = {"obj": "{", "colon": ":", "close": "}"}[state]
+                if ch != want:
+                    raise ValueError(f"ожидалось {want} конверта {root!r}: {buf[pos:pos + 40]!r}")
+                state, pos = {"obj": "key", "colon": "start", "close": "end"}[state], pos + 1
+                continue
+            if state == "start":
+                if ch != "[":
+                    raise ValueError("ожидался JSON-массив")
+                state, pos = "first", pos + 1
+                continue
+            if ch == "]" and state in ("first", "sep"):
+                state, pos = "close" if root else "end", pos + 1
+                continue
+            if state == "sep":
+                if ch != ",":
+                    raise ValueError(f"ожидалась , или ]: {buf[pos:pos + 40]!r}")
+                state, pos = "item", pos + 1
+                continue
+            if ch in ",]}:":                # значение с них не начинается: «,,», «[1,]» — сразу, не копя буфер
+                raise ValueError(f"ожидался элемент массива: {buf[pos:pos + 40]!r}")
+            try:
+                obj, end = dec.raw_decode(buf, pos)
+            except json.JSONDecodeError as exc:
+                if len(buf) - pos > MAX_ITEM:
+                    raise ValueError(f"битый элемент: {exc}") from exc
+                break                      # элемент не дочитан — ждём кусок
+            if type(obj) in (int, float) and not set(buf[end:]) - _NUM:
+                break                      # число могло оборваться на границе куска: «12.» → 12
+            if state == "key":
+                if obj != root:
+                    raise ValueError(f"в конверте ключ {obj!r}, а не {root!r}")
+                state, pos = "colon", end
+                continue
+            yield obj
+            state, pos = "sep", end
+        buf = buf[pos:]
+    if state != "end":
+        raise ValueError(f"файл оборван: {buf[:40]!r}" if buf else f"файл оборван (разбор остановился на {state})")
+
+
+def iter_jsonl(chunks):
+    """JSON Lines из кусков текста: элемент на каждой непустой строке; битая — ValueError с номером."""
+    buf, n = "", 0
+    for chunk in chunks:
+        buf += chunk
+        *lines, buf = buf.split("\n")
+        for line in lines:
+            n += 1
+            yield from _jsonl_line(line, n)
+    yield from _jsonl_line(buf, n + 1)
+
+
+def _jsonl_line(line, n):
+    if line.strip():
+        try:
+            yield json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"строка {n}: {exc}") from exc
+
+
+def _text(body):
+    """Текст объекта S3 кусками; инкрементальный декодер не рвёт кириллицу на границе куска."""
+    utf8 = codecs.getincrementaldecoder("utf-8")()
+    for chunk in body.iter_chunks(CHUNK):
+        yield utf8.decode(chunk)
+    yield utf8.decode(b"", final=True)
+
+
+def parse_item(item):
+    """Путь `item`: `"a.b"` → `["a", "b"]`; список — как есть (ключ с точкой); пусто — весь элемент."""
+    if not item:
+        return []
+    return list(item) if isinstance(item, (list, tuple)) else item.split(".")
+
+
+def pick(obj, path, n):
+    """Объект по пути `path` внутри элемента номер `n`; нет ключа или не объект — ValueError."""
+    cur = obj
+    for i, k in enumerate(path):
+        where = ".".join(path[:i + 1])
+        if not isinstance(cur, dict):
+            raise ValueError(f"элемент {n}: {where}: уровень выше — не объект")
+        if k not in cur:
+            raise ValueError(f"элемент {n}: {where}: нет ключа {k}")
+        cur = cur[k]
+    return cur
+
+
+_TYPE_ORDER = ("string", "number", "boolean", "object", "array", "null")
+
+
+def _json_type(v):
+    if isinstance(v, str):
+        return "string"
+    if isinstance(v, bool):         # до int: bool — подкласс int
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, dict):
+        return "object"
+    if isinstance(v, list):
+        return "array"
+    return "null"
+
+
+class SourceStats:
+    """Ключи объектов источника и их типы JSON — для `source` в итоге (не больше MAX_KEYS)."""
+
+    def __init__(self):
+        self.keys = {}
+        self.truncated = False
+
+    def add(self, obj):
+        for k, v in obj.items():
+            types = self.keys.get(k)
+            if types is None:
+                if len(self.keys) >= MAX_KEYS:
+                    self.truncated = True
+                    continue
+                types = self.keys[k] = set()
+            types.add(_json_type(v))
+
+    def as_dict(self):
+        return {k: "|".join(t for t in _TYPE_ORDER if t in ts) for k, ts in self.keys.items()}
+
+
+def _copy_line(obj):
+    # json.dumps экранирует управляющие символы, поэтому \x01 и \x02 из _JSON_COPY в строке не встретятся
+    return json.dumps(obj, ensure_ascii=False).encode() + b"\n"
+
+
+def _batched(lines, size=CHUNK):
+    """Строки в куски ~size байт: s3_IterStream склеивает буфер на каждом куске, мелкие — квадратично."""
+    buf = bytearray()
+    for line in lines:
+        buf += line
+        if len(buf) >= size:
+            yield bytes(buf)
+            buf.clear()
+    if buf:
+        yield bytes(buf)
 
 
 def _truncate(cur, tbl, mode):
@@ -139,12 +320,40 @@ class CsvCounter:
         n = self.records + (1 if self._open else 0)
         return max(n - 1, 0) if self.header else n
 
+    def source(self):
+        """Колонки файла для итога: в CSV все значения — текст."""
+        return {c: "text" for c in self.columns()}
+
     def columns(self):
         """Имена из заголовка (`HEADER` в options), иначе пусто."""
         if not self.header or not self._head:
             return []
         text = bytes(self._head).decode("utf-8", "replace")
         return next(csv.reader(io.StringIO(text), delimiter=self.delimiter, quotechar=self.quote), [])
+
+
+class _JsonFeed:
+    """Элементы JSON / JSON Lines → строки COPY объекта `item`; считает элементы и типы ключей."""
+
+    def __init__(self, fmt, root, path):
+        self.fmt, self.root, self.path = fmt, root or "", path
+        self.n = 0
+        self.stats = SourceStats()
+
+    def lines(self, text):
+        items = iter_jsonl(text) if self.fmt == "jsonl" else iter_json_array(text, self.root)
+        for el in items:
+            self.n += 1
+            obj = pick(el, self.path, self.n)
+            if isinstance(obj, dict):
+                self.stats.add(obj)
+            yield _copy_line(obj)
+
+    def rows(self):
+        return self.n
+
+    def source(self):
+        return self.stats.as_dict()
 
 
 class HrpS3ToPgStreamOperator(BaseOperator):
@@ -187,9 +396,10 @@ class HrpS3ToPgStreamOperator(BaseOperator):
         if re.search(r"\.(gz|zip)$", key, re.I):
             raise NotImplementedError(f"{key}: сжатие gz/zip пока не поддерживается")
         fmt = detect_format(key, self.format)
-        if fmt != "csv" or self.file_name_column:
-            raise NotImplementedError(f"{key}: пока только csv без file_name_column")
+        if self.file_name_column:
+            raise NotImplementedError("file_name_column пока не поддерживается")
         tbl = parse_table(self.table)
+        path = parse_item(self.item)
 
         obj = S3Hook(aws_conn_id=self.s3_conn_id).get_key(key, self.bucket)
         if obj is None:
@@ -205,17 +415,26 @@ class HrpS3ToPgStreamOperator(BaseOperator):
                     self.log.info("statement_timeout %s", timeout)
 
                     cur.execute(sql.SQL("select * from {} limit 0").format(tbl))
-                    target = _target_types(cur, cur.description)
+                    desc = cur.description
+                    target = _target_types(cur, desc)
+                    if fmt != "csv" and (len(desc) != 1 or desc[0].type_code not in _JSON_TYPES):
+                        raise NotImplementedError(f"{self.table}: раскладка JSON по колонкам пока не "
+                                                  "поддерживается — нужна одна колонка json/jsonb")
 
                     how = _truncate(cur, tbl, self.truncate)
                     self.log.info("усечение: %s", how or "нет")
 
-                    counter = CsvCounter(self.options)
-                    copy = sql.SQL("copy {} from stdin with " + self.options).format(tbl).as_string(conn)
                     with closing(obj.get()["Body"]) as body:
-                        # Пустой кусок s3_IterStream принимает за конец потока — отсеиваем.
-                        stream = s3_IterStream(counter.feed(c) for c in body.iter_chunks(CHUNK) if c)
-                        cur.copy_expert(copy, stream, size=CHUNK)
+                        if fmt == "csv":
+                            counter = CsvCounter(self.options)
+                            copy = sql.SQL("copy {} from stdin with " + self.options).format(tbl)
+                            # Пустой кусок s3_IterStream принимает за конец потока — отсеиваем.
+                            stream = (counter.feed(c) for c in body.iter_chunks(CHUNK) if c)
+                        else:
+                            counter = _JsonFeed(fmt, self.root, path)
+                            copy = sql.SQL(_JSON_COPY).format(tbl, sql.Identifier(desc[0].name))
+                            stream = _batched(counter.lines(_text(body)))
+                        cur.copy_expert(copy.as_string(conn), s3_IterStream(stream), size=CHUNK)
                     # GP 6.25 при SEGMENT REJECT LIMIT отвечает «COPY n» вместе с отбракованными
                     # строками (стенд 6.25.4: COPY 3, в таблице 2); их число есть только в NOTICE.
                     # NOTICE от COPY psycopg2 кладёт в conn.notices лишь после следующего запроса.
@@ -240,12 +459,14 @@ class HrpS3ToPgStreamOperator(BaseOperator):
         self.log.info("прочитано %s, загружено %s в %s", source_rows, loaded, self.table)
         if rejected:
             self.log.warning("⚠️ не загружено строк: %s (отбраковка COPY)", rejected)
-        return {
+        res = {
             "rows_source": source_rows, "rows_loaded": loaded, "rows_rejected": rejected,
-            "files": [key], "target": target,
-            "source": {c: "text" for c in counter.columns()},
+            "files": [key], "target": target, "source": counter.source(),
             "unmapped": [], "defaulted": [],
         }
+        if isinstance(counter, _JsonFeed) and counter.stats.truncated:
+            res["source_truncated"] = True
+        return res
 
 
 def _selfcheck():
@@ -282,6 +503,60 @@ def _selfcheck():
     c.feed(b"1,2\n3,4\n")
     assert (c.rows(), c.columns()) == (2, [])
     assert _opt_char("csv delimiter E'\\t'", "DELIMITER", ",") == "\t"
+
+    assert list(iter_json_array(['[1,', '2]'])) == [1, 2]
+    assert list(iter_json_array(['{"data": [{"a":1}]}'], "data")) == [{"a": 1}]
+    for bad in ('[1,,2]', '[1,]'):
+        try:
+            list(iter_json_array([bad, "1" * 100]))   # ошибка на месте, а не «файл оборван» в конце
+        except ValueError as e:
+            assert "ожидался элемент" in str(e), e
+        else:
+            raise AssertionError(bad)
+    for bad in ('[1] x', '[1,', '{"data": [1]}', '[1 2]', '[,1]'):
+        try:
+            list(iter_json_array([bad]))
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(bad)
+    data = [x for i in range(30) for x in ({"id": i, "s": 'Имя "q" \\ ,] \n\t'}, 7, 12.5e3, [1, 2], None, True)]
+    text = json.dumps(data, ensure_ascii=False, indent=2)
+    for n in (1, 3, 17, 4096):
+        assert list(iter_json_array(text[i:i + n] for i in range(0, len(text), n))) == data, n
+    assert list(iter_jsonl(['{"a":1}\n{"a"', ':2}\n\n'])) == [{"a": 1}, {"a": 2}]
+    assert list(iter_jsonl(['{"a":1}\r\n2'])) == [{"a": 1}, 2]
+    try:
+        list(iter_jsonl(['{"a":1}\n{bad\n']))
+    except ValueError as e:
+        assert "строка 2" in str(e), e
+    else:
+        raise AssertionError("битая строка jsonl")
+    st = SourceStats()
+    st.add({"a": 1, "b": True})
+    st.add({"a": None, "c": [1]})
+    assert st.as_dict() == {"a": "number|null", "b": "boolean", "c": "array"}, st.as_dict()
+    big = SourceStats()
+    big.add({f"k{i}": 1 for i in range(600)})
+    assert len(big.as_dict()) == 500 and big.truncated
+    assert parse_item("payload.value") == ["payload", "value"]
+    assert parse_item(["p", "a.b"]) == ["p", "a.b"] and parse_item(None) == parse_item("") == []
+    assert pick({"p": {"v": {"x": 1}}}, ["p", "v"], 7) == {"x": 1}
+    for el, path in (({"p": {}}, ["p", "nope"]), ({"p": 1}, ["p", "nope"])):
+        try:
+            pick(el, path, 7)
+        except ValueError as e:
+            assert "7" in str(e) and "p.nope" in str(e), e
+        else:
+            raise AssertionError(path)
+    line = _copy_line({"s": "a\x01b\x02\n\"", "к": 1})
+    assert b"\x01" not in line and b"\x02" not in line and line.count(b"\n") == 1, line
+    assert b"".join(_batched([b"ab", b"cd", b"e"], 3)) == b"abcde"
+    assert list(_batched([b"ab", b"cd", b"e"], 3)) == [b"abcd", b"e"]
+    feed = _JsonFeed("json", "data", ["payload"])
+    out = list(feed.lines(['{"data": [{"schema": 1, "payload": {"x": "я"}}, {"payload": {"x": null}}]}']))
+    assert [json.loads(x) for x in out] == [{"x": "я"}, {"x": None}] and feed.rows() == 2
+    assert feed.source() == {"x": "string|null"}, feed.source()
     print("selfcheck ok")
 
 

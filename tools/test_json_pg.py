@@ -1,5 +1,5 @@
 """🧪 DAG: загрузка JSON-массива в PostgreSQL или Greenplum через COPY — ручная проверка.
-*2026-10-15 10:02 MSK · v1.0 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:24 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Проверяет приём JSON в PG/GP целиком (тип базы — по `version()`, код один): массив
 читается потоково — синтетический или файл из S3, в том числе в конверте Kafka Connect
@@ -27,8 +27,10 @@ from airflow.models.param import Param
 
 try:
     from plugins.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from plugins.pg_stream import iter_json_array  # type: ignore
 except ImportError:
     from CI06932748.tools.utils import TOOLS_POOL, add_note, ensure_pool, on_callback  # type: ignore
+    from CI06932748.tools.pg_stream import iter_json_array  # type: ignore
 
 logger = logging.getLogger("airflow.task")
 
@@ -45,74 +47,6 @@ COPY_SQL = "copy raw_json(j) from stdin with (format csv, quote e'\\x01', delimi
 # Строка с тем, что ломает наивную загрузку: кавычки, обратный слэш, `,]` разбора массива,
 # перевод строки и табуляция (вне csv-кавычек перевод строки закончил бы запись), кириллица.
 NASTY = 'Имя "q" \\ ,] \n\t'
-
-_WS = " \t\r\n"
-_NUM = set("0123456789.eE+-")
-MAX_ITEM = 64 << 20  # символов: дольше элемент не дочитывается — значит, он битый
-
-
-def iter_json_array(chunks, root: str = ""):
-    """Потоково отдаёт элементы JSON-массива из кусков текста.
-
-    root — массив лежит в объекте под этим ключом, и ключ в объекте единственный:
-    `{"data": [...]}` (конверт Kafka Connect у файлов ТФС → GP). Пусто — массив и есть файл.
-
-    Память — один элемент плюс кусок, а не весь файл: json.load на гигабайтном массиве
-    кладёт воркер по OOM. ijson не взят — его нет в образах, а новая зависимость на
-    контурах идёт через МПР. Синтаксис строгий: запятая ровно между элементами, после `]`
-    только пробелы — иначе ValueError, а не молча урезанная загрузка.
-    """
-    # [obj → key → colon →] start → first → item ⇄ sep → [close →] end
-    dec, buf, state = json.JSONDecoder(), "", "obj" if root else "start"
-    for chunk in chunks:
-        buf += chunk
-        pos = 0
-        while True:
-            while pos < len(buf) and buf[pos] in _WS:
-                pos += 1
-            if pos == len(buf):
-                break
-            ch = buf[pos]
-            if state == "end":
-                raise ValueError(f"данные после конца массива: {buf[pos:pos + 40]!r}")
-            if state in ("obj", "colon", "close"):
-                want = {"obj": "{", "colon": ":", "close": "}"}[state]
-                if ch != want:
-                    raise ValueError(f"ожидалось {want} конверта {root!r}: {buf[pos:pos + 40]!r}")
-                state, pos = {"obj": "key", "colon": "start", "close": "end"}[state], pos + 1
-                continue
-            if state == "start":
-                if ch != "[":
-                    raise ValueError("ожидался JSON-массив")
-                state, pos = "first", pos + 1
-                continue
-            if ch == "]" and state in ("first", "sep"):
-                state, pos = "close" if root else "end", pos + 1
-                continue
-            if state == "sep":
-                if ch != ",":
-                    raise ValueError(f"ожидалась , или ]: {buf[pos:pos + 40]!r}")
-                state, pos = "item", pos + 1
-                continue
-            try:
-                obj, end = dec.raw_decode(buf, pos)
-            except json.JSONDecodeError as exc:
-                if len(buf) - pos > MAX_ITEM:
-                    raise ValueError(f"битый элемент: {exc}") from exc
-                break                      # элемент не дочитан — ждём кусок
-            if type(obj) in (int, float) and not set(buf[end:]) - _NUM:
-                break                      # число могло оборваться на границе куска: «12.» → 12
-            if state == "key":
-                if obj != root:
-                    raise ValueError(f"в конверте ключ {obj!r}, а не {root!r}")
-                state, pos = "colon", end
-                continue
-            yield obj
-            state, pos = "sep", end
-        buf = buf[pos:]
-    if state != "end":
-        raise ValueError(f"файл оборван: {buf[:40]!r}" if buf else f"файл оборван (разбор остановился на {state})")
-
 
 def _synthetic(rows: int):
     """Синтетический массив кусками: элементы с отступами (многострочные) и NASTY в имени."""

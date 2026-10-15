@@ -1,9 +1,10 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-15 13:00 MSK · v0.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 13:26 MSK · v0.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
-битой строке, опции COPY, счётчики строк, таймаут; на Greenplum — отбраковка
+битой строке, опции COPY, счётчики строк, таймаут; JSON-массив в конверте (`root`, `item`),
+JSON Lines, память на файле 300 МБ; на Greenplum — отбраковка
 `LOG ERRORS SEGMENT REJECT LIMIT`. В конце убирает таблицы и файлы.
 
 Таски: `scenarios` — все сценарии подряд, первый провал роняет таск.
@@ -12,7 +13,11 @@
 """
 from __future__ import annotations
 
+import json
 import logging
+import os
+import resource
+import tempfile
 import threading
 import time
 from contextlib import closing
@@ -252,6 +257,77 @@ def tools_test_pg_stream():
                 else:
                     raise AssertionError(".txt без format принят")
                 ok("REQ-16/17 ошибки параметров до S3 и базы")
+
+                # REQ-20, 22, 23: конверт {"data": [...]} → root, item; приёмник с одной jsonb-колонкой
+                tj = mk("json", "j jsonb")
+                env = {"data": [{"schema": {"type": "struct", "i": i},
+                                 "payload": {"id": i, "name": f'Имя "q" \\ ,] \n\t{i}', "ok": i % 2 == 0}}
+                                for i in range(4)]}
+                kj = put("ift.json", json.dumps(env, ensure_ascii=False, indent=1).encode())
+                res, _ = run("json-ift", kj, tj, root="data", item="payload", truncate="hard")
+                assert (res["rows_source"], res["rows_loaded"], res["rows_rejected"]) == (4, 4, 0), res
+                assert res["target"] == {"j": "jsonb"}, res["target"]
+                assert res["source"] == {"id": "number", "name": "string", "ok": "boolean"}, res["source"]
+                assert q(f"select count(*), count(*) filter (where j ? 'schema') from {tj}")[0] == (4, 0)
+                assert q(f"select j->>'name' from {tj} where (j->>'id')::int = 1")[0][0] == 'Имя "q" \\ ,] \n\t1'
+                ok("REQ-20/22/23 конверт root='data', item='payload' → 4 строки без schema")
+
+                # REQ-20: без root, битый массив — ошибка, приёмник прежний
+                for name, key, kw, want in (("json-noroot", kj, {}, "ожидался JSON-массив"),
+                                            ("json-comma", put("comma.json", b'[{"a":1},,{"a":2}]'),
+                                             {"truncate": "hard"}, "ожидался элемент")):
+                    try:
+                        run(name, key, tj, **kw)
+                    except Exception as e:
+                        logger.info("ожидаемая ошибка: %r", e)
+                        assert want in str(e), e
+                    else:
+                        raise AssertionError(f"{name} загрузился")
+                    assert count(tj) == 4, count(tj)
+                ok("REQ-20 без root и лишняя запятая → ошибка, ничего не загружено")
+
+                # REQ-22: нет ключа на пути — номер элемента и уровень в ошибке
+                try:
+                    run("json-nope", kj, tj, root="data", item="payload.nope")
+                except Exception as e:
+                    assert "элемент 1" in str(e) and "payload.nope" in str(e), e
+                else:
+                    raise AssertionError("item='payload.nope' принят")
+                ok("REQ-22 нет ключа → ошибка с номером элемента и путём")
+
+                # REQ-21: jsonl — пустые строки пропускаются; битая 2-я → «строка 2»
+                kl = put("rows.jsonl", b'{"a":1}\n{"a":"\xd0\xaf"}\n\n{"a":[3]}\n\n')
+                res, _ = run("jsonl", kl, tj, truncate="hard")
+                assert (res["rows_source"], res["rows_loaded"]) == (3, 3) and count(tj) == 3, res
+                assert res["source"] == {"a": "string|number|array"}, res["source"]
+                try:
+                    run("jsonl-bad", put("bad.jsonl", b'{"a":1}\n{bad\n{"a":3}\n'), tj, truncate="hard")
+                except Exception as e:
+                    assert "строка 2" in str(e), e
+                else:
+                    raise AssertionError("битая строка jsonl загрузилась")
+                assert count(tj) == 3, count(tj)
+                ok("REQ-21 jsonl: 3 строки, битая 2-я → «строка 2», откат")
+
+                # REQ-09: jsonl 300 МБ — пик памяти процесса растёт меньше чем на 200 МБ.
+                # Файл пишется на диск и уходит в S3 multipart, чтобы сама фикстура не подняла пик.
+                line = json.dumps({"id": 0, "pad": "ж" * 140}, ensure_ascii=False).encode() + b"\n"
+                n300 = (300 << 20) // len(line)
+                with tempfile.NamedTemporaryFile(suffix=".jsonl") as f:
+                    for _ in range(n300 // 10_000):
+                        f.write(line * 10_000)
+                    f.flush()
+                    k300 = prefix + "big300.jsonl"
+                    s3.load_file(f.name, k300, bucket, replace=True)
+                    keys.append(k300)
+                    size = os.path.getsize(f.name)
+                rss0 = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+                res, _ = run("jsonl-300", k300, tj, truncate="hard")
+                grew = (resource.getrusage(resource.RUSAGE_SELF).ru_maxrss - rss0) >> 10
+                # Пик процесса до загрузки уже включает Airflow; потоковая загрузка его не превышает
+                logger.info("REQ-09: файл %s МБ, пик RSS %s МБ, вырос на %s МБ", size >> 20, rss0 >> 10, grew)
+                assert res["rows_loaded"] == n300 // 10_000 * 10_000 and grew < 200, (res, grew)
+                ok(f"REQ-09 jsonl {size >> 20} МБ: пик RSS +{grew} МБ")
 
                 # REQ-11 на GP: отбраковка LOG ERRORS — rows_rejected и предупреждение
                 if gp:

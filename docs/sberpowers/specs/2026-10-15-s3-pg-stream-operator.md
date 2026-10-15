@@ -166,9 +166,9 @@
 |---|---|---|---|
 | REQ-plugins-07 | 1.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-08 | 1.1 | tools_test_pg_stream | выполнено |
-| REQ-plugins-09 | 2.1, 3.1 | — | не начато |
+| REQ-plugins-09 | 2.1, 3.1 | tools_test_pg_stream | частично (2.1: jsonl 300 МБ без сжатия) |
 | REQ-plugins-10 | 1.1 | tools_test_pg_stream | выполнено |
-| REQ-plugins-11 | 1.1, 2.1, 3.1 | tools_test_pg_stream | частично (1.1) |
+| REQ-plugins-11 | 1.1, 2.1, 3.1 | tools_test_pg_stream | частично (1.1, 2.1) |
 | REQ-plugins-12 | 1.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-13 | 1.1 | tools_test_pg_stream | выполнено |
 | REQ-plugins-14 | 1.1 | tools_test_pg_stream | выполнено |
@@ -177,10 +177,10 @@
 | REQ-plugins-17 | 1.1 | tools_test_pg_stream | частично (1.1) |
 | REQ-plugins-18 | 3.1 | — | не начато |
 | REQ-plugins-19 | 1.1 | tools_test_pg_stream | выполнено |
-| REQ-plugins-20 | 2.1 | — | не начато |
-| REQ-plugins-21 | 2.1 | — | не начато |
-| REQ-plugins-22 | 2.1 | — | не начато |
-| REQ-plugins-23 | 2.1, 3.1 | — | не начато |
+| REQ-plugins-20 | 2.1 | tools_test_pg_stream | выполнено |
+| REQ-plugins-21 | 2.1 | tools_test_pg_stream | выполнено |
+| REQ-plugins-22 | 2.1 | tools_test_pg_stream | выполнено |
+| REQ-plugins-23 | 2.1, 3.1 | tools_test_pg_stream | частично (2.1: одна json/jsonb-колонка) |
 | REQ-plugins-24 | 3.1 | — | не начато |
 | REQ-plugins-25 | 3.1 | — | не начато |
 | REQ-plugins-26 | 3.1 | — | не начато |

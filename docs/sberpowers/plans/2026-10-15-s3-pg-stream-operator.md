@@ -222,7 +222,7 @@ def _truncate(cur, tbl, mode):
     (управляющие символы JSON экранирует, поэтому `\x01`/`\x02` в строке не встречаются).
 
 **Шаги:**
-- [ ] В `_selfcheck` добавь:
+- [x] В `_selfcheck` добавь:
 ```python
     assert list(iter_json_array(['[1,', '2]'])) == [1, 2]
     assert list(iter_json_array(['{"data": [{"a":1}]}'], "data")) == [{"a": 1}]
@@ -251,8 +251,8 @@ def _truncate(cur, tbl, mode):
     except ValueError as e:
         assert "7" in str(e) and "nope" in str(e)
 ```
-- [ ] Запусти самопроверку на стенде — ожидай FAIL (`NameError: iter_jsonl`).
-- [ ] Реализуй `iter_jsonl`:
+- [x] Запусти самопроверку на стенде — ожидай FAIL (`NameError: iter_jsonl`).
+- [x] Реализуй `iter_jsonl`:
 ```python
 def iter_jsonl(chunks):
     buf, n = "", 0
@@ -280,15 +280,15 @@ def iter_jsonl(chunks):
   (каждый объект `pick(...)` — ещё и в `SourceStats.add`, если он dict; итог — `source`,
   `source_truncated` в XCom):
   `copy {tbl} ({col}) from stdin with (format csv, quote e'\x01', delimiter e'\x02')`.
-- [ ] Сценарии в даге: файл ИФТ-образец (синтетический, той же формы: `{"data": [{"schema": {...},
+- [x] Сценарии в даге: файл ИФТ-образец (синтетический, той же формы: `{"data": [{"schema": {...},
   "payload": {...}}, ×4]}`) в приёмник `(j jsonb)` с `root='data'`, `item='payload'` → 4 строки, ни у одной
   нет ключа `schema` (REQ-20, 22); без `root` → ValueError; файл `[1,,2]` → ошибка, строк 0 (REQ-20);
   jsonl 3 строки + пустая → 3; битая 2-я → «строка 2» (REQ-21); `item='payload.nope'` → ошибка с
   номером и `nope` (REQ-22); REQ-09 — jsonl.gz на 300 МБ после распаковки (появится в 3.1; в 2.1 —
   jsonl 300 МБ без сжатия): `resource.getrusage(RUSAGE_SELF).ru_maxrss` до и после — прирост < 200 МБ.
-- [ ] Выложи, прогони даг на обоих подключениях; `python3 tools/test_json_pg.py` на стенде — по-прежнему ok.
-- [ ] `ruff check` — чисто.
-- [ ] Commit: `feat(plugins): HrpS3ToPgStreamOperator — JSON-массив, JSON Lines, item (REQ-plugins-09, 20…23)`
+- [x] Выложи, прогони даг на обоих подключениях; `python3 tools/test_json_pg.py` на стенде — по-прежнему ok.
+- [x] `ruff check` — чисто.
+- [x] Commit: `feat(plugins): HrpS3ToPgStreamOperator — JSON-массив, JSON Lines, item (REQ-plugins-09, 20…23)`
 
 **Критерии выхода:**
 - Самопроверка `selfcheck ok`; `tools_test_pg_stream` зелёный на обоих подключениях;
