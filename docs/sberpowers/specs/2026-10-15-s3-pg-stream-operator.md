@@ -26,7 +26,11 @@
 - **REQ-plugins-10** — **Таймаут запроса.** На сессию ставится `statement_timeout` = параметр `statement_timeout` в минутах,
   по умолчанию 240 (4 часа) для GP и PG; `0` — без предела.
 - **REQ-plugins-11** — **Итог загрузки в лог и XCom.** По окончании оператор пишет в лог число загруженных строк
-  и возвращает (XCom `return_value`) словарь: `rows` — число строк; `files` — обработанные файлы (для zip —
+  и возвращает (XCom `return_value`) словарь: `rows_source` — записей прочитано из источника (элементов
+  JSON / записей CSV без заголовка; CSV считается разбором, а не по переводам строк); `rows_loaded` —
+  `rowcount` COPY / `insert`; `rows_rejected` = `rows_source − rows_loaded` (отбраковка, если её
+  разрешили в `options`, например `LOG ERRORS SEGMENT REJECT LIMIT n ROWS` у GP; > 0 — предупреждение в
+  лог); уведомления сервера (`notices`) — в лог задачи; `files` — обработанные файлы (для zip —
   имена внутри архива); `target` — колонки приёмника с типами короткими системными именами (`int4`,
   `varchar`, `timestamp` — как `srv_wf.pr_get_format_type`, по oid из `select * … limit 0`); `source` —
   поля источника: для JSON ключи объекта `item` с типами JSON (`string`, `number`, `boolean`, `object`,
@@ -95,6 +99,8 @@
 - Модуль в `plugins/` с двойным импортом (fallback `CI06932748.tools`); на сигме оператор упадёт на
   белом списке операторов, пока не перенесён в etl-core и не внесён в `allowed_operators.txt`.
 - Права — забота `conn_id`; оператор не меняет структуру приёмника и не зовёт функций схемы `srv_wf`.
+- Целевые версии — PostgreSQL 15 (контур 15.5) и Greenplum 6.25 (контур 6.25.3, SDP AnalyticDB 1.11.3):
+  синтаксис новее не используется (`COPY … ON_ERROR` — PG17 — недоступен). Стенд: PG16 и GP 6.25.4.
 - Синтаксис GP6 (COPY, `jsonb_populate_record`, временные таблицы с `distributed randomly`) на стенде PG16
   не проверяем — отдельная проверка на контуре.
 - Параметры оператора (контракт):
@@ -122,7 +128,7 @@
 | REQ-plugins-08 | Таблица с 5 строками, `truncate='hard'`, в файле на 1000-м элементе битое значение → таск красный, в таблице те же 5 строк |
 | REQ-plugins-09 | Файл 1 ГБ грузится при пике RSS таска, сравнимом с файлом 10 МБ (разница < 200 МБ) |
 | REQ-plugins-10 | В логе таска `statement_timeout` = 240 мин без параметра и заданное значение с параметром |
-| REQ-plugins-11 | Загрузка в пустую таблицу без усечения: `return_value.rows` = `count(*)` приёмника; `target` = колонки с `int4`/`text`/`date`…; JSON с ключами `employeeId` (числа), `extra` (объект) → `source` = `{"employeeId": "number", "extra": "object"}`, `unmapped` = `["extra"]`, `defaulted` содержит `load_dttm`; 600 разных ключей → в `source` 500 и `source_truncated: true` |
+| REQ-plugins-11 | Загрузка в пустую таблицу без усечения: `rows_loaded` = `rows_source` = `count(*)` приёмника; CSV с переводом строки внутри кавычек — `rows_source` считает его одной записью; на GP CSV из 5 записей с одной битой датой и `options` с `LOG ERRORS SEGMENT REJECT LIMIT 10 ROWS` → `rows_source` 5, `rows_loaded` 4, `rows_rejected` 1, предупреждение в логе; `target` = колонки с `int4`/`text`/`date`…; JSON с ключами `employeeId` (числа), `extra` (объект) → `source` = `{"employeeId": "number", "extra": "object"}`, `unmapped` = `["extra"]`, `defaulted` содержит `load_dttm`; 600 разных ключей → в `source` 500 и `source_truncated: true` |
 | REQ-plugins-12 | Две загрузки одного файла без `truncate` → строк вдвое больше |
 | REQ-plugins-13 | `truncate='hard'`: после загрузки в таблице только строки файла |
 | REQ-plugins-14 | `truncate='soft'`: во время загрузки другой сеанс читает таблицу без ожидания и видит старые строки; после — только строки файла |

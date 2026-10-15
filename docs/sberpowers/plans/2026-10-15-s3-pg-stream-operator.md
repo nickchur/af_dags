@@ -14,10 +14,12 @@ PG оператором `HrpS3ToPgStreamOperator` — потоково, одно
 `(j jsonb)` и `insert … select … from tmp, jsonb_populate_record(null::<приёмник>, tmp.j) r`.
 Проверка — самопроверка модуля (`python3 plugins/pg_stream.py`, на стенде) и даг
 `tools_test_pg_stream`, который гоняет оператор по сценариям спеки на `cap_gp_etl` (PG16 стенда)
-и `gp6-stand` (Greenplum 6.27.1 стенда).
+и `gp6-stand` (Greenplum 6.25.4 стенда).
 
 ## Глобальные ограничения
 
+- Целевые базы — PostgreSQL 15 и Greenplum 6.25 (PG 9.4): синтаксис новее не использовать; стенд — PG16
+  (`cap_gp_etl`) и GP 6.25.4 (`gp6-stand`).
 - Python 3.10–3.12, Airflow 2.11.2, psycopg2; новых зависимостей нет (`stream_unzip` уже
   импортирует `plugins/s3_utils`, он есть на обоих контурах).
 - Двойной импорт: `from plugins.s3_utils import …` с fallback `from CI06932748.tools.s3_utils import …`.
@@ -69,7 +71,7 @@ PG оператором `HrpS3ToPgStreamOperator` — потоково, одно
     ValueError «формат не определён по имени <name>»;
   - `_truncate(cur, tbl, mode) -> str | None` — возвращает `'truncate' | 'delete' | None`;
   - `class HrpS3ToPgStreamOperator(BaseOperator)` с `execute(context) -> dict` (итог REQ-11:
-    `rows`, `files`, `target`, `source`, `unmapped`, `defaulted`[, `source_truncated`]);
+    `rows_source`, `rows_loaded`, `rows_rejected`, `files`, `target`, `source`, `unmapped`, `defaulted`[, `source_truncated`]);
   - `_target_types(cur, description) -> dict[str, str]` — `{колонка: typname}`:
     `select oid, typname::text from pg_catalog.pg_type where oid = any(%s)` по `type_code` из
     `description` (имена как у `srv_wf.pr_get_format_type`: `int4`, `varchar`, `timestamp`).
@@ -145,8 +147,13 @@ def _truncate(cur, tbl, mode):
   при `statement_timeout` > 0, иначе `'0'`; лог таймаута; `_truncate` → лог способа; объект S3 —
   `S3Hook(aws_conn_id=s3_conn_id).get_key(s3_key, bucket)`, нет — `AirflowFailException`; тело под
   `closing`; csv: `cur.copy_expert(sql.SQL("copy {} from stdin with " + options).format(tbl).as_string(conn),
-  s3_IterStream(body.iter_chunks(1 << 20)))`; `rows += cur.rowcount`; `conn.commit()`; лог
-  «загружено N строк»; `return` словарь: `rows`, `files=[s3_key]`, `target=_target_types(...)`, `source` —
+  s3_IterStream(body.iter_chunks(1 << 20)))`; `rows_loaded += cur.rowcount`; `conn.commit()`;
+  после каждой COPY — `conn.notices` в лог (и `del conn.notices[:]`); `rows_source` для CSV — поток байт
+  идёт в COPY без изменений, а копия проходит `csv.reader` (через инкрементальный декодер utf-8 и
+  разбиение по `\n`, чтобы reader сам склеил записи с переводом строки в кавычках) с `delimiter`/`quotechar`
+  из `options` (регулярки `DELIMITER\s+'(.)'`, `QUOTE\s+'(.)'`, по умолчанию `,` и `"`), минус 1 при
+  `HEADER`; `rows_rejected = rows_source - rows_loaded`, > 0 — `log.warning`; лог «прочитано N, загружено M»;
+  `return` словарь: `rows_source`, `rows_loaded`, `rows_rejected`, `files=[s3_key]`, `target=_target_types(...)`, `source` —
   для CSV с `HEADER` в `options` первая строка файла (разбор `csv.reader` по разделителю из `options`,
   по умолчанию `,`) → `{имя: "text"}`, иначе `{}`; `unmapped=[]`, `defaulted=[]`. Любое исключение — `conn.rollback()` (даёт `closing` + явный
   rollback в `except`), исключение пробрасывается.
@@ -156,7 +163,7 @@ def _truncate(cur, tbl, mode):
   кладёт фикстуры в S3 (`S3Hook.load_bytes`), создаёт таблицы `<schema>.pg_stream_t_*` (на GP —
   `distributed randomly`), зовёт `HrpS3ToPgStreamOperator(task_id=…, …).execute(context)` и
   проверяет `assert`-ами; в `finally` — `drop table if exists`. Сценарии задачи 1.1:
-  - CSV 3 строки, `truncate=None` дважды → 6 строк (REQ-12), `return_value.rows` = 3, `target` = `{"id": "int4", "name": "text"}`, `source` из заголовка (REQ-11);
+  - CSV 3 строки, `truncate=None` дважды → 6 строк (REQ-12), `rows_source` = `rows_loaded` = 3, `rows_rejected` = 0, `target` = `{"id": "int4", "name": "text"}`, `source` из заголовка (REQ-11);
   - `truncate='hard'` → 3 (REQ-13); `'soft'` → 3, параллельное чтение другим соединением во время
     загрузки не ждёт (REQ-14: второе соединение с `statement_timeout=2s` читает таблицу между
     `_truncate` и `commit` — для этого оператор зовётся с CSV на 200 000 строк, а чтение — в потоке
@@ -167,6 +174,10 @@ def _truncate(cur, tbl, mode):
   - `options="CSV HEADER DELIMITER ';'"` (REQ-19); `truncate='yes'` → ValueError в конструкторе (REQ-16);
   - `.txt` без `format` → ValueError с именем ключа (REQ-17);
   - лог содержит `statement_timeout 240min`, с параметром `5` — `5min` (REQ-10).
+  - CSV с переводом строки внутри кавычек → `rows_source` = числу записей (REQ-11);
+  - только на GP (`select version()` содержит `Greenplum`): 5 записей, одна с битой датой,
+    `options="CSV HEADER LOG ERRORS SEGMENT REJECT LIMIT 10 ROWS"` → `rows_source` 5, `rows_loaded` 4,
+    `rows_rejected` 1 (REQ-11); на PG сценарий пропускается с записью в лог.
 - [ ] Выложи (`scp` + md5) и запусти даг на `cap_gp_etl` и на `gp6-stand`
   (`airflow dags trigger tools_test_pg_stream -c '{"conn_id": "gp6-stand"}'`), жди в фоне.
   Ожидай: оба рана `success`, в логе «selfcheck ok» не нужен — сценарии.
@@ -332,7 +343,7 @@ def iter_jsonl(chunks):
 insert into {tbl} ({cols}[, {fcol}])
 select r.{c1}, r.{c2}…[, t.f] from pg_stream_raw t, jsonb_populate_record(null::{tbl}, t.j) r
 ```
-    `rows = cur.rowcount`; `km.extra` непусто → один `log.warning` со списком (до 50 имён).
+    `rows_loaded = cur.rowcount`, `rows_source` — число элементов; `km.extra` непусто → один `log.warning` со списком (до 50 имён).
     XCom: `unmapped = sorted(km.extra)`, `defaulted = [c for c in columns if c not in km.seen and
     c != file_name_column]`, `files` — имена из `iter_sources` (для zip — `<key>/<имя в архиве>`).
   - CSV с `file_name_column`: `create temp table pg_stream_csv (like {tbl}) on commit drop`
