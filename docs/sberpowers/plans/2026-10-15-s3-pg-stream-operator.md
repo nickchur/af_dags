@@ -68,7 +68,11 @@ PG оператором `HrpS3ToPgStreamOperator` — потоково, одно
   - `detect_format(name: str, fmt: str) -> str` — `'csv' | 'json' | 'jsonl'`; `name` без `.gz`/`.zip`;
     ValueError «формат не определён по имени <name>»;
   - `_truncate(cur, tbl, mode) -> str | None` — возвращает `'truncate' | 'delete' | None`;
-  - `class HrpS3ToPgStreamOperator(BaseOperator)` с `execute(context) -> int`.
+  - `class HrpS3ToPgStreamOperator(BaseOperator)` с `execute(context) -> dict` (итог REQ-11:
+    `rows`, `files`, `target`, `source`, `unmapped`, `defaulted`[, `source_truncated`]);
+  - `_target_types(cur, description) -> dict[str, str]` — `{колонка: typname}`:
+    `select oid, typname::text from pg_catalog.pg_type where oid = any(%s)` по `type_code` из
+    `description` (имена как у `srv_wf.pr_get_format_type`: `int4`, `varchar`, `timestamp`).
 
 **Шаги:**
 - [ ] Самопроверка (в `if __name__ == "__main__":` модуля) — пишется первой:
@@ -142,7 +146,9 @@ def _truncate(cur, tbl, mode):
   `S3Hook(aws_conn_id=s3_conn_id).get_key(s3_key, bucket)`, нет — `AirflowFailException`; тело под
   `closing`; csv: `cur.copy_expert(sql.SQL("copy {} from stdin with " + options).format(tbl).as_string(conn),
   s3_IterStream(body.iter_chunks(1 << 20)))`; `rows += cur.rowcount`; `conn.commit()`; лог
-  «загружено N строк»; `return rows`. Любое исключение — `conn.rollback()` (даёт `closing` + явный
+  «загружено N строк»; `return` словарь: `rows`, `files=[s3_key]`, `target=_target_types(...)`, `source` —
+  для CSV с `HEADER` в `options` первая строка файла (разбор `csv.reader` по разделителю из `options`,
+  по умолчанию `,`) → `{имя: "text"}`, иначе `{}`; `unmapped=[]`, `defaulted=[]`. Любое исключение — `conn.rollback()` (даёт `closing` + явный
   rollback в `except`), исключение пробрасывается.
 - [ ] Даг `tools/test_pg_stream.py` (`tools_test_pg_stream`, schedule=None, теги `DataTools`, `tools`,
   `AutoQA`; параметры `conn_id` (по умолчанию `cap_gp_etl`, examples `gp6-stand`), `bucket`
@@ -150,7 +156,7 @@ def _truncate(cur, tbl, mode):
   кладёт фикстуры в S3 (`S3Hook.load_bytes`), создаёт таблицы `<schema>.pg_stream_t_*` (на GP —
   `distributed randomly`), зовёт `HrpS3ToPgStreamOperator(task_id=…, …).execute(context)` и
   проверяет `assert`-ами; в `finally` — `drop table if exists`. Сценарии задачи 1.1:
-  - CSV 3 строки, `truncate=None` дважды → 6 строк (REQ-12), `return` = 3 (REQ-11);
+  - CSV 3 строки, `truncate=None` дважды → 6 строк (REQ-12), `return_value.rows` = 3, `target` = `{"id": "int4", "name": "text"}`, `source` из заголовка (REQ-11);
   - `truncate='hard'` → 3 (REQ-13); `'soft'` → 3, параллельное чтение другим соединением во время
     загрузки не ждёт (REQ-14: второе соединение с `statement_timeout=2s` читает таблицу между
     `_truncate` и `commit` — для этого оператор зовётся с CSV на 200 000 строк, а чтение — в потоке
@@ -175,7 +181,7 @@ def _truncate(cur, tbl, mode):
 
 ### Задача 2.1: JSON-массив, JSON Lines, `item`, приёмник `json`/`jsonb` (волна 2)
 
-**REQ:** REQ-plugins-20, 21, 22, 23 (ветка одной колонки), 09
+**REQ:** REQ-plugins-20, 21, 22, 23 (ветка одной колонки), 09, 11 (`source` для JSON)
 **model-hint:** frontier
 **Blocked by:** задача 1.1
 
@@ -196,7 +202,11 @@ def _truncate(cur, tbl, mode):
     `None`/`""` → `[]`;
   - `pick(obj, path: list[str], n: int) -> dict` — ValueError «элемент n: <путь до уровня>: нет ключа k»
     или «… не объект»;
-  - `_copy_line(obj) -> bytes` — `json.dumps(obj, ensure_ascii=False).encode() + b"\n"`
+  - `class SourceStats` — `add(obj: dict)` копит `{ключ: set(типов JSON)}` (не больше 500 ключей,
+    сверх — флаг `truncated`), `as_dict() -> dict[str, str]` — типы через `|` в порядке
+    `string, number, boolean, object, array, null`; тип: `str`→string, `bool`→boolean (до int!),
+    `int`/`float`→number, `dict`→object, `list`→array, `None`→null;
+  - `_copy_line(obj) -> bytes` — `json.dumps(obj, ensure_ascii=False).encode() + b"\n"
     (управляющие символы JSON экранирует, поэтому `\x01`/`\x02` в строке не встречаются).
 
 **Шаги:**
@@ -216,6 +226,11 @@ def _truncate(cur, tbl, mode):
         list(iter_jsonl(['{"a":1}\n{bad\n']))
     except ValueError as e:
         assert "строка 2" in str(e)
+    st = SourceStats()
+    st.add({"a": 1, "b": True}); st.add({"a": None, "c": [1]})
+    assert st.as_dict() == {"a": "number|null", "b": "boolean", "c": "array"}
+    big = SourceStats(); big.add({f"k{i}": 1 for i in range(600)})
+    assert len(big.as_dict()) == 500 and big.truncated
     assert parse_item("payload.value") == ["payload", "value"]
     assert parse_item(["p", "a.b"]) == ["p", "a.b"]
     assert pick({"p": {"v": {"x": 1}}}, ["p", "v"], 7) == {"x": 1}
@@ -249,7 +264,9 @@ def iter_jsonl(chunks):
   `n` и `".".join(path[:i+1])`. Текст из S3 — инкрементальный декодер utf-8, как `_s3_chunks` в
   `tools/test_json_pg.py`. Состав приёмника: `cur.execute(sql.SQL("select * from {} limit 0").format(tbl))`,
   колонки — `cur.description` (`name`, `type_code`); одна колонка (не считая `file_name_column`) с
-  `type_code in (114, 3802)` (json, jsonb) → COPY строк `_copy_line(pick(el, path, n))` прямо в неё:
+  `type_code in (114, 3802)` (json, jsonb) → COPY строк `_copy_line(pick(el, path, n))` прямо в неё
+  (каждый объект `pick(...)` — ещё и в `SourceStats.add`, если он dict; итог — `source`,
+  `source_truncated` в XCom):
   `copy {tbl} ({col}) from stdin with (format csv, quote e'\x01', delimiter e'\x02')`.
 - [ ] Сценарии в даге: файл ИФТ-образец (синтетический, той же формы: `{"data": [{"schema": {...},
   "payload": {...}}, ×4]}`) в приёмник `(j jsonb)` с `root='data'`, `item='payload'` → 4 строки, ни у одной
@@ -269,7 +286,7 @@ def iter_jsonl(chunks):
 
 ### Задача 3.1: раскладка по колонкам, сопоставление ключей, служебная колонка, gz/zip (волна 3)
 
-**REQ:** REQ-plugins-18, 23 (ветка раскладки), 24, 25, 26, 27
+**REQ:** REQ-plugins-18, 23 (ветка раскладки), 24, 25, 26, 27, 11 (`unmapped`, `defaulted`, `files` zip)
 **model-hint:** frontier
 **Blocked by:** задача 2.1
 
@@ -316,6 +333,8 @@ insert into {tbl} ({cols}[, {fcol}])
 select r.{c1}, r.{c2}…[, t.f] from pg_stream_raw t, jsonb_populate_record(null::{tbl}, t.j) r
 ```
     `rows = cur.rowcount`; `km.extra` непусто → один `log.warning` со списком (до 50 имён).
+    XCom: `unmapped = sorted(km.extra)`, `defaulted = [c for c in columns if c not in km.seen and
+    c != file_name_column]`, `files` — имена из `iter_sources` (для zip — `<key>/<имя в архиве>`).
   - CSV с `file_name_column`: `create temp table pg_stream_csv (like {tbl}) on commit drop`
     (+ distributed randomly на GP), `alter table pg_stream_csv drop column {fcol}`, COPY в неё с
     `options`, затем `insert into {tbl} ({cols без fcol}, {fcol}) select *, %s from pg_stream_csv`.
@@ -327,7 +346,8 @@ select r.{c1}, r.{c2}…[, t.f] from pg_stream_raw t, jsonb_populate_record(null
   `NULL`; `load_dttm` заполнен (REQ-23, 24, 27); `{"a":1,"A":2}` → ошибка (REQ-24); `hired: "31.12.2026"`
   → ошибка базы с `31.12.2026`, строк 0 (REQ-25); `file_name_column='src'` для csv, json, jsonl — у всех
   строк ключ S3 (REQ-26); `.json.gz` и zip с двумя csv → строки обоих, у `src` имя внутри архива (REQ-18);
-  REQ-09 на `jsonl.gz` 300 МБ.
+  REQ-09 на `jsonl.gz` 300 МБ; XCom: `unmapped == ["extra"]`, `"load_dttm" in defaulted`,
+  `source["employeeId"] == "number"`, для zip `files` — два имени внутри архива (REQ-11).
 - [ ] Выложи, прогони даг на `cap_gp_etl` и `gp6-stand`.
 - [ ] `ruff check` — чисто.
 - [ ] Commit: `feat(plugins): HrpS3ToPgStreamOperator — раскладка по колонкам, file_name_column, gz/zip (REQ-plugins-18, 23…27)`
