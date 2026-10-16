@@ -1,5 +1,5 @@
 """### 📊 Сбои доставки задач: отчёт по журналу метабазы
-*2026-10-01 18:18 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 16:42 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки считает по журналу `log` метабазы сбои доставки задач — `stuck in queued`,
 `heartbeat timeout`, `state mismatch` — в числах задач, а не событий, и в доле от запусков
@@ -273,7 +273,7 @@ def tools_log_events():
         """💾 Сохраняет параметры запуска как значения по умолчанию."""
         return store_params_task(PARAMS_VAR, SAVED, context)
 
-    @task(task_id='collect', trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id='collect', multiple_outputs=False, trigger_rule=TriggerRule.NONE_FAILED)
     def collect(**context) -> dict:
         """🔎 Считает события за окно: всего, по дагам, по дням, и запуски для доли."""
         p = context['params']

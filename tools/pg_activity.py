@@ -1,5 +1,5 @@
 """### 🩺 Сторож метабазы: зависшие сессии, долгие запросы, блокировки
-*2026-10-01 22:26 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 16:42 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 10 минут снимает `pg_stat_activity` метабазы и разбирает находки: зависшие сессии
 (`idle in transaction`), долгие запросы, блокировки. Против находки — таск-владелец и жив ли
@@ -258,7 +258,7 @@ def _fetch(sql: str) -> list:
 )
 def tools_pg_activity():
 
-    @task(task_id='collect')
+    @task(task_id='collect', multiple_outputs=False)
     def collect(**context) -> dict:
         """📸 Снимок pg_stat_activity, разбор находок и опознание владельцев."""
         p = context['params']

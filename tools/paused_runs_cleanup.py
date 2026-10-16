@@ -1,5 +1,5 @@
 """### ⏸️ DAG: Зависшие раны запаузенных дагов
-*2026-10-02 07:26 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 16:42 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час находит раны в `running` / `queued` у дагов на паузе старше `older_than_hours` и,
 если попросили, закрывает их как **Mark failed**: незавершённые задачи → `skipped`, ран →
@@ -229,7 +229,7 @@ def tools_paused_runs_cleanup():
         return [{'dag_id': r['dag_id'], 'run_id': r['run_id'], 'state': r['state'],
                  'age_h': r['age_h'], 'paused': who(r['dag_id'])} for r in todo]
 
-    @task(task_id='close', trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id='close', multiple_outputs=False, trigger_rule=TriggerRule.NONE_FAILED)
     def close(found: list, **context) -> dict:
         """🧹 Помечает найденные раны failed. Только при close=True и не больше max_runs."""
         from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
