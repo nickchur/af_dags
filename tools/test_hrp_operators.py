@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-16 17:52 MSK · v2.0 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-16 22:00 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач, каждый
 тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор как в бою (Jinja
@@ -22,6 +22,7 @@ import datetime as dt
 import gzip
 import importlib
 import io
+import json
 import os
 import re
 import sys
@@ -134,6 +135,34 @@ def _pg_create_sql(table: str, temp: bool, incarnation: bool = False, inc_col: b
             stmts.append(f"COMMENT ON TABLE {tbl} IS 'HRP regression'")
             stmts += [f"COMMENT ON COLUMN {tbl}.{name} IS '{comment}'" for name, *_, comment in COLUMNS]
     return stmts
+
+
+# xstream_sanitize: ; таб и перевод строки вырезаются, кавычки и запятые остаются
+SANITIZED_SPECIAL = 'Спец: "кавычки", запятая,  точка-с-запятой,таб,перенос,  бэкслеш, №42'
+# формат HrpPostgresToS3ListOperator по умолчанию: TSV без кавычек, экранирование обратным слешем
+TSV = {"delimiter": "\t", "quoting": csv.QUOTE_NONE, "escapechar": "\\"}
+
+
+def _unpack(raw: bytes, compression) -> bytes:
+    """Содержимое файла выгрузки: один файл внутри архива."""
+    if compression == "gzip":
+        return gzip.decompress(raw)
+    if compression == "zip":
+        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+            return _single(z.namelist(), z.read)
+    if compression == "tar.gz":
+        # tar.gz ядра — заголовок tar с размером 0 и данные за ним сырыми (размер потока заранее не
+        # известен): tarfile и tar xzf видят пустой файл, читает только TarGzStreamReader ядра
+        from sber_app_dataplatform_etl_core.hrp_operators.utils.compress_utils import UNCOMPRESSOR_MAP
+        with UNCOMPRESSOR_MAP["tar.gz"](io.BytesIO(raw)) as r:
+            return b"".join(iter(lambda: r.read(1 << 16), b"")).rstrip(b"\n\0") + b"\n"
+    return raw
+
+
+def _single(names, read) -> bytes:
+    if len(names) != 1:
+        raise AirflowFailException(f"в архиве {len(names)} файлов, ждём один: {names}")
+    return read(names[0])
 
 
 def _csv_bytes(rows=ROWS) -> bytes:
@@ -310,6 +339,21 @@ class T:
     def pg_rows(self, table: str, session="main") -> list:
         return self.pg(f"SELECT * FROM {self.full(table)} ORDER BY id", session=session, fetch=True)
 
+    def pg_copy_out(self, query: str, header=False, session="main") -> bytes:
+        """CSV средствами самой базы: вход для S3 → PG в том виде, в каком его пишет PG (массивы, NULL)."""
+        conn = self.session(session)
+        with conn.cursor() as cur, cur.copy(f"COPY ({query}) TO STDOUT WITH CSV{' HEADER' if header else ''}") as cp:
+            data = b"".join(bytes(b) for b in cp)
+        conn.commit()
+        return data
+
+    def pg_active(self, table: str, session="main") -> tuple[int, list]:
+        """(активная инкарнация, её строки без колонки incarnation)."""
+        (active,), = self.pg(f"SELECT last_value FROM {self.full(table)}_inc_seq", session=session, fetch=True)
+        rows = self.pg(f"SELECT {', '.join(COL_NAMES)} FROM {self.full(table)}_{active} ORDER BY id",
+                       session=session, fetch=True)
+        return active, rows
+
     @contextmanager
     def pg_sessions(self, order):
         """temp-режим: get_conn оператора отдаёт сессии в порядке order (в каком их откроет оператор)."""
@@ -342,6 +386,9 @@ class T:
 
     def s3_get(self, key: str) -> bytes:
         return self.s3.get_key(key, self.bucket).get()["Body"].read()
+
+    def s3_keys(self, name: str) -> list[str]:
+        return sorted(self.s3.list_keys(bucket_name=self.bucket, prefix=self.s3_prefix + name) or [])
 
     # ── оператор ──
     def run(self, sessions=(), spy=None, **kw):
@@ -473,10 +520,231 @@ def s3_to_s3_tpl(t: T):
         raise AirflowFailException("post_file_check='False' из шаблона не подействовал: хэш сверялся")
 
 
+# ──────────────────────────── Тесты: PG → PG в инкарнацию ─────────────────────
+def _pg_inc(t: T, tpl=False, **kw):
+    src = t.pg_table("src", ROWS)
+    tgt = t.name("tgt")
+    t.pg(_pg_create_sql(t.full(tgt), t.temp, incarnation=True))
+    query, schema = f"SELECT {', '.join(COL_NAMES)} FROM {t.full(src)}", t.pg_schema
+    if tpl:
+        query, tgt_arg, schema = f"{{{{ {query!r} }}}}", f"{{{{ {tgt!r} }}}}", f"{{{{ {schema!r} }}}}"
+    result, _ = t.run(sessions=("main",), conn_id=t.pg_conn, select_query=query,
+                      target_table=tgt_arg if tpl else tgt, target_schema=schema, **kw)
+    active, got = t.pg_active(tgt)
+    if active != 1 or got != t.pg_rows(src):
+        raise AirflowFailException(f"активна инкарнация {active} (ждём 1), строки {'не ' if got != t.pg_rows(src) else ''}"
+                                   f"совпали с источником: {got!r}"[:1000])
+    t.expect_rows(result, len(got))
+
+
+def pg_inc_full(t: T):
+    """PG → PG в инкарнацию: вставка запросом в неактивную копию _1, переключение, row_count = 3"""
+    _pg_inc(t)
+
+
+def pg_inc_chunked(t: T):
+    """PG → PG в инкарнацию порциями: chunk_column=id, chunk_size=2"""
+    _pg_inc(t, chunk_column="id", chunk_size=2)
+
+
+def pg_inc_tpl(t: T):
+    """PG → PG в инкарнацию шаблоном: запрос, схема, таблица и chunk_column из {{ }}"""
+    _pg_inc(t, tpl=True, chunk_column="{{ 'id' }}", chunk_size=2)
+
+
+# ─────────────────────────────── Тесты: PG DDL ────────────────────────────────
+def _pg_ddl(t: T, tpl=False):
+    if t.temp:  # DDL читает каталог своим соединением SQLAlchemy — временную таблицу чужой сессии не видно
+        raise AirflowSkipException("нужна схема в pg: временная таблица из другой сессии не видна")
+    src = t.pg_table("src")
+    name, schema = (f"{{{{ {src!r} }}}}", f"{{{{ {t.pg_schema!r} }}}}") if tpl else (src, t.pg_schema)
+    ddl, _ = t.run(table_name=name, schema=schema, postgres_conn_id=t.pg_conn)
+    missing = [c for c in COL_NAMES if c not in (ddl or "")]
+    if not ddl or "CREATE TABLE" not in ddl or src not in ddl or missing:
+        raise AirflowFailException(f"DDL без CREATE TABLE {src} или колонок {missing}: {ddl!r}"[:1000])
+
+
+def pg_ddl_table(t: T):
+    """PG DDL: CREATE TABLE таблицы теста со всеми колонками"""
+    _pg_ddl(t)
+
+
+def pg_ddl_tpl(t: T):
+    """PG DDL шаблоном: table_name и schema из {{ }}"""
+    _pg_ddl(t, tpl=True)
+
+
+# ─────────────────────────────── Тесты: PG → S3 ───────────────────────────────
+def _pg_to_s3(t: T, compression, tpl=False):
+    src = t.pg_table("src", ROWS)
+    key = f"{t.s3_prefix}out.csv"
+    kw = dict(table_name=src, schema=t.pg_schema, s3_key=key)
+    if tpl:
+        kw = {k: f"{{{{ {v!r} }}}}" for k, v in kw.items()}
+    _, spy = t.run(sessions=("main",), spy="verify_file_hash", s3_bucket=t.bucket, postgres_conn_id=t.pg_conn,
+                   aws_conn_id=t.s3_conn, compression=compression, replace=True, post_file_check=True, **kw)
+    keys = t.s3_keys("out")
+    # порядок строк не сверяем: на GP SELECT * без ORDER BY отдаёт их в порядке сегментов
+    want = sorted(csv.reader(io.StringIO(t.pg_copy_out(f"SELECT * FROM {t.full(src)}").decode())))
+    got = sorted(csv.reader(io.StringIO(_unpack(t.s3_get(keys[0]), compression).decode()))) if len(keys) == 1 else None
+    if got != want or spy.call_count != 1:
+        raise AirflowFailException(f"файл {keys} не равен CSV таблицы или хэш не сверен (сверок {spy.call_count})")
+
+
+def pg_to_s3_gzip(t: T):
+    """PG → S3, gzip: файл .csv.gz равен COPY … CSV таблицы, оператор сверяет хэш"""
+    _pg_to_s3(t, "gzip")
+
+
+def pg_to_s3_none(t: T):
+    """PG → S3 без сжатия: файл равен COPY … CSV таблицы"""
+    _pg_to_s3(t, None)
+
+
+def pg_to_s3_tpl(t: T):
+    """PG → S3 шаблоном: таблица, схема и ключ из {{ }}"""
+    _pg_to_s3(t, "gzip", tpl=True)
+
+
+# ─────────────────────────── Тесты: PG → S3 частями ───────────────────────────
+def _pg_to_s3_list(t: T, compression, fmt=TSV, with_header=True, **kw) -> dict[str, list[str]]:
+    """Выгружает таблицу теста, сверяет файл; возвращает строки файла по id."""
+    src = t.pg_table("src", ROWS)
+    ext = {"gzip": ".gz", "zip": ".zip", "tar.gz": ".tar.gz"}.get(compression, "")
+    _, spy = t.run(sessions=("main",), spy="verify_file_hash", table_name=src, schema=t.pg_schema,
+                   s3_bucket=t.bucket, s3_key=f"{t.s3_prefix}out.csv{ext}", postgres_conn_id=t.pg_conn,
+                   aws_conn_id=t.s3_conn, compression=compression, replace=True, post_file_check=True, **kw)
+    keys = t.s3_keys("out")
+    if len(keys) != 1 or not keys[0].endswith(f"out_1.csv{ext}") or spy.call_count != 1:
+        raise AirflowFailException(f"ждём один файл out_1.csv{ext} со сверкой хэша: {keys}, сверок {spy.call_count}")
+    rows = list(csv.reader(io.StringIO(_unpack(t.s3_get(keys[0]), compression).decode()), **fmt))
+    if with_header and rows[:1] != [COL_NAMES]:
+        raise AirflowFailException(f"заголовок {rows[:1]!r}, ждём {COL_NAMES}")
+    data = {r[0]: r for r in (rows[1:] if with_header else rows)}  # на GP порядок строк — сегментов
+    if sorted(data) != sorted(str(r[0]) for r in ROWS) or len(data) != len(rows) - with_header:
+        raise AirflowFailException(f"id строк файла: {[r[:1] for r in rows]}, ждём 1, 2, 3 по разу")
+    return data
+
+
+def pg_to_s3_list_gzip(t: T):
+    """PG → S3 частями, gzip: TSV с заголовком, три строки, оператор сверяет хэш"""
+    _pg_to_s3_list(t, "gzip")
+
+
+def pg_to_s3_list_zip(t: T):
+    """PG → S3 частями, zip: в архиве один TSV с заголовком"""
+    _pg_to_s3_list(t, "zip")
+
+
+def pg_to_s3_list_targz(t: T):
+    """PG → S3 частями, tar.gz: в архиве один TSV с заголовком"""
+    _pg_to_s3_list(t, "tar.gz")
+
+
+def pg_to_s3_list_none(t: T):
+    """PG → S3 частями без сжатия: TSV с заголовком"""
+    _pg_to_s3_list(t, None)
+
+
+def pg_to_s3_list_sanitize(t: T):
+    """PG → S3 частями с очисткой: xstream_sanitize и sanitize_array вырезают спецсимволы строки 2"""
+    row = dict(zip(COL_NAMES, _pg_to_s3_list(t, "gzip", xstream_sanitize=True, sanitize_array=True)["2"]))
+    errors = []
+    if row["s_special"] != SANITIZED_SPECIAL:
+        errors.append(f"s_special={row['s_special']!r}, ждём {SANITIZED_SPECIAL!r}")
+    if "x;y" in row["arr_text"] or "xy" not in row["arr_text"]:
+        errors.append(f"arr_text не очищен (sanitize_array): {row['arr_text']!r}")
+    if errors:
+        raise AirflowFailException("; ".join(errors))
+
+
+def pg_to_s3_list_tpl(t: T):
+    """PG → S3 частями шаблоном: header='false' и format_params JSON-строкой из {{ }} — CSV без заголовка"""
+    fmt = {"delimiter": ",", "quoting": csv.QUOTE_MINIMAL}
+    _pg_to_s3_list(t, "gzip", fmt={"delimiter": ","}, with_header=False,
+                   **{"header": "{{ 'false' }}", "format_params": "{{ '%s' }}" % json.dumps(fmt)})
+
+
+# ─────────────────────────────── Тесты: S3 → PG ───────────────────────────────
+def _s3_to_pg(t: T, tpl=False):
+    src = t.pg_table("src", ROWS)
+    tgt = t.name("tgt")
+    t.pg(_pg_create_sql(t.full(tgt), t.temp, incarnation=True, inc_col=False))
+    # CSV самой PG: строка 2 с переводом строки в кавычках — row_count по rowcount COPY, а не по \n
+    key = t.s3_put("src.csv.gz", gzip.compress(t.pg_copy_out(f"SELECT * FROM {t.full(src)}")))
+    kw = dict(compression="gzip", pre_truncate=True, include_file_name=False, file_name_position=0)
+    if tpl:
+        kw = dict(compression="{{ 'gzip' }}", pre_truncate="{{ 'true' }}", include_file_name="{{ 'false' }}",
+                  file_name_position="{{ 0 }}")
+    # temp: оператор открывает соединение дважды — узнать инкарнацию и для COPY
+    result, _ = t.run(sessions=("main", "main"), s3_bucket=t.bucket, s3_key=key, aws_conn_id=t.s3_conn,
+                      target_conn_id=t.pg_conn, target_schema=t.pg_schema, target_table=tgt,
+                      copy_csv_quote='"', **kw)
+    active, got = t.pg_active(tgt)
+    if active != 1 or got != t.pg_rows(src):
+        raise AirflowFailException(f"активна инкарнация {active} (ждём 1) или строки не совпали: {got!r}"[:1000])
+    t.expect_rows(result, len(got))
+
+
+def s3_to_pg_gzip(t: T):
+    """S3 → PG: COPY gzip-CSV в неактивную копию _1, перевод строки в кавычках, row_count = 3"""
+    _s3_to_pg(t)
+
+
+def s3_to_pg_tpl(t: T):
+    """S3 → PG шаблоном: compression, pre_truncate, include_file_name, file_name_position из {{ }}"""
+    _s3_to_pg(t, tpl=True)
+
+
+# ──────────────────────────── Тесты: S3 → PG потоком ──────────────────────────
+def _s3_to_pg_stream(t: T, name: str, data_sql: str, tpl=False, **kw):
+    src = t.pg_table("src", ROWS)
+    tgt = t.pg_table("tgt")
+    q = f"SELECT * FROM {t.full(src)}"
+    data = (t.pg_copy_out(q, header=True) if name.endswith(".csv")
+            else t.pg(data_sql.format(q=q), fetch=True)[0][0].encode())
+    key = t.s3_put(name, data)
+    table, bucket = f"{t.pg_schema}.{tgt}", t.bucket
+    if tpl:
+        key, table, bucket = (f"{{{{ {v!r} }}}}" for v in (key, table, bucket))
+    result, _ = t.run(sessions=("main",), s3_key=key, table=table, bucket=bucket, s3_conn_id=t.s3_conn,
+                      conn_id=t.pg_conn, **kw)
+    got = t.pg_rows(tgt)
+    if got != t.pg_rows(src) or result.get("rows_loaded") != len(got):
+        raise AirflowFailException(f"rows_loaded={result.get('rows_loaded')}, строки не совпали с источником: {got!r}"[:1000])
+
+
+def s3_to_pg_stream_csv(t: T):
+    """S3 → PG потоком из CSV с заголовком: строки = источник"""
+    _s3_to_pg_stream(t, "src.csv", "")
+
+
+def s3_to_pg_stream_json(t: T):
+    """S3 → PG потоком из JSON-массива: раскладка по колонкам, строки = источник"""
+    _s3_to_pg_stream(t, "src.json", "SELECT json_agg(s ORDER BY id)::text FROM ({q}) s")
+
+
+def s3_to_pg_stream_tpl(t: T):
+    """S3 → PG потоком шаблоном: s3_key, table, bucket из {{ }}"""
+    _s3_to_pg_stream(t, "src.csv", "", tpl=True)
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
        [pg_to_pg_full, pg_to_pg_chunked]),
+    Op("pg_inc", "postgres_to_postgres", "HrpPostgresIncarnationInsertOperator", {"pg"},
+       [pg_inc_full, pg_inc_chunked, pg_inc_tpl]),
+    Op("pg_ddl", "postgres_ddl", "HrpPostgresDDL", {"pg"}, [pg_ddl_table, pg_ddl_tpl]),
+    Op("pg_to_s3", "postgres_to_s3", "HrpPostgresToS3Operator", {"pg", "s3"},
+       [pg_to_s3_gzip, pg_to_s3_none, pg_to_s3_tpl]),
+    Op("pg_to_s3_list", "postgres_to_s3", "HrpPostgresToS3ListOperator", {"pg", "s3"},
+       [pg_to_s3_list_gzip, pg_to_s3_list_zip, pg_to_s3_list_targz, pg_to_s3_list_none, pg_to_s3_list_sanitize,
+        pg_to_s3_list_tpl]),
+    Op("s3_to_pg", "s3_to_postgres", "HrpS3ToPostgresOperator2", {"pg", "s3"}, [s3_to_pg_gzip, s3_to_pg_tpl]),
+    # плагин af_dags, не ядро: на сигме его нет — группа «не создана»
+    Op("s3_to_pg_stream", "pg_stream", "HrpS3ToPgStreamOperator", {"pg", "s3"},
+       [s3_to_pg_stream_csv, s3_to_pg_stream_json, s3_to_pg_stream_tpl], pkg="plugins"),
     Op("s3_to_s3", "s3_to_s3", "HrpS3ToS3Operator", {"s3"}, [s3_to_s3_gzip, s3_to_s3_zip, s3_to_s3_tpl]),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
