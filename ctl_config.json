@@ -27,14 +27,14 @@
       "type": "S3"
     },
     "gp": {
-      "conn_id": "alpha-adb_dev_comm-read",
+      "conn_id": "cap_gp_etl",
       "pool_slots": 20,
       "schema": "s_grnplm_vd_hr_edp_srv_wf",
       "timeout": 300,
       "type": "Postgres"
     },
     "ppl": {
-      "conn_id": "alpha-adb_dev_comm-write",
+      "conn_id": "cap_gp_ppl",
       "schema": "s_grnplm_vd_hr_edp_srv_wf",
       "timeout": 300,
       "type": "Postgres"

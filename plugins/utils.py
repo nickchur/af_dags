@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-06 12:37 MSK · v1.24 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-14 16:01 MSK · v1.25 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -126,7 +126,7 @@ def pool_slots(pool_name, slots, session=None):
         pool.slots = slots
     else:
         session.add(Pool(pool=pool_name, slots=slots, description='CTL_worker', include_deferred=False))
-        logger.warning(f'Pool {pool_name} created')
+        logger.info(f'Pool {pool_name} created')
     session.commit()
 
     if slots > 0:
@@ -174,7 +174,7 @@ def ensure_pool(pool_name, slots=TOOLS_POOL_SLOTS, description='DataLab tools', 
                 include_deferred=False
             ))
             session.commit()
-            logger.warning(f'Pool {pool_name} created with {slots} slots')
+            logger.info(f'Pool {pool_name} created with {slots} slots')
         _ensured_pools.add(pool_name)
     except Exception:
         logger.warning(f'Не удалось проверить пул {pool_name}', exc_info=True)

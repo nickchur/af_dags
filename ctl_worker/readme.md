@@ -1,5 +1,5 @@
 # CTL (Change Tracking & Loading) — Система управления ETL-процессами в Airflow
-*2026-10-04 12:07 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-14 15:53 MSK · v3.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 ---
 
@@ -701,7 +701,7 @@ retry = {
 | Коннектор | ID | Тип | Пул | Таймаут |
 |----------|----|-----|-----|---------|
 | CTL | `ctl` | KerberosHttp | `ctl_pool` | 10 мин |
-| Greenplum | `alpha-adb_dev_comm-read` | Postgres | `gp_pool` | 4 часа |
+| Greenplum | `cap_gp_etl` (без него — `alpha-*-read`) | Postgres | `gp_pool` | 4 часа |
 | S3 | `s3` | S3 | — | — |
 | Airflow DB | `airflowdb` | Postgres | — | — |
 
@@ -845,7 +845,7 @@ Airflow-SLA не используется (снят 22.09.2026): в AF2 он с�
 | `root_category` | Корневая категория workflow'ов | `p1080` |
 | `root_entity` | Корневая сущность в иерархии | `941010000` |
 | `ue_category` | Наши потоки, которые исполняет не Airflow (другие профили и оркестраторы) | `p1080.sdpue` |
-| `gp_conn_id` | ID подключения к Greenplum | `alpha-adb_dev_comm-read` |
+| `gp_conn_id` | ID подключения к Greenplum | `cap_gp_etl` (без него — `alpha-*-read`) |
 | `gp_schema` | Схема GP для выполнения логики | `s_grnplm_vd_hr_edp_srv_wf` |
 | `gp_server_limit` | Серверный лимит запроса в Greenplum (факт, не рычаг) | `minutes=270` |
 | `gp_timeout` | `statement_timeout` загрузки, если у воркфлоу нет `wf_timeout` | `minutes=265` |

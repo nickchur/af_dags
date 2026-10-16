@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-10-01 18:02 MSK · v1.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 16:01 MSK · v1.20 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -436,7 +436,9 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
             tz = get_config()['tz']
             try:
                 seen = json.loads(Variable.get(UE_LOST_VAR, default_var='{}'))
-            except Exception:
+            except Exception as e:
+                # без лога сброс памяти о пропавших потоках выглядел бы как новые пропажи
+                logger.warning(f"⚠️ {UE_LOST_VAR} не прочитана, начинаю с пустой: {e}")
                 seen = {}
             lost = {}
             for wid, w in (ctl_obj_load('ctl_workflows') or {}).items():
@@ -555,7 +557,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     after = 'true' if r.get('sch') else 'false'
                     if active: ctl_api(f"/v4/api/wf/{wid}/loading?scheduleAfterStart={after}", "post", json={})
                 except Exception as e:
-                    logger.error(f"ctl_action Started failed for wf={wid}: {e}")
+                    logger.exception(f"ctl_action Started failed for wf={wid}: {e}")
                 continue
 
             lid = int(lid)
@@ -596,7 +598,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                     if active: ctl_api(f'/v4/api/wf/{wid}/scheduled','put')
 
             except Exception as e:
-                logger.error(f"ctl_action failed for lid={lid} action={action}: {e}")
+                logger.exception(f"ctl_action failed for lid={lid} action={action}: {e}")
 
     
     @task(pool='ctl_pool')
@@ -856,7 +858,7 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
                 ctl_set_completed(lid, completed=False)
                 closed.append(lid)
             except Exception as e:                       # одна загрузка не должна ронять уборку
-                logger.error(f"ctl_zombie: не закрыл загрузку {lid}: {e}")
+                logger.exception(f"ctl_zombie: не закрыл загрузку {lid}: {e}")
 
         if not (failed or runs or paused_runs):
             add_note('🧟 Зависших тасков и осиротевших ранов нет', context, level='Task')

@@ -1,5 +1,5 @@
 """### 🔐 DAG: Конфигурация CTL
-*2026-10-01 18:20 MSK · v1.15 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-14 17:01 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Сохраняет параметры системы в `Variable['ctl_config']`. Запускается вручную. Требует PIN-код (`CTL_PIN` = `AIRFLOW__CTL_PIN`).
 
@@ -12,7 +12,6 @@ from airflow.models import Variable, Param
 
 from plugins.utils import on_callback, add_note, default_args, str2timedelta, get_conns_by_type, get_conn  # type: ignore
 from plugins.s3_utils import s3_set_ttl, s3_create_bucket  # type: ignore
-import os
 import base64
 import json
 import pendulum
@@ -41,6 +40,7 @@ def enum_default(value, allowed, fallback='off'):
     v = str(value or '').strip().lower()
     return v if v in allowed else fallback
 
+_pg_conns = get_conns_by_type('postgres')
 conns = {
     'ctl': {
         'type': 'KerberosHttp',
@@ -52,11 +52,11 @@ conns = {
     },
     'gp': {
         'type': 'Postgres',
-        # 'conn_id': 'alpha-adb_dev_comm-read', 
+        # cap_gp_etl — имя из vault (<сервис>_<USER_AIRFLOW_READ_CONN_ID> тенанта, etl-core 1.3.1), одно на всех контурах.
+        # Без него — прежнее угадывание alpha-*-read: контур с ещё не обновлённым vault не ломается
         'conn_id': conf.get('conns', {}).get('gp', {}).get('conn_id') or (
-            [ c for c in get_conns_by_type('postgres') 
-                  if c.startswith('alpha-') and c.endswith('-read')
-            ] or ['alpha-capgp2-read'])[0], 
+            'cap_gp_etl' if 'cap_gp_etl' in _pg_conns else
+            next((c for c in _pg_conns if c.startswith('alpha-') and c.endswith('-read')), 'alpha-capgp2-read')),
         'pool_slots': 20,
         'timeout': 300, # in seconds
         'schema': 's_grnplm_vd_hr_edp_srv_wf',
@@ -140,7 +140,7 @@ config = {
 }
 
 if not conf:
-    ctl = get_conn('ctl')
+    ctl = get_conn(config['conns']['ctl']['conn_id'])
     config['conns']['ctl']['url'] = f"{ctl.get('schema', 'https')}://{ctl.get('host')}:{ctl.get('port','9080')}"
     Variable.set('ctl_config', config, serialize_json=True, description=str(pendulum.now(config['tz']))[:19])
 
@@ -250,10 +250,7 @@ with DAG(f'CTL.{config["profile"]}.config',
             ctl_obj_save('ctl_config', config, var=True)
             
             msg = "✅ Configuration successfully saved to Variable 'ctl_config'"
-            
-            for e in os.environ:
-                if e.startswith('AIRFLOW__'):
-                    logger.info("⚠️{}: {}".format(e, os.getenv(e)))
+
         else:
             msg = "⚠️ Save skipped: 'CTL_PIN' is False}"
         
