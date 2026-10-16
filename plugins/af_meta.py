@@ -1,5 +1,5 @@
 """### 🗄️ Метабаза Airflow без ORM (`plugins/af_meta.py`)
-*2026-10-13 18:12 MSK · v1.3 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 11:33 MSK · v1.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 В Airflow 3 у задачи и у разбора DAG-файла нет ORM-доступа к метабазе: `create_session`
 бросает «Direct database access via the ORM is not allowed in Airflow 3.0». Всё, что даги
@@ -103,11 +103,15 @@ def _engine(conn_id):
     соединение с выставленным search_path не должно пережить задачу в чужих руках."""
     if conn_id not in _engines:
         from airflow.providers.postgres.hooks.postgres import PostgresHook  # type: ignore
+        from sqlalchemy import create_engine
         from sqlalchemy.pool import NullPool
+        # Драйвер psycopg2 явно: на SQLAlchemy 2 провайдер даёт `postgresql+psycopg`, его параметр
+        # `context` перехват подключения ядра (failover на psycopg2) до 3.0.1 отдавал в libpq,
+        # и подключение падало «invalid connection option "context"» (REQ-plugins-30).
+        url = PostgresHook(postgres_conn_id=conn_id).sqlalchemy_url.set(drivername='postgresql+psycopg2')
         # search_path и в параметрах подключения: каждое новое соединение сразу видит схему
-        _engines[conn_id] = PostgresHook(postgres_conn_id=conn_id).get_sqlalchemy_engine(
-            engine_kwargs={'poolclass': NullPool,
-                           'connect_args': {'options': f'-c search_path={search_path()}'}})
+        _engines[conn_id] = create_engine(
+            url, poolclass=NullPool, connect_args={'options': f'-c search_path={search_path()}'})
     return _engines[conn_id]
 
 
