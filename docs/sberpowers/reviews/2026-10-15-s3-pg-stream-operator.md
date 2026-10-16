@@ -67,3 +67,10 @@ Tests: tools_test_pg_stream (cap_gp_etl, gp6-stand) → success; python3 plugins
 
 Пустые файлы, `source_truncated` e2e (есть в самопроверке), `ESCAPE` ≠ `QUOTE` в csv, `statement_timeout=0`
 — не влияют на REQ; добавлять при правке соответствующих мест.
+
+## Дополнение 16.10.2026: `GeneratorExit` в `guard()`
+
+Найдено при переносе на Airflow 3. Когда база обрывает COPY посреди потока, генератор закрывается, и
+`GeneratorExit` попадал в `failed`; `raise failed[0]` поднимал его вместо ошибки базы — причина
+падения терялась. Исправлено: `GeneratorExit` пробрасывается до общего перехвата. Проверено модельно
+(потребитель на C, как `copy_expert`); живой обрыв COPY на psycopg2 на стенде не прогонялся.

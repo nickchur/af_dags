@@ -1,5 +1,5 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 14:41 MSK · v0.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 09:02 MSK · v0.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Для баз, где длинная транзакция
@@ -544,6 +544,8 @@ class HrpS3ToPgStreamOperator(BaseOperator):
             # (тот же SQLSTATE, что у statement_timeout): исходное поднимаем сами.
             try:
                 yield from chunks
+            except GeneratorExit:   # закрытие генератора при ошибке базы — не ошибка источника
+                raise
             except BaseException as exc:
                 failed.append(exc)
                 raise
