@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-13 23:04 MSK · v3.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-16 16:06 MSK · v3.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -194,12 +194,30 @@ def _label(item: dict) -> str:
 # Объединенная функция проверки соединений
 # ---------------------------------------------------------------------------
 
+def _pg_facts(row: dict) -> dict:
+    """Строка chk_conn → тип и версия базы: GP узнаётся по «Greenplum Database X.Y.Z» в version()."""
+    import re
+
+    v = row.get("version") or ""
+    m = re.search(r"Greenplum Database (\d+(?:\.\d+)*)", v)
+    if m:
+        kind, ver = "GP", m.group(1)
+    else:
+        m = re.search(r"PostgreSQL (\S+)", v)
+        kind, ver = "PG", m.group(1).rstrip(",") if m else None
+    return {"kind": kind, "version": ver, "user": row.get("current_user"),
+            "database": row.get("current_database"), "host": str(row.get("inet_server_addr") or "")}
+
+
 def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     """Единая точка входа для проверки всех типов соединений.
 
     Postgres/S3/HTTP — через общую `chk_conn` из plugins.utils (типы ctl* маппятся на KerberosHttp);
     ClickHouse/Kafka/Trino/Redis — напрямую.
+    Успех — `facts` о системе (тип, версия, `latency_ms`, …); в Variable их пишет `report`, а не проверка:
+    проверки идут параллельно и перетёрли бы друг друга.
     """
+    import json
     import time
 
     from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
@@ -226,13 +244,31 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     try:
         # 2. Выполнение проверки
         if chk_type in ("Postgres", "S3", "KerberosHttp"):
-            chk_conn(chk_type, conn_id, context)
-            result = "Success via chk_conn"
+            result = chk_conn(chk_type, conn_id, context)
+            if chk_type == "Postgres":
+                facts = _pg_facts(result)
+                add_note(f"{facts['kind']} {facts['version']}", context, level="task",
+                         title=f"🐘 {facts['kind']} {facts['version']}")
+            elif chk_type == "S3":
+                facts = {"kind": "S3", "buckets": sorted(b["Name"] for b in result)}
+            else:
+                # 2 КБ — байты, а не символы: кириллица в UTF-8 вдвое длиннее
+                info = json.dumps(result, ensure_ascii=False, default=str).encode()[:2048]
+                facts = {"kind": "CTL", "info": info.decode(errors="ignore")}
 
         elif chk_type == "ClickHouse":
             from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook  # type: ignore
             hook = ClickHouseHook(clickhouse_conn_id=conn_id)
-            result = hook.execute("SELECT version()")
+            user, host, ver = hook.execute("SELECT currentUser(), hostName(), version()")[0]
+            from clickhouse_driver.errors import ServerException  # type: ignore
+            try:  # system.* бывает закрыта для ТУЗ — тогда отпечаток по hostName
+                clusters = {c: sorted(h) for c, h in hook.execute(
+                    "SELECT cluster, groupUniqArray(host_name) FROM system.clusters GROUP BY cluster")}
+            except ServerException as e:
+                logger.warning("%s: system.clusters недоступна: %s", conn_id, e)
+                clusters = {}
+            facts = {"kind": "CH", "version": ver, "user": user, "host": host, "clusters": clusters}
+            result = facts
 
         elif chk_type == "Kafka":
             import confluent_kafka.admin as kafka_admin
@@ -246,13 +282,16 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 
             client = kafka_admin.AdminClient(conf)
             meta = client.list_topics(timeout=15)
-            result = sorted(meta.topics.keys())[:10]
+            topics = sorted(meta.topics.keys())
+            facts = {"kind": "Kafka", "topics": len(topics), "tfs": any(t.startswith("TFS.HRPLT.") for t in topics)}
+            result = topics[:10]
 
         elif chk_type == "Trino":
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
             hook = TrinoHook(trino_conn_id=conn_id)
             try:
-                result = hook.get_first("SELECT current_user, current_catalog, current_schema")
+                result = hook.get_first("SELECT node_version FROM system.runtime.nodes LIMIT 1")
+                facts = {"kind": "Trino", "version": result[0] if result else None}
             except Exception as err:
                 # Хост не резолвится: соединение заведено под контур, где Trino нет.
                 # Это не деградация связности, а отсутствие сервиса — скип, а не падение.
@@ -280,6 +319,12 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
                 socket_timeout=int(extra.get("socket_timeout", 15)),
             )
             result = f"PONG: {client.ping()}"
+            try:
+                ver = client.info("server").get("redis_version")
+            except redis.ResponseError as err:  # ACL без INFO: связь есть, версии нет — не ошибка проверки
+                logger.warning("Redis %s: INFO недоступен — %s", conn_id, err)
+                ver = None
+            facts = {"kind": "Redis", "version": ver}
 
         else:
             raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")
@@ -290,7 +335,8 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
             msg = f"✅ {time.time() - ts:.2f} sec chk_{conn_id}_conn"
             add_note({"result": str(result)}, context, title=msg)
 
-        return {"status": "ok", "conn_id": conn_id, "conn_type": conn_type}
+        facts["latency_ms"] = round((time.time() - ts) * 1000)
+        return {"status": "ok", "conn_id": conn_id, "conn_type": conn_type, "facts": facts}
 
     except AirflowSkipException:
         raise
@@ -305,6 +351,64 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(str(err), context, level="task,DAG", title=msg)
         raise  # re-raise оригинальное исключение, а не AirflowFailException — в логе видна причина
+
+
+def _merge_facts(old_facts: dict, old_clusters: dict, checked: dict, listed: set) -> tuple[dict, dict, list]:
+    """Новые сведения поверх прежних → (conn_facts, ch_clusters, строки изменений).
+
+    checked — {conn_id: facts} прошедших проверок рана; listed — все conn_id из collect. Упавшее или
+    пропущенное подключение прежние сведения не затирает; пропавшее из secret backend — удаляется.
+    Ключ ch_clusters — отпечаток сервера: хосты его кластеров (или hostName без кластеров).
+    """
+    changes = []
+    facts = {k: v for k, v in old_facts.items() if k in listed}
+    changes += [f"пропало: `{k}`" for k in sorted(set(old_facts) - listed)]
+    for conn_id, f in sorted(checked.items()):
+        was = old_facts.get(conn_id)
+        if was is None:
+            changes.append(f"новое: `{conn_id}` {f.get('kind')} {f.get('version') or ''}".rstrip())
+        elif (was.get("kind"), was.get("version")) != (f.get("kind"), f.get("version")):
+            changes.append(f"изменилось: `{conn_id}` {was.get('kind')} {was.get('version')}"
+                           f" → {f.get('kind')} {f.get('version')}")
+        facts[conn_id] = f
+
+    clusters: dict = {}
+    for conn_id, f in sorted(checked.items()):
+        if f.get("kind") != "CH":
+            continue
+        # loopback в system.clusters (одиночный сервер, кластер default) отпечатком не годится:
+        # все такие серверы склеились бы в одну запись «localhost»
+        hosts = sorted({h for hs in f["clusters"].values() for h in hs
+                        if h not in ("localhost", "::1") and not h.startswith("127.")}) or [f["host"]]
+        e = clusters.setdefault(",".join(hosts), {"hosts": hosts, "version": f["version"],
+                                                  "clusters": f["clusters"], "conns": []})
+        e["conns"].append(conn_id)
+    # Прежняя запись того же сервера — по общим conn_id, а не по отпечатку: добавленный в кластер
+    # узел меняет отпечаток, и сравнение по ключу выдало бы «другой сервер» вместо «состав»
+    # (версия сервера уже в строках conn_facts — здесь не повторяется)
+    matched = set()
+    for fp, new in clusters.items():
+        conns = set(new["conns"])
+        old_fp = fp if fp in old_clusters else next(
+            (k for k, e in old_clusters.items() if conns & set(e.get("conns") or [])), None)
+        if old_fp is None:
+            continue
+        matched.add(old_fp)
+        # непроверенное в этот ран подключение того же сервера из conns не выпадает
+        new["conns"] += [c for c in old_clusters[old_fp].get("conns") or []
+                         if c in listed and c not in checked]
+        was = old_clusters[old_fp].get("clusters") or {}
+        for name in sorted(set(was) | set(new["clusters"])):
+            a, b = was.get(name), new["clusters"].get(name)
+            if a != b:
+                changes.append(f"кластер `{name}`: состав {a or '—'} → {b or '—'}")
+    for fp, e in old_clusters.items():
+        conns = [c for c in e.get("conns") or [] if c in listed]
+        # ни одно из его подключений сейчас не проверено — сведения прежние, не выбрасываем;
+        # подключений не осталось вовсе — запись больше не нужна
+        if fp not in clusters and fp not in matched and conns and not set(conns) & set(checked):
+            clusters[fp] = {**e, "conns": conns}
+    return facts, clusters, changes
 
 
 # ---------------------------------------------------------------------------
@@ -550,6 +654,21 @@ def tools_test_connections():  # noqa: PLR0915
 
         add_note("\n".join(row for _, row in sorted(all_rows)) or "все проверки прошли", context, level="DAG",
                  title=headline)
+
+        # Сведения о системах — только здесь: проверки параллельны и перетёрли бы Variable друг другу
+        if collect_ok:
+            from airflow.sdk import Variable
+
+            pulled = context["ti"].xcom_pull(task_ids="check") or []
+            checked = {r["conn_id"]: r["facts"] for r in pulled if isinstance(r, dict) and r.get("facts")}
+            old_facts = Variable.get("conn_facts", default=None, deserialize_json=True) or {}
+            old_clusters = Variable.get("ch_clusters", default=None, deserialize_json=True) or {}
+            facts, clusters, changes = _merge_facts(old_facts, old_clusters, checked,
+                                                    {i["conn_id"] for i in listed})
+            Variable.set("conn_facts", facts, serialize_json=True)
+            Variable.set("ch_clusters", clusters, serialize_json=True)
+            if changes and (old_facts or old_clusters):  # первый ран — всё «новое», шуметь незачем
+                add_note("\n".join(changes[:50]), context, level="DAG", title=f"🔄 изменения систем: {len(changes)}")
         logger.info("report: %s", headline)
         # Упавшие подключения таск не роняют: важное — error (ран красный через health_errors),
         # вспомогательное — warn (ран зелёный, ⚠️ в health_warn)

@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-19 19:12 MSK · v1.27 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 21:21 MSK · v1.28 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -447,7 +447,7 @@ def chk_conn(conn_type, conn_id, context=None, name=None, tz=None, default=False
     ts = time.time()
     try:
         if conn_type == 'Postgres':
-            sql = 'SELECT current_user, current_database(), inet_server_addr()'
+            sql = 'SELECT current_user, current_database(), inet_server_addr(), version()'
             if default:
                 # Метабаза: в Airflow 3 не create_session, а af_meta (тот же conns.pg)
                 result = af_meta.sql(sql, timeout=15)[0]
