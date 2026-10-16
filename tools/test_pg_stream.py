@@ -1,5 +1,5 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-15 15:20 MSK · v0.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 22:37 MSK · v0.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
@@ -193,7 +193,9 @@ def tools_test_pg_stream():
                     with closing(pg.get_conn()) as rc:
                         rc.autocommit = True
                         rcur = rc.cursor()
-                        rcur.execute("set statement_timeout = '2s'")
+                        # 10 с, а не 2: разовый затык диска на общей метабазе ронял сценарий (16.10). Ожидание
+                        # блокировки всё равно ловится — такое чтение вернётся после коммита с 500 000 строк
+                        rcur.execute("set statement_timeout = '10s'")
                         while not stop.is_set():
                             try:
                                 # чужая блокировка сильнее чтения — значит, загрузка идёт. Два
