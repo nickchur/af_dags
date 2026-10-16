@@ -1,5 +1,5 @@
 """### 🔬 Разбор очереди: почему задачи ждут, и мусор в брокере
-*2026-10-02 07:26 MSK · v3.25 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-16 16:42 MSK · v3.26 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в час (в :10) разбирает, почему задачи ждут: лимиты дагов, пулы, приоритет, окно
 шедулера, ёмкость исполнителя, мусор в брокере и раздутый сет привязок ответных очередей.
@@ -713,7 +713,7 @@ def tools_queue_analyze():
     # Своя попытка сверх нуля: broker ничего не удаляет, а метабаза на дэве рвёт соединения
     # сама по себе (падает праймери, реплика read-only). Прогон делает человек, и терять его
     # из-за обрыва в середине опроса состояний обидно.
-    @task(task_id="broker", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id="broker", multiple_outputs=False, retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def broker(**context) -> dict:
         """📨 Обход очередей брокера, разметка по метабазе и дамп мусора в S3."""
         from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -804,7 +804,7 @@ def tools_queue_analyze():
         )
         return snapshot
 
-    @task(task_id="scheduler", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id="scheduler", multiple_outputs=False, retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def scheduler(**context) -> dict:
         """🗓️ Почему задачи ждут в scheduled: лимит дага, пул, приоритет; следы голодания."""
         # Airflow 3: ORM у задачи нет — те же выборки SQL-ом через af_meta
@@ -869,7 +869,7 @@ def tools_queue_analyze():
         Feed(context, "🗓️ scheduled").done(summary, keep=lines)
         return out
 
-    @task(task_id="capacity", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id="capacity", multiple_outputs=False, retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def capacity(**context) -> dict:
         """🔋 Ёмкость: parallelism × живые шедулеры против queued+running; слоты воркеров."""
         now = datetime.now(timezone.utc)
@@ -909,7 +909,7 @@ def tools_queue_analyze():
         add_note("\n".join(lines), context=context, level="Task", title="🔋 ёмкость")
         return out
 
-    @task(task_id="purge", trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id="purge", multiple_outputs=False, trigger_rule=TriggerRule.NONE_FAILED)
     def purge(snapshot: dict = None, **context) -> dict:
         """🧹 Удаляет размеченный мусор. Только при purge=True."""
         from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
@@ -989,7 +989,7 @@ def tools_queue_analyze():
         )
         return result
 
-    @task(task_id="pidbox", retries=1, trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id="pidbox", multiple_outputs=False, retries=1, trigger_rule=TriggerRule.NONE_FAILED)
     def pidbox(**context) -> dict:
         """📮 Привязки ответных очередей control-канала: сколько их и пять для примера."""
         res = reply_bindings()
@@ -999,7 +999,7 @@ def tools_queue_analyze():
         add_note(text, context=context, level="Task", title="📮 pidbox")
         return res
 
-    @task(task_id="purge_pidbox", trigger_rule=TriggerRule.NONE_FAILED)
+    @task(task_id="purge_pidbox", multiple_outputs=False, trigger_rule=TriggerRule.NONE_FAILED)
     def purge_pidbox(**context) -> dict:
         """🧹 Удаляет сет привязок ответных очередей. Только при purge_pidbox=True."""
         # Отдельным таском, а не флагом внутри `pidbox`: по сетке видно, запускалась ли чистка
