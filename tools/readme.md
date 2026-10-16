@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-13 23:04 MSK · v1.84 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-15 14:49 MSK · v1.85 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > **Airflow 3.** Порт `af_dags@89117cf`. Метабаза — через `plugins/af_meta.py`, отличия от Airflow 2 — в `readme.md` корня.
 
@@ -47,7 +47,7 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 |---|---|---|
 | `health` | **плагин здоровья — контракт с core**: `get_system_health` ждёт от каждого активного дага с этим тегом отчёт `system_health/checks/<dag_id>.json`, иначе пишет «плагин X: нет отчёта», а просроченный по `ttl_sec` — «последний отчёт N назад». Тег — только вместе с `health_tasks`; плагин создаётся включённым (`is_paused_upon_creation=False`), кроме чистильщиков — они удаляют и создаются на паузе | `system_health` (2 ч 10 мин), `pg_activity` (40 мин), `log_events`, `test_connections`, `test_dags`, `queue_analyze`, `db_cleanup`, `log_cleanup` (26 ч) |
 | `clean` | удаляет или закрывает: строки метабазы, файлы, раны | `db_cleanup`, `log_cleanup`, `paused_runs_cleanup` |
-| `AutoQA` | регрессия и проверка «работает ли» | `dummy` (раз в час), `test_connections`, `test_dags`, `test_hrp_operators`, `test_kafka_*` |
+| `AutoQA` | регрессия и проверка «работает ли» | `dummy` (раз в час), `test_connections`, `test_dags`, `test_hrp_operators`, `test_kafka_*`, `test_pg_stream` |
 
 Тег-роль один на даг (плюс `AutoQA`); предметные теги (`conn`, `dag`, `mcp`, `operators`,
 `kafka`, `dummy`, `check`) сняты 28.09.2026 — отбирать по ним нечего.
@@ -959,6 +959,33 @@ dag_snapshots/<dag_id>/00002.<dag_hash>.json.gz
 (`TFS.HRPLT.IN` — туда пишем мы, чужих слушателей там нет), и в режиме `wait` сначала
 триггерить `tools_test_kafka_rcv`, а `tools_test_kafka_snd` — пока идёт опрос
 (`timeout` секунд). Для `read_last` порядок любой.
+
+### [test_pg_stream.py](test_pg_stream.py)
+**Ручная проверка оператора `HrpS3ToPgStreamOperator` (`tools_test_pg_stream`).**
+
+Оператор — `plugins/pg_stream.py`: потоковая загрузка объекта S3 (csv, JSON-массив, JSON Lines;
+`.gz`, `.zip`) в таблицу GP/PG одной транзакцией; параметры и итог — в шапке модуля. Даг
+кладёт в S3 маленькие фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, вызывает
+`op.execute(context)` по сценариям спеки (`docs/sberpowers/specs/2026-10-15-s3-pg-stream-operator.md`,
+REQ-plugins-07…28) и сверяет итог и содержимое приёмника. В конце убирает таблицы и файлы.
+
+*   **Сценарии:** усечение None / hard / soft / auto (auto при занятой таблице уходит в delete),
+    откат при битой строке, опции COPY, счётчики `rows_*`, таймаут; JSON-массив в конверте
+    (`root`, `item`), JSON Lines, раскладка по колонкам (регистр ключей, лишние ключи, `default`),
+    `file_name_column`, gz и zip; `tmp_table` — две транзакции, сбой второй оставляет сырьё,
+    чужая блокировка той же `tmp_table` — предупреждение и ожидание.
+*   **Память:** jsonl.gz 300 МБ после распаковки — пик RSS воркера не растёт.
+*   **Только GP:** отбраковка `LOG ERRORS SEGMENT REJECT LIMIT` — `COPY n` у GP включает
+    отбракованные строки, их число оператор берёт из NOTICE.
+*   **Блокировка:** оператор идёт в главном потоке таска, чужой сеанс снимает блокировку по
+    таймеру — `execute` из другого потока Airflow не даёт (`ExecutorSafeguard`).
+
+Прогон: на `cap_gp_etl` (PG16 стенда) и `gp6-stand` (GP 6.25.4). На стенде не проверяемо: контур
+(PG 15.5, GP 6.25.3) — текст NOTICE отбраковки и `jsonb_populate_record` для вложенных
+значений на GP.
+
+**Параметры:** `conn_id`, `bucket`, `prefix` (фикстуры в S3), `schema` (таблицы сценариев).
+Самопроверка разбора и вспомогательных функций — `python3 plugins/pg_stream.py` там, где есть Airflow.
 
 ### [mcp_skills.py](mcp_skills.py)
 **Навыки агента для MCP-эндпоинта (`tools_mcp_skills`, раз в 30 минут).**
