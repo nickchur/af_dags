@@ -31,11 +31,14 @@ class Client:
         self.objs = dict(objs)          # key -> (bytes, LastModified)
         self.parts, self.aborted, self.fail_key = {}, [], None
 
-    def get_paginator(self, _):
+    def get_paginator(self, name):
         client = self
 
         class P:
             def paginate(self, Bucket, Prefix):
+                if name == 'list_multipart_uploads':
+                    yield {'Uploads': [{'Key': k, 'UploadId': k} for k in client.parts if k.startswith(Prefix)]}
+                    return
                 yield {'Contents': [{'Key': k, 'Size': len(d), 'LastModified': t}
                                     for k, (d, t) in sorted(client.objs.items()) if k.startswith(Prefix)]}
         return P()
@@ -114,3 +117,10 @@ def test_abort_on_failure(cl):
     with pytest.raises(IOError):
         s3_utils.s3_to_zip('s3://b/logs/', 's3://b/arc/y.zip', part_size=100_000)
     assert cl.aborted == ['arc/y.zip'] and 'arc/y.zip' not in cl.objs
+
+
+def test_abort_stale_uploads(cl):
+    cl.parts = {'arc/old.zip': [b'part'], 'arc/sub/keep.zip': [b'p'], 'arc/keep.csv': [b'p']}
+    r = s3_utils.s3_to_zip('s3://b/logs/', 's3://b/arc/z.zip')
+    assert cl.aborted == ['arc/old.zip'] and r['aborted'] == ['arc/old.zip']
+    assert set(cl.parts) == {'arc/sub/keep.zip', 'arc/keep.csv'}

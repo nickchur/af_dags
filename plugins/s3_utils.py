@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-10-19 15:29 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 15:31 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -618,6 +618,8 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
     dst_path на .zip — ключ архива, иначе папка: имя <последняя папка src>_<UTC-время>.zip.
     date_from/date_to — 'YYYY-MM-DD' по LastModified (UTC, включительно). max_bytes — лимит
     сырого объёма (0 — без лимита). Своя multipart-загрузка: при сбое отменяется, хвостов нет.
+    Хвосты жёстко убитого пода (OOM, SIGKILL — отмена не успела) снимаются в начале следующего
+    вызова: незавершённые загрузки *.zip прямо в папке архива. Папка — только для этого дага.
     Уже сжатые файлы — deflate уровня 0: NO_COMPRESSION_64 держит файл в памяти ради CRC.
     """
     src, dst = s3_path_parse(src_path), s3_path_parse(dst_path)
@@ -641,6 +643,16 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
         except ClientError as e:
             if e.response['Error']['Code'] not in ('404', 'NoSuchKey', 'NotFound'):
                 raise
+
+    folder = dst_key.rpartition('/')[0] + '/' if '/' in dst_key else ''
+    aborted = []
+    for page in d_cli.get_paginator('list_multipart_uploads').paginate(Bucket=dst['bucket'], Prefix=folder):
+        for u in page.get('Uploads', []):
+            if u['Key'].lower().endswith('.zip') and '/' not in u['Key'][len(folder):]:
+                d_cli.abort_multipart_upload(Bucket=dst['bucket'], Key=u['Key'], UploadId=u['UploadId'])
+                aborted.append(u['Key'])
+    if aborted:
+        logger.warning(f"🧹 Отменены брошенные загрузки: {aborted}")
 
     objs = []
     for page in s_cli.get_paginator('list_objects_v2').paginate(Bucket=src['bucket'], Prefix=base):
@@ -690,7 +702,7 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
         raise
     sec = round(time.time() - start, 1)
     stats = {'path': out, 'count': len(objs), 'raw': raw, 'size': size, 'sec': sec,
-             'speed': readable_size(raw / sec if sec else raw) + '/с'}
+             'speed': readable_size(raw / sec if sec else raw) + '/с', 'aborted': aborted}
     logger.info(f"🏁 {out}: {len(objs)} файлов, {readable_size(raw)} → {readable_size(size)} за {sec} с")
     return stats
 
