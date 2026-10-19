@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-16 22:00 MSK · v2.1 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 21:57 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач, каждый
 тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор как в бою (Jinja
@@ -20,9 +20,11 @@ PG: `conn.схема` — таблицы в схеме (нужны CREATE и DRO
 import csv
 import datetime as dt
 import gzip
+import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import sys
@@ -137,6 +139,39 @@ def _pg_create_sql(table: str, temp: bool, incarnation: bool = False, inc_col: b
     return stmts
 
 
+def _ch_lit(v) -> str:
+    """Литерал значения для ClickHouse INSERT ... VALUES."""
+    if v is None:
+        return "NULL"
+    if isinstance(v, bool):
+        return "1" if v else "0"
+    if isinstance(v, (int, Decimal)):
+        return str(v)
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, dt.datetime):
+        # с поясом — DateTime64(3): миллисекунды; без — DateTime: до секунд
+        fmt = "%Y-%m-%d %H:%M:%S.%f" if v.tzinfo else "%Y-%m-%d %H:%M:%S"
+        return "'" + v.strftime(fmt)[:23] + "'"
+    if isinstance(v, dt.date):
+        return "'" + v.strftime("%Y-%m-%d") + "'"
+    if isinstance(v, (list, tuple)):
+        return "[" + ", ".join(_ch_lit(x) for x in v) + "]"
+    s = (str(v).replace("\\", "\\\\").replace("'", "\\'")
+         .replace("\n", "\\n").replace("\t", "\\t").replace("\r", "\\r"))
+    return "'" + s + "'"
+
+
+def _ch_create_sql(table: str, typed: bool, lead: str = "") -> str:
+    """CREATE TABLE для ClickHouse: typed — типы источника (Array/Nullable), иначе все String.
+
+    lead — колонка перед колонками источника (S3ToClickhouseTransformed пишет file_name первой).
+    """
+    idx = 2 if typed else 3  # позиция типа в COLUMNS
+    cols = ", ".join([lead] * bool(lead) + [f"{c[0]} {c[idx]}" for c in COLUMNS])
+    return f"CREATE TABLE {table} ({cols}) ENGINE = MergeTree() ORDER BY {'id' if typed else 'tuple()'}"
+
+
 # xstream_sanitize: ; таб и перевод строки вырезаются, кавычки и запятые остаются
 SANITIZED_SPECIAL = 'Спец: "кавычки", запятая,  точка-с-запятой,таб,перенос,  бэкслеш, №42'
 # формат HrpPostgresToS3ListOperator по умолчанию: TSV без кавычек, экранирование обратным слешем
@@ -165,10 +200,27 @@ def _single(names, read) -> bytes:
     return read(names[0])
 
 
-def _csv_bytes(rows=ROWS) -> bytes:
+def _csv_bytes(rows=ROWS, header=True) -> bytes:
     buf = io.StringIO()
-    csv.writer(buf, lineterminator="\n").writerows([COL_NAMES, *rows])
+    csv.writer(buf, lineterminator="\n").writerows([COL_NAMES, *rows] if header else rows)
     return buf.getvalue().encode()
+
+
+def _tsv_bytes(rows=ROWS, esc=lambda s: s.replace("\\", "\\\\").replace("\t", "\\t").replace("\n", "\\n")) -> bytes:
+    """TabSeparatedWithNames по правилам ClickHouse: \\t, \\n и \\\\ экранами; NULL — пусто."""
+    lines = [COL_NAMES] + [["" if v is None else esc(str(v)) for v in r] for r in rows]
+    return "".join("\t".join(x) + "\n" for x in lines).encode()
+
+
+def _check_sanitized(row: dict):
+    """Строка 2 после xstream_sanitize и sanitize_array: спецсимволы вырезаны и в строке, и в массиве."""
+    errors = []
+    if row["s_special"] != SANITIZED_SPECIAL:
+        errors.append(f"s_special={row['s_special']!r}, ждём {SANITIZED_SPECIAL!r}")
+    if "x;y" in row["arr_text"] or "xy" not in row["arr_text"]:
+        errors.append(f"arr_text не очищен (sanitize_array): {row['arr_text']!r}")
+    if errors:
+        raise AirflowFailException("; ".join(errors))
 
 
 # ─────────────────────────────── Реестр групп ─────────────────────────────────
@@ -181,6 +233,7 @@ class Op:
     systems: set
     cases: list
     pkg: str = PKG
+    policy: bool = True  # False — утилита пакета (lineage), не оператор: allowed_operators её не касается
     loaded: type | None = field(default=None, repr=False)
 
 
@@ -211,7 +264,7 @@ def _load(op: Op) -> tuple[type | None, str, str]:
     if cls is None:
         return None, "missing", f"нет {op.cls} в {mod}"
     allowed = getattr(_policy(), "ALLOWED_OPERATORS", None)
-    if allowed is not None and op.cls not in allowed:
+    if allowed is not None and op.policy and op.cls not in allowed:
         return None, "forbidden", "нет в allowed_operators"
     return cls, "ok", ""
 
@@ -268,6 +321,8 @@ class T:
         self._sessions: dict = {}
         self._main = None
         self._s3 = None
+        self._ch = None
+        self.systems: dict = {}
         self._ops = 0
         self._tmp = tempfile.TemporaryDirectory(prefix=self.prefix, ignore_cleanup_errors=True)
         self.tmp = self._tmp.name
@@ -278,14 +333,17 @@ class T:
         p = self.context["params"]
         if not p.get(f"op_{self.op.group}", True):
             raise AirflowSkipException(f"{self.op.group}: выключен (op_{self.op.group}=False)")
-        systems = self.context["ti"].xcom_pull(task_ids="systems")
+        self.systems = systems = self.context["ti"].xcom_pull(task_ids="systems")
         if systems is None:  # {} — все системы выключены, это не сбой
             raise AirflowFailException("нет результата задачи systems")
+        # порядок ch < ch_http < cluster: без CH про его HTTP и кластер не спрашиваем
         for s in sorted(self.op.systems):
             flag = {"pg": "test_pg", "ch": "test_ch", "s3": "test_s3", "ch_http": "ch_http"}.get(s)
             if flag and not p.get(flag):
                 raise AirflowSkipException(f"{flag}=False")
-            st = systems.get(s)
+            st = (systems.get("ch") or {}).get("cluster") or {} if s == "cluster" else systems.get(s)
+            if s == "cluster" and not st.get("ok"):
+                raise AirflowSkipException(f"кластер: {st.get('reason') or 'нет сведений'}")
             if st is not None and not st["ok"]:
                 raise AirflowSkipException(f"{s.upper()} недоступен: {st['reason']}")
         pg = systems.get("pg") or {}
@@ -371,6 +429,29 @@ class T:
         with mock.patch.object(PostgresHook, "get_conn", _get_conn):
             yield
 
+    # ── CH ──
+    def ch(self, sql: str):
+        if self._ch is None:
+            from airflow_clickhouse_plugin.hooks.clickhouse import ClickHouseHook
+            self._ch = ClickHouseHook(clickhouse_conn_id=self.ch_conn)
+        return self._ch.execute(sql)
+
+    def ch_full(self, table: str) -> str:
+        return f"{self.ch_db}.{table}"
+
+    def ch_table(self, x: str, typed=True, rows=(), lead="") -> str:
+        """Создаёт таблицу CH теста (и наполняет rows); возвращает полное имя."""
+        table = self.ch_full(self.name(x))
+        self.ch(_ch_create_sql(table, typed, lead))
+        if rows:
+            self.ch(f"INSERT INTO {table} VALUES " + ", ".join("(" + ", ".join(map(_ch_lit, r)) + ")" for r in rows))
+        return table
+
+    def pushed(self, key: str):
+        """XCom, который оператор положил в задачу теста (row_count и т. п.)."""
+        ti = self.context["ti"]
+        return ti.xcom_pull(task_ids=ti.task_id, key=key)
+
     # ── S3 ──
     @property
     def s3(self):
@@ -410,16 +491,19 @@ class T:
             result = op.execute(ctx)
         return result, m
 
-    def expect_rows(self, result, actual: int):
-        """REQ-19: в цели EXPECTED_ROWS строк, а row_count оператора (если есть) равен числу в цели."""
+    def expect_rows(self, result, actual: int, required=False):
+        """REQ-19: в цели EXPECTED_ROWS строк, а row_count оператора (если есть, required — обязан быть)
+        равен числу в цели."""
         rc = result.get("row_count") if isinstance(result, dict) else None
-        if actual != EXPECTED_ROWS or (rc is not None and int(rc) != actual):
+        if actual != EXPECTED_ROWS or (rc is None and required) or (rc is not None and int(rc) != actual):
             raise AirflowFailException(f"в цели {actual} строк (ждём {EXPECTED_ROWS}), row_count={rc}")
 
     # ── уборка ──
-    def _drop_own(self):
-        """Удаляет объекты теста: таблицы и последовательности по префиксу, ключи под своей папкой S3."""
-        if "pg" in self.op.systems and not self.temp:
+    def _drop_own(self, only=None):
+        """Удаляет объекты теста: таблицы и последовательности по префиксу, ключи под своей папкой S3.
+
+        only — одна система (pg, ch, s3); без него — все."""
+        if "pg" in self.op.systems and not self.temp and only in (None, "pg"):
             main = self._sessions.get("main")
             if main is not None and main.info.transaction_status != 0:
                 main.rollback()  # таймаут посреди запроса: иначе «current transaction is aborted»
@@ -431,7 +515,11 @@ class T:
             for rel, kind in sorted(rels, key=lambda r: r[1] == "S"):
                 what = {"S": "SEQUENCE", "v": "VIEW"}.get(kind, "TABLE")
                 self.pg(f"DROP {what} IF EXISTS {self.pg_schema}.{rel} CASCADE")
-        if "s3" in self.op.systems:
+        if "ch" in self.op.systems and only in (None, "ch"):
+            for (rel,) in self.ch(f"SELECT name FROM system.tables WHERE database = '{self.ch_db}' "
+                                  f"AND startsWith(name, '{self.prefix}_')"):
+                self.ch(f"DROP TABLE IF EXISTS {self.ch_full(rel)}")
+        if "s3" in self.op.systems and only in (None, "s3"):
             keys = self.s3.list_keys(bucket_name=self.bucket, prefix=self.s3_prefix)
             if keys:
                 # у S3Hook delete_objects принимает bucket, а не bucket_name
@@ -442,12 +530,14 @@ class T:
         self._drop_own()
 
     def cleanup(self):
-        try:
-            self._drop_own()
-        except Exception as e:  # исход теста уборка не подменяет (REQ-23)
-            logger.exception("уборка %s не удалась", self.prefix)
-            self.not_cleaned.append(f"{self.prefix}: {type(e).__name__}: {e}"[:300])
-            add_note(self.not_cleaned[-1], self.context, level="task", title="⚠️ не убрано")
+        # каждая система — отдельно: упавшая уборка PG не должна оставить таблицы CH и ключи S3
+        for system in ("pg", "ch", "s3"):
+            try:
+                self._drop_own(only=system)
+            except Exception as e:  # исход теста уборка не подменяет (REQ-23)
+                logger.exception("уборка %s (%s) не удалась", self.prefix, system)
+                self.not_cleaned.append(f"{self.prefix} {system}: {type(e).__name__}: {e}"[:300])
+                add_note(self.not_cleaned[-1], self.context, level="task", title="⚠️ не убрано")
 
     def close(self):
         for conn in self._sessions.values():
@@ -534,7 +624,7 @@ def _pg_inc(t: T, tpl=False, **kw):
     if active != 1 or got != t.pg_rows(src):
         raise AirflowFailException(f"активна инкарнация {active} (ждём 1), строки {'не ' if got != t.pg_rows(src) else ''}"
                                    f"совпали с источником: {got!r}"[:1000])
-    t.expect_rows(result, len(got))
+    t.expect_rows(result, len(got), required=True)
 
 
 def pg_inc_full(t: T):
@@ -623,6 +713,9 @@ def _pg_to_s3_list(t: T, compression, fmt=TSV, with_header=True, **kw) -> dict[s
     data = {r[0]: r for r in (rows[1:] if with_header else rows)}  # на GP порядок строк — сегментов
     if sorted(data) != sorted(str(r[0]) for r in ROWS) or len(data) != len(rows) - with_header:
         raise AirflowFailException(f"id строк файла: {[r[:1] for r in rows]}, ждём 1, 2, 3 по разу")
+    # значения не сверяем (формат TSV оператора ≠ COPY), но сдвиг разделителя ловит число полей
+    if bad := [r[:1] for r in data.values() if len(r) != len(COL_NAMES)]:
+        raise AirflowFailException(f"строки {bad}: полей не {len(COL_NAMES)}")
     return data
 
 
@@ -648,14 +741,7 @@ def pg_to_s3_list_none(t: T):
 
 def pg_to_s3_list_sanitize(t: T):
     """PG → S3 частями с очисткой: xstream_sanitize и sanitize_array вырезают спецсимволы строки 2"""
-    row = dict(zip(COL_NAMES, _pg_to_s3_list(t, "gzip", xstream_sanitize=True, sanitize_array=True)["2"]))
-    errors = []
-    if row["s_special"] != SANITIZED_SPECIAL:
-        errors.append(f"s_special={row['s_special']!r}, ждём {SANITIZED_SPECIAL!r}")
-    if "x;y" in row["arr_text"] or "xy" not in row["arr_text"]:
-        errors.append(f"arr_text не очищен (sanitize_array): {row['arr_text']!r}")
-    if errors:
-        raise AirflowFailException("; ".join(errors))
+    _check_sanitized(dict(zip(COL_NAMES, _pg_to_s3_list(t, "gzip", xstream_sanitize=True, sanitize_array=True)["2"])))
 
 
 def pg_to_s3_list_tpl(t: T):
@@ -670,6 +756,7 @@ def _s3_to_pg(t: T, tpl=False):
     src = t.pg_table("src", ROWS)
     tgt = t.name("tgt")
     t.pg(_pg_create_sql(t.full(tgt), t.temp, incarnation=True, inc_col=False))
+    t.pg(f"INSERT INTO {t.full(tgt)}_1 (id) VALUES (99)")  # лишняя строка: pre_truncate обязан её убрать
     # CSV самой PG: строка 2 с переводом строки в кавычках — row_count по rowcount COPY, а не по \n
     key = t.s3_put("src.csv.gz", gzip.compress(t.pg_copy_out(f"SELECT * FROM {t.full(src)}")))
     kw = dict(compression="gzip", pre_truncate=True, include_file_name=False, file_name_position=0)
@@ -683,7 +770,7 @@ def _s3_to_pg(t: T, tpl=False):
     active, got = t.pg_active(tgt)
     if active != 1 or got != t.pg_rows(src):
         raise AirflowFailException(f"активна инкарнация {active} (ждём 1) или строки не совпали: {got!r}"[:1000])
-    t.expect_rows(result, len(got))
+    t.expect_rows(result, len(got), required=True)
 
 
 def s3_to_pg_gzip(t: T):
@@ -729,6 +816,509 @@ def s3_to_pg_stream_tpl(t: T):
     _s3_to_pg_stream(t, "src.csv", "", tpl=True)
 
 
+# ──────────────────────────── Тесты: CH → S3 ──────────────────────────────────
+def _transport(t: T) -> str:
+    # auto ходит по HTTP там, где файл выходит тот же; без HTTP у ClickHouse — только native
+    return "auto" if t.context["params"]["ch_http"] else "native"
+
+
+def _ch_to_s3(t: T, out: str, comp, **kw) -> bytes:
+    """Выгрузка оператором в out[.ext] своей папки; один файл со сверкой хэша.
+
+    comp — сжатие для имени и распаковки; оператору уходит kw["compression"] (шаблон), если он есть."""
+    ext = {"gzip": ".gz", "zip": ".zip", "tar.gz": ".tar.gz"}.get(comp, "")
+    _, spy = t.run(spy="verify_file_hash", s3_bucket=t.bucket, s3_key=f"{t.s3_prefix}{out}{ext}",
+                   clickhouse_conn_id=t.ch_conn, aws_conn_id=t.s3_conn, replace=True, post_file_check=True,
+                   **{"compression": comp, **kw})
+    stem = out.rsplit(".", 1)[0]
+    keys = t.s3_keys(stem)
+    if len(keys) != 1 or spy.call_count != 1:
+        raise AirflowFailException(f"ждём один файл {stem}… со сверкой хэша: {keys}, сверок {spy.call_count}")
+    return _unpack(t.s3_get(keys[0]), comp)
+
+
+def _rows_by_id(rows: list, ids=("1", "2", "3"), width=None) -> dict:
+    """Строки файла по первой колонке; без заголовка; каждый id ровно раз (на CH порядок не гарантирован).
+
+    width — полей в строке: неэкранированный таб или перевод строки разносит строку на лишние поля."""
+    data = {r[0]: r for r in rows}
+    if sorted(data) != sorted(ids) or len(data) != len(rows):
+        raise AirflowFailException(f"id строк файла: {[r[:1] for r in rows]}, ждём {', '.join(ids)} по разу")
+    if width and any(len(r) != width for r in rows):
+        raise AirflowFailException(f"полей в строках {[len(r) for r in rows]}, ждём по {width}")
+    return data
+
+
+def _native_tsv(t: T, compression, sanitize=False, tpl=False):
+    src = t.ch_table("src", rows=ROWS)
+    kw = dict(sql=f"SELECT * FROM {src}", compression=compression, xstream_sanitize=sanitize, sanitize_array=sanitize)
+    if tpl:
+        kw = {k: f"{{{{ {v!r} }}}}" for k, v in kw.items()}
+        kw["xstream_sanitize"] = kw["sanitize_array"] = "{{ 'false' }}"
+    data = _ch_to_s3(t, "out.csv", compression, fmt="CSV", transport=_transport(t), **kw)
+    rows = list(csv.reader(io.StringIO(data.decode()), **TSV))
+    if rows[:1] != [COL_NAMES]:
+        raise AirflowFailException(f"заголовок {rows[:1]!r}, ждём {COL_NAMES}")
+    if t.pushed("row_count") != EXPECTED_ROWS:
+        raise AirflowFailException(f"row_count={t.pushed('row_count')}, ждём {EXPECTED_ROWS}")
+    return dict(zip(COL_NAMES, _rows_by_id(rows[1:], width=len(COL_NAMES))["2"]))
+
+
+def ch_native_to_s3_gzip(t: T):
+    """CH → S3, gzip: TSV с заголовком, три строки, оператор сверяет хэш"""
+    _native_tsv(t, "gzip")
+
+
+def ch_native_to_s3_zip(t: T):
+    """CH → S3, zip: в архиве один TSV с заголовком"""
+    _native_tsv(t, "zip")
+
+
+def ch_native_to_s3_targz(t: T):
+    """CH → S3, tar.gz: в архиве один TSV с заголовком"""
+    _native_tsv(t, "tar.gz")
+
+
+def ch_native_to_s3_none(t: T):
+    """CH → S3 без сжатия: TSV с заголовком"""
+    _native_tsv(t, None)
+
+
+def ch_native_to_s3_sanitize(t: T):
+    """CH → S3 с очисткой: xstream_sanitize и sanitize_array вырезают спецсимволы строки 2"""
+    _check_sanitized(_native_tsv(t, "gzip", sanitize=True))
+
+
+def ch_native_to_s3_tpl(t: T):
+    """CH → S3 шаблоном: sql, compression и xstream_sanitize='false' из {{ }} — строка 2 без очистки"""
+    row = _native_tsv(t, "gzip", tpl=True)
+    if row["s_special"] != _SPECIAL:
+        raise AirflowFailException(f"xstream_sanitize='false' из шаблона: s_special={row['s_special']!r}")
+
+
+def _native_list(t: T, compression, tpl=False):
+    src = t.ch_table("src", rows=ROWS)
+    kw = dict(sql=f"SELECT * FROM {src}", compression=compression, fmt="JSON")
+    if tpl:
+        kw = {k: f"{{{{ {v!r} }}}}" for k, v in kw.items()}
+    # у JSON Lines заголовка нет: с header=True (по умолчанию) native первой строкой пишет имена колонок
+    data = _ch_to_s3(t, "out.json", compression, transport=_transport(t), header=False, **kw)
+    rows = [json.loads(line) for line in data.decode().splitlines() if line.strip()]
+    _rows_by_id([[str(r.get("id"))] for r in rows])
+    if t.pushed("row_count_list") != [EXPECTED_ROWS]:
+        raise AirflowFailException(f"row_count_list={t.pushed('row_count_list')}, ждём [{EXPECTED_ROWS}]")
+    row2 = next((r for r in rows if str(r.get("id")) == "2"), None)
+    if row2 is None:
+        raise AirflowFailException("в JSON нет строки id=2")
+    special = row2["s_special"]
+    if special != _SPECIAL:
+        raise AirflowFailException(f"s_special={special!r}, ждём {_SPECIAL!r}")
+
+
+def ch_native_list_gzip(t: T):
+    """CH → S3 частями, gzip: JSON Lines, файл out_1, три объекта, спецсимволы целы"""
+    _native_list(t, "gzip")
+
+
+def ch_native_list_zip(t: T):
+    """CH → S3 частями, zip: в архиве один JSON Lines"""
+    _native_list(t, "zip")
+
+
+def ch_native_list_targz(t: T):
+    """CH → S3 частями, tar.gz: в архиве один JSON Lines"""
+    _native_list(t, "tar.gz")
+
+
+def ch_native_list_none(t: T):
+    """CH → S3 частями без сжатия: JSON Lines"""
+    _native_list(t, None)
+
+
+def ch_native_list_tpl(t: T):
+    """CH → S3 частями шаблоном: sql, compression и fmt из {{ }}"""
+    _native_list(t, "gzip", tpl=True)
+
+
+def _ch_csv_ids(data: bytes) -> list:
+    rows = list(csv.reader(io.StringIO(data.decode())))
+    return rows[1:] if rows[:1] and rows[0][:1] == ["id"] else rows  # с заголовком или без — CSV клика
+
+
+def _ch_table_to_s3(t: T, compression, tpl=False):
+    src = t.ch_table("src", rows=ROWS)
+    db, _, table = src.partition(".")
+    kw = dict(table_name=table, schema=db)
+    if tpl:
+        kw = {k: f"{{{{ {v!r} }}}}" for k, v in kw.items()}
+    _rows_by_id(_ch_csv_ids(_ch_to_s3(t, "out.csv", compression, **kw)))
+    if t.pushed("row_count") != EXPECTED_ROWS:
+        raise AirflowFailException(f"row_count={t.pushed('row_count')} (журнал запросов кластера), ждём {EXPECTED_ROWS}")
+
+
+def ch_table_to_s3_gzip(t: T):
+    """Таблица CH → S3, gzip: три строки, row_count по журналу запросов кластера datalab"""
+    _ch_table_to_s3(t, "gzip")
+
+
+def ch_table_to_s3_none(t: T):
+    """Таблица CH → S3 без сжатия: три строки"""
+    _ch_table_to_s3(t, None)
+
+
+def ch_table_to_s3_tpl(t: T):
+    """Таблица CH → S3 шаблоном: table_name и schema из {{ }}"""
+    _ch_table_to_s3(t, "gzip", tpl=True)
+
+
+def _ch_query_to_s3(t: T, tpl=False):
+    src = t.ch_table("src", rows=ROWS)
+    sql_ = f"SELECT id, name FROM {src} WHERE id > 1"
+    _rows_by_id(_ch_csv_ids(_ch_to_s3(t, "out.csv", "gzip", sql=f"{{{{ {sql_!r} }}}}" if tpl else sql_)),
+                ids=("2", "3"))
+    if t.pushed("row_count") != 2:
+        raise AirflowFailException(f"row_count={t.pushed('row_count')} (журнал запросов кластера), ждём 2")
+
+
+def ch_query_to_s3_gzip(t: T):
+    """Запрос CH → S3, gzip: две строки по условию, row_count по журналу запросов кластера datalab"""
+    _ch_query_to_s3(t)
+
+
+def ch_query_to_s3_tpl(t: T):
+    """Запрос CH → S3 шаблоном: sql из {{ }}"""
+    _ch_query_to_s3(t, tpl=True)
+
+
+# ──────────────────────────── Тесты: CH ↔ PG ──────────────────────────────────
+def _ch_to_pg(t: T, tpl=False, inc=False):
+    src = t.ch_table("src", rows=ROWS)
+    want = t.pg_table("want", ROWS)
+    tgt = t.name("tgt")
+    if inc:
+        t.pg(_pg_create_sql(t.full(tgt), t.temp, incarnation=True))
+    else:
+        t.pg_table("tgt")
+    kw = dict(sql=f"SELECT {', '.join(COL_NAMES)} FROM {src}", target_table=tgt, target_schema=t.pg_schema)
+    if tpl:
+        kw = {k: f"{{{{ {v!r} }}}}" for k, v in kw.items()}
+    result, _ = t.run(sessions=("main",), clickhouse_conn_id=t.ch_conn, target_conn_id=t.pg_conn,
+                      **kw, **({} if inc else {"truncate": True}))
+    active, got = t.pg_active(tgt) if inc else (1, t.pg_rows(tgt))
+    exp = t.pg_rows(want)
+    # float — с допуском: клик по умолчанию парсит литерал быстро (precise_float_parsing=0), 4.56 → 4.5600000000000005
+    diff = [(r[0], c, g, w) for r, e in zip(got, exp) for c, g, w in zip(COL_NAMES, r, e)
+            if not (g == w or isinstance(g, float) and isinstance(w, float) and math.isclose(g, w))]
+    if active != 1 or len(got) != len(exp) or diff:
+        raise AirflowFailException(f"активна инкарнация {active} (ждём 1), строк {len(got)} из {len(exp)}; "
+                                   f"(id, колонка, в цели, в источнике): {diff!r}"[:1000])
+    t.expect_rows(result, len(got))
+
+
+def ch_to_pg_full(t: T):
+    """CH → PG: перелив запроса с truncate, строки = источник (пустая строка остаётся пустой, не NULL)"""
+    _ch_to_pg(t)
+
+
+def ch_to_pg_tpl(t: T):
+    """CH → PG шаблоном: sql, target_table и target_schema из {{ }}"""
+    _ch_to_pg(t, tpl=True)
+
+
+def ch_to_pg_inc_full(t: T):
+    """CH → PG в инкарнацию: перелив в неактивную копию _1 и переключение"""
+    _ch_to_pg(t, inc=True)
+
+
+def ch_to_pg_inc_tpl(t: T):
+    """CH → PG в инкарнацию шаблоном: sql, target_table и target_schema из {{ }}"""
+    _ch_to_pg(t, tpl=True, inc=True)
+
+
+def pg_to_ch_table(t: T):
+    """PG → CH: таблица в строковую таблицу CH через CSV, сверка числа строк оператором, спецсимволы целы"""
+    src = t.pg_table("src", ROWS)
+    tgt = t.ch_table("tgt", typed=False)
+    db, _, table = tgt.partition(".")
+    t.run(sessions=("main",), source_conn_id=t.pg_conn, source_schema=t.pg_schema, source_table=src,
+          target_conn_id=t.ch_conn, target_schema=db, target_table=table, target_truncate=True,
+          target_fmt="CSV", post_count_check=True)
+    (cnt,), = t.ch(f"SELECT count() FROM {tgt}")
+    special = t.ch(f"SELECT s_special FROM {tgt} WHERE id = '2'")
+    if cnt != EXPECTED_ROWS or t.pushed("row_count") != cnt or special != [(_SPECIAL,)]:
+        raise AirflowFailException(f"в цели {cnt} строк, row_count={t.pushed('row_count')}, s_special={special!r}")
+
+
+# ──────────────────────────── Тесты: CH → CH ──────────────────────────────────
+def _ch_to_ch(t: T, cols="id, name, s_special", typed=False, tpl=False, **kw):
+    src = t.ch_table("src", rows=ROWS)
+    if typed:
+        tgt = t.ch_table("tgt")
+    else:
+        # три колонки: JSONEachRow отдаёт даты строками, а типизированную вставку дат clickhouse_connect
+        # не делает — здесь проверяется сам поток, приведения — в случае typed
+        tgt = t.ch_full(t.name("tgt"))
+        t.ch(f"CREATE TABLE {tgt} (id Int32, name String, s_special String) ENGINE = MergeTree() ORDER BY id")
+    t.ch(f"INSERT INTO {tgt} (id, name, s_special) VALUES (99, 'лишняя', '')")  # truncate_target её уберёт
+    names = {"source_sql": f"SELECT {cols} FROM {src}", "target_table": tgt}
+    kw = {**({k: f"{{{{ {v!r} }}}}" for k, v in names.items()} if tpl else names), **kw}
+    result, _ = t.run(clickhouse_source_conn_id=t.ch_conn, clickhouse_target_conn_id=t.ch_conn, heimdall_conn_id=None,
+                      truncate_target=True, **kw)
+    cnt, sid = t.ch(f"SELECT count(), sum(id) FROM {tgt}")[0]
+    special = t.ch(f"SELECT s_special FROM {tgt} WHERE id = 2")
+    if cnt != EXPECTED_ROWS or sid != 6 or special != [(_SPECIAL,)] or (result or {}).get("total_rows") != cnt:
+        raise AirflowFailException(f"в цели count={cnt}, sum(id)={sid}, s_special={special!r}, результат {result!r}")
+    if typed and t.ch(f"SELECT * FROM {tgt} ORDER BY id") != t.ch(f"SELECT * FROM {src} ORDER BY id"):
+        raise AirflowFailException("типизированная цель отличается от источника построчно")
+
+
+def ch_to_ch_stream(t: T):
+    """CH → CH: поток в таблицу из трёх колонок порциями по 2, truncate_target убирает лишнюю строку"""
+    _ch_to_ch(t, batch_size=2)
+
+
+def ch_to_ch_typed(t: T):
+    """CH → CH типизированно: SELECT * в таблицу с типами источника, цель = источник построчно"""
+    _ch_to_ch(t, cols="*", typed=True)
+
+
+def ch_to_ch_tpl(t: T):
+    """CH → CH шаблоном: source_sql, target_table и batch_size='2' из {{ }}"""
+    _ch_to_ch(t, batch_size="{{ 2 }}", tpl=True)
+
+
+# ──────────────────────────── Тесты: кластер CH ───────────────────────────────
+def _ch_cluster(t: T, cluster="datalab"):
+    # DDL идёт на каждый узел своим подключением click-dlab-<узел>; таблица — с префиксом теста:
+    # упавший посреди тест оставит её на узлах, повтор пройдёт (IF NOT EXISTS / IF EXISTS)
+    tbl = t.ch_full(t.name("probe"))
+    nodes = t.systems["ch"]["cluster"]["nodes"]
+    for sql_ in (f"CREATE TABLE IF NOT EXISTS {tbl} (id Int32) ENGINE = MergeTree() ORDER BY id",
+                 f"DROP TABLE IF EXISTS {tbl}"):
+        res, _ = t.run(sql=sql_, clickhouse_conn_id=t.ch_conn, cluster_name=cluster)
+        ok = sorted(r["node"] for r in res or [] if r.get("success"))
+        if ok != sorted(nodes):
+            raise AirflowFailException(f"{sql_.split(' (')[0]}: выполнено на {ok}, узлы кластера {sorted(nodes)}")
+
+
+def ch_cluster_ddl(t: T):
+    """Кластер CH: CREATE и DROP таблицы на каждом узле datalab"""
+    _ch_cluster(t)
+
+
+def ch_cluster_tpl(t: T):
+    """Кластер CH шаблоном: cluster_name из {{ }}"""
+    _ch_cluster(t, cluster="{{ 'datalab' }}")
+
+
+# ──────────────────────────── Тесты: S3 → CH ──────────────────────────────────
+def _s3_to_ch_table(t: T, name, data, fmt, **kw):
+    tgt = t.ch_table("tgt", typed=False)
+    t.ch(f"INSERT INTO {tgt} (id) VALUES ('99')")  # truncate её уберёт
+    key = t.s3_put(name, gzip.compress(data))
+    db, _, table = tgt.partition(".")
+    kw = {"truncate": True, **kw}
+    t.run(table_name=table, schema=db, s3_bucket=t.bucket, s3_key=key, clickhouse_conn_id=t.ch_conn,
+          aws_conn_id=t.s3_conn, fmt=fmt, compression="gzip", **kw)
+    (cnt,), = t.ch(f"SELECT count() FROM {tgt}")
+    special = t.ch(f"SELECT s_special FROM {tgt} WHERE id = '2'")
+    if cnt != EXPECTED_ROWS or special != [(_SPECIAL,)]:
+        raise AirflowFailException(f"в цели {cnt} строк (ждём {EXPECTED_ROWS}), s_special={special!r}")
+    t.expect_rows({"row_count": t.pushed("row_count")}, cnt, required=True)
+
+
+def s3_to_ch_table_csv(t: T):
+    """S3 → CH из CSV без заголовка: перевод строки в кавычках, truncate убирает лишнюю строку"""
+    _s3_to_ch_table(t, "src.csv.gz", _csv_bytes(header=False), "CSV")
+
+
+def s3_to_ch_table_tsv(t: T):
+    """S3 → CH из TSVWithNames: экраны \\t \\n \\\\ раскрываются, строки = источник"""
+    _s3_to_ch_table(t, "src.tsv.gz", _tsv_bytes(), "TSVWithNames")
+
+
+def s3_to_ch_table_tpl(t: T):
+    """S3 → CH шаблоном: truncate='true' и settings JSON-строкой из {{ }}"""
+    _s3_to_ch_table(t, "src.csv.gz", _csv_bytes(header=False), "CSV", truncate="{{ 'true' }}",
+                    settings="{{ '%s' }}" % json.dumps({"input_format_csv_empty_as_default": 1}))
+
+
+def _s3_to_ch_transformed(t: T, **kw):
+    # Transformed читает TSV без экранов (формат пакетной выгрузки в ПКАП): табов, переводов строк и
+    # обратных слешей в значениях быть не должно — вход как после xstream_sanitize
+    rows = [tuple(SANITIZED_SPECIAL if c == "s_special" and r[0] == 2 else v for c, v in zip(COL_NAMES, r))
+            for r in ROWS]
+    tgt = t.ch_table("tgt", typed=False, lead="file_name String")
+    key = t.s3_put("src.tsv.gz", gzip.compress(_tsv_bytes(rows, esc=lambda s: s.replace("\\", ""))))
+    t.ch(f"INSERT INTO {tgt} (file_name, id) VALUES ('old', '99')")  # truncate обязан её убрать
+    db, _, table = tgt.partition(".")
+    t.run(table_name=table, schema=db, s3_bucket=t.bucket, s3_key=key, clickhouse_conn_id=t.ch_conn,
+          aws_conn_id=t.s3_conn, fmt="TabSeparatedWithNames", compression="gzip", **kw)
+    got = t.ch(f"SELECT file_name, count(), countIf(id = '2' AND s_special = '{SANITIZED_SPECIAL}') "
+               f"FROM {tgt} GROUP BY file_name")
+    if got != [("src.tsv.gz", EXPECTED_ROWS, 1)]:
+        raise AirflowFailException(f"(file_name, строк, строка 2 цела): {got!r}, ждём [('src.tsv.gz', 3, 1)]")
+    t.expect_rows({"row_count": t.pushed("row_count")}, EXPECTED_ROWS, required=True)  # заголовок — не строка
+
+
+def s3_to_ch_transformed_tsv(t: T):
+    """S3 → CH с именем файла: TSV пакетной выгрузки, имя файла первой колонкой"""
+    _s3_to_ch_transformed(t, truncate=True, include_file_name=True, file_name_position=0)
+
+
+def s3_to_ch_transformed_tpl(t: T):
+    """S3 → CH с именем файла шаблоном: truncate, include_file_name, file_name_position из {{ }}"""
+    _s3_to_ch_transformed(t, truncate="{{ 'true' }}", include_file_name="{{ 'true' }}", file_name_position="{{ 0 }}")
+
+
+# ──────────────────────────── Тесты: S3-утилиты ────────────────────────────────
+def _s3_archive(t: T, post_file_check):
+    parts = {"a.csv": _csv_bytes(), "b.csv": _csv_bytes(header=False)}
+    keys = [t.s3_put(n, d) for n, d in parts.items()]
+    tgt = f"{t.s3_prefix}bundle.zip"
+    _, spy = t.run(spy="verify_file_hash", s3_keys_source=keys, s3_bucket_source=t.bucket,
+                   aws_conn_id_source=t.s3_conn, s3_bucket=t.bucket, s3_key=tgt, aws_conn_id=t.s3_conn,
+                   replace=True, post_file_check=post_file_check)
+    with zipfile.ZipFile(io.BytesIO(t.s3_get(tgt))) as z:
+        got = sorted(z.read(n) for n in z.namelist())
+    if got != sorted(parts.values()):
+        raise AirflowFailException(f"в архиве {len(got)} файлов, содержимое не совпало с исходными")
+    return spy
+
+
+def s3_archive_two(t: T):
+    """Архив S3: два файла упаковываются в один zip байт в байт, post_file_check сверяет хэш архива"""
+    spy = _s3_archive(t, True)
+    if spy.call_count != 1:
+        raise AirflowFailException(f"post_file_check=True не подействовал: сверок {spy.call_count}")
+
+
+def s3_archive_tpl(t: T):
+    """Архив S3 шаблоном: post_file_check='False' из {{ }} — ложь, а не непустая строка: сверки нет"""
+    spy = _s3_archive(t, "{{ 'False' }}")
+    if spy.call_count:
+        raise AirflowFailException(f"post_file_check='False' из шаблона сочтён истиной: сверок {spy.call_count}")
+
+
+def _s3_file_hash(t: T, checksum: str, tpl=False):
+    raw = _csv_bytes()
+    want = hashlib.md5(raw).hexdigest()  # noqa: S324 — так считает оператор
+    key = t.s3_put("src.csv.gz", gzip.compress(raw))
+    checksum = checksum or want
+    if tpl:  # шаблонные поля оператора — строки: checksum, s3_key (compression не шаблонизируется)
+        key, checksum = f"{{{{ {key!r} }}}}", f"{{{{ {checksum!r} }}}}"
+    t.run(s3_bucket=t.bucket, s3_key=key, aws_conn_id=t.s3_conn, compression="gzip", checksum=checksum)
+    return t.pushed("checksum"), want
+
+
+def s3_file_hash_ok(t: T):
+    """Хэш файла S3: md5 распакованного gzip совпадает, оператор кладёт его в XCom"""
+    got, want = _s3_file_hash(t, "")
+    if got != want:
+        raise AirflowFailException(f"checksum в XCom {got}, ждём {want}")
+
+
+def s3_file_hash_mismatch(t: T):
+    """Хэш файла S3: чужой хэш — оператор падает, а не пропускает файл"""
+    try:
+        _s3_file_hash(t, "0" * 32)
+    except AirflowFailException as e:
+        if "does not match" not in str(e):
+            raise
+        return
+    raise AirflowFailException("чужой хэш принят")
+
+
+def s3_file_hash_tpl(t: T):
+    """Хэш файла S3 шаблоном: s3_key и checksum из {{ }}"""
+    got, want = _s3_file_hash(t, "", tpl=True)
+    if got != want:
+        raise AirflowFailException(f"checksum в XCom {got}, ждём {want}")
+
+
+def _s3_list_keys(t: T, **kw) -> list:
+    for i in range(5):
+        t.s3_put(f"k{i}.txt", b"x")
+    result, _ = t.run(bucket=t.bucket, prefix=t.s3_prefix, aws_conn_id=t.s3_conn, **kw)
+    return [r.get("Key") if isinstance(r, dict) else r for r in result or []]
+
+
+def s3_list_keys_all(t: T):
+    """Список ключей S3: все пять своих ключей"""
+    got = _s3_list_keys(t)
+    if sorted(got) != [f"{t.s3_prefix}k{i}.txt" for i in range(5)]:
+        raise AirflowFailException(f"ключи: {got}")
+
+
+def s3_list_keys_tpl(t: T):
+    """Список ключей S3 шаблоном: max_items='2' из {{ }} — список урезан"""
+    got = _s3_list_keys(t, max_items="{{ 2 }}")
+    # оператор запрашивает max_items + 1 — лишний ключ нужен ему для признака has_next
+    if got != [f"{t.s3_prefix}k{i}.txt" for i in range(3)]:
+        raise AirflowFailException(f"max_items='2' из шаблона: {got} (ждём 2 + 1 для has_next из 5)")
+
+
+def _s3_file_read(t: T, rows) -> list:
+    key = t.s3_put("src.csv.gz", gzip.compress(_csv_bytes()))
+    got, orig = [], t.cls.read_rows
+
+    def read_rows(self, *a, **kw):  # оператор только пишет строки в лог — перехватываем, что он прочёл
+        got.append(orig(self, *a, **kw))
+        return got[-1]
+
+    with mock.patch.object(t.cls, "read_rows", read_rows):
+        t.run(s3_bucket=t.bucket, s3_key=key, aws_conn_id=t.s3_conn, rows=rows)
+    if not got:
+        raise AirflowFailException("read_rows не вызван или прерван лимитом строк")
+    return got[0][0]
+
+
+def s3_file_read_rows(t: T):
+    """Чтение файла S3: первые две строки gzip-файла — заголовок и первая запись"""
+    got = _s3_file_read(t, 2)
+    want = _csv_bytes().decode().splitlines()[:2]
+    if got != want:
+        raise AirflowFailException(f"прочитано {got!r}"[:500])
+
+
+def s3_file_read_tpl(t: T):
+    """Чтение файла S3 шаблоном: rows='1' из {{ }} — одна строка"""
+    got = _s3_file_read(t, "{{ 1 }}")
+    # не только число: на пустом потоке read_rows всё равно вернёт rows пустых строк
+    if got != _csv_bytes().decode().splitlines()[:1]:
+        raise AirflowFailException(f"rows='1' из шаблона: прочитано {got!r}"[:500])
+
+
+def _s3_bucket_viewer(t: T, conn):
+    result, _ = t.run(aws_conn_id=conn)
+    names = [b.get("Name") for b in result or []]
+    if t.bucket not in names:
+        raise AirflowFailException(f"бакета {t.bucket} нет в списке {names}"[:500])
+
+
+def s3_bucket_viewer_list(t: T):
+    """Обзор бакетов S3: бакет из формы в списке подключения"""
+    _s3_bucket_viewer(t, t.s3_conn)
+
+
+def s3_bucket_viewer_tpl(t: T):
+    """Обзор бакетов S3 шаблоном: aws_conn_id из {{ }}"""
+    _s3_bucket_viewer(t, f"{{{{ {t.s3_conn!r} }}}}")
+
+
+# ─────────────────────────────── Тесты: lineage ───────────────────────────────
+def lineage_sql(t: T):
+    """Lineage из SQL: inlets и outlets — Asset Airflow 3 (утилита пакета, систем не трогает)"""
+    from airflow.sdk import Asset
+
+    src, tgt = f"{t.ch_db}.{t.name('src')}", f"{t.ch_db}.{t.name('tgt')}"
+    inlets, outlets = t.cls(f"INSERT INTO {tgt} SELECT id, name FROM {src}", t.ch_conn)
+    got = ([a.uri for a in inlets], [a.uri for a in outlets])
+    want = ([f"table://{t.ch_conn}/{src.replace('.', '/')}"], [f"table://{t.ch_conn}/{tgt.replace('.', '/')}"])
+    if got != want or not all(isinstance(a, Asset) for a in inlets + outlets):
+        raise AirflowFailException(f"lineage: получено {got}, ожидалось {want}")
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -743,9 +1333,41 @@ OPS = [
         pg_to_s3_list_tpl]),
     Op("s3_to_pg", "s3_to_postgres", "HrpS3ToPostgresOperator2", {"pg", "s3"}, [s3_to_pg_gzip, s3_to_pg_tpl]),
     # плагин af_dags, не ядро: на сигме его нет — группа «не создана»
-    Op("s3_to_pg_stream", "pg_stream", "HrpS3ToPgStreamOperator", {"pg", "s3"},
-       [s3_to_pg_stream_csv, s3_to_pg_stream_json, s3_to_pg_stream_tpl], pkg="plugins"),
+    Op("s3_to_pg_stream", "s3_to_pg_stream", "HrpS3ToPgStreamOperator", {"pg", "s3"},
+       [s3_to_pg_stream_csv, s3_to_pg_stream_json, s3_to_pg_stream_tpl]),
     Op("s3_to_s3", "s3_to_s3", "HrpS3ToS3Operator", {"s3"}, [s3_to_s3_gzip, s3_to_s3_zip, s3_to_s3_tpl]),
+    Op("ch_native_to_s3", "clickhouse_to_s3", "HrpClickNativeToS3Operator", {"ch", "s3"},
+       [ch_native_to_s3_gzip, ch_native_to_s3_zip, ch_native_to_s3_targz, ch_native_to_s3_none,
+        ch_native_to_s3_sanitize, ch_native_to_s3_tpl]),
+    Op("ch_native_list", "clickhouse_to_s3", "HrpClickNativeToS3ListOperator", {"ch", "s3"},
+       [ch_native_list_gzip, ch_native_list_zip, ch_native_list_targz, ch_native_list_none, ch_native_list_tpl]),
+    Op("ch_table_to_s3", "clickhouse_to_s3", "HrpClickhouseTableToS3Operator", {"ch", "s3", "ch_http", "cluster"},
+       [ch_table_to_s3_gzip, ch_table_to_s3_none, ch_table_to_s3_tpl]),
+    Op("ch_query_to_s3", "clickhouse_to_s3", "HrpClickhouseQueryToS3Operator", {"ch", "s3", "ch_http", "cluster"},
+       [ch_query_to_s3_gzip, ch_query_to_s3_tpl]),
+    Op("ch_to_pg", "clickhouse_to_postgres", "HrpClickhouseToPostgresOperator", {"ch", "pg"},
+       [ch_to_pg_full, ch_to_pg_tpl]),
+    Op("ch_to_pg_inc", "clickhouse_to_postgres", "HrpClickhouseToPostgresIncarnationOperator", {"ch", "pg"},
+       [ch_to_pg_inc_full, ch_to_pg_inc_tpl]),
+    # шаблонного случая нет: у оператора пустые template_fields
+    Op("pg_to_ch", "postgres_to_clickhouse", "HrpPostgresToClickhouseOperator", {"pg", "ch", "ch_http"},
+       [pg_to_ch_table]),
+    Op("ch_to_ch", "click_to_click", "HrpClickhouseToClickhouseOperator", {"ch", "ch_http"},
+       [ch_to_ch_stream, ch_to_ch_typed, ch_to_ch_tpl]),
+    Op("ch_cluster", "clickhouse_cluster_operator", "HrpClickHouseClusterOperator", {"ch", "cluster"},
+       [ch_cluster_ddl, ch_cluster_tpl]),
+    Op("s3_to_ch_table", "s3_to_clickhouse", "HrpS3ToClickhouseTableOperator", {"s3", "ch", "ch_http"},
+       [s3_to_ch_table_csv, s3_to_ch_table_tsv, s3_to_ch_table_tpl]),
+    Op("s3_to_ch_transformed", "s3_to_clickhouse", "HrpS3ToClickhouseTransformedOperator", {"s3", "ch", "ch_http"},
+       [s3_to_ch_transformed_tsv, s3_to_ch_transformed_tpl]),
+    Op("s3_archive", "s3_archive", "HrpS3ArchiveOperator", {"s3"}, [s3_archive_two, s3_archive_tpl]),
+    Op("s3_file_hash", "s3_file_hash", "HrpCheckS3FileHash", {"s3"},
+       [s3_file_hash_ok, s3_file_hash_mismatch, s3_file_hash_tpl]),
+    Op("s3_list_keys", "s3_viewer_operator", "HrpS3ListKeysOperator", {"s3"}, [s3_list_keys_all, s3_list_keys_tpl]),
+    Op("s3_file_read", "s3_viewer_operator", "HrpS3FileReadOperator", {"s3"}, [s3_file_read_rows, s3_file_read_tpl]),
+    Op("s3_bucket_viewer", "s3_viewer_operator", "HrpS3BucketViewerOperator", {"s3"},
+       [s3_bucket_viewer_list, s3_bucket_viewer_tpl]),
+    Op("lineage", "utils.lineage", "extract_lineage_from_sql", set(), [lineage_sql], policy=False),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
 
@@ -809,7 +1431,16 @@ def _probe_ch(conn_id: str, db: str) -> dict:
     elif "datalab" not in (entry.get("clusters") or {}):
         cluster = {"ok": False, "reason": f"у {conn_id} нет кластера datalab"}
     else:
-        cluster = {"ok": True, "reason": "", "nodes": entry["clusters"]["datalab"]}
+        from airflow.sdk import BaseHook
+        nodes = entry["clusters"]["datalab"]
+        lost = []
+        for n in nodes:  # оператор ходит на узел через click-dlab-<короткое имя>
+            try:
+                BaseHook.get_connection(f"click-dlab-{n.split('.')[0]}")
+            except Exception:
+                lost.append(f"click-dlab-{n.split('.')[0]}")
+        cluster = ({"ok": False, "reason": f"нет подключений {', '.join(lost)}"} if lost
+                   else {"ok": True, "reason": "", "nodes": nodes})
     return {"ok": True, "reason": "", "cluster": cluster}
 
 
@@ -1008,6 +1639,7 @@ def test_hrp_operators_dag():
 
     systems_t = systems()
     leaves = [systems_t]
+    NOT_CREATED.clear()  # процесс разбора живёт долго: без этого остаются группы прошлых разборов
     for op in OPS:
         op.loaded, status, why = _load(op)
         if status in ("missing", "forbidden"):

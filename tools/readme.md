@@ -79,6 +79,10 @@ DAG автоматически обнаруживает все подключе�
         `report`.
 *   **`skip_<группа>`** (`skip_tfs`, `skip_kafka`, …; секция формы «Пропуск групп») —
     подключения группы не проверяются (☮️, не ошибка); сохраняются с `save_params`.
+*   **Сведения о системах** (для регресса операторов): `report` пишет Variable `conn_facts` — по `conn_id`
+    тип (`kind`) и версия; у баз ещё пользователь и база, у S3 — бакеты — и `ch_clusters` — серверы ClickHouse с их кластерами
+    (`system.clusters`) и подключениями. Упавшее или пропущенное подключение прежние сведения не затирает,
+    пропавшее из secret backend — удаляется; изменения — строками в заметке рана.
 *   **Стандартизация**: Статус пропущенных проверок помечается символом `☮️`.
 *   **Отчетность**: таск `report` — строка на непрошедшую проверку ✅/❌/☮️ (⭐ — важное) с подписью экземпляра в заметке рана, упавшие важные первыми.
 *   **Важные подключения** — параметр `critical` (шаблоны `conn_id`, fnmatch; по умолчанию
@@ -102,111 +106,52 @@ DAG автоматически обнаруживает все подключе�
 ### [test_hrp_operators.py](test_hrp_operators.py)
 **Регрессионный стенд операторов HRP (`test_hrp_operators`).**
 
-Config-driven стенд для пакета `sber_app_dataplatform_etl_core.hrp_operators`: прогон на каждом
-релизе и хотфиксе, при обновлении Airflow и зависимостей (встраивается в пайплайн dpm).
+Регресс пакета `sber_app_dataplatform_etl_core.hrp_operators` на каждый релиз и хотфикс, при обновлении
+Airflow и зависимостей; итог — гейт релиза в DPM. Запуск вручную (`@once`), `max_active_runs=1`,
+`dagrun_timeout` — 2 ч.
 
-**Что покрывается** (по группам)
+**Устройство**
+- **Группа на оператор** (24 оператора + утилита `lineage`), **тест — одна задача**. Тест сам готовит вход
+  (таблицу, файл в S3) с именами по префиксу `rg_<группа>_<тест>`, выполняет оператор как в бою — шаблоны
+  рендерит окружение дага, политика контура (`task_policy`) применяется — и сверяет результат. После себя
+  убирает, даже при ❌ и `execution_timeout`; остатки убитого прогона снимаются перед подготовкой. Тесты
+  группы идут друг за другом, группы — параллельно.
+- **Оператора нет в пакете или он запрещён** (`ALLOWED_OPERATORS` в `airflow_local_settings`) — группы нет, в сводке строка
+  «не созданы». Сломан импорт модуля — в группе одна красная задача с ошибкой.
+- **В каждой группе — шаблонный тест** (`*.tpl`): нестроковые параметры (bool, int, dict) переданы `{{ … }}`
+  с нестандартным значением, тест проверяет, что значение подействовало. Даг без
+  `render_template_as_native_obj` — шаблон всегда строка.
+- **`row_count`**: если оператор его возвращает, тест сверяет с числом строк в цели.
+- Первая задача `systems` проверяет системы и права, последняя `report` пишет сводку.
 
-- `to_s3` — `PostgresToS3(List)`, `Clickhouse{Table,Query}ToS3`, `ClickNativeToS3(List)`:
-  все сжатия (`gzip`/`zip`/`tar.gz`/`None`), массивы, NULL, спецсимволы.
-  Каждый оператор с `post_file_check=True` сам перечитывает файл и сверяет хэш.
-- `xstream_sanitize` — `pg_to_s3_list_sanitize` и `ch_native_to_s3_sanitize` (с `sanitize_array`);
-  `v_*_sanitize` читает файл и сверяет строку со спецсимволами с литералом
-  `SANITIZED_SPECIAL`: вырезаны `;`, таб, перенос и обратный слеш, массив очищен. Литерал, а не
-  регулярка ядра — проверка не доверяет проверяемому коду. До ядра 1.2.7 флаг не чистил
-  ничего, поэтому на старом ядре эти проверки красные, и в карантин они не спрятаны.
-  `s3_to_ch_transformed` грузит очищенную выгрузку CH и ждёт `v_ch_native_sanitize`: на старом
-  ядре он `upstream_failed` (в сводке ☮️), а не второй ❌ с ошибкой разбора ClickHouse.
-- `s3_to_db` — `S3ToClickhouseTable` (CSV и TSV-семейство): end-to-end PG→S3→CH, сверка row count;
-  `S3ToPostgresOperator2` — выгрузка `pg_to_s3_gzip` в инкарнационный таргет
-  (`copy_csv_quote='"'`: файл — родной CSV Postgres); `S3ToClickhouseTransformed` — очищенная
-  выгрузка CH с `include_file_name` (TSV без экранирования, табы в значениях ему противопоказаны).
-- `db_to_db` — `PostgresToPostgres`, `ClickhouseToPostgres`, `PostgresToClickhouse`,
-  `ClickhouseToClickhouse`, `*Incarnation*`: прямые переливки, сверка count и содержимого.
-- `s3_utils` — `S3ToS3`, `S3Archive`, `CheckS3FileHash`, `PostgresDDL`: перепаковка сжатий,
-  ZIP-архив, сверка MD5, генерация DDL.
-- `viewers` — `S3ListKeys`, `S3FileRead`, `S3BucketViewer`: листинг ключей/бакетов, чтение строк.
-- `cluster` — `ClickHouseClusterOperator`: DDL на ноды кластера (за флагом `run_known_broken`).
+**Группы**: PG → PG, PG в инкарнацию, DDL PG, PG → S3 (целиком и частями), S3 → PG, S3 → PG потоком,
+S3 → S3, CH → S3 (native, native частями, table, query), CH → PG (и в инкарнацию), PG → CH, CH → CH,
+кластер CH, S3 → CH (table, transformed), архив S3, хэш файла S3, список ключей, чтение файла, обзор
+бакетов, `lineage`. Не покрыты: `ClickhouseToIdp`, `ClickhouseToDatacatalog`, LLM, эмбеддинги,
+OpenMetadata — их систем на стендах нет.
 
-**Типы колонок** (`COLUMNS`, единый источник для PG и CH): integer, bigint, double, numeric,
-boolean, date, timestamp, timestamptz/`DateTime64(3, 'UTC')`, uuid, jsonb, `text[]`/`integer[]`,
-`Array(Nullable(String))` с NULL внутри, `LowCardinality(String)`. Строка 3 — NULL во всех
-nullable-колонках.
+**Параметры формы**
+- `pg` — `conn_id.схема`: таблицы в схеме (нужны CREATE и DROP); только `conn_id` — временные таблицы
+  сессии, в базе после рана ничего не остаётся. GP — так же, как PG.
+- `ch` — `conn_id.база`; `s3` — `conn_id://бакет/папка`, по умолчанию папка `test-operators` в бакете
+  логов. Папка у каждого теста своя: `<папка>/<группа>/<тест>/`.
+- `test_pg` / `test_ch` / `test_s3` — системы; тест идёт, только если включены все его системы,
+  иначе ☮️. `ch_http` — операторы, которые ходят в ClickHouse по HTTP (на альфе DEV закрыт).
+- `op_<группа>` (секция «Операторы») — выключатель группы.
+- `run_cleanup` — `False` оставляет объекты для отладки; `save_params` пишет форму в Variable
+  `tools_test_hrp_operators_params`, она становится значениями по умолчанию.
 
-**Не покрыт**: `ClickhouseToIdpOperator` — нужна IDP, на стенде её нет.
+**Системы** (`systems`): тип и версию базы берёт из Variable `conn_facts`, кластер ClickHouse `datalab` —
+из `ch_clusters`; обе пишет `tools_test_connections`. Без записи — проба `version()`; кластерные тесты без
+`ch_clusters` уходят в ☮️ «запустите test_connections». Недоступная включённая система — провал рана.
 
-**Инфраструктура**
-- Postgres: таблицы в `airflowdb.hrp_test` (параметр `pg` — `conn_id.схема`), отдельно от таблиц
-  Airflow в `main`; учётке тасков в схеме нужно право CREATE. На сигме схему заводит liquibase
-  метабазы (ядро 1.2.7), на альфе и стенде — администратор БД руками; на таблицу и каждую колонку ставится
-  `COMMENT` (требование Quality Gate).
-- ClickHouse: таблицы в `dlab-click.technical` (параметр `ch` — `conn_id.база`), имена по имени теста.
-- S3: параметр `s3` — `conn_id://бакет/папка`, по умолчанию папка `test-operators` в бакете логов
-  (подключение и бакет из `[logging]`, `log_bucket_path()`; на альфе
-  `s3-archive://dataplatform-monitoring/test-operators`). Папка обязательна: setup и cleanup
-  очищают её целиком.
-
-**Методология**
-1. **Setup** — DROP/CREATE источников и таргетов (PG + CH) с данными (NULL, спецсимволы, массивы);
-   `setup_s3` проверяет соединение/бакет и чистит S3-префикс (идемпотентность). Каждый setup
-   скипается при выключенном флаге своей системы (`setup_pg`→`test_pg` и т.д.) ИЛИ при
-   недоступности системы: ошибка соединения гасит флаг (проверки уходят в ☮️, а не ❌ каскадом).
-2. **Execution** — операторы под тестом во всех поддерживаемых сжатиях.
-3. **Validation** — сверка row count и (где формат детерминирован) содержимого.
-4. **Summary и вердикт** — в заметке рана упавшие построчно с названием из `doc_md` таска
-   («Название: описание», в сводку идёт часть до двоеточия), пропущенные и успешные — по
-   строке списком task_id; `report` падает, если регресс провален (см. «Вердикт для DPM»).
-5. **Cleanup** — гарантированное удаление таблиц и S3-ключей (`trigger_rule=ALL_DONE`).
-
-**Флаги выбора проверок**
-- `test_pg` / `test_ch` / `test_s3` (по умолчанию `True`) — включают проверки по системам.
-  Каждая проверка гейтуется по всем задействованным ею системам (**AND**): `pg→s3` идёт только
-  при `test_pg И test_s3`, `s3→ch` — при `test_s3 И test_ch`, `ch→pg` — при `test_ch И test_pg`.
-  Выключение системы уводит все её проверки (в т.ч. кросс-системные) в ☮️ skipped.
-- `run_known_broken` (по умолчанию `False`) — «карантин» для дефектов пакета, исправленных в
-  ядре 1.2.7: `pg_to_s3_list` (`prepare_row`), `s3_to_ch_tsv` (зависит от него),
-  `ch_native_list` (Decimal в JSON), `pg_incarnation` (`insert_incarnation`), `ch_to_ch` (Date строкой в типизированный insert). После выкладки
-  1.2.7 на контуры карантин снимается.
-- `run_cluster` (по умолчанию `False`) — проверки, которым нужен кластер ClickHouse `datalab`:
-  `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `ch_cluster_ddl`. В сводке — строка «кластер datalab».
-- `run_ch_http` (по умолчанию `True`) — проверки операторов, которые ходят в ClickHouse по HTTP:
-  `ch_table_to_s3_*`, `ch_query_to_s3_gzip`, `s3_to_ch_*`, `pg_to_ch`, `ch_to_ch`. HTTP-клиент
-  ядра берёт из подключения только хост (порт 8123 без TLS); на альфе DEV HTTP у ClickHouse
-  закрыт — флаг выключается там сохранением формы. `ch_native_list_*` (JSON идёт по HTTP при
-  `transport=auto`) без HTTP проверяется на `transport=native`.
-- `run_cleanup` (по умолчанию `True`) — операционный флаг: `False` оставляет таблицы/S3-ключи
-  для отладки упавшего прогона.
-
-**Сохранение формы**: галочка `save_params` пишет форму в Variable
-`tools_test_hrp_operators_params`, на разборе она становится значениями по умолчанию.
-Поля `pg`, `ch` и `s3` операторы получают литералами на
-разборе: часть операторов не шаблонизирует `conn_id`. Поэтому таск `params` роняет запуск,
-если эти поля формы расходятся с разбором: «сохраните и запустите ещё раз». Иначе setup
-создал бы таблицы по форме, а операторы пошли бы по старым значениям.
-
-Примечание: `max_active_runs=1` — имена таблиц фиксированы, параллельные прогоны не поддержаны.
-`ClickhouseTableToS3`/`ClickhouseQueryToS3` считают строки через `clusterAllReplicas(datalab,
-system.query_log)` — в окружении без кластера `datalab` они не работают, поэтому держатся за
-`run_cluster`.
-
-**Вердикт для DPM** (гейт релиза и хотфикса):
-- запуск — `POST /api/v1/dags/test_hrp_operators/dagRuns`, флаги в `conf` (имена как у `params`);
-- итог — `state` рана: `success` — пройден, `failed` — провален. Провал — любой ❌ или система,
-  включённая флагом, но недоступная (`setup_*` пропущен по ошибке соединения или прав). ☮️ по
-  флагам — `run_known_broken`, `run_cluster`, `run_ch_http`, выключенные `test_*` — провалом не считаются;
-- детали — XCom `verdict` таска `report`:
-  `GET …/dagRuns/{run_id}/taskInstances/report/xcomEntries/verdict?stringify=false` (без
-  параметра `value` приходит строкой Python-repr, а не JSON) →
-  `{"passed", "ok", "failed": [task_id…], "skipped", "unavailable": ["PG"…], "core": "<версия ядра>"}`;
-- `report` и `cleanup` — оба листья: состояние рана Airflow выводит из листьев, и при цепочке
-  `report >> cleanup` ран с 13 ❌ оставался `success` (стенд, 05.10.2026);
-- `max_active_runs=1`: второй запуск встаёт в очередь, `dagrun_timeout` — 2 ч.
-
-**Не-DEV стенды**: таблицы предсозданы, стенд их только очищает. С v1.12 (05.10.2026) у
-источника и таргетов новые колонки, появились таблицы `hrp_s3_to_pg_0/_1` + `hrp_s3_to_pg_inc_seq`
-(без колонки `incarnation`), `technical.hrp_s3_to_ch_tr` (первая колонка `file_name String`) и
-`technical.hrp_ch_to_ch` (типы как у источника) — их DDL печатают `_pg_create_sql` /
-`_ch_create_sql` при `IS_DEV=True`, пересоздать до прогона.
+**Вердикт для DPM**
+- запуск — `POST /api/v2/dags/test_hrp_operators/dagRuns`, параметры в `conf` (имена как у формы);
+- итог — `state` рана: `success` — пройден, `failed` — есть ❌ или включённая система недоступна;
+  ☮️ провалом не считается;
+- детали — XCom `verdict` таска `report`: `{"passed", "ok", "failed": [task_id…], "skipped",
+  "unavailable": ["PG"…], "core": "<версия ядра>", "groups": {группа: {тест: значок}},
+  "not_created": {группа: "нет в пакете" | "запрещён"}}`.
 
 ### [db_cleanup.py](db_cleanup.py)
 **Очистка метадаты Airflow (`tools_db_cleanup`).**
