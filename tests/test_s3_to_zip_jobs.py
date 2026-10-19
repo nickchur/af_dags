@@ -1,0 +1,41 @@
+"""Раскладка запуска `tools_s3_to_zip` по архивам: вчера по MSK, имена с номерами, одна метка.
+
+Прогон: `python -m pytest tests -q` в окружении Airflow 3 (`/opt/aftest/venv312`).
+"""
+import ast
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from airflow.sdk.exceptions import AirflowFailException
+
+from plugins.s3_utils import s3_path_parse
+
+_SRC = Path(__file__).resolve().parents[1] / "s3_tools" / "s3_to_zip.py"
+_tree = ast.parse(_SRC.read_text(encoding="utf-8"))
+_ns = {'s3_path_parse': s3_path_parse, 'AirflowFailException': AirflowFailException,
+       'datetime': datetime, 'timedelta': timedelta, 'timezone': timezone, 'MSK': timezone(timedelta(hours=3))}
+exec(compile(ast.Module([n for n in _tree.body if isinstance(n, ast.FunctionDef) and n.name == '_jobs'], []),
+             str(_SRC), "exec"), _ns)
+_jobs = _ns['_jobs']
+
+P = {'src': ['s3://b/airflow-logs/', 's3://c/x/airflow-logs/', 's3://b/ctl/'], 'dst': 's3://b/archive/',
+     'date_from': None, 'date_to': None, 'add_ts': True, 'max_size_gb': 1, 'replace': False}
+NOW = datetime(2026, 10, 18, 22, 30, tzinfo=timezone.utc)   # 19.10 01:30 MSK
+
+
+def test_names_ts_and_yesterday_msk():
+    j = _jobs(P, NOW)
+    assert [x['name'] for x in j] == ['airflow-logs', 'airflow-logs_2', 'ctl']
+    assert {x['ts'] for x in j} == {'20261018_223000'}
+    assert {(x['date_from'], x['date_to']) for x in j} == {('2026-10-18', '2026-10-18')}   # вчера по MSK
+    assert j[0]['max_bytes'] == 1024**3 and j[0]['dst'] == 's3://b/archive/'
+
+
+def test_explicit_dates_no_ts_and_dst_zip():
+    j = _jobs({**P, 'src': ['s3://b/a/'], 'date_from': '2026-10-01', 'add_ts': False, 'dst': 's3://b/a.zip'}, NOW)
+    assert (j[0]['date_from'], j[0]['date_to'], j[0]['ts']) == ('2026-10-01', None, None)
+    with pytest.raises(AirflowFailException, match='папкой'):
+        _jobs({**P, 'dst': 's3://b/a.zip'}, NOW)
+    with pytest.raises(AirflowFailException, match='src'):
+        _jobs({**P, 'src': ['', ' ']}, NOW)
