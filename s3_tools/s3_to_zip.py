@@ -1,7 +1,7 @@
 """### 🗜️ DAG: ZIP-архив из S3 в S3
-*2026-10-19 17:24 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 17:42 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Раз в сутки (по умолчанию 01:30 MSK) архивирует вчерашнее по MSK: на каждый путь из `src` — свой ZIP64 в `dst`.
+Раз в сутки (по умолчанию 01:30 MSK) архивирует вчерашнее по MSK (ручной запуск без дат — сегодняшнее): на каждый путь из `src` — свой ZIP64 в `dst`.
 Сборка потоковая — без диска воркера и без буфера под весь архив; исходники не трогает. По умолчанию — логи задач
 в `archive/` бакета логов (срок хранения — общий для бакета). Пустой день у src — экземпляр skipped.
 Значения формы — из переменной `tools_s3_to_zip_params`, сохранить — галочка `save_params` (даты разовые).
@@ -49,11 +49,11 @@ def _param(key, default, **kwargs):
     return Param(SAVED.get(key, default), **kwargs)
 
 
-def _jobs(p, now):
-    """Раскладка запуска по архивам: на каждый src — свой; вчера по MSK, имена с номерами, одна метка на ран.
+def _jobs(p, now, manual=False):
+    """Раскладка запуска по архивам: на каждый src — свой; имена с номерами, одна метка на ран.
 
-    now — dag_run.run_after: у рана по расписанию это слот, у ручного — время запуска; Clear его не меняет,
-    поэтому перезапуск вчерашнего рана архивирует те же сутки.
+    Пустые даты: авто-ран — вчера по MSK, ручной (manual) — сегодня. now — dag_run.run_after: у рана по
+    расписанию это слот, у ручного — время запуска; Clear его не меняет, поэтому перезапуск архивирует те же сутки.
     """
     src = p['src']
     srcs = [s.strip() for s in ([src] if isinstance(src, str) else src) if s and s.strip()]
@@ -64,7 +64,7 @@ def _jobs(p, now):
         raise AirflowFailException(f"src {len(srcs)}, а dst — один ключ .zip: при нескольких src dst должен быть папкой")
     d_from, d_to = p.get('date_from') or None, p.get('date_to') or None
     if not d_from and not d_to:
-        d_from = d_to = (now.astimezone(MSK) - timedelta(days=1)).date().isoformat()
+        d_from = d_to = (now.astimezone(MSK) - timedelta(days=0 if manual else 1)).date().isoformat()
     ts = now.astimezone(timezone.utc).strftime('%Y%m%d_%H%M%S') if p.get('add_ts', True) else None
     stems = []
     for s in srcs:
@@ -99,9 +99,9 @@ params = {
     ),
     # Разовые: в переменную не сохраняются, иначе ежедневный ран застынет на одной дате
     'date_from': Param(None, type=['null', 'string'], format='date',
-                       description='LastModified с (MSK, включительно); обе даты пусто — вчера по MSK'),
+                       description='LastModified с (MSK, включительно); обе пусто — вчера (по расписанию) или сегодня (вручную)'),
     'date_to': Param(None, type=['null', 'string'], format='date',
-                     description='LastModified по (MSK, включительно); обе даты пусто — вчера по MSK'),
+                     description='LastModified по (MSK, включительно); обе пусто — вчера (по расписанию) или сегодня (вручную)'),
     'add_ts': _param('add_ts', True, type='boolean',
                      description='Добавлять к имени метку _YYYYMMDD_HHMMSS (UTC, старт рана); без неё повтор упрётся в replace'),
     'max_size_gb': _param('max_size_gb', 20, type='number', minimum=0,
@@ -153,8 +153,9 @@ def tools_s3_to_zip():
     # NONE_FAILED: params штатно пропускает себя без save_params, ALL_SUCCESS утянул бы всё в skip
     @task(task_id='jobs', trigger_rule=TriggerRule.NONE_FAILED)
     def jobs(params=None, **context):
-        """🧮 Раскладка по архивам: вчера по MSK, имена с номерами, одна метка на ран."""
-        j = _jobs(params, context['dag_run'].run_after)
+        """🧮 Раскладка по архивам: пустые даты — вчера (авто) или сегодня (вручную) по MSK, имена, одна метка."""
+        dr = context['dag_run']
+        j = _jobs(params, dr.run_after, manual=dr.run_type == 'manual')
         add_note({x['name']: x['src'] for x in j}, context)
         return j
 

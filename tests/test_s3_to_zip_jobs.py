@@ -48,3 +48,11 @@ def test_names_unique_against_numbered_and_str_src():
     assert [x['src'] for x in j] == ['s3://b/one/']
     j = _jobs({**P, 'src': ['s3://b/a/'], 'dst': 's3://b/arc/custom.zip'}, NOW)
     assert j[0]['name'] == 'custom'                                   # подпись экземпляра = имя архива
+
+
+def test_manual_run_today_msk():
+    """Ручной ран без дат — сегодня по MSK: 22:30 UTC 18.10 — это уже 19.10 MSK."""
+    j = _jobs(P, NOW, manual=True)
+    assert {(x['date_from'], x['date_to']) for x in j} == {('2026-10-19', '2026-10-19')}
+    j = _jobs({**P, 'date_to': '2026-10-10'}, NOW, manual=True)       # задана одна — вторая без границы
+    assert (j[0]['date_from'], j[0]['date_to']) == (None, '2026-10-10')
