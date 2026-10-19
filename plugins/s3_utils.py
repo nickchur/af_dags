@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-10-19 17:13 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 17:24 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -657,7 +657,7 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
             if e.response['Error']['Code'] not in ('404', 'NoSuchKey', 'NotFound'):
                 raise
 
-    own = re.compile(re.escape(stem) + r'(_\d{8}_\d{6})?\.zip')
+    own = re.compile(re.escape(stem) + r'(_\d{8}_\d{6})?\.zip', re.IGNORECASE)
     aborted = []
     for page in d_cli.get_paginator('list_multipart_uploads').paginate(Bucket=dst['bucket'], Prefix=folder):
         for u in page.get('Uploads', []):

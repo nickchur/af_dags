@@ -39,3 +39,12 @@ def test_explicit_dates_no_ts_and_dst_zip():
         _jobs({**P, 'dst': 's3://b/a.zip'}, NOW)
     with pytest.raises(AirflowFailException, match='src'):
         _jobs({**P, 'src': ['', ' ']}, NOW)
+
+
+def test_names_unique_against_numbered_and_str_src():
+    j = _jobs({**P, 'src': ['s3://b/logs/', 's3://c/logs/', 's3://d/logs_2/']}, NOW)
+    assert [x['name'] for x in j] == ['logs', 'logs_3', 'logs_2']      # номер — до первого свободного
+    j = _jobs({**P, 'src': 's3://b/one/'}, NOW)                      # строка из переменной — как список из одного
+    assert [x['src'] for x in j] == ['s3://b/one/']
+    j = _jobs({**P, 'src': ['s3://b/a/'], 'dst': 's3://b/arc/custom.zip'}, NOW)
+    assert j[0]['name'] == 'custom'                                   # подпись экземпляра = имя архива

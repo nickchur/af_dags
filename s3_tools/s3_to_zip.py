@@ -1,5 +1,5 @@
 """### 🗜️ DAG: ZIP-архив из S3 в S3
-*2026-10-19 17:14 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 17:24 MSK · v1.1 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (по умолчанию 01:30 MSK) архивирует вчерашнее по MSK: на каждый путь из `src` — свой ZIP64 в `dst`.
 Сборка потоковая — без диска воркера и без буфера под весь архив; исходники не трогает. По умолчанию — логи задач
@@ -50,23 +50,37 @@ def _param(key, default, **kwargs):
 
 
 def _jobs(p, now):
-    """Раскладка запуска по архивам: на каждый src — свой; вчера по MSK, имена с номерами, одна метка на ран."""
-    srcs = [s.strip() for s in p['src'] if s and s.strip()]
+    """Раскладка запуска по архивам: на каждый src — свой; вчера по MSK, имена с номерами, одна метка на ран.
+
+    now — dag_run.run_after: у рана по расписанию это слот, у ручного — время запуска; Clear его не меняет,
+    поэтому перезапуск вчерашнего рана архивирует те же сутки.
+    """
+    src = p['src']
+    srcs = [s.strip() for s in ([src] if isinstance(src, str) else src) if s and s.strip()]
     if not srcs:
         raise AirflowFailException('src пуст: нужен хотя бы один путь conn_id://бакет/путь')
-    if len(srcs) > 1 and p['dst'].strip().lower().endswith('.zip'):
+    dst = p['dst'].strip()
+    if len(srcs) > 1 and dst.lower().endswith('.zip'):
         raise AirflowFailException(f"src {len(srcs)}, а dst — один ключ .zip: при нескольких src dst должен быть папкой")
     d_from, d_to = p.get('date_from') or None, p.get('date_to') or None
     if not d_from and not d_to:
         d_from = d_to = (now.astimezone(MSK) - timedelta(days=1)).date().isoformat()
     ts = now.astimezone(timezone.utc).strftime('%Y%m%d_%H%M%S') if p.get('add_ts', True) else None
-    jobs, seen = [], {}
+    stems = []
     for s in srcs:
         sp = s3_path_parse(s)
         base = sp['prefix'] if sp['is_mask'] else sp['key']
-        stem = base.rstrip('/').rsplit('/', 1)[-1] or sp['bucket']
-        seen[stem] = seen.get(stem, 0) + 1
-        jobs.append({'src': s, 'dst': p['dst'].strip(), 'name': stem if seen[stem] == 1 else f'{stem}_{seen[stem]}',
+        # dst — ключ .zip: архив назовёт он, подпись экземпляра — так же
+        stems.append(dst.rsplit('/', 1)[-1][:-4] if dst.lower().endswith('.zip')
+                     else base.rstrip('/').rsplit('/', 1)[-1] or sp['bucket'])
+    # Номер — до первого свободного: src logs, logs, logs_2 дадут logs, logs_3, logs_2
+    jobs, taken = [], set(stems)
+    for s, stem in zip(srcs, stems):
+        name, n = stem, 1
+        while name in {j['name'] for j in jobs} or (n > 1 and name in taken):
+            n += 1
+            name = f'{stem}_{n}'
+        jobs.append({'src': s, 'dst': dst, 'name': name,
                      'ts': ts, 'date_from': d_from, 'date_to': d_to,
                      'max_bytes': int(float(p['max_size_gb']) * 1024**3), 'replace': bool(p['replace'])})
     return jobs
@@ -140,7 +154,7 @@ def tools_s3_to_zip():
     @task(task_id='jobs', trigger_rule=TriggerRule.NONE_FAILED)
     def jobs(params=None, **context):
         """🧮 Раскладка по архивам: вчера по MSK, имена с номерами, одна метка на ран."""
-        j = _jobs(params, datetime.now(timezone.utc))
+        j = _jobs(params, context['dag_run'].run_after)
         add_note({x['name']: x['src'] for x in j}, context)
         return j
 

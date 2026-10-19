@@ -149,7 +149,7 @@ def test_empty_skips(cl):
 
 def test_abort_stale_uploads_own_name_only(cl):
     cl.parts = {'arc/logs_20261018_013000.zip': [b'p'], 'arc/logs.zip': [b'p'], 'arc/logs_2_20261018_013000.zip': [b'p'],
-                'arc/other_20261018_013000.zip': [b'p'], 'arc/sub/logs.zip': [b'p']}
+                'arc/other_20261018_013000.zip': [b'p'], 'arc/sub/logs.zip': [b'p'], 'arc/logs.ZIP': [b'p']}
     r = s3_utils.s3_to_zip('s3://b/logs/', 's3://b/arc/', ts='20261019_013000')
-    assert sorted(r['aborted']) == ['arc/logs.zip', 'arc/logs_20261018_013000.zip']
+    assert sorted(r['aborted']) == ['arc/logs.ZIP', 'arc/logs.zip', 'arc/logs_20261018_013000.zip']
     assert set(cl.parts) == {'arc/logs_2_20261018_013000.zip', 'arc/other_20261018_013000.zip', 'arc/sub/logs.zip'}

@@ -66,10 +66,10 @@
 
 | REQ-ID | Задача | Тест | Статус |
 |---|---|---|---|
-| REQ-s3zip-01 | 2.1 | | |
-| REQ-s3zip-03 | 1.1, 2.1 | | |
-| REQ-s3zip-04 | 1.1 | | |
-| REQ-s3zip-05 | 1.1, 2.1 | | |
-| REQ-s3zip-10 | 2.1 | | |
-| REQ-s3zip-11 | 1.1 | | |
-| REQ-s3zip-12 | 2.1 | | |
+| REQ-s3zip-01 | 2.1 | test_s3_to_zip_jobs (dst .zip, str src), daily_multi_2 | готово |
+| REQ-s3zip-03 | 1.1, 2.1 | test_dates_msk_boundary, test_names_ts_and_yesterday_msk, daily_default_1 | готово |
+| REQ-s3zip-04 | 1.1 | test_empty_skips, daily_multi_2 | готово |
+| REQ-s3zip-05 | 1.1, 2.1 | test_mask_dates_and_name_ts, test_names_unique…, daily_dup_5 | готово |
+| REQ-s3zip-10 | 2.1 | DagBag, scheduled__2026-10-18T22:30 | готово |
+| REQ-s3zip-11 | 1.1 | test_abort_stale_uploads_own_name_only | готово |
+| REQ-s3zip-12 | 2.1 | daily_save_3 | готово |
