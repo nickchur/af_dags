@@ -1,5 +1,5 @@
 """### ⚙️ DAG: `CTL.{wf_name}` — Рабочий процесс
-*2026-10-13 18:12 MSK · v1.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 19:12 MSK · v1.19 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Динамически генерируемый DAG для выполнения ETL-загрузок CTL.
 Поддерживает расписание: `Asset`, `Cron`, `AssetOrTimeSchedule`, `startCondition (AND/OR)`.
@@ -574,8 +574,6 @@ def build_worker_dag(w):
             # 'owner': 'EDP.ETL',
             'owner': profile,
             'depends_on_past': False,
-            'email_on_failure': False,
-            'email_on_retry': False,
             'retries': 2,
             'retry_delay': timedelta(minutes=1),
             'retry_exponential_backoff': True,  

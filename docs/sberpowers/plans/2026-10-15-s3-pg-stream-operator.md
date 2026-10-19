@@ -455,6 +455,11 @@ HrpS3ToPgStreamOperator(
 - [x] Стенд AF3 (ядро 3.0.1, psycopg 3): `tools_test_pg_stream` на `cap_gp_etl` и `gp6-stand` → success.
 - [x] Ревью правки драйверов двумя моделями и поиском молча проглоченных ошибок.
 - [x] ~~Та же правка в Airflow 2~~ — отменено 15.10: AF2 остаётся на psycopg2, правка только в AF3.
+- [x] Гейт на альфе (AF3, Greenplum `alpha-adb_dev_comm-read`) — 19.10.2026, ран
+  `manual__2026-10-19T11:26:33`: `tools_test_pg_stream` → success, сценариев 23, падений нет. `jsonl.gz` 298 МБ
+  (1 040 000 строк) — 49 с, пик RSS 425 МБ, прирост 0 МБ; сбой второй транзакции `tmp_table` оставляет сырьё,
+  отбраковка COPY 5 → 4 + 1. Шум в логе: `_GrabOp.execute cannot be called outside of the Task Runner!` —
+  тест зовёт `execute()` внутри таска; предупреждение OpenTelemetry про `engine` — ядро до 3.0.2.
 
 **Критерии выхода:**
-- `tools_test_pg_stream` success на AF3 и AF2, оба подключения.
+- `tools_test_pg_stream` success на AF3: оба подключения стенда и Greenplum альфы.

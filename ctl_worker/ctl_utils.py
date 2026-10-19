@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-10-14 16:00 MSK · v1.14 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 17:34 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -231,6 +231,24 @@ def rate_limit(pool_name='ctl_pool', ctl_api_calls=None):
             _last_call_time[pool_name] = current_time
     
 
+#: Сколько секунд процесс верит прочитанному состоянию gp_pool (REQ-ctl-api-01)
+GP_POOL_TTL = 60
+_gp_pool = {'ts': None, 'open': False}
+
+
+def _gp_pool_open() -> bool:
+    """gp_pool открыт. Метабазу спрашивает не чаще раза в GP_POOL_TTL: ctl_api зовут сотни раз
+    за задачу, а каждое чтение — новое подключение. Неудачное чтение до конца TTL оставляет
+    пул закрытым — повторно висеть на подключении не будем, исключение уходит наверх."""
+    if _gp_pool['ts'] is None or time.monotonic() - _gp_pool['ts'] >= GP_POOL_TTL:
+        _gp_pool['open'] = False
+        try:
+            _gp_pool['open'] = pool_size('gp_pool') > 0
+        finally:
+            _gp_pool['ts'] = time.monotonic()
+    return _gp_pool['open']
+
+
 class CtlTooManyRequests(Exception):
     """CTL ответил 429: запрос не выполнен, его можно повторить после паузы."""
 
@@ -307,24 +325,34 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
     except:
         out = response.text
     
-    if method == 'GET': 
-        # Журнал в GP — когда GP доступен (gp_pool открыт). С первого коммита (054ff46) здесь
-        # стояло «not pool_slots(...)», то есть журнал писался только при закрытом GP и падал в
-        # except; к тому же pool_slots пишет в slot_pool, а здесь нужно только прочитать
-        if gp_log and 'tmpl' not in url and 'statval' not in url and pool_size('gp_pool') > 0:
-            
-            ts = time.time()
-            url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
+    if method == 'GET' and gp_log and 'tmpl' not in url and 'statval' not in url:
+        # Журнал в GP — когда GP доступен (gp_pool открыт). Проверка внутри try: журнал
+        # необязателен, и отказ метабазы не должен ронять сам GET (REQ-ctl-api-02)
+        ts = time.time()
+        url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
+        try:
+            pool_open = _gp_pool_open()
+        except Exception as e:
+            pool_open = False
+            msg = f"⚠️ gp_pool не прочитан из метабазы — журнал CTL в GP пропущен на {GP_POOL_TTL} с: {e}"
+            logger.error(msg)
+            try:
+                add_note(msg, level='Task', title='Журнал CTL в GP')
+            except Exception:  # вне контекста задачи заметке некуда писать — лога выше достаточно
+                pass
+        if pool_open:
             try:
                 import json
-                # Параметрами, а не f-строкой: журнал теперь пишется на каждый GET, и кавычка в
-                # URL или «$jsn$» в ответе CTL ломали бы запрос (и открывали бы подстановку SQL)
+                # Параметрами, а не f-строкой: кавычка в URL или «$jsn$» в ответе CTL ломали бы
+                # запрос (и открывали бы подстановку SQL)
                 gp_exe("select pr_log_ctl(%s, %s)", (url, json.dumps(out)))
                 logger.debug(f"{time.time()-ts:.2f} sec ✅ Записан лог в GP")
             except Exception as e:
                 logger.error(f"{time.time()-ts:.2f} sec ❌ Ошибка записи лога в GP: {str(e)}")
         else:
-            logger.debug(f"✅ Запрос к API без логирования")
+            logger.debug("✅ gp_pool закрыт, журнал в GP не пишем")
+    else:
+        logger.debug(f"✅ Запрос к API без логирования")
 
     return out
 

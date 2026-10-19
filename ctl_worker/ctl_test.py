@@ -1,5 +1,5 @@
 """### 🧪 DAG: Симулятор нагрузки CTL
-*2026-10-01 18:02 MSK · v1.9 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 19:12 MSK · v1.10 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Генерирует нагрузку: события сущностей, Asset-сигналы или запуски дагов воркфлоу.
 Режим задаётся ключом `simulator` в `ctl_config`, частота — `simulator_interval`.
@@ -97,9 +97,6 @@ else:
         default_args={ 
         'owner': 'EDP.ETL',
             'depends_on_past': False,
-            'email': ['p1080@sber.ru'],
-            'email_on_failure': False,
-            'email_on_retry': False,
             'retries': 2,
             'retry_delay': timedelta(minutes=1),
             "on_failure_callback": on_callback,
