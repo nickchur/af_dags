@@ -1,5 +1,5 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-16 22:37 MSK · v0.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 21:36 MSK · v0.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
@@ -375,6 +375,15 @@ def tools_test_pg_stream():
                 assert q(f"select employeeid, name, hired::text, load_dttm is not null from {tc} order by 1") == \
                     [(1, "Анна", "2026-01-01", True), (2, None, "2026-01-02", True)]
                 ok("REQ-23/24/27 раскладка: employeeId → employeeid, extra в лог, NULL, default now()")
+
+                # колонка-массив и JSON-массив в jsonb в одной записи: массив PG — из JSON-массива (GP6),
+                # jsonb-массив не теряется
+                ta = mk("arr", "id int, a int[], j jsonb")
+                run("arr", put("arr.json", b'[{"id": 1, "a": [1, 2], "j": [1, 2]}, {"id": 2, "a": "{3}", "j": {"k": 1}}]'),
+                    ta, truncate="hard")
+                got = q(f"select id, a, j::text from {ta} order by 1")
+                assert got == [(1, [1, 2], "[1, 2]"), (2, [3], '{"k": 1}')], got
+                ok("массивы: int[] из JSON-массива и из литерала, JSON-массив в jsonb цел")
 
                 # REQ-24: ключи, различающиеся регистром; REQ-25: неприводимое значение — откат
                 for name, body, want in (("case", b'{"employeeId": 3, "a": 1, "A": 2}\n', "регистром"),

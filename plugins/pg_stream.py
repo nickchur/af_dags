@@ -1,5 +1,5 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-16 22:25 MSK · v0.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 21:36 MSK · v0.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Для баз, где длинная транзакция
@@ -829,9 +829,10 @@ class HrpS3ToPgStreamOperator(BaseOperator):
             arrays = {c for c in cols if ctx.target[c].startswith("_")}
             sel = [_array_col(c, ctx.target[c]) if c in arrays else "r." + _ident(c) for c in cols]
             item = "t.item"
-            if arrays:  # JSON-массивы — мимо populate_record: на GP6 он падает на них (см. _array_col)
-                item = ("(select json_object_agg(key, value) from jsonb_each(t.item) "
-                        "where jsonb_typeof(value) <> 'array')::jsonb")
+            if arrays:  # JSON-массивы колонок-массивов — мимо populate_record: на GP6 он падает на них (см. _array_col)
+                keys = ", ".join("'" + c.replace("'", "''") + "'" for c in sorted(arrays))
+                item = ("coalesce((select json_object_agg(key, value) from jsonb_each(t.item) "
+                        f"where not (key in ({keys}) and jsonb_typeof(value) = 'array')), '{{}}')::jsonb")
             src = f"{raw} t, jsonb_populate_record(null::{tbl}, {item}) r"
             if km.extra:
                 extra = sorted(km.extra)
