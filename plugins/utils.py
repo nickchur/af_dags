@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-14 16:00 MSK · v1.26 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 19:12 MSK · v1.27 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -324,9 +324,6 @@ default_args = {
     'owner': 'EDP.ETL',
     'depends_on_past': False,
     'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
-    'email': ['p1080@sber.ru'],
-    'email_on_failure': False,
-    'email_on_retry': False,
     'retries': 2,
     'retry_delay': timedelta(minutes=1),
     'pool': 'default_pool',

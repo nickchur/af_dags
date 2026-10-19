@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-10-01 18:02 MSK · v1.10 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 19:12 MSK · v1.11 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
@@ -121,9 +121,6 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         'owner': 'EDP.ETL',
         'depends_on_past': False,
         'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
-        'email': ['p1080@sber.ru'],
-        'email_on_failure': False,
-        'email_on_retry': False,
         'retries': 2,
         'retry_delay': timedelta(minutes=1),
         'pool': 'ctl_pool',

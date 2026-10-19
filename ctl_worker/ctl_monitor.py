@@ -1,5 +1,5 @@
 """### 📊 DAG: Мониторинг CTL
-*2026-10-14 16:00 MSK · v1.21 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-19 19:12 MSK · v1.22 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Каждые 15 минут анализирует активные загрузки и выполняет автоматические действия.
 
@@ -160,9 +160,6 @@ with DAG(f'CTL.{get_config()["profile"]}.monitor',
         'owner': 'EDP.ETL',
         'depends_on_past': False,
         'start_date': datetime(2025, 1, 1, tzinfo=timezone.utc),
-        'email': ['p1080@sber.ru'],
-        'email_on_failure': False,
-        'email_on_retry': False,
         'retries': 2,
         'retry_delay': timedelta(minutes=1),
         'pool': 'ctl_pool',
