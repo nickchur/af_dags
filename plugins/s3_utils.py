@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-10-19 15:40 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 17:13 MSK · v1.9 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -25,7 +25,7 @@ from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
 from stream_unzip import stream_unzip # type: ignore
 from stream_zip import stream_zip, ZIP_AUTO  # type: ignore
-from airflow.sdk.exceptions import AirflowFailException
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 
 # Фолбэк обязателен: на контуре модуль лежит не в plugins/, а в CI06932748/tools/,
 # и пакета plugins там нет. Без него ломался не только этот файл — tfs_utils, который
@@ -36,8 +36,9 @@ except ImportError:
     from CI06932748.tools.utils import readable_size, get_conns_by_type  # type: ignore
 
 from fnmatch import fnmatch
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 import base64
+import re
 import stat
 import hashlib
 import time
@@ -611,17 +612,23 @@ def s3_from_zip(src_path, dst_prefix, compress=True):
 
     return total_uploaded_size, total_count, stats
 
-def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, replace=False, part_size=64 * 1024**2):
+MSK = timezone(timedelta(hours=3))  # MSK круглый год UTC+3
+
+
+def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, replace=False, part_size=64 * 1024**2,
+              name=None, ts=None):
     """Потоково собирает объекты S3 в один ZIP64 в S3 — без диска и без буфера под весь архив.
 
     src_path — conn_id://bucket/путь: без маски берёт всё под путём, с маской (* ?) — по fnmatch.
-    dst_path на .zip — ключ архива, иначе папка: имя <последняя папка src>_<UTC-время>.zip.
-    date_from/date_to — 'YYYY-MM-DD' по LastModified (UTC, включительно). max_bytes — лимит
+    dst_path на .zip — ключ архива, иначе папка: имя name (по умолчанию последняя папка src).
+    ts — метка: к имени добавляется _<ts>, в том числе перед .zip ключа. Пустой отбор — skip.
+    date_from/date_to — 'YYYY-MM-DD' по LastModified в MSK (включительно). max_bytes — лимит
     сырого объёма (0 — без лимита). Своя multipart-загрузка: при сбое отменяется, хвостов нет;
     часть растёт с объёмом, чтобы не упереться в 10 000 частей. В памяти — буфер части и
     список отобранных ключей кортежами (~200 байт на объект): лимит нужен до записи.
     Хвосты жёстко убитого пода (OOM, SIGKILL — отмена не успела) снимаются в начале следующего
-    вызова: незавершённые загрузки *.zip прямо в папке архива. Папка — только для этого дага.
+    вызова: незавершённые загрузки этого же имени (<имя>.zip, <имя>_<YYYYMMDD_HHMMSS>.zip) в папке
+    архива — чужие имена (другие src того же рана) не трогаются.
     Уже сжатые файлы — deflate уровня 0: NO_COMPRESSION_64 держит файл в памяти ради CRC.
     """
     src, dst = s3_path_parse(src_path), s3_path_parse(dst_path)
@@ -632,9 +639,13 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
         raise AirflowFailException(f"Формат дат — YYYY-MM-DD: {e}")
 
     dst_key = dst['key']
-    if not dst_key.lower().endswith('.zip'):
-        name = base.rstrip('/').rsplit('/', 1)[-1] or src['bucket']
-        dst_key = (dst_key.rstrip('/') + '/' if dst_key else '') + f"{name}_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.zip"
+    if dst_key.lower().endswith('.zip'):
+        folder, _, stem = dst_key.rpartition('/')
+        folder, stem = folder + '/' if folder else '', stem[:-4]
+    else:
+        folder = dst_key.rstrip('/') + '/' if dst_key else ''
+        stem = name or base.rstrip('/').rsplit('/', 1)[-1] or src['bucket']
+    dst_key = f"{folder}{stem}{'_' + ts if ts else ''}.zip"
     out = f"{dst['conn_id']}://{dst['bucket']}/{dst_key}"
     s_cli = S3Hook(aws_conn_id=src['conn_id']).get_conn()
     d_cli = S3Hook(aws_conn_id=dst['conn_id']).get_conn()
@@ -646,11 +657,11 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
             if e.response['Error']['Code'] not in ('404', 'NoSuchKey', 'NotFound'):
                 raise
 
-    folder = dst_key.rpartition('/')[0] + '/' if '/' in dst_key else ''
+    own = re.compile(re.escape(stem) + r'(_\d{8}_\d{6})?\.zip')
     aborted = []
     for page in d_cli.get_paginator('list_multipart_uploads').paginate(Bucket=dst['bucket'], Prefix=folder):
         for u in page.get('Uploads', []):
-            if u['Key'].lower().endswith('.zip') and '/' not in u['Key'][len(folder):]:
+            if own.fullmatch(u['Key'][len(folder):]):
                 d_cli.abort_multipart_upload(Bucket=dst['bucket'], Key=u['Key'], UploadId=u['UploadId'])
                 aborted.append(u['Key'])
     if aborted:
@@ -659,7 +670,7 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
     objs = []
     for page in s_cli.get_paginator('list_objects_v2').paginate(Bucket=src['bucket'], Prefix=base):
         for o in page.get('Contents', []):
-            k, day = o['Key'], o['LastModified'].astimezone(timezone.utc).date()
+            k, day = o['Key'], o['LastModified'].astimezone(MSK).date()
             if k.endswith('/') or (src['is_mask'] and not fnmatch(k, src['key'])) \
                     or (src['conn_id'] == dst['conn_id'] and src['bucket'] == dst['bucket'] and k == dst_key) \
                     or (d_from and day < d_from) or (d_to and day > d_to):
@@ -667,7 +678,7 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
             objs.append((k, o['Size'], o['LastModified']))
     raw = sum(o[1] for o in objs)
     if not objs:
-        raise AirflowFailException(f"Под {src_path} нечего архивировать (даты {date_from}…{date_to})")
+        raise AirflowSkipException(f"Под {src_path} нечего архивировать (даты MSK {date_from}…{date_to})")
     if max_bytes and raw > max_bytes:
         raise AirflowFailException(
             f"{len(objs)} объектов, {readable_size(raw)} — больше лимита {readable_size(max_bytes)}")
