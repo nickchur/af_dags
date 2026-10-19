@@ -1,5 +1,5 @@
 """### 🗜️ DAG: ZIP-архив из S3 в S3
-*2026-10-19 17:42 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 17:52 MSK · v1.2 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (по умолчанию 01:30 MSK) архивирует вчерашнее по MSK (ручной запуск без дат — сегодняшнее): на каждый путь из `src` — свой ZIP64 в `dst`.
 Сборка потоковая — без диска воркера и без буфера под весь архив; исходники не трогает. По умолчанию — логи задач
@@ -47,6 +47,11 @@ SAVED = saved_params(PARAMS_VAR)
 def _param(key, default, **kwargs):
     """Param со значением по умолчанию из переменной, если оно там есть."""
     return Param(SAVED.get(key, default), **kwargs)
+
+
+def _manual(run_type):
+    """Ручной ли ран: DagRunType или строка — сравниваем значение, а не тип."""
+    return str(getattr(run_type, 'value', run_type)) == 'manual'
 
 
 def _jobs(p, now, manual=False):
@@ -155,7 +160,7 @@ def tools_s3_to_zip():
     def jobs(params=None, **context):
         """🧮 Раскладка по архивам: пустые даты — вчера (авто) или сегодня (вручную) по MSK, имена, одна метка."""
         dr = context['dag_run']
-        j = _jobs(params, dr.run_after, manual=dr.run_type == 'manual')
+        j = _jobs(params, dr.run_after, manual=_manual(dr.run_type))
         add_note({x['name']: x['src'] for x in j}, context)
         return j
 
