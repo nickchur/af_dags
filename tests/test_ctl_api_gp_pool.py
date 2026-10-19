@@ -35,8 +35,21 @@ def env(monkeypatch):
     monkeypatch.setattr(ctl_utils, 'get_config', lambda: {})
     monkeypatch.setattr(ctl_utils.time, 'monotonic', lambda: now[0])
     monkeypatch.setattr(ctl_utils, '_gp_pool', {'ts': None, 'open': False})
+    calls.notes = []
+    monkeypatch.setattr(ctl_utils, 'add_note', lambda msg, **k: calls.notes.append(msg))
     calls.now = now
     return calls
+
+
+@pytest.mark.parametrize('kw', [
+    {'url': '/v5/api/wf/1', 'gp_log': False},
+    {'url': '/v5/api/wf/1', 'method': 'POST'},
+    {'url': '/v5/api/tmpl/1'},
+    {'url': '/v5/api/statval/1'},
+])
+def test_no_journal_no_metabase(env, kw):
+    ctl_utils.ctl_api(**kw)
+    assert env.pool == 0 and env.gp == 0
 
 
 def test_pool_read_once_per_ttl(env):
@@ -54,11 +67,14 @@ def test_closed_pool_skips_journal(env):
     assert env.pool == 1 and env.gp == 0
 
 
-def test_metabase_failure_does_not_fail_get(env):
+def test_metabase_failure_does_not_fail_get(env, caplog):
     env.pool_exc = TimeoutError('connection timeout expired')
-    assert ctl_utils.ctl_api('/v5/api/wf/1') == {'ok': 1}
+    with caplog.at_level('ERROR'):
+        assert ctl_utils.ctl_api('/v5/api/wf/1') == {'ok': 1}
     assert ctl_utils.ctl_api('/v5/api/wf/2') == {'ok': 1}
     assert env.pool == 1 and env.gp == 0  # в пределах TTL метабазу не трогаем
+    assert any('gp_pool не прочитан' in r.getMessage() for r in caplog.records)
+    assert len(env.notes) == 1 and 'connection timeout expired' in env.notes[0]
     env.pool_exc = None
     env.now[0] += ctl_utils.GP_POOL_TTL
     ctl_utils.ctl_api('/v5/api/wf/3')

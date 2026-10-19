@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-10-19 17:25 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 17:34 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -331,16 +331,26 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         ts = time.time()
         url = url[7:] if url.startswith('/v5/api') or url.startswith('/v4/api') else url
         try:
-            if _gp_pool_open():
+            pool_open = _gp_pool_open()
+        except Exception as e:
+            pool_open = False
+            msg = f"⚠️ gp_pool не прочитан из метабазы — журнал CTL в GP пропущен на {GP_POOL_TTL} с: {e}"
+            logger.error(msg)
+            try:
+                add_note(msg, level='Task', title='Журнал CTL в GP')
+            except Exception:  # вне контекста задачи заметке некуда писать — лога выше достаточно
+                pass
+        if pool_open:
+            try:
                 import json
                 # Параметрами, а не f-строкой: кавычка в URL или «$jsn$» в ответе CTL ломали бы
                 # запрос (и открывали бы подстановку SQL)
                 gp_exe("select pr_log_ctl(%s, %s)", (url, json.dumps(out)))
                 logger.debug(f"{time.time()-ts:.2f} sec ✅ Записан лог в GP")
-            else:
-                logger.debug("✅ gp_pool закрыт, журнал в GP не пишем")
-        except Exception as e:
-            logger.error(f"{time.time()-ts:.2f} sec ❌ Ошибка записи лога в GP: {str(e)}")
+            except Exception as e:
+                logger.error(f"{time.time()-ts:.2f} sec ❌ Ошибка записи лога в GP: {str(e)}")
+        else:
+            logger.debug("✅ gp_pool закрыт, журнал в GP не пишем")
     else:
         logger.debug(f"✅ Запрос к API без логирования")
 
