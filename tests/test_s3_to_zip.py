@@ -8,7 +8,7 @@ import zipfile
 from datetime import datetime, timezone
 
 import pytest
-from airflow.sdk.exceptions import AirflowFailException
+from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
 from botocore.exceptions import ClientError
 
 from plugins import s3_utils
@@ -96,15 +96,7 @@ def test_roundtrip_prefix_multipart(cl):
     assert len(cl.objs['arc/x.zip'][0]) == r['size'] and r['size'] > 100_000
 
 
-def test_mask_dates_and_auto_name(cl):
-    r = s3_utils.s3_to_zip('s3://b/logs/*/*.log', 's3://b/arc/', date_from='2026-10-05', date_to='2026-10-05')
-    assert r['path'].startswith('s3://b/arc/logs_') and r['path'].endswith('.zip')
-    assert unzip(cl, r['path'].split('/', 3)[3]) == {'b/3.log': b'y' * 10}
-
-
-def test_empty_limit_exists_bad_date(cl):
-    with pytest.raises(AirflowFailException, match='нечего'):
-        s3_utils.s3_to_zip('s3://b/nope/', 's3://b/arc/')
+def test_limit_exists_bad_date(cl):
     with pytest.raises(AirflowFailException, match='лимит'):
         s3_utils.s3_to_zip('s3://b/logs/', 's3://b/arc/', max_bytes=1000)
     s3_utils.s3_to_zip('s3://b/logs/', 's3://b/x.zip')
@@ -122,16 +114,42 @@ def test_abort_on_failure(cl):
     assert cl.aborted == ['arc/y.zip'] and 'arc/y.zip' not in cl.objs
 
 
-def test_abort_stale_uploads(cl):
-    cl.parts = {'arc/old.zip': [b'part'], 'arc/sub/keep.zip': [b'p'], 'arc/keep.csv': [b'p']}
-    r = s3_utils.s3_to_zip('s3://b/logs/', 's3://b/arc/z.zip')
-    assert cl.aborted == ['arc/old.zip'] and r['aborted'] == ['arc/old.zip']
-    assert set(cl.parts) == {'arc/sub/keep.zip', 'arc/keep.csv'}
-
-
 def test_zip64_many_entries(cl):
     """Больше 65 535 записей — нужен ZIP64-каталог; несколько страниц листинга."""
     cl.objs.update({f'many/{i:05}.log': (b'', D1) for i in range(66_000)})
     r = s3_utils.s3_to_zip('s3://b/many/', 's3://b/arc/many.zip')
     with zipfile.ZipFile(io.BytesIO(cl.objs['arc/many.zip'][0])) as z:
         assert len(z.infolist()) == r['count'] == 66_000
+
+
+def test_mask_dates_and_name_ts(cl):
+    r = s3_utils.s3_to_zip('s3://b/logs/*/*.log', 's3://b/arc/', date_from='2026-10-05', date_to='2026-10-05',
+                           ts='20261019_013000')
+    assert r['path'] == 's3://b/arc/logs_20261019_013000.zip'
+    assert unzip(cl, 'arc/logs_20261019_013000.zip') == {'b/3.log': b'y' * 10}
+    r = s3_utils.s3_to_zip('s3://b/logs/b/', 's3://b/arc/x.zip', name='ignored', ts='T')
+    assert r['path'] == 's3://b/arc/x_T.zip'                      # метка и в ключе .zip
+    r = s3_utils.s3_to_zip('s3://b/logs/b/', 's3://b/arc/', name='logs_2')
+    assert r['path'] == 's3://b/arc/logs_2.zip'                   # без метки — имя как есть
+
+
+def test_dates_msk_boundary(cl):
+    """23:30 UTC 4 октября — это уже 5 октября по MSK."""
+    cl.objs['msk/late.log'] = (b'L', datetime(2026, 10, 4, 23, 30, tzinfo=timezone.utc))
+    cl.objs['msk/early.log'] = (b'E', datetime(2026, 10, 4, 20, 30, tzinfo=timezone.utc))
+    r = s3_utils.s3_to_zip('s3://b/msk/', 's3://b/arc/m.zip', date_from='2026-10-05', date_to='2026-10-05')
+    assert unzip(cl, 'arc/m.zip') == {'late.log': b'L'} and r['count'] == 1
+
+
+def test_empty_skips(cl):
+    with pytest.raises(AirflowSkipException, match='нечего'):
+        s3_utils.s3_to_zip('s3://b/nope/', 's3://b/arc/')
+    assert 'arc/nope.zip' not in cl.objs and not cl.parts
+
+
+def test_abort_stale_uploads_own_name_only(cl):
+    cl.parts = {'arc/logs_20261018_013000.zip': [b'p'], 'arc/logs.zip': [b'p'], 'arc/logs_2_20261018_013000.zip': [b'p'],
+                'arc/other_20261018_013000.zip': [b'p'], 'arc/sub/logs.zip': [b'p'], 'arc/logs.ZIP': [b'p']}
+    r = s3_utils.s3_to_zip('s3://b/logs/', 's3://b/arc/', ts='20261019_013000')
+    assert sorted(r['aborted']) == ['arc/logs.ZIP', 'arc/logs.zip', 'arc/logs_20261018_013000.zip']
+    assert set(cl.parts) == {'arc/logs_2_20261018_013000.zip', 'arc/other_20261018_013000.zip', 'arc/sub/logs.zip'}
