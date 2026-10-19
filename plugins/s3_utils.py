@@ -1,5 +1,5 @@
 """###🛠️ Утилиты S3 (`plugins/s3_utils.py`)
-*2026-10-19 15:31 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 15:40 MSK · v1.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Расширенные функции для работы с S3.
 
@@ -25,7 +25,7 @@ from botocore.exceptions import ClientError
 from boto3.s3.transfer import TransferConfig
 from stream_unzip import stream_unzip # type: ignore
 from stream_zip import stream_zip, ZIP_AUTO  # type: ignore
-from airflow.exceptions import AirflowFailException
+from airflow.sdk.exceptions import AirflowFailException
 
 # Фолбэк обязателен: на контуре модуль лежит не в plugins/, а в CI06932748/tools/,
 # и пакета plugins там нет. Без него ломался не только этот файл — tfs_utils, который
@@ -617,7 +617,9 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
     src_path — conn_id://bucket/путь: без маски берёт всё под путём, с маской (* ?) — по fnmatch.
     dst_path на .zip — ключ архива, иначе папка: имя <последняя папка src>_<UTC-время>.zip.
     date_from/date_to — 'YYYY-MM-DD' по LastModified (UTC, включительно). max_bytes — лимит
-    сырого объёма (0 — без лимита). Своя multipart-загрузка: при сбое отменяется, хвостов нет.
+    сырого объёма (0 — без лимита). Своя multipart-загрузка: при сбое отменяется, хвостов нет;
+    часть растёт с объёмом, чтобы не упереться в 10 000 частей. В памяти — буфер части и
+    список отобранных ключей кортежами (~200 байт на объект): лимит нужен до записи.
     Хвосты жёстко убитого пода (OOM, SIGKILL — отмена не успела) снимаются в начале следующего
     вызова: незавершённые загрузки *.zip прямо в папке архива. Папка — только для этого дага.
     Уже сжатые файлы — deflate уровня 0: NO_COMPRESSION_64 держит файл в памяти ради CRC.
@@ -659,11 +661,11 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
         for o in page.get('Contents', []):
             k, day = o['Key'], o['LastModified'].astimezone(timezone.utc).date()
             if k.endswith('/') or (src['is_mask'] and not fnmatch(k, src['key'])) \
-                    or (src['bucket'] == dst['bucket'] and k == dst_key) \
+                    or (src['conn_id'] == dst['conn_id'] and src['bucket'] == dst['bucket'] and k == dst_key) \
                     or (d_from and day < d_from) or (d_to and day > d_to):
                 continue
-            objs.append(o)
-    raw = sum(o['Size'] for o in objs)
+            objs.append((k, o['Size'], o['LastModified']))
+    raw = sum(o[1] for o in objs)
     if not objs:
         raise AirflowFailException(f"Под {src_path} нечего архивировать (даты {date_from}…{date_to})")
     if max_bytes and raw > max_bytes:
@@ -672,11 +674,13 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
     logger.info(f"📦 {len(objs)} объектов, {readable_size(raw)} → {out}")
 
     def members():
-        for o in objs:
-            level = 0 if o['Key'].lower().endswith(('.gz', '.zip', '.parquet')) else 6
-            body = s_cli.get_object(Bucket=src['bucket'], Key=o['Key'])['Body']
-            yield (o['Key'][len(base):], o['LastModified'], stat.S_IFREG | 0o644,
-                   ZIP_AUTO(o['Size'], level=level), body.iter_chunks(1024**2))
+        for k, sz, mtime in objs:
+            level = 0 if k.lower().endswith(('.gz', '.zip', '.parquet')) else 6
+            body = s_cli.get_object(Bucket=src['bucket'], Key=k)['Body']
+            yield k[len(base):], mtime, stat.S_IFREG | 0o644, ZIP_AUTO(sz, level=level), body.iter_chunks(1024**2)
+
+    # Архив не больше сырого объёма с заголовками; 9 000 частей — запас до лимита S3 в 10 000
+    part_size = max(part_size, (raw + 1024 * len(objs)) // 9000 + 1)
 
     start, size, parts, buf = time.time(), 0, [], bytearray()
     upload_id = d_cli.create_multipart_upload(Bucket=dst['bucket'], Key=dst_key)['UploadId']
@@ -698,7 +702,10 @@ def s3_to_zip(src_path, dst_path, date_from=None, date_to=None, max_bytes=0, rep
         d_cli.complete_multipart_upload(Bucket=dst['bucket'], Key=dst_key, UploadId=upload_id,
                                         MultipartUpload={'Parts': parts})
     except BaseException:
-        d_cli.abort_multipart_upload(Bucket=dst['bucket'], Key=dst_key, UploadId=upload_id)
+        try:
+            d_cli.abort_multipart_upload(Bucket=dst['bucket'], Key=dst_key, UploadId=upload_id)
+        except Exception as e:  # исходная ошибка важнее: хвост снимет следующий запуск (REQ-s3zip-11)
+            logger.error(f"❌ Не отменена загрузка {out}: {e}")
         raise
     sec = round(time.time() - start, 1)
     stats = {'path': out, 'count': len(objs), 'raw': raw, 'size': size, 'sec': sec,
