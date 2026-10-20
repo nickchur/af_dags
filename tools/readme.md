@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-15 14:49 MSK · v1.85 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 14:24 MSK · v1.86 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > **Airflow 3.** Порт `af_dags@89117cf`. Метабаза — через `plugins/af_meta.py`, отличия от Airflow 2 — в `readme.md` корня.
 
@@ -65,8 +65,8 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 **Мониторинг и проверка всех Airflow Connections.**
 
 DAG автоматически обнаруживает все подключения и проверяет их доступность.
-*   **Список в том же ране**: первый таск `collect` снимает подключения из secret backend
-    (заметка — строка на тип; полная таблица `conn_type, conn_id, host, port, schema, description` — в логе; тот же словарь, что в Variable, — в XCom `collect` под ключом `connections`)
+*   **Список в том же ране**: после `params` таск `collect` снимает подключения из secret backend
+    (заметка — строка на тип; полная таблица `conn_type, conn_id, host, port, schema, description` — в логе; тот же словарь `{conn_type: {conn_id: {host, port, schema, description}}}`, что в Variable, — в XCom `collect` под ключом `connections`)
     и пишет Variable `local_connections` — из неё строят выпадающие списки kafka-подключений
     `test_kafka` и `ctl_tfs`. Разбор файла Variable не читает. До 29.09.2026 список снимал
     отдельный даг `show_connections`.
