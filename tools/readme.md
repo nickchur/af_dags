@@ -66,7 +66,7 @@ DAG'а в `test_dags`): красный, чтобы клетка называла
 
 DAG автоматически обнаруживает все подключения и проверяет их доступность.
 *   **Список в том же ране**: первый таск `collect` снимает подключения из secret backend
-    (заметка — строка на тип; полная таблица `conn_type, conn_id, host, port, schema, description` — в логе; тот же словарь, что в Variable, — в XCom `collect` под ключом `connections`)
+    (заметка — строка на тип; полная таблица `conn_type, conn_id, host, port, schema, description` — в логе; тот же словарь `{conn_type: {conn_id: {host, port, schema, description}}}`, что в Variable, — в XCom `collect` под ключом `connections`)
     и пишет Variable `local_connections` — из неё строят выпадающие списки kafka-подключений
     `test_kafka` и `ctl_tfs`. Разбор файла Variable не читает. До 29.09.2026 список снимал
     отдельный даг `show_connections`.

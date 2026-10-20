@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-16 16:06 MSK · v3.16 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-20 14:19 MSK · v3.17 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -506,15 +506,15 @@ def tools_test_connections():  # noqa: PLR0915
         logger.info("Loaded %d connections from backend", len(conns))
 
         # Variable — для выпадающих списков kafka-подключений (test_kafka, ctl_tfs):
-        # {conn_type: [{conn_id, host, ...}]}, sqlite показываем как clickhouse
-        by_type = defaultdict(list)
+        # {conn_type: {conn_id: {host, port, ...}}}, sqlite показываем как clickhouse
+        by_type = defaultdict(dict)
         items = []
         for cid, conn in sorted(conns.items()):
             host, port = _conn_addr(conn.host, conn.port, conn.extra_dejson, conn_id=cid)
-            by_type["clickhouse" if conn.conn_type == "sqlite" else conn.conn_type].append({
-                "conn_id": cid, "host": host, "port": port, "schema": conn.schema,
+            by_type["clickhouse" if conn.conn_type == "sqlite" else conn.conn_type][cid] = {
+                "host": host, "port": port, "schema": conn.schema,
                 "description": conn.description or "No description",
-            })
+            }
             items.append({"group": _group(cid, conn.conn_type), "conn_id": cid, "conn_type": conn.conn_type,
                           "host": host, "port": port})
         Variable.set("local_connections", dict(by_type), serialize_json=True)
@@ -525,12 +525,12 @@ def tools_test_connections():  # noqa: PLR0915
         # Полная таблица — в лог: в заметку (1000 символов) сотня строк не влезает
         headers = ("conn_type", "conn_id", "host", "port", "schema", "description")
         table = ["| " + " | ".join(headers) + " |", "|" + "|".join(["---"] * len(headers)) + "|"]
-        table += ["| " + " | ".join(str(c[h] if h != "conn_type" else ctype) for h in headers) + " |"
-                  for ctype, rows in sorted(by_type.items()) for c in rows]
+        table += ["| " + " | ".join(str({**c, "conn_type": ctype, "conn_id": cid}[h]) for h in headers) + " |"
+                  for ctype, rows in sorted(by_type.items()) for cid, c in rows.items()]
         logger.info("Подключения:\n%s", "\n".join(table))
 
         # Строка на тип, без таблицы: адреса — в логе, в подписях check и в report
-        lines = [f"`{ctype}` ({len(rows)}): " + ", ".join(c["conn_id"] for c in rows)
+        lines = [f"`{ctype}` ({len(rows)}): " + ", ".join(rows)
                  for ctype, rows in sorted(by_type.items(), key=lambda kv: -len(kv[1]))]
         Feed(context, "🔌 collect").done(f"подключений {len(conns)} в {len(by_type)} типах", keep=lines)
         return sorted(items, key=lambda i: (GROUPS.index(i["group"]), i["conn_id"]))
