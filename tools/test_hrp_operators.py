@@ -1,12 +1,12 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-20 15:01 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 16:14 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
-Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач, каждый
-тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор как в бою (Jinja
-окружением дага, политика контура) и сверяет результат, после себя убирает. Тесты группы идут
-друг за другом, группы — параллельно. Оператора нет в пакете или он запрещён политикой — группы
-нет; сломан импорт — в группе одна красная задача. Первая задача `systems` проверяет системы и
-права, последняя `report` пишет сводку по группам. Запуск вручную (`@once`).
+Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
+группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
+как в бою (Jinja окружением дага, политика контура) и сверяет результат, после себя убирает. Тесты
+группы идут друг за другом, группы — параллельно. Оператора нет в пакете или он запрещён политикой —
+группы нет; сломан импорт — в группе одна красная задача. Первая задача `systems` проверяет системы
+и права, последняя `report` пишет сводку по группам. Запуск вручную (`@once`).
 
 PG: `conn.схема` — таблицы в схеме (нужны CREATE и DROP), только `conn` — временные таблицы
 сессии, в базе после рана ничего не остаётся. GP — так же, как PG.
@@ -1370,6 +1370,7 @@ OPS = [
     Op("lineage", "utils.lineage", "extract_lineage_from_sql", set(), [lineage_sql], policy=False),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
+TESTS = "tests."  # группы операторов — внутри группы tests: task_id = tests.<группа>.<тест>
 
 
 # ───────────────────────────────── systems ────────────────────────────────────
@@ -1584,14 +1585,14 @@ def test_hrp_operators_dag():
         groups: dict = {}
         failed = []
         # по задачам дага, а не по ответу API: задача без строки в метабазе — ❌, а не пропажа из сводки
-        test_ids = sorted(tid for tid in dag_.task_ids if "." in tid)  # без systems и report
+        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TESTS))  # без systems и report
         for task_id in test_ids:
             state = states.get(task_id) or "no_status"
             icon = "✅" if state == "success" else "☮️" if state in ("skipped", "upstream_failed", "removed") else "❌"
-            g, case = task_id.split(".", 1)
+            g, case = task_id.removeprefix(TESTS).split(".", 1)
             groups.setdefault(g, {})[case] = icon
             if icon == "❌":
-                failed.append(task_id)
+                failed.append(task_id.removeprefix(TESTS))  # в verdict — <группа>.<тест>, как до группы tests
         pulled = ti.xcom_pull(task_ids=test_ids, key="not_cleaned") if test_ids else []
         if pulled and not isinstance(pulled, list):
             pulled = [pulled]
@@ -1608,7 +1609,7 @@ def test_hrp_operators_dag():
         passed = not (failed or unavailable)
         headline = (f"🧪 HRP operators {'✅ пройден' if passed else '❌ провален'}: "
                     f"✅ {ok} / ❌ {len(failed)} / ☮️ {skip}")
-        lines = [f"❌ {tid} — {(dag_.get_task(tid).doc_md or '').split(':')[0]}" for tid in failed]
+        lines = [f"❌ {tid} — {(dag_.get_task(TESTS + tid).doc_md or '').split(':')[0]}" for tid in failed]
         lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items()) for g, cases in sorted(groups.items())]
         if unavailable:
             lines.append("недоступны: " + ", ".join(unavailable))
@@ -1640,23 +1641,24 @@ def test_hrp_operators_dag():
     systems_t = systems()
     leaves = [systems_t]
     NOT_CREATED.clear()  # процесс разбора живёт долго: без этого остаются группы прошлых разборов
-    for op in OPS:
-        op.loaded, status, why = _load(op)
-        if status in ("missing", "forbidden"):
-            NOT_CREATED[op.group] = "запрещён" if status == "forbidden" else why
-            continue
-        with TaskGroup(op.group, tooltip=op.cls):
-            if status == "broken":
-                imp = broken_import(op.group, why)
-                systems_t >> imp
-                leaves.append(imp)
+    with TaskGroup("tests", tooltip="Тесты операторов: группа на оператор"):
+        for op in OPS:
+            op.loaded, status, why = _load(op)
+            if status in ("missing", "forbidden"):
+                NOT_CREATED[op.group] = "запрещён" if status == "forbidden" else why
                 continue
-            prev = systems_t
-            for case in op.cases:
-                cur = make_test(op, case)
-                prev >> cur
-                prev = cur
-            leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
+            with TaskGroup(op.group, tooltip=op.cls):
+                if status == "broken":
+                    imp = broken_import(op.group, why)
+                    systems_t >> imp
+                    leaves.append(imp)
+                    continue
+                prev = systems_t
+                for case in op.cases:
+                    cur = make_test(op, case)
+                    prev >> cur
+                    prev = cur
+                leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
     # report — единственный лист: ран краснеет через него
     leaves >> report()
 
