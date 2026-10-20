@@ -370,8 +370,11 @@ def _on_callback(context, level=None):
     if level != 'DAG' and not state:
         # Airflow 3: падение, о котором сообщил исполнитель (задача не стартовала, например стояла в очереди,
         # пока лежал контур), — колбэк исполняет dag-processor, а у ti в контексте нет ни состояния, ни
-        # исключения. on_retry_callback у нас не назначен, значит это on_failure_callback
-        state = 'failed'
+        # исключения. Ретрай или падение — по правилу шедулера (TaskInstance.is_eligible_to_retry, 3.3.1):
+        # on_callback стоит и в on_retry_callback (s3_viewer)
+        retries = getattr(getattr(ti, 'task', None), 'retries', 0)
+        max_tries = getattr(ti, 'max_tries', None) or 0
+        state = 'up_for_retry' if retries and try_number <= max_tries else 'failed'
         msg = msg or 'задача не стартовала: падение сообщил исполнитель, исключения нет'
 
     # if state == TaskInstanceState.FAILED:
