@@ -1,5 +1,5 @@
 """🧪 DAG: ручные тесты Kafka.
-*2026-10-01 18:18 MSK · v1.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 14:30 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два ручных DAG'а для проверки Kafka-связки (коннект, топик, формат сообщения) без
 прикладного пайплайна: 📤 `tools_test_kafka_snd` шлёт одно сообщение (по умолчанию —
@@ -86,7 +86,7 @@ DEFAULT_MESSAGE = _default_message()
 def _kafka_conn_ids() -> list[str]:
     """conn_id всех kafka-соединений из Variable `local_connections` — для выпадающего списка.
 
-    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: {conn_id: {host, ...}}}.
     Читаем на парсинге. Если Variable нет
     (test_connections ещё не запускали) — остаются дефолты направлений, чтобы список не
     оказался пустым; они же всегда в списке, иначе выпадашка откроется без своего значения.
@@ -94,7 +94,7 @@ def _kafka_conn_ids() -> list[str]:
     conn_ids = {SND_CONN, RCV_CONN}
     try:
         var_data = Variable.get("local_connections", deserialize_json=True, default_var=None) or {}
-        conn_ids |= {c["conn_id"] for c in var_data.get("kafka", []) if c.get("conn_id")}
+        conn_ids |= set(var_data.get("kafka") or {})
     except Exception as exc:
         logger.warning("Не прочитали local_connections, список conn_id только из дефолтов: %s", exc)
     return sorted(conn_ids)

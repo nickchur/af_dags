@@ -1,5 +1,5 @@
 """### 📁 CTL TFS → S3
-*2026-10-01 18:20 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 14:30 MSK · v1.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Два DAG'а копируют файлы из TFS в `edpetl-files`:
 
@@ -34,7 +34,6 @@ from ctl_worker.ctl_utils import get_config   # type: ignore
 import xml.etree.ElementTree as ET
 import pendulum
 from botocore.exceptions import ClientError
-from fnmatch import fnmatch
 from datetime import timedelta, datetime, timezone
 from logging import getLogger
 
@@ -64,7 +63,7 @@ KAFKA_SND_CONN = 'tfs-kafka-in'
 def _kafka_conn_ids() -> list[str]:
     """conn_id kafka-соединений из Variable `local_connections` — для выпадающего списка.
 
-    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: [{conn_id, host, ...}]}.
+    Variable наполняет таск `collect` DAG'а `tools_test_connections`: {conn_type: {conn_id: {host, ...}}}.
     Читается на парсинге, иначе examples не попадут в форму запуска. Дефолтные коннекты
     держим в списке всегда: без них выпадашка откроется без своего же значения, а при
     недоступной Variable осталась бы пустой.
@@ -72,7 +71,7 @@ def _kafka_conn_ids() -> list[str]:
     conn_ids = {KAFKA_RCV_CONN, KAFKA_SND_CONN}
     try:
         var_data = Variable.get('local_connections', deserialize_json=True, default_var=None) or {}
-        conn_ids |= {c['conn_id'] for c in var_data.get('kafka', []) if c.get('conn_id')}
+        conn_ids |= set(var_data.get('kafka') or {})
     except Exception as exc:
         logger.warning("Не прочитали local_connections, список conn_id только из дефолтов: %s", exc)
     return sorted(conn_ids)
@@ -382,7 +381,7 @@ with DAG(f'CTL.{get_config()["profile"]}.tfs_sensor',
             )
         
         if manual:
-            msg = f">❌ No files found in TFS"
+            msg = ">❌ No files found in TFS"
             add_note(msg, context, level='DAG,Task')
             raise AirflowException(msg)
         else:
