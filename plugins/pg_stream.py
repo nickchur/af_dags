@@ -1,5 +1,5 @@
 """###🛠️ Потоковая загрузка S3 → GP/PG (`plugins/pg_stream.py`)
-*2026-10-15 15:22 MSK · v0.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-19 21:36 MSK · v0.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 `HrpS3ToPgStreamOperator` — один объект S3 в одну таблицу Greenplum или PostgreSQL:
 потоково, одной транзакцией, одной командой COPY на файл. Для баз, где длинная транзакция
@@ -353,6 +353,18 @@ def _truncate(cur, tbl, mode):
         cur.execute("rollback to savepoint pg_stream_trunc")
         cur.execute("delete from " + tbl)
         return "delete"
+
+
+def _array_col(col, typname):
+    """Колонка-массив из JSON-массива. jsonb_populate_record на GP6 (PG 9.4) JSON-массив в массив PG
+    не переводит («malformed array literal: "[4, 5, 6]"», стенд GP 6.25.4, 16.10.2026) и падает на всей
+    записи, поэтому JSON-массивы ему не передаются (`jsonb - key` в 9.4 нет — объект собирается заново);
+    строка-литерал «{1,2}» и null идут через него, как раньше. Порядок — WITH ORDINALITY, [] → пустой массив."""
+    key, c = "'" + col.replace("'", "''") + "'", _ident(col)
+    # ponytail: одномерные массивы; вложенный JSON-массив станет текстом элемента
+    return (f"case jsonb_typeof(t.item->{key}) when 'array' then coalesce((select array_agg(e order by n) "
+            f"from jsonb_array_elements_text(t.item->{key}) with ordinality x(e, n)), '{{}}')::{_ident(typname)} "
+            f"else r.{c} end")
 
 
 def _target_types(cur, description):
@@ -814,8 +826,14 @@ class HrpS3ToPgStreamOperator(BaseOperator):
             cols = [c.name for c in ctx.data if c.name in km.seen]
             if not cols and ctx.feed.n:
                 raise ValueError(f"{self.s3_key}: ни один ключ не совпал с колонками {self.table}")
-            sel = ["r." + _ident(c) for c in cols]
-            src = f"{raw} t, jsonb_populate_record(null::{tbl}, t.item) r"
+            arrays = {c for c in cols if ctx.target[c].startswith("_")}
+            sel = [_array_col(c, ctx.target[c]) if c in arrays else "r." + _ident(c) for c in cols]
+            item = "t.item"
+            if arrays:  # JSON-массивы колонок-массивов — мимо populate_record: на GP6 он падает на них (см. _array_col)
+                keys = ", ".join("'" + c.replace("'", "''") + "'" for c in sorted(arrays))
+                item = ("coalesce((select json_object_agg(key, value) from jsonb_each(t.item) "
+                        f"where not (key in ({keys}) and jsonb_typeof(value) = 'array')), '{{}}')::jsonb")
+            src = f"{raw} t, jsonb_populate_record(null::{tbl}, {item}) r"
             if km.extra:
                 extra = sorted(km.extra)
                 self.log.warning("⚠️ ключи без колонки в %s отброшены (%s): %s", self.table, len(extra),
