@@ -40,7 +40,12 @@
 
 ## Non-goals
 
-В исходной спецификации границы не записаны; дополняется при первой дельте
+- **REMOVED: REQ-plugins-07…28** (дельта `2026-10-15-s3-pg-stream-operator.md`, оператор
+  `HrpS3ToPgStreamOperator`). В baseline не вносятся: оператор перенесён в пакет etl-core 3.0.2
+  (`hrp_operators/s3_to_pg_stream.py`, REQ-pgs-core-01…06 спеки etl-core `2026-10-19-s3-to-pg-stream-core.md`),
+  и обязанности теперь у пакета. `plugins/pg_stream.py` живёт до выкладки 3.0.2 на альфу: проверка
+  `tools_test_pg_stream` на операторе пакета, переход дагов, затем удаление модуля. Номера 07…28 не
+  переиспользуются.
 
 ## Критерии приёмки
 
@@ -70,3 +75,4 @@
 | REQ-plugins-04 | — | — | реализовано |
 | REQ-plugins-05 | — | — | реализовано |
 | REQ-plugins-06 | — | — | реализовано |
+| REQ-plugins-07…28 | дельта 2026-10-15 | `tools_test_pg_stream` | удалено (перенесено в etl-core 3.0.2) |
