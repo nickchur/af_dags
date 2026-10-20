@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-19 21:57 MSK · v2.4 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 15:01 MSK · v2.5 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач, каждый
 тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор как в бою (Jinja
@@ -80,7 +80,7 @@ PROBE = "rg_probe"
 # ───────────────────────── Единый источник данных ─────────────────────────────
 # (name, pg_type, ch_type_typed, ch_type_string, comment) — комменты обязательны для QG.
 COLUMNS = [
-    ("id",          "integer",          "Int32",                    "String", "Первичный ключ строки"),
+    ("id",          "integer",          "Int32",                    "String", "Идентификатор строки"),
     ("name",        "text",             "String",                   "String", "Обычная строка без спецсимволов"),
     ("s_special",   "text",             "String",                   "String", "Строка со спецсимволами и кириллицей"),
     ("val_int",     "integer",          "Nullable(Int32)",          "String", "Целое число, nullable"),
@@ -126,9 +126,9 @@ def _pg_create_sql(table: str, temp: bool, incarnation: bool = False, inc_col: b
     таблиц (Quality Gate). DROP здесь нет: остатки убирает подготовка теста по префиксу.
     """
     t = "TEMP " if temp else ""
+    # без PRIMARY KEY: в GP таблицы по умолчанию append-only, уникальный индекс на них запрещён
     cols = (["incarnation integer"] if incarnation and inc_col else []) + [
-        f"{name} {pg_type}{' PRIMARY KEY' if name == 'id' and not incarnation else ''}"
-        for name, pg_type, *_ in COLUMNS]
+        f"{name} {pg_type}" for name, pg_type, *_ in COLUMNS]
     tables = [f"{table}_0", f"{table}_1"] if incarnation else [table]
     stmts = [f"CREATE {t}SEQUENCE {table}_inc_seq START WITH 0 MINVALUE 0"] if incarnation else []
     for tbl in tables:
