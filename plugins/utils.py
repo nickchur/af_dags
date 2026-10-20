@@ -1,5 +1,5 @@
 """###🛠️ Утилиты Airflow (`plugins/utils.py`)
-*2026-10-19 21:21 MSK · v1.28 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 11:54 MSK · v1.29 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Вспомогательные функции, используемые во всех DAG'ах.
 
@@ -366,6 +366,13 @@ def _on_callback(context, level=None):
     state = str(getattr(task.state, 'value', task.state) or '')
         
     msg = context.get('exception') # or getattr(ti, 'error', None) or "No exception trace available"
+
+    if level != 'DAG' and not state:
+        # Airflow 3: падение, о котором сообщил исполнитель (задача не стартовала, например стояла в очереди,
+        # пока лежал контур), — колбэк исполняет dag-processor, а у ti в контексте нет ни состояния, ни
+        # исключения. on_retry_callback у нас не назначен, значит это on_failure_callback
+        state = 'failed'
+        msg = msg or 'задача не стартовала: падение сообщил исполнитель, исключения нет'
 
     # if state == TaskInstanceState.FAILED:
     # elif state == TaskInstanceState.SUCCESS:
