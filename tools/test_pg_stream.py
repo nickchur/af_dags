@@ -1,5 +1,5 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-19 21:36 MSK · v0.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 12:18 MSK · v0.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
@@ -193,9 +193,11 @@ def tools_test_pg_stream():
                     with closing(pg.get_conn()) as rc:
                         rc.autocommit = True
                         rcur = rc.cursor()
-                        # 10 с, а не 2: разовый затык диска на общей метабазе ронял сценарий (16.10). Ожидание
-                        # блокировки всё равно ловится — такое чтение вернётся после коммита с 500 000 строк
+                        # 10 с, а не 2: разовый затык диска на общей метабазе ронял сценарий (16.10)
                         rcur.execute("set statement_timeout = '10s'")
+                        # ожидание блокировки — сразу ошибка: по времени чтения его не отличить (загрузка на альфе
+                        # 0,85 с), а затык диска на захват блокировки не влияет
+                        rcur.execute("set lock_timeout = '100ms'")
                         while not stop.is_set():
                             try:
                                 # чужая блокировка сильнее чтения — значит, загрузка идёт. Два
@@ -220,7 +222,11 @@ def tools_test_pg_stream():
                 during = [n for n, locked in reads if locked]
                 logger.info("soft: чтений %s, во время загрузки %s, ошибок %s", len(reads), len(during), errors)
                 assert not errors, errors[:3]
-                assert during and set(during) == {3}, reads
+                # «занято» и count — два запроса: коммит между ними даёт (500000, True) последним чтением (альфа
+                # 20.10, GP) — только последним. Ожидание ловит lock_timeout (errors); здесь — частичная загрузка или
+                # старых строк под загрузкой не видно
+                assert {n for n, _ in reads} <= {3, 500_000}, reads
+                assert 3 in during and set(during[:-1]) <= {3}, reads
                 assert count(t) == 500_000 and log.has("усечение: delete") and res["rows_loaded"] == 500_000
                 ok("REQ-14 soft: чтение не ждёт и видит старые строки")
 
