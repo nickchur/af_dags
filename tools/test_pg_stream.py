@@ -1,5 +1,5 @@
 """🧪 DAG: проверка оператора HrpS3ToPgStreamOperator (S3 → GP/PG) по сценариям спеки.
-*2026-10-19 21:36 MSK · v0.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-20 12:18 MSK · v0.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Кладёт в S3 маленькие файлы-фикстуры, создаёт таблицы `<schema>.pg_stream_t_*`, гоняет
 оператор (`op.execute(context)`) по сценариям: усечение none/hard/soft/auto, откат при
@@ -220,7 +220,9 @@ def tools_test_pg_stream():
                 during = [n for n, locked in reads if locked]
                 logger.info("soft: чтений %s, во время загрузки %s, ошибок %s", len(reads), len(during), errors)
                 assert not errors, errors[:3]
-                assert during and set(during) == {3}, reads
+                # «занято» и count — два запроса: коммит между ними даёт (500000, True) последним чтением (альфа
+                # 20.10, GP). Провал REQ-14 — иное число (ожидание, частичная загрузка) или старых строк не видно
+                assert 3 in during and set(during) <= {3, 500_000}, reads
                 assert count(t) == 500_000 and log.has("усечение: delete") and res["rows_loaded"] == 500_000
                 ok("REQ-14 soft: чтение не ждёт и видит старые строки")
 
