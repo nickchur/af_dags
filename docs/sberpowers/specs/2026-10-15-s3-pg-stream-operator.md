@@ -1,7 +1,8 @@
 # Delta-спека: оператор HrpS3ToPgStreamOperator (S3 → GP/PG, CSV и JSON)
 
 - Дата: 2026-10-15
-- Статус: подтверждена
+- Статус: реализована в `plugins/pg_stream.py`; в baseline не внесена — REMOVED, перенесена в etl-core 3.0.2
+  (см. Non-goals `plugins-baseline.md`)
 - Baseline: `docs/sberpowers/specs/plugins-baseline.md` (новая возможность в `plugins`, нумерация продолжает baseline)
 - Источник: discover `discovery/2026-10-15-s3-to-gp-operator.md`, grill `discovery/2026-10-15-s3-to-gp-operator-decisions.md`
 
@@ -134,7 +135,7 @@
 - Промежуточные коммиты и инкарнации (`<table>_0/1`) — это `HrpS3ToPostgresOperator2`.
 - Вложенный `root` (`a.b`) — по запросу; сейчас один уровень.
 - Номер элемента в служебной колонке, таблица отбраковки, `NULL` вместо неприводимых значений.
-- Перенос в etl-core и строка в `allowed_operators.txt` — второй этап.
+- Перенос в etl-core и строка в `allowed_operators.txt` — второй этап (сделан в etl-core 3.0.2).
 
 ## Критерии приёмки
 
