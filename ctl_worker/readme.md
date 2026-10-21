@@ -509,6 +509,9 @@ XCom из `ctl_monitor`: `{lid: {wid, wfn, sts, act, sch, ...}}` — перед�
 - Фильтрация по диапазону ID сущностей и префиксам workflows.
 - Режим `safe=True`: маскирует внешние ID сущностей (оставляет только `9410*`).
 - Параметрическая подстановка: `{{ CTL_PROFILE_NAME }}` и аналоги.
+- Проверка ссылок: каждая сущность из `link_entities` и `schedule_params.entities` выгруженных workflows
+  должна быть в `ctl_entity.yml`; остальные — заметкой «⚠️ Ссылки на сущности вне выгрузки» (workflow,
+  сущность, где), выгрузка при этом не падает.
 
 **Файлы в S3:**
 - `ctl_yaml/ctl_category_{root_category}.yml`
