@@ -1,5 +1,5 @@
 """### 📥 DAG: Загрузчик метаданных CTL
-*2026-10-21 14:04 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-21 14:11 MSK · v1.12 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в `loader_interval` (по умолчанию 5 минут) выгружает данные из CTL и сохраняет в Airflow Variables + S3 (папка `ctl/` бакета логов).
 
@@ -406,8 +406,8 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         found.update(ctl_entities_get(parents, set(data) | set(found)))
         data.update({k: v for k, v in found.items() if v})
         present = set(data) | {k for k, v in found.items() if v is None}
-        failed = sorted(k for k, v in found.items() if v is None)
-        logger.info(f"адресных запросов сущностей: {len(found)}, CTL не ответил: {failed}")
+        failed = {k for k, v in found.items() if v is None}
+        logger.info(f"адресных запросов сущностей: {len(found)}, CTL не ответил: {sorted(failed)}")
 
         # Висячие ссылки: сущность или профиль события в CTL не существуют. Сенсор событий
         # спрашивал бы их на каждой проверке и получал 422 — на alpha 14.09.2026 это 13 ключей
@@ -429,18 +429,19 @@ with DAG(f'CTL.{get_config()["profile"]}.loader',
         # неизменные события уводили задачу в skip раньше, чем обновлялись имена сущностей
         changed = load_obj_save('ctl_events', events, var=True)
         
-        eids_parents = [int(e['parentId']) for e in eids.values()]
+        eids_parents = [int(e.get('parentId') or 0) for e in eids.values()]
         
-        events_parents = [int(data[e]['parentId']) for e in entity_events if data.get(e)]
+        events_parents = [int(data[e].get('parentId') or 0) for e in entity_events if data.get(e)]
         
         all_keys = set(eids.keys()) | entity_events | set(eids_parents) | set(events_parents)
         
         # Извлекаем имя, берем часть после # и оставляем только ASCII
-        # CTL не ответил — имя от прошлого круга: на имени стоит Asset события, менять его нельзя
+        # CTL не ответил по сущности — её имя от прошлого круга: на имени стоит Asset события, менять
+        # его нельзя. 4xx — сущности нет, `_Not_found_`, как раньше
         old_enames = {int(k): v for k, v in (ctl_obj_load('ctl_enames') or {}).items()} if failed else {}
         enames = {
-            e: (''.join(c for c in data[e].get('name','_Not_found_').split('#')[-1] if ord(c) < 128).strip() or str(e))
-               if e in data else old_enames.get(e, '_Not_found_')
+            e: (''.join(c for c in (data[e].get('name') or '_Not_found_').split('#')[-1] if ord(c) < 128).strip() or str(e))
+               if e in data else old_enames.get(e, '_Not_found_') if e in failed else '_Not_found_'
             for e in all_keys if e > 0
         }
         # Сохраняем в S3
