@@ -724,14 +724,13 @@ def ctl_tree_entities(tree, root):
     return out
 
 
-def ctl_entity_exists(eid):
-    """Есть ли сущность в CTL: True — есть, False — CTL ответил 4xx, None — не ответил по существу.
+def ctl_entity_get(eid):
+    """Запись сущности из CTL: dict — есть, False — CTL ответил 4xx (нет), None — не ответил по существу.
 
-    Журнал GET в GP не пишем: это проверка, а не данные.
+    Журнал GET в GP не пишем: это справка, а не данные.
     """
     try:
-        ctl_api(f'/v4/api/entity/{int(eid)}', gp_log=False)
-        return True
+        return ctl_api(f'/v4/api/entity/{int(eid)}', gp_log=False) or None
     except AirflowSkipException:
         return False
     except Exception as e:
@@ -739,13 +738,10 @@ def ctl_entity_exists(eid):
         return None
 
 
-def ctl_entities_present(needed, known):
-    """Какие сущности есть в CTL: known — без запросов, остальные из needed — адресно, по разу.
-
-    Сбой проверки (None) считаем «есть»: сенсор лучше спросит лишний раз, чем потеряет событие.
-    """
+def ctl_entities_get(needed, known):
+    """Сущности из needed, которых нет в known, — адресно, по разу, по возрастанию id: {id: dict | False | None}."""
     known = {int(e) for e in known}
-    return known | {e for e in sorted({int(e) for e in needed} - known) if ctl_entity_exists(e) is not False}
+    return {e: ctl_entity_get(e) for e in sorted({int(e) for e in needed} - known)}
 
 
 @retry(

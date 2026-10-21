@@ -51,36 +51,36 @@ def ctl(monkeypatch):
     return SimpleNamespace(calls=calls, answers=answers)
 
 
-def test_exists_true_without_gp_log(ctl):
-    assert ctl_utils.ctl_entity_exists(5) is True
+def test_get_record_without_gp_log(ctl):
+    assert ctl_utils.ctl_entity_get(5) == {'id': 1}
     assert ctl.calls == [('/v4/api/entity/5', {'gp_log': False})]
 
 
-def test_exists_false_on_4xx(ctl):
+def test_get_false_on_4xx(ctl):
     ctl.answers['/v4/api/entity/5'] = AirflowSkipException('404')
-    assert ctl_utils.ctl_entity_exists(5) is False
+    assert ctl_utils.ctl_entity_get(5) is False
 
 
-def test_exists_none_on_failure(ctl):
+def test_get_none_on_failure(ctl):
     ctl.answers['/v4/api/entity/5'] = requests.exceptions.ReadTimeout('t')
-    assert ctl_utils.ctl_entity_exists(5) is None
+    assert ctl_utils.ctl_entity_get(5) is None
 
 
-def test_present_known_without_requests(ctl):
-    assert ctl_utils.ctl_entities_present({1, 2}, {1, 2, 3}) == {1, 2, 3}
+def test_known_without_requests(ctl):
+    assert ctl_utils.ctl_entities_get({1, 2}, {1, 2, 3}) == {}
     assert ctl.calls == []
 
 
-def test_present_outside_once_and_by_answer(ctl):
+def test_outside_once_and_by_answer(ctl):
     ctl.answers['/v4/api/entity/7'] = AirflowSkipException('404')
     ctl.answers['/v4/api/entity/8'] = requests.exceptions.ConnectionError('c')
-    got = ctl_utils.ctl_entities_present([1, 6, 6, 7, 8], {1})
-    assert got == {1, 6, 8}            # 7 — нет в CTL; 8 — сбой, висячей не считаем
+    got = ctl_utils.ctl_entities_get([1, 6, 6, 7, 8], {1})
+    assert got == {6: {'id': 1}, 7: False, 8: None}   # 7 — нет в CTL; 8 — сбой, висячей не считаем
     assert [u for u, _ in ctl.calls] == ['/v4/api/entity/6', '/v4/api/entity/7', '/v4/api/entity/8']
 
 
 def test_ctl_api_maps_404_to_skip(monkeypatch):
-    """Настоящий ctl_api: 404 у CTL → AirflowSkipException → ctl_entity_exists() is False."""
+    """Настоящий ctl_api: 404 у CTL → AirflowSkipException → ctl_entity_get() is False."""
     resp = SimpleNamespace(status_code=404, text='404 Entity not found')
 
     class Hook:
@@ -94,4 +94,4 @@ def test_ctl_api_maps_404_to_skip(monkeypatch):
     monkeypatch.setattr(ctl_utils, 'rate_limit', lambda: None)
     monkeypatch.setattr(ctl_utils, 'get_config', lambda: {})
     monkeypatch.setattr(ctl_utils, 'add_note', lambda *a, **k: None)
-    assert ctl_utils.ctl_entity_exists(5) is False
+    assert ctl_utils.ctl_entity_get(5) is False
