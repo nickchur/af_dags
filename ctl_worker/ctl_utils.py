@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-10-19 17:34 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-21 14:13 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -267,7 +267,7 @@ class CtlTooManyRequests(Exception):
     reraise=True
 )
 def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True,
-            gp_log=True):
+            gp_log=True, note=True):
     """HTTP-клиент к CTL API через KerberosHttpHook с rate-limiting и retry.
 
     4xx → AirflowSkipException (skip=True) или AirflowFailException (skip=False).
@@ -311,7 +311,8 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         # вместо повтора tenacity задача падала сразу (найдено 21.09.2026 на таймаутах
         # эмулятора CTL при переносе на Airflow 3)
         if resp_text.startswith('4') or (status_code is not None and 300 <= status_code < 500):
-            add_note(error_msg, level='Task,DAG', title='Ошибка API')
+            if note:
+                add_note(error_msg, level='Task,DAG', title='Ошибка API')
             if skip:
                 raise AirflowSkipException(error_msg)
             else:
@@ -691,7 +692,64 @@ def ctl_obj_load(key):
         logger.error(f"Бакет для {key} не указан в конфигурации.")
         return {}
 
-    
+
+def ctl_tree_entities(tree, root):
+    """Сущности поддерева root из ответа `/v4/api/entity/{root}/child?direct=false`: {id: entity}.
+
+    Ответ CTL — дерево `{entity, kidz}` вместе с самим корнем. Порядок фиксирован — в ширину,
+    дети по возрастанию id: на нём стоит сравнение MD5 в ctl_obj_save, и от порядка ответа он
+    зависеть не должен. Корня в ответе нет — пусто.
+    """
+    flat, kids = {}, {}
+    stack = [tree] if isinstance(tree, dict) else []
+    while stack:
+        n = stack.pop()
+        ent = n.get('entity') or {}
+        if ent.get('id') is None:
+            continue
+        eid = int(ent['id'])
+        flat[eid] = ent
+        for k in n.get('kidz') or []:
+            kid = (k.get('entity') or {}).get('id')
+            if kid is not None:
+                kids.setdefault(eid, []).append(int(kid))
+                stack.append(k)
+
+    out, queue = {}, [int(root)]
+    while queue:
+        eid = queue.pop(0)
+        if eid in out or eid not in flat:
+            continue
+        out[eid] = flat[eid]
+        queue.extend(sorted(kids.get(eid, [])))
+    return out
+
+
+def ctl_entity_get(eid):
+    """Запись сущности из CTL: dict — есть, False — CTL ответил 404 (нет), None — не ответил по существу.
+
+    «Нет» — только 404 (так CTL отвечает на несуществующую сущность): 401/403 — сбой, а не отсутствие,
+    иначе сбой авторизации переименовал бы сущности в `_Not_found_`. Журнал GET в GP и заметку
+    «Ошибка API» не пишем: висячие load_events собирает в одну заметку.
+    """
+    try:
+        return ctl_api(f'/v4/api/entity/{int(eid)}', gp_log=False, note=False) or None
+    except AirflowSkipException as e:
+        if 'Error: 404 ' in str(e):
+            return False
+        logger.warning(f"⚠️ Сущность {eid}: CTL отказал ({e}) — висячей не считаем")
+        return None
+    except Exception as e:
+        logger.warning(f"⚠️ Сущность {eid}: CTL не ответил ({e}) — висячей не считаем")
+        return None
+
+
+def ctl_entities_get(needed, known):
+    """Сущности из needed, которых нет в known, — адресно, по разу, по возрастанию id: {id: dict | False | None}."""
+    known = {int(e) for e in known}
+    return {e: ctl_entity_get(e) for e in sorted({int(e) for e in needed} - known)}
+
+
 @retry(
     stop=stop_after_attempt(3), # Максимум 3 попытки
     wait=wait_exponential(multiplier=1, min=2, max=10), # Паузы 2с, 4с, 8с

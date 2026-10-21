@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-10-01 22:26 MSK · v1.6 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-21 14:37 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -12,6 +12,7 @@
 """
 
 from airflow.sdk import DAG, Param, task
+from airflow.sdk.exceptions import AirflowFailException
 
 from plugins.utils import add_note, default_args # type: ignore
 from ctl_worker.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
@@ -233,6 +234,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         # used = dict()
         # used_eids = dict()
         find = list()
+        bad = list()  # (workflow, сущность, где) — ссылки yml на сущности вне выгрузки entities
         for i, data in enumerate(sorted(res, key=lambda x: int(x['wf']['id']))):
             # print(data['wf']['id'])
             if int(data['wf']['id']) > 999999 or int(data['wf']['id']) in [0, ] or data['wf']['name'] in wfs:
@@ -249,12 +251,19 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
 
                 j = dict()
                 j['date'] = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
-                j['version'] = ver['version'] + ' ' + ver['ci']
+                j['version'] = f"{ver.get('version', '')} {ver.get('ci', '')}".strip()
                 j['wfExt'] = data
                 
                 yaml_data = dict()
                 yaml_data['workflows'] = list()
                 wf_yml(None, data, yaml_data, safe=safe)
+
+                # Ссылки потока на сущности должны вести в ту же выгрузку: иначе yml не встанет
+                # на чистый CTL или привяжет поток к чужой сущности
+                wf_y = yaml_data['workflows'][0][data['wf']['name']]
+                refs = {('link_entities', int(e['id'] if isinstance(e, dict) else e)) for e in wf_y.get('link_entities') or []}
+                refs |= {('schedule_params', int(e['entity']['id'])) for e in wf_y.get('schedule_params', {}).get('entities') or []}
+                bad += [(data['wf']['name'], eid, where) for where, eid in sorted(refs, key=lambda r: (r[1], r[0])) if eid not in e_ids]
 
                 key = f"ctl_yaml/ctl_wf_{data['wf']['id']}_{data['wf']['name']}"
                 ctl_obj_save(key, yaml_data, ext='yml')
@@ -263,8 +272,19 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         
         add_note({'Find': find}, context, level='DAG,Task')
 
+        if bad:
+            rows = [f"| {w} | `{e}` | {where} |" for w, e, where in bad]
+            add_note("| Workflow | Сущность | Где |\n|---|---|---|\n" + "\n".join(rows[:40]), context,
+                     level='DAG,Task', title=f"⚠️ Ссылки на сущности вне выгрузки: {len(bad)}")
+            logger.warning(f"⚠️ Ссылки на сущности вне выгрузки: {bad}")
+
         not_found = [w for w in wfs if w not in find]
         if not_found:
             add_note({'Not found': not_found}, context, level='DAG,Task')
+
+        if bad:
+            # Файлы уже выгружены (их видно и с битой ссылкой), но ран красный: такой yml не встанет в CTL.
+            # Без повторов — ответ тот же
+            raise AirflowFailException(f"⚠️ Ссылки на сущности вне выгрузки: {len(bad)}")
 
     get_yml()
