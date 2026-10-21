@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-10-21 14:33 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-21 14:37 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -12,6 +12,7 @@
 """
 
 from airflow.sdk import DAG, Param, task
+from airflow.sdk.exceptions import AirflowFailException
 
 from plugins.utils import add_note, default_args # type: ignore
 from ctl_worker.ctl_utils import get_config, ctl_obj_save, ctl_obj_load, ctl_api # type: ignore
@@ -280,5 +281,10 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
         not_found = [w for w in wfs if w not in find]
         if not_found:
             add_note({'Not found': not_found}, context, level='DAG,Task')
+
+        if bad:
+            # Файлы уже выгружены (их видно и с битой ссылкой), но ран красный: такой yml не встанет в CTL.
+            # Без повторов — ответ тот же
+            raise AirflowFailException(f"⚠️ Ссылки на сущности вне выгрузки: {len(bad)}")
 
     get_yml()
