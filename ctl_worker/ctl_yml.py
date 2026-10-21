@@ -1,5 +1,5 @@
 """### 💾 DAG: Экспорт конфигурации CTL в YAML
-*2026-10-21 14:14 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-21 14:33 MSK · v1.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Ручной запуск. Экспортирует конфигурацию CTL в YAML и сохраняет в S3.
 
@@ -250,7 +250,7 @@ with DAG(f"CTL_{get_config()['profile']}.yml",
 
                 j = dict()
                 j['date'] = pendulum.now(get_config()['tz']).format('YYYY-MM-DD HH:mm:ss')
-                j['version'] = ver['version'] + ' ' + ver['ci']
+                j['version'] = f"{ver.get('version', '')} {ver.get('ci', '')}".strip()
                 j['wfExt'] = data
                 
                 yaml_data = dict()
