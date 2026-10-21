@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-10-19 17:34 MSK · v1.15 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-21 14:02 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -691,7 +691,63 @@ def ctl_obj_load(key):
         logger.error(f"Бакет для {key} не указан в конфигурации.")
         return {}
 
-    
+
+def ctl_tree_entities(tree, root):
+    """Сущности поддерева root из ответа `/v4/api/entity/{root}/child?direct=false`: {id: entity}.
+
+    Ответ CTL — дерево `{entity, kidz}` вместе с самим корнем. Порядок фиксирован — в ширину,
+    дети по возрастанию id: на нём стоит сравнение MD5 в ctl_obj_save, и от порядка ответа он
+    зависеть не должен. Корня в ответе нет — пусто.
+    """
+    flat, kids = {}, {}
+    stack = [tree] if isinstance(tree, dict) else []
+    while stack:
+        n = stack.pop()
+        ent = n.get('entity') or {}
+        if ent.get('id') is None:
+            continue
+        eid = int(ent['id'])
+        flat[eid] = ent
+        for k in n.get('kidz') or []:
+            kid = (k.get('entity') or {}).get('id')
+            if kid is not None:
+                kids.setdefault(eid, []).append(int(kid))
+                stack.append(k)
+
+    out, queue = {}, [int(root)]
+    while queue:
+        eid = queue.pop(0)
+        if eid in out or eid not in flat:
+            continue
+        out[eid] = flat[eid]
+        queue.extend(sorted(kids.get(eid, [])))
+    return out
+
+
+def ctl_entity_exists(eid):
+    """Есть ли сущность в CTL: True — есть, False — CTL ответил 4xx, None — не ответил по существу.
+
+    Журнал GET в GP не пишем: это проверка, а не данные.
+    """
+    try:
+        ctl_api(f'/v4/api/entity/{int(eid)}', gp_log=False)
+        return True
+    except AirflowSkipException:
+        return False
+    except Exception as e:
+        logger.warning(f"⚠️ Сущность {eid}: CTL не ответил ({e}) — висячей не считаем")
+        return None
+
+
+def ctl_entities_present(needed, known):
+    """Какие сущности есть в CTL: known — без запросов, остальные из needed — адресно, по разу.
+
+    Сбой проверки (None) считаем «есть»: сенсор лучше спросит лишний раз, чем потеряет событие.
+    """
+    known = {int(e) for e in known}
+    return known | {e for e in sorted({int(e) for e in needed} - known) if ctl_entity_exists(e) is not False}
+
+
 @retry(
     stop=stop_after_attempt(3), # Максимум 3 попытки
     wait=wait_exponential(multiplier=1, min=2, max=10), # Паузы 2с, 4с, 8с
