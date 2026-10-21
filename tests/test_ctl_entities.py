@@ -53,12 +53,18 @@ def ctl(monkeypatch):
 
 def test_get_record_without_gp_log(ctl):
     assert ctl_utils.ctl_entity_get(5) == {'id': 1}
-    assert ctl.calls == [('/v4/api/entity/5', {'gp_log': False})]
+    assert ctl.calls == [('/v4/api/entity/5', {'gp_log': False, 'note': False})]
 
 
-def test_get_false_on_4xx(ctl):
-    ctl.answers['/v4/api/entity/5'] = AirflowSkipException('404')
+def test_get_false_on_404(ctl):
+    ctl.answers['/v4/api/entity/5'] = AirflowSkipException('nf ❌ Error: 404 HTTP GET /v4/api/entity/5')
     assert ctl_utils.ctl_entity_get(5) is False
+    assert ctl.calls == [('/v4/api/entity/5', {'gp_log': False, 'note': False})]
+
+
+def test_get_none_on_403(ctl):
+    ctl.answers['/v4/api/entity/5'] = AirflowSkipException('denied ❌ Error: 403 HTTP GET /v4/api/entity/5')
+    assert ctl_utils.ctl_entity_get(5) is None
 
 
 def test_get_none_on_failure(ctl):
@@ -72,7 +78,7 @@ def test_known_without_requests(ctl):
 
 
 def test_outside_once_and_by_answer(ctl):
-    ctl.answers['/v4/api/entity/7'] = AirflowSkipException('404')
+    ctl.answers['/v4/api/entity/7'] = AirflowSkipException('❌ Error: 404 HTTP GET /v4/api/entity/7')
     ctl.answers['/v4/api/entity/8'] = requests.exceptions.ConnectionError('c')
     got = ctl_utils.ctl_entities_get([1, 6, 6, 7, 8], {1})
     assert got == {6: {'id': 1}, 7: False, 8: None}   # 7 — нет в CTL; 8 — сбой, висячей не считаем
@@ -93,5 +99,5 @@ def test_ctl_api_maps_404_to_skip(monkeypatch):
     monkeypatch.setattr(ctl_utils, 'KerberosHttpHook', Hook)
     monkeypatch.setattr(ctl_utils, 'rate_limit', lambda: None)
     monkeypatch.setattr(ctl_utils, 'get_config', lambda: {})
-    monkeypatch.setattr(ctl_utils, 'add_note', lambda *a, **k: None)
+    monkeypatch.setattr(ctl_utils, 'add_note', lambda *a, **k: pytest.fail('заметка при note=False'))
     assert ctl_utils.ctl_entity_get(5) is False

@@ -1,5 +1,5 @@
 """### 🛠️ Утилиты CTL (`ctl_worker/ctl_utils.py`)
-*2026-10-21 14:02 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-21 14:13 MSK · v1.16 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Базовый модуль для всех DAG'ов CTL.
 
@@ -267,7 +267,7 @@ class CtlTooManyRequests(Exception):
     reraise=True
 )
 def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, check_response=False, skip=True,
-            gp_log=True):
+            gp_log=True, note=True):
     """HTTP-клиент к CTL API через KerberosHttpHook с rate-limiting и retry.
 
     4xx → AirflowSkipException (skip=True) или AirflowFailException (skip=False).
@@ -311,7 +311,8 @@ def ctl_api(url='/v5/api/info', method='GET', data={}, json={}, timeout=None, ch
         # вместо повтора tenacity задача падала сразу (найдено 21.09.2026 на таймаутах
         # эмулятора CTL при переносе на Airflow 3)
         if resp_text.startswith('4') or (status_code is not None and 300 <= status_code < 500):
-            add_note(error_msg, level='Task,DAG', title='Ошибка API')
+            if note:
+                add_note(error_msg, level='Task,DAG', title='Ошибка API')
             if skip:
                 raise AirflowSkipException(error_msg)
             else:
@@ -725,14 +726,19 @@ def ctl_tree_entities(tree, root):
 
 
 def ctl_entity_get(eid):
-    """Запись сущности из CTL: dict — есть, False — CTL ответил 4xx (нет), None — не ответил по существу.
+    """Запись сущности из CTL: dict — есть, False — CTL ответил 404 (нет), None — не ответил по существу.
 
-    Журнал GET в GP не пишем: это справка, а не данные.
+    «Нет» — только 404 (так CTL отвечает на несуществующую сущность): 401/403 — сбой, а не отсутствие,
+    иначе сбой авторизации переименовал бы сущности в `_Not_found_`. Журнал GET в GP и заметку
+    «Ошибка API» не пишем: висячие load_events собирает в одну заметку.
     """
     try:
-        return ctl_api(f'/v4/api/entity/{int(eid)}', gp_log=False) or None
-    except AirflowSkipException:
-        return False
+        return ctl_api(f'/v4/api/entity/{int(eid)}', gp_log=False, note=False) or None
+    except AirflowSkipException as e:
+        if 'Error: 404 ' in str(e):
+            return False
+        logger.warning(f"⚠️ Сущность {eid}: CTL отказал ({e}) — висячей не считаем")
+        return None
     except Exception as e:
         logger.warning(f"⚠️ Сущность {eid}: CTL не ответил ({e}) — висячей не считаем")
         return None
