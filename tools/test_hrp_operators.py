@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-20 16:14 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 14:06 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -7,6 +7,8 @@
 группы идут друг за другом, группы — параллельно. Оператора нет в пакете или он запрещён политикой —
 группы нет; сломан импорт — в группе одна красная задача. Первая задача `systems` проверяет системы
 и права, последняя `report` пишет сводку по группам. Запуск вручную (`@once`).
+Стандартные операторы Airflow и провайдеров из замера сигмы — в главной группе `test_standart`,
+по тем же правилам.
 
 PG: `conn.схема` — таблицы в схеме (нужны CREATE и DROP), только `conn` — временные таблицы
 сессии, в базе после рана ничего не остаётся. GP — так же, как PG.
@@ -486,6 +488,9 @@ class T:
         policy = _policy()
         if policy is not None and hasattr(policy, "task_policy"):
             policy.task_policy(op)  # нарушение политики — ❌ теста, как падение разбора в бою
+        # как исполнитель задачи: копия с замком, иначе присвоение template-поля в execute (op_kwargs у
+        # PythonOperator) ищет в нём XComArg и уходит в рекурсию по контексту
+        op = op.prepare_for_execution()
         spy_cm = mock.patch.object(op, spy, wraps=getattr(op, spy)) if spy else nullcontext()
         with self.pg_sessions(sessions), spy_cm as m:
             result = op.execute(ctx)
@@ -1319,6 +1324,46 @@ def lineage_sql(t: T):
         raise AirflowFailException(f"lineage: получено {got}, ожидалось {want}")
 
 
+# ─────────────────────────── Тесты: стандартные — Python ──────────────────────────
+def _ctx_fn(a, b=0, **kw):
+    """Вызываемое Python-операторов: аргументы и контекст рана (ti, run_id)."""
+    return {"a": a, "b": b, "ti": kw["ti"].task_id, "run_id": kw["run_id"]}
+
+
+def _python(t: T, b, want_b):
+    result, _ = t.run(python_callable=_ctx_fn, op_args=[1], op_kwargs={"b": b})
+    want = {"a": 1, "b": want_b, "ti": t.context["ti"].task_id, "run_id": t.context["run_id"]}
+    if result != want:
+        raise AirflowFailException(f"вернула {result}, ждём {want}")
+
+
+def empty_run(t: T):
+    """EmptyOperator: выполняется без ошибки и ничего не возвращает"""
+    result, _ = t.run()
+    if result is not None:
+        raise AirflowFailException(f"вернул {result!r}")
+
+
+def python_args(t: T):
+    """PythonOperator: op_args, op_kwargs и контекст рана в функции"""
+    _python(t, 2, 2)
+
+
+def python_tpl(t: T):
+    """PythonOperator шаблоном: op_kwargs из {{ }} — строка '42'"""
+    _python(t, "{{ 40 + 2 }}", "42")
+
+
+def task_args(t: T):
+    """@task: op_args, op_kwargs и контекст рана в функции"""
+    _python(t, 2, 2)
+
+
+def task_tpl(t: T):
+    """@task шаблоном: op_kwargs из {{ }} — строка '42'"""
+    _python(t, "{{ 40 + 2 }}", "42")
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -1369,8 +1414,17 @@ OPS = [
        [s3_bucket_viewer_list, s3_bucket_viewer_tpl]),
     Op("lineage", "utils.lineage", "extract_lineage_from_sql", set(), [lineage_sql], policy=False),
 ]
+STD = "airflow.providers"  # стандартные операторы: классы из пакетов, которые импортируют даги контура
+STD_OPS = [
+    Op("empty", "standard.operators.empty", "EmptyOperator", set(), [empty_run], pkg=STD),
+    Op("python", "standard.operators.python", "PythonOperator", set(), [python_args, python_tpl], pkg=STD),
+    Op("task", "standard.decorators.python", "_PythonDecoratedOperator", set(), [task_args, task_tpl], pkg=STD),
+]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
-TESTS = "tests."  # группы операторов — внутри группы tests: task_id = tests.<группа>.<тест>
+# главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>
+TOPS = ("tests.", "test_standart.")
+# в verdict группа — без главной группы: имена обязаны не совпадать
+assert not {o.group for o in OPS} & {o.group for o in STD_OPS}, "имя группы в tests и test_standart"
 
 
 # ───────────────────────────────── systems ────────────────────────────────────
@@ -1507,9 +1561,11 @@ _S3_DEFAULT = log_bucket_path("test-operators") or "s3-archive://dataplatform-mo
                              description=f"Сохранить форму в Variable {PARAMS_VAR} как значения по умолчанию"),
         **{f"op_{op.group}": Param(SAVED.get(f"op_{op.group}", True), type="boolean", section="Операторы",
                                    description=op.cls) for op in OPS},
+        **{f"op_{op.group}": Param(SAVED.get(f"op_{op.group}", True), type="boolean",
+                                   section="Стандартные операторы", description=op.cls) for op in STD_OPS},
     },
     doc_md=__doc__,
-    description="Регресс операторов hrp_operators по группам: pg, ch, s3",
+    description="Регресс операторов hrp_operators и стандартных по группам: pg, ch, s3",
 )
 def test_hrp_operators_dag():
 
@@ -1585,14 +1641,16 @@ def test_hrp_operators_dag():
         groups: dict = {}
         failed = []
         # по задачам дага, а не по ответу API: задача без строки в метабазе — ❌, а не пропажа из сводки
-        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TESTS))  # без systems и report
+        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TOPS))  # без systems и report
+        full = {}  # <группа>.<тест> → task_id: в verdict без главной группы, как до группы tests
         for task_id in test_ids:
             state = states.get(task_id) or "no_status"
             icon = "✅" if state == "success" else "☮️" if state in ("skipped", "upstream_failed", "removed") else "❌"
-            g, case = task_id.removeprefix(TESTS).split(".", 1)
+            _, g, case = task_id.split(".", 2)
+            full[f"{g}.{case}"] = task_id
             groups.setdefault(g, {})[case] = icon
             if icon == "❌":
-                failed.append(task_id.removeprefix(TESTS))  # в verdict — <группа>.<тест>, как до группы tests
+                failed.append(f"{g}.{case}")
         pulled = ti.xcom_pull(task_ids=test_ids, key="not_cleaned") if test_ids else []
         if pulled and not isinstance(pulled, list):
             pulled = [pulled]
@@ -1607,10 +1665,16 @@ def test_hrp_operators_dag():
         icons = [i for cases in groups.values() for i in cases.values()]
         ok, skip = icons.count("✅"), icons.count("☮️")
         passed = not (failed or unavailable)
-        headline = (f"🧪 HRP operators {'✅ пройден' if passed else '❌ провален'}: "
+        headline = (f"🧪 Регресс операторов {'✅ пройден' if passed else '❌ провален'}: "
                     f"✅ {ok} / ❌ {len(failed)} / ☮️ {skip}")
-        lines = [f"❌ {tid} — {(dag_.get_task(TESTS + tid).doc_md or '').split(':')[0]}" for tid in failed]
-        lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items()) for g, cases in sorted(groups.items())]
+        lines = [f"❌ {tid} — {(dag_.get_task(full[tid]).doc_md or '').split(':')[0]}" for tid in failed]
+        std = {o.group for o in STD_OPS}
+        lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items())
+                  for g, cases in sorted(groups.items()) if g not in std]
+        if std & groups.keys():
+            lines.append("Стандартные операторы:")
+            lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items())
+                      for g, cases in sorted(groups.items()) if g in std]
         if unavailable:
             lines.append("недоступны: " + ", ".join(unavailable))
         missing = sorted(g for g, r in NOT_CREATED.items() if r != "запрещён")
@@ -1641,24 +1705,26 @@ def test_hrp_operators_dag():
     systems_t = systems()
     leaves = [systems_t]
     NOT_CREATED.clear()  # процесс разбора живёт долго: без этого остаются группы прошлых разборов
-    with TaskGroup("tests", tooltip="Тесты операторов: группа на оператор"):
-        for op in OPS:
-            op.loaded, status, why = _load(op)
-            if status in ("missing", "forbidden"):
-                NOT_CREATED[op.group] = "запрещён" if status == "forbidden" else why
-                continue
-            with TaskGroup(op.group, tooltip=op.cls):
-                if status == "broken":
-                    imp = broken_import(op.group, why)
-                    systems_t >> imp
-                    leaves.append(imp)
+    for top, ops, tip in (("tests", OPS, "Тесты операторов: группа на оператор"),
+                          ("test_standart", STD_OPS, "Стандартные операторы Airflow и провайдеров")):
+        with TaskGroup(top, tooltip=tip):
+            for op in ops:
+                op.loaded, status, why = _load(op)
+                if status in ("missing", "forbidden"):
+                    NOT_CREATED[op.group] = "запрещён" if status == "forbidden" else why
                     continue
-                prev = systems_t
-                for case in op.cases:
-                    cur = make_test(op, case)
-                    prev >> cur
-                    prev = cur
-                leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
+                with TaskGroup(op.group, tooltip=op.cls):
+                    if status == "broken":
+                        imp = broken_import(op.group, why)
+                        systems_t >> imp
+                        leaves.append(imp)
+                        continue
+                    prev = systems_t
+                    for case in op.cases:
+                        cur = make_test(op, case)
+                        prev >> cur
+                        prev = cur
+                    leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
     # report — единственный лист: ран краснеет через него
     leaves >> report()
 
