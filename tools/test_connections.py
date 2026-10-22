@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-22 10:04 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 10:20 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -261,15 +261,31 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 
             conn = BaseHook.get_connection(conn_id)
             extra = conn.extra_dejson.copy()
-            client = redis.Redis(
-                host=conn.host,
-                port=conn.port or 6379,
-                username=conn.login or None,
-                password=conn.password or None,
-                db=int(extra.get("db", 0)),
-                socket_timeout=int(extra.get("socket_timeout", 15)),
-            )
-            result = f"PONG: {client.ping()}"
+            # Все узлы кластера (celery-broker, hrp — cluster_hosts из секрет-бэкенда), иначе хост подключения;
+            # TLS — как у воркера: ssl и ssl_cert_reqs/ssl_ca_certs из extra
+            nodes = [n.strip() for n in str(extra.get("cluster_hosts") or "").split(",") if n.strip()] \
+                or [f"{conn.host}:{conn.port or 6379}"]
+            tls = {k: extra[k] for k in ("ssl_cert_reqs", "ssl_ca_certs") if extra.get(k)} if extra.get("ssl") else {}
+            pongs, errors = [], {}
+            for node in nodes:
+                host, _, port = node.partition(":")
+                try:
+                    redis.Redis(
+                        host=host, port=int(port or conn.port or 6379),
+                        username=conn.login or None, password=conn.password or None,
+                        db=int(extra.get("db", 0)), socket_timeout=int(extra.get("socket_timeout", 15)),
+                        ssl=bool(extra.get("ssl")), **tls,
+                    ).ping()
+                    pongs.append(node)
+                except redis.RedisError as e:
+                    errors[node] = e
+            dns = [n for n, e in errors.items() if "Name or service not known" in str(e)]
+            if errors and len(dns) == len(nodes):
+                raise errors[nodes[0]]  # ни один узел не резолвится — ☮️ в общем обработчике
+            if errors:
+                raise redis.ConnectionError(f"узлов недоступно {len(errors)} из {len(nodes)}: " + "; ".join(
+                    f"{n}: {'хост не резолвится' if n in dns else e}" for n, e in errors.items()))
+            result = f"PONG от {len(pongs)} узлов: {', '.join(pongs)}"
 
         else:
             raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")
