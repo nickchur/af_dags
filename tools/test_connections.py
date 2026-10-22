@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-22 09:55 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 10:04 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -253,19 +253,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         elif chk_type == "Trino":
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
             hook = TrinoHook(trino_conn_id=conn_id)
-            try:
-                result = hook.get_first("SELECT current_user, current_catalog, current_schema")
-            except Exception as err:
-                # Хост не резолвится: соединение заведено под контур, где Trino нет.
-                # Это не деградация связности, а отсутствие сервиса — скип, а не падение.
-                # Сообщение приезжает из urllib3 внутрь requests.ConnectionError, поэтому
-                # ищем по всей строке, а не сравниваем тип исключения.
-                if "Name or service not known" not in str(err):
-                    raise
-                msg = f"☮️ {conn_id}: хост не резолвится — {err}"
-                add_note(msg, context, level="task", title=f"☮️ {conn_id}")
-                logger.warning(msg)
-                raise AirflowSkipException(msg) from err
+            result = hook.get_first("SELECT current_user, current_catalog, current_schema")
 
         elif chk_type == "Redis":
             import redis
@@ -304,6 +292,15 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         raise AirflowSkipException(msg) from err
 
     except Exception as err:
+        # Хост не резолвится: соединение заведено под контур, где сервиса нет (Trino, Redis
+        # с delta-хостами на сигме). Это не деградация связности, а отсутствие сервиса — скип.
+        # Сообщение приезжает вложенным (urllib3 в requests, gaierror в redis), поэтому
+        # ищем по всей строке, а не сравниваем тип исключения.
+        if chk_type in ("Trino", "Redis") and "Name or service not known" in str(err):
+            msg = f"☮️ {conn_id}: хост не резолвится — {err}"
+            add_note(msg, context, level="task", title=f"☮️ {conn_id}")
+            logger.warning(msg)
+            raise AirflowSkipException(msg) from err
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(str(err), context, level="task,DAG", title=msg)
         raise  # re-raise оригинальное исключение, а не AirflowFailException — в логе видна причина
