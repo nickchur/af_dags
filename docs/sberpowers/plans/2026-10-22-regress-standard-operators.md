@@ -3,7 +3,7 @@
 > Исполняется скиллом execute. Исполнитель — я сам (feedback_sberpowers_flow), ревью — DeepSeek
 > v4-pro + agy в фоне после последней задачи. Шаги — чекбоксы `- [ ]`.
 
-**Спека:** docs/sberpowers/specs/2026-10-22-regress-standard-operators.md (REQ-hrp-regress-01, 34…44)
+**Спека:** docs/sberpowers/specs/2026-10-22-regress-standard-operators.md (REQ-hrp-regress-01, 34…45)
 **Цель:** `test_hrp_operators` в AF3 гоняет 14 стандартных операторов в главной группе `test_standart`;
 `verdict` и `report` учитывают их наравне с Hrp-группами.
 **Архитектура:** тот же реестр `Op` (поле `pkg` уже есть — загрузчик `_load` не меняется), второй список
@@ -167,7 +167,7 @@ assert not {o.group for o in OPS} & {o.group for o in STD_OPS}, "имя груп
 
 ### Задача 2.1: ветвление и @task.sensor (волна 2)
 
-**REQ:** REQ-hrp-regress-37, 38, 36
+**REQ:** REQ-hrp-regress-37, 38, 36, 45
 **model-hint:** any
 **Blocked by:** задача 1.1
 
@@ -288,8 +288,54 @@ def task_sensor_tpl(t: T):
     Op("task_sensor", "standard.decorators.sensor", "DecoratedSensorOperator", set(),
        [task_sensor_ok, task_sensor_timeout, task_sensor_tpl], pkg=STD),
 ```
+- [ ] Подгруппа `skip_graph` (REQ-hrp-regress-45) — настоящий пропуск. Хелперы рядом с `_pick`:
+```python
+SKIP_GRAPH = "test_standart.skip_graph."
+# служебные задачи подгруппы: в verdict и сводке не считаются, тест — только check
+GRAPH_TASKS = {SKIP_GRAPH + x for x in ("branch", "keep", "drop", "short", "after")}
+GRAPH_WANT = {"branch": "success", "keep": "success", "drop": "skipped", "short": "success", "after": "skipped"}
+
+
+def _graph_branch():
+    return SKIP_GRAPH + "keep"
+```
+  В теле дага — задача-проверка:
+```python
+    @task(task_id="check", trigger_rule=TriggerRule.ALL_DONE, retries=0,
+          doc_md="Пропуск веток в графе: Branch и ShortCircuit настоящими задачами, невыбранные ☮️")
+    def skip_graph_check(**context):
+        if not context["params"].get("op_skip_graph", True):
+            raise AirflowSkipException("skip_graph: выключен (op_skip_graph=False)")
+        ti, dr = context["ti"], context["dag_run"]
+        states = ti.get_task_states(dag_id=dr.dag_id, run_ids=[dr.run_id]).get(dr.run_id, {})
+        got = {x: states.get(SKIP_GRAPH + x) for x in GRAPH_WANT}
+        if got != GRAPH_WANT:
+            raise AirflowFailException(f"состояния {got}, ждём {GRAPH_WANT}")
+```
+  В цикле сборки, внутри `with TaskGroup("test_standart", …)`, после цикла по `STD_OPS`:
+```python
+            if all(o.loaded for o in STD_OPS if o.group in ("branch_python", "short_circuit")):
+                with TaskGroup("skip_graph", tooltip="Пропуск веток настоящими задачами графа"):
+                    by = {o.group: o.loaded for o in STD_OPS}
+                    from airflow.providers.standard.operators.empty import EmptyOperator
+                    br = by["branch_python"](task_id="branch", python_callable=_graph_branch)
+                    sc = by["short_circuit"](task_id="short", python_callable=lambda: False)
+                    keep, drop, after = (EmptyOperator(task_id=x) for x in ("keep", "drop", "after"))
+                    chk = skip_graph_check()
+                    systems_t >> [br, sc]
+                    br >> [keep, drop]
+                    sc >> after
+                    [keep, drop, after] >> chk  # check — ALL_DONE: выполняется и после ☮️ веток
+                    leaves.append(chk)
+```
+  `Param` `op_skip_graph` (секция «Стандартные операторы», description «пропуск веток в графе»).
+  В `report`: `test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TOPS) and tid not in GRAPH_TASKS)`.
+  Если `branch_python`/`short_circuit` не созданы — в сводке и `not_created` они уже есть; `skip_graph` не
+  создаётся молча (её причина — их строка).
 - [ ] ruff, EOL; стенд: прогон только `test_standart` → все ✅; у `branch_python` и `short_circuit` следующий
-  тест группы выполнился (не ☮️); `task_sensor.timeout` длится 10–30 с.
+  тест группы выполнился (не ☮️); `task_sensor.timeout` длится 10–30 с; `skip_graph.check` ✅,
+  `skip_graph.drop`/`after` ☮️; руками поменять `_graph_branch` на `return [SKIP_GRAPH + "keep", SKIP_GRAPH + "drop"]`
+  на стенде → `check` ❌ (вернуть).
 - [ ] Commit: `feat(test_hrp_operators): ветвление и @task.sensor в test_standart (REQ-hrp-regress-37, 38)`
 
 **Критерии выхода:**
@@ -556,20 +602,20 @@ def trigger_dagrun_conf(t: T):
   замер сигмы 22.10, Kafka — в `test_kafka_*`, бакеты не создаются, ветвление подменено); `tools/skill/tools.md` —
   одна строка. Без упоминаний Claude/GitHub (feedback_docs_gigacode_only).
 - [ ] ruff, EOL; стенд: **полный ран** (все группы, `pg=airflowdb.hrp_test`) → `report` success или ❌ только
-  у известных Hrp-дефектов (сверить с последним раном v2.6); `test_standart` — 29 ✅ (`trigger_dagrun` ✅,
+  у известных Hrp-дефектов (сверить с последним раном v2.6); `test_standart` — 30 ✅ (`trigger_dagrun` ✅,
   у `tools_dummy` ран `rg_trigger_dagrun_conf__…` с conf); в форме секция «Стандартные операторы» с 14
   выключателями; Kafka-групп нет; снятый `op_ch_operator` → ☮️ «выключен».
 - [ ] Commit: `feat(test_hrp_operators): TriggerDagRun в test_standart, readme (REQ-hrp-regress-43)`
 
 **Критерии выхода:**
-- Полный ран на стенде: 14 групп `test_standart`, 29 тестов ✅; `verdict` — прежние ключи, `groups` с новыми
+- Полный ран на стенде: 14 групп `test_standart`, 30 тестов ✅; `verdict` — прежние ключи, `groups` с новыми
   группами без префикса; `report` — блок «Стандартные операторы:».
 - Дальше: ревью DeepSeek v4-pro + agy в фоне по спеке и диффу → свод `docs/sberpowers/reviews/2026-10-22-regress-standard-operators.md` → PR в `develop_3`.
 
 ## Self-review
 - Покрытие: 01 — 1.1, 5.1; 34 — 1.1–5.1; 35 — 1.1, 5.1; 36 — 1.1–4.1; 37 — 2.1, 3.1; 38 — 2.1, 3.1, 4.1;
-  39 — 1.1; 40 — 3.1; 41 — 3.1; 42 — 4.1; 43 — 5.1; 44 — 1.1, 5.1.
-- Счёт тестов: 1.1 — 5, 2.1 — 7, 3.1 — 8, 4.1 — 8, 5.1 — 1 → 29.
+  39 — 1.1; 40 — 3.1; 41 — 3.1; 42 — 4.1; 43 — 5.1; 44 — 1.1, 5.1; 45 — 2.1.
+- Счёт тестов: 1.1 — 5, 2.1 — 7 + check, 3.1 — 8, 4.1 — 8, 5.1 — 1 → 30.
 - Имена: `_no_skip`, `_ids`, `_sensor_ok`, `_sensor_timeout`, `SENSOR_TIMEOUT`, `STD`, `STD_OPS`, `TOPS` — одинаковы во всех задачах.
 - Риски на стенде: `ClickHouseDbApiHook` и тип подключения `dlab-click`; ответ `_handle_trigger_dag_run`;
   `SQLExecuteQueryOperator` во временном режиме (hook.run открывает соединение через `get_conn` — подменён).
