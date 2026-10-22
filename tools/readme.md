@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-20 16:14 MSK · v1.87 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 10:23 MSK · v1.88 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > **Airflow 3.** Порт `af_dags@89117cf`. Метабаза — через `plugins/af_meta.py`, отличия от Airflow 2 — в `readme.md` корня.
 
@@ -100,7 +100,7 @@ DAG автоматически обнаруживает все подключе�
 | **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
 | **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
 | **trino** | тип `trino` | Валидация сессии через `TrinoHook`; нерезолвящийся хост → `☮️` |
-| **redis** | тип `redis` | Проверка доступности через `redis.Redis(...).ping()` |
+| **redis** | тип `redis` | `ping` каждого узла `cluster_hosts` (иначе хоста), TLS из extra; `celery-broker` — брокер воркера; ни один узел не резолвится → `☮️` |
 | **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
 ### [test_hrp_operators.py](test_hrp_operators.py)
