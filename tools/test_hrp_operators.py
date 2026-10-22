@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-22 14:06 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 15:52 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -1601,6 +1601,36 @@ def s3_create_bucket_tpl(t: T):
     _s3_create_bucket(t, f"{{{{ {t.bucket!r} }}}}")
 
 
+# ─────────────────────────── Тесты: стандартные — TriggerDagRun ───────────────────
+DUMMY = "tools_dummy"
+
+
+def trigger_dagrun_conf(t: T):
+    """TriggerDagRunOperator шаблоном: ран tools_dummy с conf теста, без ожидания"""
+    import structlog
+    from airflow.sdk.exceptions import DagRunTriggerException
+    from airflow.sdk.execution_time.task_runner import _handle_trigger_dag_run
+
+    ti = t.context["ti"]
+    # ponytail: «нет ранов» = «нет дага» — tools_dummy ежечасный; точнее — запрос DagBag через API
+    if not ti.get_dr_count(dag_id=DUMMY):
+        raise AirflowSkipException(f"нет дага {DUMMY} (нет ни одного рана)")
+    run_id = f"{t.prefix}__{t.context['run_id']}__{ti.try_number}"[:250]
+    try:
+        t.run(trigger_dag_id=f"{{{{ {DUMMY!r} }}}}", trigger_run_id=run_id,
+              conf={"rg": "{{ ti.task_id }}"}, wait_for_completion=False)
+    except DagRunTriggerException as e:
+        drte = e
+    else:
+        raise AirflowFailException("оператор не бросил DagRunTriggerException")
+    if (drte.trigger_dag_id, drte.conf) != (DUMMY, {"rg": ti.task_id}):
+        raise AirflowFailException(f"запрошено {drte.trigger_dag_id} conf={drte.conf}")
+    # ран создаёт исполнитель задачи по исключению; при успехе — SUCCESS, при существующем ране — FAILED
+    _, state = _handle_trigger_dag_run(drte, t.context, ti, structlog.get_logger())
+    if state != "success" or ti.get_dr_count(dag_id=DUMMY, run_ids=[run_id]) != 1:
+        raise AirflowFailException(f"ран {DUMMY}/{run_id} не создан (state={state})")
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -1676,6 +1706,8 @@ STD_OPS = [
        [s3_key_sensor_ok, s3_key_sensor_timeout, s3_key_sensor_tpl], pkg=STD),
     Op("s3_create_bucket", "amazon.aws.operators.s3", "S3CreateBucketOperator", {"s3"},
        [s3_create_bucket_exists, s3_create_bucket_tpl], pkg=STD),
+    Op("trigger_dagrun", "standard.operators.trigger_dagrun", "TriggerDagRunOperator", set(),
+       [trigger_dagrun_conf], pkg=STD),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
 # главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>
