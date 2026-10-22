@@ -3,8 +3,8 @@
 > Исполняется скиллом execute. Исполнитель — я сам (feedback_sberpowers_flow), ревью — DeepSeek
 > v4-pro + agy в фоне после последней задачи. Шаги — чекбоксы `- [ ]`.
 
-**Спека:** docs/sberpowers/specs/2026-10-22-regress-standard-operators.md (REQ-hrp-regress-01, 34…45)
-**Цель:** `test_hrp_operators` в AF3 гоняет 14 стандартных операторов в главной группе `test_standart`;
+**Спека:** docs/sberpowers/specs/2026-10-22-regress-standard-operators.md (REQ-hrp-regress-01, 34…46)
+**Цель:** `test_hrp_operators` в AF3 гоняет 20 стандартных операторов (14 + 6 по поправке 22.10, волна 6) в главной группе `test_standart`;
 `verdict` и `report` учитывают их наравне с Hrp-группами.
 **Архитектура:** тот же реестр `Op` (поле `pkg` уже есть — загрузчик `_load` не меняется), второй список
 `STD_OPS`, сборка дага — цикл по двум главным группам. Ветвление AF3 (`skip_all_except`/`skip` берут `ti`
@@ -29,6 +29,7 @@
 - Волна 3: 3.1 — SQL и ClickHouse (blocked by 2.1: использует `_no_skip`, `_sensor_*`)
 - Волна 4: 4.1 — S3 (blocked by 2.1)
 - Волна 5: 5.1 — TriggerDagRun, документация, полный ран (blocked by 3.1, 4.1)
+- Волна 6: 6.1 — ещё 6 операторов по замеру dev за всё время, полный ран (blocked by 5.1; поправка 22.10)
 
 ## Деплой и прогон на стенде (общий рецепт для «Критериев выхода»)
 ```bash
@@ -612,10 +613,147 @@ def trigger_dagrun_conf(t: T):
   группами без префикса; `report` — блок «Стандартные операторы:».
 - Дальше: ревью DeepSeek v4-pro + agy в фоне по спеке и диффу → свод `docs/sberpowers/reviews/2026-10-22-regress-standard-operators.md` → PR в `develop_3`.
 
+### Задача 6.1: ещё 6 операторов по замеру dev (волна 6, поправка 22.10)
+
+**REQ:** REQ-hrp-regress-34, 37, 41, 42, 46, 01
+**model-hint:** any
+**Blocked by:** задача 5.1
+
+**Контекст:** замер сигмы dev за всё время (22.10) — сверх 14: `S3CopyObjectOperator` (20 задач),
+`@task.branch` (3), `S3CreateObjectOperator` (1), `BranchSQLOperator` (1), `ClickHouseSQLExecuteQueryOperator` (1),
+`HttpOperator` (2). Все в `ALLOWED_OPERATORS`. На стенде: `/api/v2/version` и `/api/v2/monitor/health` — 200 без
+авторизации, `/api/v1` — 404 («removed in Airflow 3»); подключения `airflow_api` нет — его заведёт ядро
+отдельной задачей. `ClickHouseSQLExecuteQueryOperator` подменён патчем ядра (как `ch_operator`) — на стенде
+ожидается ❌ по тому же дефекту; логику теста проверить копией с исходным классом плагина.
+
+**Шаги:**
+- [ ] Тесты (после `ch_sensor_timeout` — CH/SQL, после `s3_create_bucket_tpl` — S3, после `trigger_dagrun_conf` — Http):
+```python
+def task_branch_both(t: T):
+    """@task.branch: обе ветки по условию, задачи регресса не пропускаются"""
+    for flag, want in ((True, "systems"), (False, "report")):
+        _branch(t, flag, want, python_callable=_pick, op_kwargs={"flag": flag})
+
+
+def task_branch_tpl(t: T):
+    """@task.branch шаблоном: условие из {{ }} — строка 'True'"""
+    _branch(t, "{{ 1 == 1 }}", "systems", python_callable=_pick, op_kwargs={"flag": "{{ 1 == 1 }}"})
+
+
+def _branch_sql(t: T, sql: str, want: str, **kw):
+    with _no_skip(t) as (m_all, _):
+        t.run(conn_id=t.pg_conn, sql=sql, follow_task_ids_if_true="systems", follow_task_ids_if_false="report", **kw)
+    asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+    if asked != [want]:
+        raise AirflowFailException(f"{sql}: пропуск кроме {asked}, ждём {want}")
+
+
+def branch_sql_both(t: T):
+    """BranchSQLOperator: обе ветки по результату SQL с parameters на pg формы"""
+    src = t.full(t.pg_table("src", ROWS))
+    for n, want in ((_IDS[0], "systems"), (_IDS[0] - 1, "report")):
+        _branch_sql(t, f"SELECT count(*) FROM {src} WHERE id <= %(n)s", want, parameters={"n": n}, sessions=["main"])
+
+
+def branch_sql_tpl(t: T):
+    """BranchSQLOperator шаблоном: SQL из {{ }}"""
+    _branch_sql(t, "SELECT {{ 1 }}", "systems")
+
+
+def ch_sql_execute_select(t: T):
+    """ClickHouseSQLExecuteQueryOperator: SELECT с parameters по таблице теста"""
+    src = t.ch_table("src", rows=ROWS)
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, parameters={"n": _IDS[1]},
+                      sql=f"SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id")
+    if [int(r[0]) for r in result or []] != _IDS[:2]:
+        raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
+
+
+def ch_sql_execute_tpl(t: T):
+    """ClickHouseSQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 40 + 2 }}")
+    if [tuple(r) for r in result or []] != [(42,)]:
+        raise AirflowFailException(f"получено {result}")
+
+
+def _s3_copy(t: T, dst: str):
+    src = t.s3_put("src.csv", b"id\n1\n")
+    t.run(aws_conn_id=t.s3_conn, source_bucket_name=t.bucket, source_bucket_key=src,
+          dest_bucket_name=t.bucket, dest_bucket_key=dst)
+    if (got := t.s3.read_key(t.s3_prefix + "dst.csv", t.bucket)) != "id\n1\n":
+        raise AirflowFailException(f"в копии {got!r}")
+
+
+def s3_copy_key(t: T):
+    """S3CopyObjectOperator: копия ключа теста в своей папке"""
+    _s3_copy(t, t.s3_prefix + "dst.csv")
+
+
+def s3_copy_tpl(t: T):
+    """S3CopyObjectOperator шаблоном: dest_bucket_key из {{ }}"""
+    _s3_copy(t, f"{{{{ {t.s3_prefix + 'dst.csv'!r} }}}}")
+
+
+def _s3_create_object(t: T, data, want):
+    key = t.s3_prefix + "obj.csv"
+    t.run(aws_conn_id=t.s3_conn, s3_bucket=t.bucket, s3_key=key, data=data, replace=True)
+    if (got := t.s3.read_key(key, t.bucket)) != want:
+        raise AirflowFailException(f"записано {got!r}, ждём {want!r}")
+
+
+def s3_create_object_data(t: T):
+    """S3CreateObjectOperator: ключ из data"""
+    _s3_create_object(t, "id\n1\n", "id\n1\n")
+
+
+def s3_create_object_tpl(t: T):
+    """S3CreateObjectOperator шаблоном: data из {{ }}"""
+    _s3_create_object(t, "{{ 40 + 2 }}", "42")
+
+
+HTTP_CONN = "airflow_api"  # свой API контура; заводит ядро
+
+
+def _http(t: T, endpoint: str):
+    from airflow.sdk import BaseHook
+    try:
+        BaseHook.get_connection(HTTP_CONN)
+    except Exception:
+        raise AirflowSkipException(f"нет подключения {HTTP_CONN}") from None
+    import airflow
+    result, _ = t.run(http_conn_id=HTTP_CONN, method="GET", endpoint=endpoint, response_filter=lambda r: r.json())
+    if (result or {}).get("version") != airflow.__version__:
+        raise AirflowFailException(f"ответ {result}, ждём версию {airflow.__version__}")
+
+
+def http_version(t: T):
+    """HttpOperator: GET api/v2/version своего API, версия = версии рана"""
+    _http(t, "api/v2/version")
+
+
+def http_tpl(t: T):
+    """HttpOperator шаблоном: endpoint из {{ }}"""
+    _http(t, "{{ 'api/v2/version' }}")
+```
+- [ ] В `STD_OPS`: `task_branch` (`standard.decorators.branch_python`, `_BranchPythonDecoratedOperator`, set()),
+  `branch_sql` (`common.sql.operators.sql`, `BranchSQLOperator`, {"pg"}), `ch_sql_execute`
+  (`clickhouse_dbapi`, `ClickHouseSQLExecuteQueryOperator`, {"ch"}, pkg `airflow_clickhouse_plugin`), `s3_copy`,
+  `s3_create_object` (`amazon.aws.operators.s3`, {"s3"}), `http` (`http.operators.http`, `HttpOperator`, set()).
+  Модуль/класс сверить на стенде до правки.
+- [ ] Документация: readme — 14 → 20 и новые имена, Http — подключение `airflow_api`; `tools/skill/tools.md` — 14 → 20.
+- [ ] ruff, EOL; стенд: прогон новых групп; `http` с подключением `airflow_api` (вручную: `airflow connections add
+  airflow_api --conn-type http --conn-host localhost --conn-port 8093 --conn-schema http`) → ✅, удалить
+  подключение → ☮️ «нет подключения»; `ch_sql_execute` — ❌ по патчу ядра, логика ✅ копией с исходным классом;
+  полный ран → 60 Hrp ✅ как v2.6, ❌ только ch_operator/ch_branch_sql/ch_sql_execute.
+- [ ] Commit: `feat(test_hrp_operators): ещё 6 стандартных операторов по замеру dev (REQ-hrp-regress-46)`
+
+**Критерии выхода:** 20 групп `test_standart`, 42 теста; полный ран — ❌ только известные ядровые; `verdict` — прежние ключи.
+
 ## Self-review
 - Покрытие: 01 — 1.1, 5.1; 34 — 1.1–5.1; 35 — 1.1, 5.1; 36 — 1.1–4.1; 37 — 2.1, 3.1; 38 — 2.1, 3.1, 4.1;
-  39 — 1.1; 40 — 3.1; 41 — 3.1; 42 — 4.1; 43 — 5.1; 44 — 1.1, 5.1; 45 — 2.1.
-- Счёт тестов: 1.1 — 5, 2.1 — 7 + check, 3.1 — 8, 4.1 — 8, 5.1 — 1 → 30.
+  39 — 1.1; 40 — 3.1; 41 — 3.1, 6.1; 42 — 4.1, 6.1; 43 — 5.1; 44 — 1.1, 5.1; 45 — 2.1; 46 — 6.1;
+  34, 37, 01 — ещё и 6.1.
+- Счёт тестов: 1.1 — 5, 2.1 — 7 + check, 3.1 — 8, 4.1 — 8, 5.1 — 1 → 30; 6.1 — 12 → 42.
 - Имена: `_no_skip`, `_ids`, `_sensor_ok`, `_sensor_timeout`, `SENSOR_TIMEOUT`, `STD`, `STD_OPS`, `TOPS` — одинаковы во всех задачах.
 - Риски на стенде: `ClickHouseDbApiHook` и тип подключения `dlab-click`; ответ `_handle_trigger_dag_run`;
   `SQLExecuteQueryOperator` во временном режиме (hook.run открывает соединение через `get_conn` — подменён).
