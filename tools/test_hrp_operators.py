@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-22 15:52 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 16:41 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -1542,6 +1542,53 @@ def ch_sensor_timeout(t: T):
     _sensor_timeout(t, clickhouse_conn_id=t.ch_conn, sql="SELECT 0", is_success=lambda r: bool(r[0][0]))
 
 
+def ch_sql_execute_select(t: T):
+    """ClickHouseSQLExecuteQueryOperator: SELECT с parameters по таблице теста"""
+    src = t.ch_table("src", rows=ROWS)
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, parameters={"n": _IDS[1]},
+                      sql=f"SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id")
+    if [int(r[0]) for r in result or []] != _IDS[:2]:
+        raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
+
+
+def ch_sql_execute_tpl(t: T):
+    """ClickHouseSQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 40 + 2 }}")
+    if [tuple(r) for r in result or []] != [(42,)]:
+        raise AirflowFailException(f"получено {result}")
+
+
+def task_branch_both(t: T):
+    """@task.branch: обе ветки по условию, задачи регресса не пропускаются"""
+    for flag, want in ((True, "systems"), (False, "report")):  # декорированному op_args обязателен
+        _branch(t, flag, want, python_callable=_pick, op_args=[], op_kwargs={"flag": flag})
+
+
+def task_branch_tpl(t: T):
+    """@task.branch шаблоном: условие из {{ }} — строка 'True'"""
+    _branch(t, "{{ 1 == 1 }}", "systems", python_callable=_pick, op_args=[], op_kwargs={"flag": "{{ 1 == 1 }}"})
+
+
+def _branch_sql(t: T, sql: str, want: str, **kw):
+    with _no_skip(t) as (m_all, _):
+        t.run(conn_id=t.pg_conn, sql=sql, follow_task_ids_if_true="systems", follow_task_ids_if_false="report", **kw)
+    asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+    if asked != [want]:
+        raise AirflowFailException(f"{sql}: пропуск кроме {asked}, ждём {want}")
+
+
+def branch_sql_both(t: T):
+    """BranchSQLOperator: обе ветки по результату SQL с parameters на pg формы"""
+    src = t.full(t.pg_table("src", ROWS))
+    for n, want in ((_IDS[0], "systems"), (_IDS[0] - 1, "report")):
+        _branch_sql(t, f"SELECT count(*) FROM {src} WHERE id <= %(n)s", want, parameters={"n": n}, sessions=["main"])
+
+
+def branch_sql_tpl(t: T):
+    """BranchSQLOperator шаблоном: SQL из {{ }}"""
+    _branch_sql(t, "SELECT {{ 1 }}", "systems")
+
+
 # ─────────────────────────────── Тесты: стандартные — S3 ──────────────────────────
 def _s3_delete(t: T, **kw):
     for n in ("del/a.csv", "del/b.csv"):
@@ -1601,6 +1648,42 @@ def s3_create_bucket_tpl(t: T):
     _s3_create_bucket(t, f"{{{{ {t.bucket!r} }}}}")
 
 
+def _s3_copy(t: T, dst: str):
+    src = t.s3_put("src.csv", b"id\n1\n")
+    t.run(aws_conn_id=t.s3_conn, source_bucket_name=t.bucket, source_bucket_key=src,
+          dest_bucket_name=t.bucket, dest_bucket_key=dst)
+    if (got := t.s3.read_key(t.s3_prefix + "dst.csv", t.bucket)) != "id\n1\n":
+        raise AirflowFailException(f"в копии {got!r}")
+
+
+def s3_copy_key(t: T):
+    """S3CopyObjectOperator: копия ключа теста в своей папке"""
+    _s3_copy(t, t.s3_prefix + "dst.csv")
+
+
+def s3_copy_tpl(t: T):
+    """S3CopyObjectOperator шаблоном: dest_bucket_key из {{ }}"""
+    _s3_copy(t, f"{{{{ {t.s3_prefix + 'dst.csv'!r} }}}}")
+
+
+def _s3_create_object(t: T, data, want):
+    key = t.s3_prefix + "obj.csv"
+    t.run(aws_conn_id=t.s3_conn, s3_bucket=t.bucket, s3_key=key, data=data, replace=True)
+    if (got := t.s3.read_key(key, t.bucket)) != want:
+        raise AirflowFailException(f"записано {got!r}, ждём {want!r}")
+
+
+def s3_create_object_data(t: T):
+    """S3CreateObjectOperator: ключ из data"""
+    # data — шаблонное поле: Jinja срезает завершающий перевод строки, без него — как в бою
+    _s3_create_object(t, "id\n1", "id\n1")
+
+
+def s3_create_object_tpl(t: T):
+    """S3CreateObjectOperator шаблоном: data из {{ }}"""
+    _s3_create_object(t, "{{ 40 + 2 }}", "42")
+
+
 # ─────────────────────────── Тесты: стандартные — TriggerDagRun ───────────────────
 DUMMY = "tools_dummy"
 
@@ -1629,6 +1712,32 @@ def trigger_dagrun_conf(t: T):
     _, state = _handle_trigger_dag_run(drte, t.context, ti, structlog.get_logger())
     if state != "success" or ti.get_dr_count(dag_id=DUMMY, run_ids=[run_id]) != 1:
         raise AirflowFailException(f"ран {DUMMY}/{run_id} не создан (state={state})")
+
+
+# ─────────────────────────────── Тесты: стандартные — HTTP ────────────────────────
+HTTP_CONN = "af_api"  # свой API контура; заводит ядро
+
+
+def _http(t: T, endpoint: str):
+    from airflow.sdk import BaseHook
+    try:
+        BaseHook.get_connection(HTTP_CONN)
+    except Exception:
+        raise AirflowSkipException(f"нет подключения {HTTP_CONN}") from None
+    import airflow
+    result, _ = t.run(http_conn_id=HTTP_CONN, method="GET", endpoint=endpoint, response_filter=lambda r: r.json())
+    if (result or {}).get("version") != airflow.__version__:
+        raise AirflowFailException(f"ответ {result}, ждём версию {airflow.__version__}")
+
+
+def http_version(t: T):
+    """HttpOperator: GET api/v2/version своего API, версия = версии рана"""
+    _http(t, "api/v2/version")
+
+
+def http_tpl(t: T):
+    """HttpOperator шаблоном: endpoint из {{ }}"""
+    _http(t, "{{ 'api/v2/version' }}")
 
 
 OPS = [
@@ -1708,6 +1817,16 @@ STD_OPS = [
        [s3_create_bucket_exists, s3_create_bucket_tpl], pkg=STD),
     Op("trigger_dagrun", "standard.operators.trigger_dagrun", "TriggerDagRunOperator", set(),
        [trigger_dagrun_conf], pkg=STD),
+    # замер сигмы dev за всё время (22.10)
+    Op("task_branch", "standard.decorators.branch_python", "_BranchPythonDecoratedOperator", set(),
+       [task_branch_both, task_branch_tpl], pkg=STD),
+    Op("branch_sql", "common.sql.operators.sql", "BranchSQLOperator", {"pg"}, [branch_sql_both, branch_sql_tpl], pkg=STD),
+    Op("ch_sql_execute", "operators.clickhouse_dbapi", "ClickHouseSQLExecuteQueryOperator", {"ch"},
+       [ch_sql_execute_select, ch_sql_execute_tpl], pkg="airflow_clickhouse_plugin"),
+    Op("s3_copy", "amazon.aws.operators.s3", "S3CopyObjectOperator", {"s3"}, [s3_copy_key, s3_copy_tpl], pkg=STD),
+    Op("s3_create_object", "amazon.aws.operators.s3", "S3CreateObjectOperator", {"s3"},
+       [s3_create_object_data, s3_create_object_tpl], pkg=STD),
+    Op("http", "http.operators.http", "HttpOperator", set(), [http_version, http_tpl], pkg=STD),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
 # главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>

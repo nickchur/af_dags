@@ -132,12 +132,14 @@ S3 → S3, CH → S3 (native, native частями, table, query), CH → PG (�
 OpenMetadata — их систем на стендах нет.
 
 **Стандартные операторы** — главная группа `test_standart` (`test_standart.<группа>.<тест>`), правила те же:
-14 операторов Airflow и провайдеров, которые даги сигмы используют (замер 22.10.2026) — `Empty`, `Python`,
-`@task`, `BranchPython`, `ShortCircuit`, `@task.sensor`, `SQLExecuteQuery`, `ClickHouse`, `ClickHouseBranchSQL`,
-`ClickHouseSensor`, `S3DeleteObjects`, `S3KeySensor`, `S3CreateBucket`, `TriggerDagRun`. Ветвление внутри теста
+20 операторов Airflow и провайдеров, которые даги сигмы используют (замер 22.10.2026) — `Empty`, `Python`,
+`@task`, `BranchPython`, `@task.branch`, `ShortCircuit`, `@task.sensor`, `SQLExecuteQuery`, `BranchSQL`,
+`ClickHouse`, `ClickHouseBranchSQL`, `ClickHouseSQLExecuteQuery`, `ClickHouseSensor`, `S3DeleteObjects`,
+`S3KeySensor`, `S3CreateBucket`, `S3CopyObject`, `S3CreateObject`, `TriggerDagRun`, `Http`. Ветвление внутри теста
 проверяется без пропуска задач; настоящий пропуск веток — подгруппа `skip_graph` (задача `check` сверяет
 состояния). Бакеты не создаются (`S3CreateBucket` — только существующий бакет), `TriggerDagRun` создаёт ран
-`tools_dummy` без ожидания. Kafka — в своих дагах `test_kafka_*`.
+`tools_dummy` без ожидания. `Http` ходит в свой API (`GET api/v2/version`) через подключение `af_api` —
+его нет, группа ☮️. Kafka — в своих дагах `test_kafka_*`.
 
 **Параметры формы**
 - `pg` — `conn_id.схема`: таблицы в схеме (нужны CREATE и DROP); только `conn_id` — временные таблицы

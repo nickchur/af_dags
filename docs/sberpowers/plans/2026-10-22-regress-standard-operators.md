@@ -622,7 +622,7 @@ def trigger_dagrun_conf(t: T):
 **Контекст:** замер сигмы dev за всё время (22.10) — сверх 14: `S3CopyObjectOperator` (20 задач),
 `@task.branch` (3), `S3CreateObjectOperator` (1), `BranchSQLOperator` (1), `ClickHouseSQLExecuteQueryOperator` (1),
 `HttpOperator` (2). Все в `ALLOWED_OPERATORS`. На стенде: `/api/v2/version` и `/api/v2/monitor/health` — 200 без
-авторизации, `/api/v1` — 404 («removed in Airflow 3»); подключения `airflow_api` нет — его заведёт ядро
+авторизации, `/api/v1` — 404 («removed in Airflow 3»); подключения `af_api` нет — его заведёт ядро
 отдельной задачей. `ClickHouseSQLExecuteQueryOperator` подменён патчем ядра (как `ch_operator`) — на стенде
 ожидается ❌ по тому же дефекту; логику теста проверить копией с исходным классом плагина.
 
@@ -711,7 +711,7 @@ def s3_create_object_tpl(t: T):
     _s3_create_object(t, "{{ 40 + 2 }}", "42")
 
 
-HTTP_CONN = "airflow_api"  # свой API контура; заводит ядро
+HTTP_CONN = "af_api"  # свой API контура; заводит ядро
 
 
 def _http(t: T, endpoint: str):
@@ -740,9 +740,9 @@ def http_tpl(t: T):
   (`clickhouse_dbapi`, `ClickHouseSQLExecuteQueryOperator`, {"ch"}, pkg `airflow_clickhouse_plugin`), `s3_copy`,
   `s3_create_object` (`amazon.aws.operators.s3`, {"s3"}), `http` (`http.operators.http`, `HttpOperator`, set()).
   Модуль/класс сверить на стенде до правки.
-- [ ] Документация: readme — 14 → 20 и новые имена, Http — подключение `airflow_api`; `tools/skill/tools.md` — 14 → 20.
-- [ ] ruff, EOL; стенд: прогон новых групп; `http` с подключением `airflow_api` (вручную: `airflow connections add
-  airflow_api --conn-type http --conn-host localhost --conn-port 8093 --conn-schema http`) → ✅, удалить
+- [ ] Документация: readme — 14 → 20 и новые имена, Http — подключение `af_api`; `tools/skill/tools.md` — 14 → 20.
+- [ ] ruff, EOL; стенд: прогон новых групп; `http` с подключением `af_api` (вручную: `airflow connections add
+  af_api --conn-type http --conn-host localhost --conn-port 8093 --conn-schema http`) → ✅, удалить
   подключение → ☮️ «нет подключения»; `ch_sql_execute` — ❌ по патчу ядра, логика ✅ копией с исходным классом;
   полный ран → 60 Hrp ✅ как v2.6, ❌ только ch_operator/ch_branch_sql/ch_sql_execute.
 - [ ] Commit: `feat(test_hrp_operators): ещё 6 стандартных операторов по замеру dev (REQ-hrp-regress-46)`
