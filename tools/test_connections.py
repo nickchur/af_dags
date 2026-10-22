@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-07 14:45 MSK · v3.13 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 10:20 MSK · v3.14 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -253,19 +253,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         elif chk_type == "Trino":
             from airflow.providers.trino.hooks.trino import TrinoHook  # type: ignore
             hook = TrinoHook(trino_conn_id=conn_id)
-            try:
-                result = hook.get_first("SELECT current_user, current_catalog, current_schema")
-            except Exception as err:
-                # Хост не резолвится: соединение заведено под контур, где Trino нет.
-                # Это не деградация связности, а отсутствие сервиса — скип, а не падение.
-                # Сообщение приезжает из urllib3 внутрь requests.ConnectionError, поэтому
-                # ищем по всей строке, а не сравниваем тип исключения.
-                if "Name or service not known" not in str(err):
-                    raise
-                msg = f"☮️ {conn_id}: хост не резолвится — {err}"
-                add_note(msg, context, level="task", title=f"☮️ {conn_id}")
-                logger.warning(msg)
-                raise AirflowSkipException(msg) from err
+            result = hook.get_first("SELECT current_user, current_catalog, current_schema")
 
         elif chk_type == "Redis":
             import redis
@@ -273,15 +261,31 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 
             conn = BaseHook.get_connection(conn_id)
             extra = conn.extra_dejson.copy()
-            client = redis.Redis(
-                host=conn.host,
-                port=conn.port or 6379,
-                username=conn.login or None,
-                password=conn.password or None,
-                db=int(extra.get("db", 0)),
-                socket_timeout=int(extra.get("socket_timeout", 15)),
-            )
-            result = f"PONG: {client.ping()}"
+            # Все узлы кластера (celery-broker, hrp — cluster_hosts из секрет-бэкенда), иначе хост подключения;
+            # TLS — как у воркера: ssl и ssl_cert_reqs/ssl_ca_certs из extra
+            nodes = [n.strip() for n in str(extra.get("cluster_hosts") or "").split(",") if n.strip()] \
+                or [f"{conn.host}:{conn.port or 6379}"]
+            tls = {k: extra[k] for k in ("ssl_cert_reqs", "ssl_ca_certs") if extra.get(k)} if extra.get("ssl") else {}
+            pongs, errors = [], {}
+            for node in nodes:
+                host, _, port = node.partition(":")
+                try:
+                    redis.Redis(
+                        host=host, port=int(port or conn.port or 6379),
+                        username=conn.login or None, password=conn.password or None,
+                        db=int(extra.get("db", 0)), socket_timeout=int(extra.get("socket_timeout", 15)),
+                        ssl=bool(extra.get("ssl")), **tls,
+                    ).ping()
+                    pongs.append(node)
+                except redis.RedisError as e:
+                    errors[node] = e
+            dns = [n for n, e in errors.items() if "Name or service not known" in str(e)]
+            if errors and len(dns) == len(nodes):
+                raise errors[nodes[0]]  # ни один узел не резолвится — ☮️ в общем обработчике
+            if errors:
+                raise redis.ConnectionError(f"узлов недоступно {len(errors)} из {len(nodes)}: " + "; ".join(
+                    f"{n}: {'хост не резолвится' if n in dns else e}" for n, e in errors.items()))
+            result = f"PONG от {len(pongs)} узлов: {', '.join(pongs)}"
 
         else:
             raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")
@@ -304,6 +308,15 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
         raise AirflowSkipException(msg) from err
 
     except Exception as err:
+        # Хост не резолвится: соединение заведено под контур, где сервиса нет (Trino, Redis
+        # с delta-хостами на сигме). Это не деградация связности, а отсутствие сервиса — скип.
+        # Сообщение приезжает вложенным (urllib3 в requests, gaierror в redis), поэтому
+        # ищем по всей строке, а не сравниваем тип исключения.
+        if chk_type in ("Trino", "Redis") and "Name or service not known" in str(err):
+            msg = f"☮️ {conn_id}: хост не резолвится — {err}"
+            add_note(msg, context, level="task", title=f"☮️ {conn_id}")
+            logger.warning(msg)
+            raise AirflowSkipException(msg) from err
         msg = f"❌ {time.time() - ts:.2f} sec chk_{conn_id}_conn ERROR Try {ti.try_number}"
         add_note(str(err), context, level="task,DAG", title=msg)
         raise  # re-raise оригинальное исключение, а не AirflowFailException — в логе видна причина
@@ -372,18 +385,17 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
 )
 def tools_test_connections():  # noqa: PLR0915
 
-    # Без потомков: пропуск (save_params=False) ни на что не влияет; report его не считает
+    # params строго до collect: новые значения сохранены до проверок; report его не считает
     @task(task_id="params")
     def save_params(**context):
         """💾 Сохраняет параметры запуска (в т. ч. расписание) как значения по умолчанию."""
         return store_params_task(PARAMS_VAR, SAVED, context)
 
-    save_params()
-
     # Список снимается в том же ране: состав проверок всегда свежий, парсинг файла
     # Variable не читает. Один expand на весь список: по XCom-ключу группы Airflow 2
     # раскрывать не умеет, группа — в подписи экземпляра
-    @task(task_id="collect", retries=2)
+    # NONE_FAILED: params штатно пропускает себя без save_params, ALL_SUCCESS утянул бы всё в skip
+    @task(task_id="collect", retries=2, trigger_rule=TriggerRule.NONE_FAILED)
     def collect(**context):
         """🔌 Подключения secret backend: список проверок по группам и Variable local_connections."""
         from collections import defaultdict
@@ -453,7 +465,9 @@ def tools_test_connections():  # noqa: PLR0915
             raise AirflowSkipException(msg)
         return _run_test(item["conn_id"], item["conn_type"], **context)
 
-    checks = check.override(doc_md=check.function.__doc__).expand(item=collect())
+    conns = collect()
+    save_params() >> conns
+    checks = check.override(doc_md=check.function.__doc__).expand(item=conns)
 
 
     # --- Summary ---

@@ -1,5 +1,5 @@
 # Служебные даги (`tools/`): проверка и обслуживание
-*2026-10-15 14:25 MSK · v1.85 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-22 10:20 MSK · v1.86 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 > До 24.09.2026 каталог назывался `check/`. На сигме он всегда был `tools/` (`CI06932748/tools/…`),
 > теперь и в репозитории так же. S3-инструменты альфы переехали в [`s3_tools/`](../s3_tools/readme.md).
@@ -94,7 +94,7 @@ DAG автоматически обнаруживает все подключе�
 | **clickhouse** | тип `sqlite` / `clickhouse` | Проверка версии через `ClickHouseHook` |
 | **kafka** | тип `kafka` | Листинг топиков через `KafkaAdminClientHook` |
 | **trino** | тип `trino` | Валидация сессии через `TrinoHook`; нерезолвящийся хост → `☮️` |
-| **redis** | тип `redis` | Проверка доступности через `redis.Redis(...).ping()` |
+| **redis** | тип `redis` | `ping` каждого узла `cluster_hosts` (иначе хоста), TLS из extra; `celery-broker` — брокер воркера; ни один узел не резолвится → `☮️` |
 | **other** | прочие | Помечаются символом `☮️` (пропуск) |
 
 ### [test_hrp_operators.py](test_hrp_operators.py)
