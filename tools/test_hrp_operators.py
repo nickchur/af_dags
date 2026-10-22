@@ -1470,6 +1470,78 @@ def task_sensor_tpl(t: T):
     _sensor_ok(t, python_callable=lambda x: x == "ok", op_kwargs={"x": "{{ 'o' ~ 'k' }}"})
 
 
+# ─────────────────────────── Тесты: стандартные — SQL и CH ────────────────────────
+_IDS = sorted(r[0] for r in ROWS)  # id — первая колонка COLUMNS
+
+
+def _sql_select(t: T, sql, params, want):
+    src = t.full(t.pg_table("src", ROWS))
+    result, _ = t.run(conn_id=t.pg_conn, sql=sql.format(src=src), parameters=params, sessions=["main"])
+    got = [tuple(r) for r in result or []]
+    if got != want:
+        raise AirflowFailException(f"получено {got}, ждём {want}")
+
+
+def sql_execute_select(t: T):
+    """SQLExecuteQueryOperator: SELECT с parameters по таблице теста на pg формы"""
+    _sql_select(t, "SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id", {"n": _IDS[1]}, [(i,) for i in _IDS[:2]])
+
+
+def sql_execute_tpl(t: T):
+    """SQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
+    _sql_select(t, "SELECT count(*) FROM {src} WHERE id <= {{{{ %d }}}}" % _IDS[1], None, [(2,)])
+
+
+def ch_operator_rows(t: T):
+    """ClickHouseOperator: DDL, INSERT … SELECT с parameters и SELECT одним списком"""
+    src, tgt = t.ch_table("src", rows=ROWS), t.ch_full(t.name("tgt"))
+    result, _ = t.run(clickhouse_conn_id=t.ch_conn, parameters={"n": _IDS[1]}, sql=[
+        f"CREATE TABLE {tgt} (id Int64) ENGINE = MergeTree ORDER BY id",
+        f"INSERT INTO {tgt} SELECT id FROM {src} WHERE id <= %(n)s",
+        f"SELECT id FROM {tgt} ORDER BY id"])
+    if [int(r[0]) for r in result or []] != _IDS[:2]:
+        raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
+
+
+def ch_operator_tpl(t: T):
+    """ClickHouseOperator шаблоном: SQL из {{ }}"""
+    result, _ = t.run(clickhouse_conn_id=t.ch_conn, sql="SELECT {{ 40 + 2 }}")
+    if result != [(42,)]:
+        raise AirflowFailException(f"получено {result}")
+
+
+def ch_branch_sql_both(t: T):
+    """ClickHouseBranchSQLOperator: обе ветки по результату SQL, задачи регресса не пропускаются"""
+    for sql, want in (("SELECT 1", "systems"), ("SELECT 0", "report")):
+        with _no_skip(t) as (m_all, _):
+            t.run(conn_id=t.ch_conn, database=t.ch_db, sql=sql,
+                  follow_task_ids_if_true="systems", follow_task_ids_if_false="report")
+        asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+        if asked != [want]:
+            raise AirflowFailException(f"{sql}: пропуск кроме {asked}, ждём {want}")
+
+
+def ch_branch_sql_tpl(t: T):
+    """ClickHouseBranchSQLOperator шаблоном: SQL из {{ }}"""
+    with _no_skip(t) as (m_all, _):
+        t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 1 }}",
+              follow_task_ids_if_true="systems", follow_task_ids_if_false="report")
+    if not m_all.called or _ids(m_all.call_args.args[1]) != ["systems"]:
+        raise AirflowFailException(f"пропуск: {m_all.call_args}")
+
+
+def ch_sensor_ok(t: T):
+    """ClickHouseSensor шаблоном: строки есть — выход за первый poke"""
+    src = t.ch_table("src", rows=ROWS)
+    _sensor_ok(t, clickhouse_conn_id=t.ch_conn, sql=f"SELECT count() FROM {src} WHERE id > {{{{ 0 }}}}",
+               is_success=lambda r: r[0][0] == len(ROWS))
+
+
+def ch_sensor_timeout(t: T):
+    """ClickHouseSensor: условие не выполнено — падение по timeout"""
+    _sensor_timeout(t, clickhouse_conn_id=t.ch_conn, sql="SELECT 0", is_success=lambda r: bool(r[0][0]))
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -1531,6 +1603,14 @@ STD_OPS = [
        [short_circuit_both, short_circuit_tpl], pkg=STD),
     Op("task_sensor", "standard.decorators.sensor", "DecoratedSensorOperator", set(),
        [task_sensor_ok, task_sensor_timeout, task_sensor_tpl], pkg=STD),
+    Op("sql_execute", "common.sql.operators.sql", "SQLExecuteQueryOperator", {"pg"},
+       [sql_execute_select, sql_execute_tpl], pkg=STD),
+    Op("ch_operator", "operators.clickhouse", "ClickHouseOperator", {"ch"},
+       [ch_operator_rows, ch_operator_tpl], pkg="airflow_clickhouse_plugin"),
+    Op("ch_branch_sql", "operators.clickhouse_dbapi", "ClickHouseBranchSQLOperator", {"ch"},
+       [ch_branch_sql_both, ch_branch_sql_tpl], pkg="airflow_clickhouse_plugin"),
+    Op("ch_sensor", "sensors.clickhouse", "ClickHouseSensor", {"ch"},
+       [ch_sensor_ok, ch_sensor_timeout], pkg="airflow_clickhouse_plugin"),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
 # главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>
