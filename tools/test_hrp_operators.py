@@ -1542,6 +1542,65 @@ def ch_sensor_timeout(t: T):
     _sensor_timeout(t, clickhouse_conn_id=t.ch_conn, sql="SELECT 0", is_success=lambda r: bool(r[0][0]))
 
 
+# ─────────────────────────────── Тесты: стандартные — S3 ──────────────────────────
+def _s3_delete(t: T, **kw):
+    for n in ("del/a.csv", "del/b.csv"):
+        t.s3_put(n, b"x")
+    t.run(aws_conn_id=t.s3_conn, bucket=t.bucket, **kw)
+    if left := t.s3_keys("del/"):
+        raise AirflowFailException(f"не удалены: {left}")
+
+
+def s3_delete_keys(t: T):
+    """S3DeleteObjectsOperator: удаление списком keys"""
+    _s3_delete(t, keys=[t.s3_prefix + "del/a.csv", t.s3_prefix + "del/b.csv"])
+
+
+def s3_delete_prefix(t: T):
+    """S3DeleteObjectsOperator: удаление по prefix"""
+    _s3_delete(t, prefix=t.s3_prefix + "del/")
+
+
+def s3_delete_tpl(t: T):
+    """S3DeleteObjectsOperator шаблоном: prefix из {{ }}"""
+    _s3_delete(t, prefix=f"{{{{ {t.s3_prefix + 'del/'!r} }}}}")
+
+
+def s3_key_sensor_ok(t: T):
+    """S3KeySensor: ключ есть — выход за первый poke"""
+    key = t.s3_put("ready.csv", b"x")
+    _sensor_ok(t, aws_conn_id=t.s3_conn, bucket_name=t.bucket, bucket_key=key)
+
+
+def s3_key_sensor_timeout(t: T):
+    """S3KeySensor: ключа нет — падение по timeout"""
+    _sensor_timeout(t, aws_conn_id=t.s3_conn, bucket_name=t.bucket, bucket_key=t.s3_prefix + "absent.csv")
+
+
+def s3_key_sensor_tpl(t: T):
+    """S3KeySensor шаблоном: bucket_key из {{ }}"""
+    key = t.s3_put("ready.csv", b"x")
+    _sensor_ok(t, aws_conn_id=t.s3_conn, bucket_name=t.bucket, bucket_key=f"{{{{ {key!r} }}}}")
+
+
+def _s3_create_bucket(t: T, name):
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    with mock.patch.object(S3Hook, "create_bucket") as create:  # бакеты регресс не создаёт
+        t.run(aws_conn_id=t.s3_conn, bucket_name=name)
+    if create.called or not t.s3.check_for_bucket(t.bucket):
+        raise AirflowFailException(f"create_bucket вызван={create.called}: оператор не увидел бакет {t.bucket}")
+
+
+def s3_create_bucket_exists(t: T):
+    """S3CreateBucketOperator: бакет формы уже есть — без ошибки и без создания"""
+    _s3_create_bucket(t, t.bucket)
+
+
+def s3_create_bucket_tpl(t: T):
+    """S3CreateBucketOperator шаблоном: bucket_name из {{ }}"""
+    _s3_create_bucket(t, f"{{{{ {t.bucket!r} }}}}")
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -1611,6 +1670,12 @@ STD_OPS = [
        [ch_branch_sql_both, ch_branch_sql_tpl], pkg="airflow_clickhouse_plugin"),
     Op("ch_sensor", "sensors.clickhouse", "ClickHouseSensor", {"ch"},
        [ch_sensor_ok, ch_sensor_timeout], pkg="airflow_clickhouse_plugin"),
+    Op("s3_delete", "amazon.aws.operators.s3", "S3DeleteObjectsOperator", {"s3"},
+       [s3_delete_keys, s3_delete_prefix, s3_delete_tpl], pkg=STD),
+    Op("s3_key_sensor", "amazon.aws.sensors.s3", "S3KeySensor", {"s3"},
+       [s3_key_sensor_ok, s3_key_sensor_timeout, s3_key_sensor_tpl], pkg=STD),
+    Op("s3_create_bucket", "amazon.aws.operators.s3", "S3CreateBucketOperator", {"s3"},
+       [s3_create_bucket_exists, s3_create_bucket_tpl], pkg=STD),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
 # главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>
