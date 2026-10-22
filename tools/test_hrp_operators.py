@@ -31,6 +31,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import zipfile
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -47,7 +48,7 @@ for _env_var in ("HRP_ETL_CORE_PATH", "HRP_OPERATORS_SRC_PATH"):
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook  # noqa: E402
 from airflow.sdk import Param, TaskGroup, TriggerRule, dag, task  # noqa: E402
-from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException  # noqa: E402
+from airflow.sdk.exceptions import AirflowFailException, AirflowSensorTimeout, AirflowSkipException  # noqa: E402
 
 try:
     from plugins.utils import (  # type: ignore
@@ -1364,6 +1365,111 @@ def task_tpl(t: T):
     _python(t, "{{ 40 + 2 }}", "42")
 
 
+# ─────────────────────── Тесты: стандартные — ветвление, сенсоры ──────────────────
+SENSOR_TIMEOUT = 10  # с: тест «нет» ждёт его целиком
+
+
+@contextmanager
+def _no_skip(t: T):
+    """Ветвление AF3 пропускает downstream задачи из контекста — это задача-тест и следующий тест группы.
+    Подменяем пропуск на классе оператора и сверяем, что он запросил."""
+    with mock.patch.object(t.cls, "skip_all_except") as m_all, mock.patch.object(t.cls, "skip") as m_skip:
+        yield m_all, m_skip
+
+
+def _ids(x) -> list[str]:
+    return [x] if isinstance(x, str) else sorted(x or [])
+
+
+def _branch(t: T, flag, want: str, **kw):
+    """Ветка выбрана по flag: execute вернул её, пропуск запрошен «всё, кроме неё»."""
+    with _no_skip(t) as (m_all, _):
+        result, _ = t.run(**kw)
+    asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+    if _ids(result) != [want] or asked != [want]:
+        raise AirflowFailException(f"flag={flag!r}: вернул {result!r}, пропуск кроме {asked}, ждём {want}")
+
+
+def _pick(flag):
+    """Вызываемое ветвления: ветка — существующая задача дага (иначе skip_all_except отвергнет id)."""
+    return "systems" if flag in (True, "True") else "report"
+
+
+SKIP_GRAPH = "test_standart.skip_graph."
+# служебные задачи подгруппы: в verdict и сводке не считаются, тест — только check
+GRAPH_TASKS = {SKIP_GRAPH + x for x in ("branch", "keep", "drop", "short", "after")}
+GRAPH_WANT = {"branch": "success", "keep": "success", "drop": "skipped", "short": "success", "after": "skipped"}
+
+
+def _graph_branch():
+    return SKIP_GRAPH + "keep"
+
+
+def _sensor_ok(t: T, **kw):
+    """Условие выполнено — сенсор выходит за первый poke."""
+    _, m = t.run(mode="poke", poke_interval=1, timeout=SENSOR_TIMEOUT, spy="poke", **kw)
+    if m.call_count != 1:
+        raise AirflowFailException(f"poke вызван {m.call_count} раз, ждём 1")
+
+
+def _sensor_timeout(t: T, **kw):
+    """Условие не выполнено — сенсор падает по своему timeout, не раньше и не сильно позже."""
+    started = time.monotonic()
+    try:
+        t.run(mode="poke", poke_interval=1, timeout=SENSOR_TIMEOUT, **kw)
+    except AirflowSensorTimeout:
+        took = time.monotonic() - started
+        if not SENSOR_TIMEOUT <= took <= SENSOR_TIMEOUT + 20:
+            raise AirflowFailException(f"таймаут через {took:.1f} с, ждём ~{SENSOR_TIMEOUT}") from None
+        return
+    raise AirflowFailException("сенсор вышел без AirflowSensorTimeout")
+
+
+def branch_python_both(t: T):
+    """BranchPythonOperator: обе ветки по условию, задачи регресса не пропускаются"""
+    for flag, want in ((True, "systems"), (False, "report")):
+        _branch(t, flag, want, python_callable=_pick, op_kwargs={"flag": flag})
+
+
+def branch_python_tpl(t: T):
+    """BranchPythonOperator шаблоном: условие из {{ }} — строка 'True'"""
+    _branch(t, "{{ 1 == 1 }}", "systems", python_callable=_pick, op_kwargs={"flag": "{{ 1 == 1 }}"})
+
+
+def _short(t: T, flag, want):
+    with _no_skip(t) as (m_all, m_skip):
+        result, _ = t.run(python_callable=lambda flag: flag, op_kwargs={"flag": flag})
+    # у оператора в тесте нет downstream: «нет» не должно ничего пропускать
+    if result != want or m_all.called or m_skip.called:
+        raise AirflowFailException(f"flag={flag!r}: вернул {result!r}, skip={m_skip.called or m_all.called}")
+
+
+def short_circuit_both(t: T):
+    """ShortCircuitOperator: «да» и «нет», задачи регресса не пропускаются"""
+    _short(t, True, True)
+    _short(t, False, False)
+
+
+def short_circuit_tpl(t: T):
+    """ShortCircuitOperator шаблоном: условие из {{ }} — строка 'True'"""
+    _short(t, "{{ 1 == 1 }}", "True")
+
+
+def task_sensor_ok(t: T):
+    """@task.sensor: условие выполнено — выход за первый poke"""
+    _sensor_ok(t, python_callable=lambda: True)
+
+
+def task_sensor_timeout(t: T):
+    """@task.sensor: условие не выполнено — падение по timeout"""
+    _sensor_timeout(t, python_callable=lambda: False)
+
+
+def task_sensor_tpl(t: T):
+    """@task.sensor шаблоном: op_kwargs из {{ }} доходит до функции"""
+    _sensor_ok(t, python_callable=lambda x: x == "ok", op_kwargs={"x": "{{ 'o' ~ 'k' }}"})
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -1419,6 +1525,12 @@ STD_OPS = [
     Op("empty", "standard.operators.empty", "EmptyOperator", set(), [empty_run], pkg=STD),
     Op("python", "standard.operators.python", "PythonOperator", set(), [python_args, python_tpl], pkg=STD),
     Op("task", "standard.decorators.python", "_PythonDecoratedOperator", set(), [task_args, task_tpl], pkg=STD),
+    Op("branch_python", "standard.operators.python", "BranchPythonOperator", set(),
+       [branch_python_both, branch_python_tpl], pkg=STD),
+    Op("short_circuit", "standard.operators.python", "ShortCircuitOperator", set(),
+       [short_circuit_both, short_circuit_tpl], pkg=STD),
+    Op("task_sensor", "standard.decorators.sensor", "DecoratedSensorOperator", set(),
+       [task_sensor_ok, task_sensor_timeout, task_sensor_tpl], pkg=STD),
 ]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
 # главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>
@@ -1563,6 +1675,8 @@ _S3_DEFAULT = log_bucket_path("test-operators") or "s3-archive://dataplatform-mo
                                    description=op.cls) for op in OPS},
         **{f"op_{op.group}": Param(SAVED.get(f"op_{op.group}", True), type="boolean",
                                    section="Стандартные операторы", description=op.cls) for op in STD_OPS},
+        "op_skip_graph": Param(SAVED.get("op_skip_graph", True), type="boolean", section="Стандартные операторы",
+                               description="пропуск веток в графе"),
     },
     doc_md=__doc__,
     description="Регресс операторов hrp_operators и стандартных по группам: pg, ch, s3",
@@ -1631,6 +1745,17 @@ def test_hrp_operators_dag():
 
         return _test()
 
+    @task(task_id="check", trigger_rule=TriggerRule.ALL_DONE, retries=0,
+          doc_md="Пропуск веток в графе: Branch и ShortCircuit настоящими задачами, невыбранные ☮️")
+    def skip_graph_check(**context):
+        if not context["params"].get("op_skip_graph", True):
+            raise AirflowSkipException("skip_graph: выключен (op_skip_graph=False)")
+        ti, dr = context["ti"], context["dag_run"]
+        states = ti.get_task_states(dag_id=dr.dag_id, run_ids=[dr.run_id]).get(dr.run_id, {})
+        got = {x: states.get(SKIP_GRAPH + x) for x in GRAPH_WANT}
+        if got != GRAPH_WANT:
+            raise AirflowFailException(f"состояния {got}, ждём {GRAPH_WANT}")
+
     # retries=0: провал вердикта — итог, а не сбой, перезапуск ничего не изменит
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE, retries=0)
     def report(**context):
@@ -1641,7 +1766,8 @@ def test_hrp_operators_dag():
         groups: dict = {}
         failed = []
         # по задачам дага, а не по ответу API: задача без строки в метабазе — ❌, а не пропажа из сводки
-        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TOPS))  # без systems и report
+        # без systems, report и служебных задач skip_graph
+        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TOPS) and tid not in GRAPH_TASKS)
         full = {}  # <группа>.<тест> → task_id: в verdict без главной группы, как до группы tests
         for task_id in test_ids:
             state = states.get(task_id) or "no_status"
@@ -1725,6 +1851,22 @@ def test_hrp_operators_dag():
                         prev >> cur
                         prev = cur
                     leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
+            # нет Branch или ShortCircuit — подгруппы нет молча: причина уже в строке их группы
+            if ops is STD_OPS and all(o.loaded for o in STD_OPS if o.group in ("branch_python", "short_circuit")):
+                with TaskGroup("skip_graph", tooltip="Пропуск веток настоящими задачами графа"):
+                    from airflow.providers.standard.operators.empty import EmptyOperator
+                    by = {o.group: o.loaded for o in STD_OPS}
+                    br = by["branch_python"](task_id="branch", python_callable=_graph_branch)
+                    # False: пропустить только прямого потомка, иначе ☮️ уйдут check и report
+                    sc = by["short_circuit"](task_id="short", python_callable=lambda: False,
+                                             ignore_downstream_trigger_rules=False)
+                    keep, drop, after = (EmptyOperator(task_id=x) for x in ("keep", "drop", "after"))
+                    chk = skip_graph_check()
+                    systems_t >> [br, sc]
+                    br >> [keep, drop]
+                    sc >> after
+                    [keep, drop, after] >> chk  # check — ALL_DONE: выполняется и после ☮️ веток
+                    leaves.append(chk)
     # report — единственный лист: ран краснеет через него
     leaves >> report()
 
