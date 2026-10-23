@@ -88,10 +88,18 @@ Airflow и провайдеров: `ClickHouseOperator` используется
   гейт должен её видеть). На стенде не проверяемо: там API на `localhost:8093` без шлюза; адрес проверить с
   пода воркера альфы до выкладки ядра.
 
+- **REQ-hrp-regress-47** — **Все классы, которые подменяет ядро.** Ядро подменяет девять ClickHouse-классов
+  плагина; в `test_standart` есть группа на каждый, даже если даги контуров его не используют: кроме
+  `ch_operator`, `ch_branch_sql`, `ch_sql_execute` — `ch_sql_check`, `ch_value_check`, `ch_threshold_check`,
+  `ch_interval_check`, `ch_column_check`, `ch_table_check`. У check-группы два теста: проверка проходит — ✅;
+  проверка не проходит — оператор падает своим «… failed», и тест ✅; прошла, когда должна упасть, или упала
+  ошибкой SQL — ❌. `ch_sql_execute` сверяет форму плагина: строка SQL → строки, без результата служебного
+  `SET log_comment` (контракт ядра 3.0.3).
+
 ## MODIFIED — изменённое поведение
 
-- **REQ-hrp-regress-01** — было: 24 группы операторов `hrp_operators` + lineage → станет: те же 24 + 20
-  групп стандартных операторов (REQ-hrp-regress-34) + lineage. Исключения прежние (Idp, Datacatalog,
+- **REQ-hrp-regress-01** — было: 24 группы операторов `hrp_operators` + lineage → станет: те же 24 + 26
+  групп стандартных операторов (REQ-hrp-regress-34, 47) + lineage. Исключения прежние (Idp, Datacatalog,
   LLM, Embeddings, OpenMetadata), к ним добавлены `ConsumeFromTopicOperator`/`ProduceToTopicOperator`.
   Kafka покрывает отдельный даг `test_kafka_*`.
 
@@ -145,6 +153,7 @@ Airflow и провайдеров: `ClickHouseOperator` используется
 | REQ-hrp-regress-42 | ран → S3CreateBucket ✅, список бакетов подключения до и после одинаков; S3Delete ✅, ключей теста нет, 6.1 |
 | REQ-hrp-regress-43 | ран → у `tools_dummy` новый ран с `conf` теста; на стенде без `tools_dummy` → ☮️, `report` зелёный |
 | REQ-hrp-regress-46 | с подключением `af_api` (на стенде — вручную) → ✅, версия = версии стенда; без подключения → ☮️ «нет подключения», `report` зелёный |
+| REQ-hrp-regress-47 | ран на ядре 3.0.3 → шесть check-групп ✅ оба теста; ядро до 3.0.3 → `ch_sql_execute` ❌ на `[[], строки]` |
 | REQ-hrp-regress-01 | разобрать даг → 24 Hrp + 20 стандартных + lineage, групп Kafka нет |
 
 ## Traceability
@@ -165,6 +174,7 @@ Airflow и провайдеров: `ClickHouseOperator` используется
 | REQ-hrp-regress-44 | 1.1, 5.1 | — | не начато |
 | REQ-hrp-regress-45 | 2.1 | — | не начато |
 | REQ-hrp-regress-46 | 6.1 | — | не начато |
+| REQ-hrp-regress-47 | 7.1 | стенд AF3: ран на ядре 3.0.3 ✅, шесть check-групп ok/fail ✅; ядро без правки результата → `ch_sql_execute` ❌ | выполнено |
 
 ## Задачи
 

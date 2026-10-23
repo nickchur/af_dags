@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-23 09:49 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-23 10:59 MSK · v2.8 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -1542,28 +1542,123 @@ def ch_sensor_timeout(t: T):
     _sensor_timeout(t, clickhouse_conn_id=t.ch_conn, sql="SELECT 0", is_success=lambda r: bool(r[0][0]))
 
 
-def _ch_last(result):
-    """Строки последнего запроса: ядро ставит перед SQL `SET log_comment=…;` (ClickHouseLogCommentMixin), строка
-    становится списком из двух запросов, и return_last не действует — даги платформы получают `[[], строки]`"""
-    return result[-1] if result and isinstance(result[0], list) else result
-
-
 def ch_sql_execute_select(t: T):
     """ClickHouseSQLExecuteQueryOperator: SELECT с parameters по таблице теста"""
     src = t.ch_table("src", rows=ROWS)
     result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, parameters={"n": _IDS[1]},
                       sql=f"SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id")
-    result = _ch_last(result)
     if [int(r[0]) for r in result or []] != _IDS[:2]:
         raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
+
+
+def ch_sql_execute_list(t: T):
+    """ClickHouseSQLExecuteQueryOperator: список запросов — по результату на каждый, без служебного SET"""
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, sql=["SELECT 1", "SELECT 2"])
+    if [[tuple(r) for r in rows] for rows in result or []] != [[(1,)], [(2,)]]:
+        raise AirflowFailException(f"получено {result}, ждём [[(1,)], [(2,)]]")
 
 
 def ch_sql_execute_tpl(t: T):
     """ClickHouseSQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
     result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 40 + 2 }}")
-    result = _ch_last(result)
     if [tuple(r) for r in result or []] != [(42,)]:
         raise AirflowFailException(f"получено {result}")
+
+
+def _ch_check(t: T, fail: bool, **kw):
+    """Check-оператор на CH: проходит молча, а при fail — падает своим «… failed», не ошибкой SQL."""
+    try:
+        t.run(conn_id=t.ch_conn, database=t.ch_db, **kw)
+    except Exception as e:
+        # отказ проверки — AirflowException/AirflowFailException; у ошибки CH тоже бывает «Syntax error: failed»
+        msg = str(e)
+        if (fail and type(e).__name__ in ("AirflowException", "AirflowFailException") and "failed" in msg
+                and "zero rows" not in msg and "Converting" not in msg):
+            return
+        raise
+    if fail:
+        raise AirflowFailException("проверка прошла, ждём падения")
+
+
+def ch_sql_check_ok(t: T):
+    """ClickHouseSQLCheckOperator шаблоном: все значения первой строки истинны"""
+    _ch_check(t, False, sql=f"SELECT count() = {{{{ {len(ROWS)} }}}}, 1 FROM {t.ch_table('src', rows=ROWS)}")
+
+
+def ch_sql_check_fail(t: T):
+    """ClickHouseSQLCheckOperator: ложное значение — падение"""
+    _ch_check(t, True, sql="SELECT 1, 0")
+
+
+def ch_value_check_ok(t: T):
+    """ClickHouseSQLValueCheckOperator шаблоном: count() совпал с pass_value из {{ }}"""
+    _ch_check(t, False, sql=f"SELECT count() FROM {t.ch_table('src', rows=ROWS)}", pass_value=f"{{{{ {len(ROWS)} }}}}")
+
+
+def ch_value_check_fail(t: T):
+    """ClickHouseSQLValueCheckOperator: значение вне tolerance — падение"""
+    _ch_check(t, True, sql="SELECT 10", pass_value=5, tolerance=0.1)
+
+
+def ch_threshold_check_ok(t: T):
+    """ClickHouseSQLThresholdCheckOperator: значение в границах, верхняя граница — SQL"""
+    _ch_check(t, False, sql=f"SELECT count() FROM {t.ch_table('src', rows=ROWS)}",
+              min_threshold=1, max_threshold=f"SELECT {len(ROWS)}")
+
+
+def ch_threshold_check_fail(t: T):
+    """ClickHouseSQLThresholdCheckOperator: значение ниже границы — падение"""
+    _ch_check(t, True, sql="SELECT 1", min_threshold=2, max_threshold=10)
+
+
+def _ch_interval(t: T, fail: bool):
+    # SQL оператора — по `ds` контекста; у ручного рана AF3 без logical_date его нет — ставим на время теста
+    ds = dt.date(2026, 1, 8)
+    table = t.ch_full(t.name("iv"))
+    t.ch(f"CREATE TABLE {table} (ds Date, v Int64) ENGINE = MergeTree ORDER BY ds")
+    t.ch(f"INSERT INTO {table} VALUES ('{ds}', {100 if fail else 10}), ('{ds - dt.timedelta(days=7)}', 10)")
+    had, old = "ds" in t.context, t.context.get("ds")
+    t.context["ds"] = ds.isoformat()
+    try:
+        _ch_check(t, fail, table=table, metrics_thresholds={"sum(v)": 1.5}, days_back=7)
+    finally:
+        if had:
+            t.context["ds"] = old
+        else:
+            del t.context["ds"]
+
+
+def ch_interval_check_ok(t: T):
+    """ClickHouseSQLIntervalCheckOperator: метрика за ds и ds-7 в пределах 1.5×"""
+    _ch_interval(t, False)
+
+
+def ch_interval_check_fail(t: T):
+    """ClickHouseSQLIntervalCheckOperator: метрика выросла в 10 раз — падение"""
+    _ch_interval(t, True)
+
+
+def ch_column_check_ok(t: T):
+    """ClickHouseSQLColumnCheckOperator шаблоном: null_check и distinct_check по id, таблица из {{ }}"""
+    _ch_check(t, False, table="{{ '%s' }}" % t.ch_table("src", rows=ROWS),
+              column_mapping={"id": {"null_check": {"equal_to": 0}, "distinct_check": {"equal_to": len(ROWS)}}})
+
+
+def ch_column_check_fail(t: T):
+    """ClickHouseSQLColumnCheckOperator: distinct_check не сошёлся — падение"""
+    _ch_check(t, True, table=t.ch_table("src", rows=ROWS),
+              column_mapping={"id": {"distinct_check": {"equal_to": len(ROWS) + 1}}})
+
+
+def ch_table_check_ok(t: T):
+    """ClickHouseSQLTableCheckOperator: check_statement по таблице выполнен"""
+    _ch_check(t, False, table=t.ch_table("src", rows=ROWS),
+              checks={"rows": {"check_statement": f"COUNT(*) = {len(ROWS)}"}})
+
+
+def ch_table_check_fail(t: T):
+    """ClickHouseSQLTableCheckOperator: check_statement ложен — падение"""
+    _ch_check(t, True, table=t.ch_table("src", rows=ROWS), checks={"rows": {"check_statement": "COUNT(*) = 0"}})
 
 
 def task_branch_both(t: T):
@@ -1830,7 +1925,20 @@ STD_OPS = [
        [task_branch_both, task_branch_tpl], pkg=STD),
     Op("branch_sql", "common.sql.operators.sql", "BranchSQLOperator", {"pg"}, [branch_sql_both, branch_sql_tpl], pkg=STD),
     Op("ch_sql_execute", "operators.clickhouse_dbapi", "ClickHouseSQLExecuteQueryOperator", {"ch"},
-       [ch_sql_execute_select, ch_sql_execute_tpl], pkg="airflow_clickhouse_plugin"),
+       [ch_sql_execute_select, ch_sql_execute_list, ch_sql_execute_tpl], pkg="airflow_clickhouse_plugin"),
+    # остальные классы, которые подменяет ядро: на сигме не используются, но подмена не должна их ломать
+    Op("ch_sql_check", "operators.clickhouse_dbapi", "ClickHouseSQLCheckOperator", {"ch"},
+       [ch_sql_check_ok, ch_sql_check_fail], pkg="airflow_clickhouse_plugin"),
+    Op("ch_value_check", "operators.clickhouse_dbapi", "ClickHouseSQLValueCheckOperator", {"ch"},
+       [ch_value_check_ok, ch_value_check_fail], pkg="airflow_clickhouse_plugin"),
+    Op("ch_threshold_check", "operators.clickhouse_dbapi", "ClickHouseSQLThresholdCheckOperator", {"ch"},
+       [ch_threshold_check_ok, ch_threshold_check_fail], pkg="airflow_clickhouse_plugin"),
+    Op("ch_interval_check", "operators.clickhouse_dbapi", "ClickHouseSQLIntervalCheckOperator", {"ch"},
+       [ch_interval_check_ok, ch_interval_check_fail], pkg="airflow_clickhouse_plugin"),
+    Op("ch_column_check", "operators.clickhouse_dbapi", "ClickHouseSQLColumnCheckOperator", {"ch"},
+       [ch_column_check_ok, ch_column_check_fail], pkg="airflow_clickhouse_plugin"),
+    Op("ch_table_check", "operators.clickhouse_dbapi", "ClickHouseSQLTableCheckOperator", {"ch"},
+       [ch_table_check_ok, ch_table_check_fail], pkg="airflow_clickhouse_plugin"),
     Op("s3_copy", "amazon.aws.operators.s3", "S3CopyObjectOperator", {"s3"}, [s3_copy_key, s3_copy_tpl], pkg=STD),
     Op("s3_create_object", "amazon.aws.operators.s3", "S3CreateObjectOperator", {"s3"},
        [s3_create_object_data, s3_create_object_tpl], pkg=STD),
