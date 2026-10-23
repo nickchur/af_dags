@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-22 16:41 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-23 09:01 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -2090,7 +2090,7 @@ def test_hrp_operators_dag():
         headline = (f"🧪 Регресс операторов {'✅ пройден' if passed else '❌ провален'}: "
                     f"✅ {ok} / ❌ {len(failed)} / ☮️ {skip}")
         lines = [f"❌ {tid} — {(dag_.get_task(full[tid]).doc_md or '').split(':')[0]}" for tid in failed]
-        std = {o.group for o in STD_OPS}
+        std = {o.group for o in STD_OPS} | {SKIP_GRAPH.split(".")[1]}
         lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items())
                   for g, cases in sorted(groups.items()) if g not in std]
         if std & groups.keys():

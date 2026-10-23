@@ -135,7 +135,8 @@ OpenMetadata — их систем на стендах нет.
 20 операторов Airflow и провайдеров, которые даги сигмы используют (замер 22.10.2026) — `Empty`, `Python`,
 `@task`, `BranchPython`, `@task.branch`, `ShortCircuit`, `@task.sensor`, `SQLExecuteQuery`, `BranchSQL`,
 `ClickHouse`, `ClickHouseBranchSQL`, `ClickHouseSQLExecuteQuery`, `ClickHouseSensor`, `S3DeleteObjects`,
-`S3KeySensor`, `S3CreateBucket`, `S3CopyObject`, `S3CreateObject`, `TriggerDagRun`, `Http`. Ветвление внутри теста
+`S3KeySensor`, `S3CreateBucket`, `S3CopyObject`, `S3CreateObject`, `TriggerDagRun`, `Http`. Шаблон — там, где у оператора есть
+`template_fields`: у сенсоров и `TriggerDagRun` он в основном тесте, отдельного `*.tpl` нет. Ветвление внутри теста
 проверяется без пропуска задач; настоящий пропуск веток — подгруппа `skip_graph` (задача `check` сверяет
 состояния). Бакеты не создаются (`S3CreateBucket` — только существующий бакет), `TriggerDagRun` создаёт ран
 `tools_dummy` без ожидания. `Http` ходит в свой API (`GET api/v2/version`) через подключение `af_api` —
