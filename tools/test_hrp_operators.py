@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-20 16:14 MSK · v2.6 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-23 09:01 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -7,6 +7,8 @@
 группы идут друг за другом, группы — параллельно. Оператора нет в пакете или он запрещён политикой —
 группы нет; сломан импорт — в группе одна красная задача. Первая задача `systems` проверяет системы
 и права, последняя `report` пишет сводку по группам. Запуск вручную (`@once`).
+Стандартные операторы Airflow и провайдеров из замера сигмы — в главной группе `test_standart`,
+по тем же правилам.
 
 PG: `conn.схема` — таблицы в схеме (нужны CREATE и DROP), только `conn` — временные таблицы
 сессии, в базе после рана ничего не остаётся. GP — так же, как PG.
@@ -29,6 +31,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 import zipfile
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import dataclass, field
@@ -45,7 +48,7 @@ for _env_var in ("HRP_ETL_CORE_PATH", "HRP_OPERATORS_SRC_PATH"):
 
 from airflow.providers.postgres.hooks.postgres import PostgresHook  # noqa: E402
 from airflow.sdk import Param, TaskGroup, TriggerRule, dag, task  # noqa: E402
-from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException  # noqa: E402
+from airflow.sdk.exceptions import AirflowFailException, AirflowSensorTimeout, AirflowSkipException  # noqa: E402
 
 try:
     from plugins.utils import (  # type: ignore
@@ -486,6 +489,9 @@ class T:
         policy = _policy()
         if policy is not None and hasattr(policy, "task_policy"):
             policy.task_policy(op)  # нарушение политики — ❌ теста, как падение разбора в бою
+        # как исполнитель задачи: копия с замком, иначе присвоение template-поля в execute (op_kwargs у
+        # PythonOperator) ищет в нём XComArg и уходит в рекурсию по контексту
+        op = op.prepare_for_execution()
         spy_cm = mock.patch.object(op, spy, wraps=getattr(op, spy)) if spy else nullcontext()
         with self.pg_sessions(sessions), spy_cm as m:
             result = op.execute(ctx)
@@ -1319,6 +1325,421 @@ def lineage_sql(t: T):
         raise AirflowFailException(f"lineage: получено {got}, ожидалось {want}")
 
 
+# ─────────────────────────── Тесты: стандартные — Python ──────────────────────────
+def _ctx_fn(a, b=0, **kw):
+    """Вызываемое Python-операторов: аргументы и контекст рана (ti, run_id)."""
+    return {"a": a, "b": b, "ti": kw["ti"].task_id, "run_id": kw["run_id"]}
+
+
+def _python(t: T, b, want_b):
+    result, _ = t.run(python_callable=_ctx_fn, op_args=[1], op_kwargs={"b": b})
+    want = {"a": 1, "b": want_b, "ti": t.context["ti"].task_id, "run_id": t.context["run_id"]}
+    if result != want:
+        raise AirflowFailException(f"вернула {result}, ждём {want}")
+
+
+def empty_run(t: T):
+    """EmptyOperator: выполняется без ошибки и ничего не возвращает"""
+    result, _ = t.run()
+    if result is not None:
+        raise AirflowFailException(f"вернул {result!r}")
+
+
+def python_args(t: T):
+    """PythonOperator: op_args, op_kwargs и контекст рана в функции"""
+    _python(t, 2, 2)
+
+
+def python_tpl(t: T):
+    """PythonOperator шаблоном: op_kwargs из {{ }} — строка '42'"""
+    _python(t, "{{ 40 + 2 }}", "42")
+
+
+def task_args(t: T):
+    """@task: op_args, op_kwargs и контекст рана в функции"""
+    _python(t, 2, 2)
+
+
+def task_tpl(t: T):
+    """@task шаблоном: op_kwargs из {{ }} — строка '42'"""
+    _python(t, "{{ 40 + 2 }}", "42")
+
+
+# ─────────────────────── Тесты: стандартные — ветвление, сенсоры ──────────────────
+SENSOR_TIMEOUT = 10  # с: тест «нет» ждёт его целиком
+
+
+@contextmanager
+def _no_skip(t: T):
+    """Ветвление AF3 пропускает downstream задачи из контекста — это задача-тест и следующий тест группы.
+    Подменяем пропуск на классе оператора и сверяем, что он запросил."""
+    with mock.patch.object(t.cls, "skip_all_except") as m_all, mock.patch.object(t.cls, "skip") as m_skip:
+        yield m_all, m_skip
+
+
+def _ids(x) -> list[str]:
+    return [x] if isinstance(x, str) else sorted(x or [])
+
+
+def _branch(t: T, flag, want: str, **kw):
+    """Ветка выбрана по flag: execute вернул её, пропуск запрошен «всё, кроме неё»."""
+    with _no_skip(t) as (m_all, _):
+        result, _ = t.run(**kw)
+    asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+    if _ids(result) != [want] or asked != [want]:
+        raise AirflowFailException(f"flag={flag!r}: вернул {result!r}, пропуск кроме {asked}, ждём {want}")
+
+
+def _pick(flag):
+    """Вызываемое ветвления: ветка — существующая задача дага (иначе skip_all_except отвергнет id)."""
+    return "systems" if flag in (True, "True") else "report"
+
+
+SKIP_GRAPH = "test_standart.skip_graph."
+# служебные задачи подгруппы: в verdict и сводке не считаются, тест — только check
+GRAPH_TASKS = {SKIP_GRAPH + x for x in ("branch", "keep", "drop", "short", "after")}
+GRAPH_WANT = {"branch": "success", "keep": "success", "drop": "skipped", "short": "success", "after": "skipped"}
+
+
+def _graph_branch():
+    return SKIP_GRAPH + "keep"
+
+
+def _sensor_ok(t: T, **kw):
+    """Условие выполнено — сенсор выходит за первый poke."""
+    _, m = t.run(mode="poke", poke_interval=1, timeout=SENSOR_TIMEOUT, spy="poke", **kw)
+    if m.call_count != 1:
+        raise AirflowFailException(f"poke вызван {m.call_count} раз, ждём 1")
+
+
+def _sensor_timeout(t: T, **kw):
+    """Условие не выполнено — сенсор падает по своему timeout, не раньше и не сильно позже."""
+    started = time.monotonic()
+    try:
+        t.run(mode="poke", poke_interval=1, timeout=SENSOR_TIMEOUT, **kw)
+    except AirflowSensorTimeout:
+        took = time.monotonic() - started
+        if not SENSOR_TIMEOUT <= took <= SENSOR_TIMEOUT + 20:
+            raise AirflowFailException(f"таймаут через {took:.1f} с, ждём ~{SENSOR_TIMEOUT}") from None
+        return
+    raise AirflowFailException("сенсор вышел без AirflowSensorTimeout")
+
+
+def branch_python_both(t: T):
+    """BranchPythonOperator: обе ветки по условию, задачи регресса не пропускаются"""
+    for flag, want in ((True, "systems"), (False, "report")):
+        _branch(t, flag, want, python_callable=_pick, op_kwargs={"flag": flag})
+
+
+def branch_python_tpl(t: T):
+    """BranchPythonOperator шаблоном: условие из {{ }} — строка 'True'"""
+    _branch(t, "{{ 1 == 1 }}", "systems", python_callable=_pick, op_kwargs={"flag": "{{ 1 == 1 }}"})
+
+
+def _short(t: T, flag, want):
+    with _no_skip(t) as (m_all, m_skip):
+        result, _ = t.run(python_callable=lambda flag: flag, op_kwargs={"flag": flag})
+    # у оператора в тесте нет downstream: «нет» не должно ничего пропускать
+    if result != want or m_all.called or m_skip.called:
+        raise AirflowFailException(f"flag={flag!r}: вернул {result!r}, skip={m_skip.called or m_all.called}")
+
+
+def short_circuit_both(t: T):
+    """ShortCircuitOperator: «да» и «нет», задачи регресса не пропускаются"""
+    _short(t, True, True)
+    _short(t, False, False)
+
+
+def short_circuit_tpl(t: T):
+    """ShortCircuitOperator шаблоном: условие из {{ }} — строка 'True'"""
+    _short(t, "{{ 1 == 1 }}", "True")
+
+
+def task_sensor_ok(t: T):
+    """@task.sensor: условие выполнено — выход за первый poke"""
+    _sensor_ok(t, python_callable=lambda: True)
+
+
+def task_sensor_timeout(t: T):
+    """@task.sensor: условие не выполнено — падение по timeout"""
+    _sensor_timeout(t, python_callable=lambda: False)
+
+
+def task_sensor_tpl(t: T):
+    """@task.sensor шаблоном: op_kwargs из {{ }} доходит до функции"""
+    _sensor_ok(t, python_callable=lambda x: x == "ok", op_kwargs={"x": "{{ 'o' ~ 'k' }}"})
+
+
+# ─────────────────────────── Тесты: стандартные — SQL и CH ────────────────────────
+_IDS = sorted(r[0] for r in ROWS)  # id — первая колонка COLUMNS
+
+
+def _sql_select(t: T, sql, params, want):
+    src = t.full(t.pg_table("src", ROWS))
+    result, _ = t.run(conn_id=t.pg_conn, sql=sql.format(src=src), parameters=params, sessions=["main"])
+    got = [tuple(r) for r in result or []]
+    if got != want:
+        raise AirflowFailException(f"получено {got}, ждём {want}")
+
+
+def sql_execute_select(t: T):
+    """SQLExecuteQueryOperator: SELECT с parameters по таблице теста на pg формы"""
+    _sql_select(t, "SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id", {"n": _IDS[1]}, [(i,) for i in _IDS[:2]])
+
+
+def sql_execute_tpl(t: T):
+    """SQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
+    _sql_select(t, "SELECT count(*) FROM {src} WHERE id <= {{{{ %d }}}}" % _IDS[1], None, [(2,)])
+
+
+def ch_operator_rows(t: T):
+    """ClickHouseOperator: DDL, INSERT … SELECT с parameters и SELECT одним списком"""
+    src, tgt = t.ch_table("src", rows=ROWS), t.ch_full(t.name("tgt"))
+    result, _ = t.run(clickhouse_conn_id=t.ch_conn, parameters={"n": _IDS[1]}, sql=[
+        f"CREATE TABLE {tgt} (id Int64) ENGINE = MergeTree ORDER BY id",
+        f"INSERT INTO {tgt} SELECT id FROM {src} WHERE id <= %(n)s",
+        f"SELECT id FROM {tgt} ORDER BY id"])
+    if [int(r[0]) for r in result or []] != _IDS[:2]:
+        raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
+
+
+def ch_operator_tpl(t: T):
+    """ClickHouseOperator шаблоном: SQL из {{ }}"""
+    result, _ = t.run(clickhouse_conn_id=t.ch_conn, sql="SELECT {{ 40 + 2 }}")
+    if result != [(42,)]:
+        raise AirflowFailException(f"получено {result}")
+
+
+def ch_branch_sql_both(t: T):
+    """ClickHouseBranchSQLOperator: обе ветки по результату SQL, задачи регресса не пропускаются"""
+    for sql, want in (("SELECT 1", "systems"), ("SELECT 0", "report")):
+        with _no_skip(t) as (m_all, _):
+            t.run(conn_id=t.ch_conn, database=t.ch_db, sql=sql,
+                  follow_task_ids_if_true="systems", follow_task_ids_if_false="report")
+        asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+        if asked != [want]:
+            raise AirflowFailException(f"{sql}: пропуск кроме {asked}, ждём {want}")
+
+
+def ch_branch_sql_tpl(t: T):
+    """ClickHouseBranchSQLOperator шаблоном: SQL из {{ }}"""
+    with _no_skip(t) as (m_all, _):
+        t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 1 }}",
+              follow_task_ids_if_true="systems", follow_task_ids_if_false="report")
+    if not m_all.called or _ids(m_all.call_args.args[1]) != ["systems"]:
+        raise AirflowFailException(f"пропуск: {m_all.call_args}")
+
+
+def ch_sensor_ok(t: T):
+    """ClickHouseSensor шаблоном: строки есть — выход за первый poke"""
+    src = t.ch_table("src", rows=ROWS)
+    _sensor_ok(t, clickhouse_conn_id=t.ch_conn, sql=f"SELECT count() FROM {src} WHERE id > {{{{ 0 }}}}",
+               is_success=lambda r: r[0][0] == len(ROWS))
+
+
+def ch_sensor_timeout(t: T):
+    """ClickHouseSensor: условие не выполнено — падение по timeout"""
+    _sensor_timeout(t, clickhouse_conn_id=t.ch_conn, sql="SELECT 0", is_success=lambda r: bool(r[0][0]))
+
+
+def ch_sql_execute_select(t: T):
+    """ClickHouseSQLExecuteQueryOperator: SELECT с parameters по таблице теста"""
+    src = t.ch_table("src", rows=ROWS)
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, parameters={"n": _IDS[1]},
+                      sql=f"SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id")
+    if [int(r[0]) for r in result or []] != _IDS[:2]:
+        raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
+
+
+def ch_sql_execute_tpl(t: T):
+    """ClickHouseSQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
+    result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 40 + 2 }}")
+    if [tuple(r) for r in result or []] != [(42,)]:
+        raise AirflowFailException(f"получено {result}")
+
+
+def task_branch_both(t: T):
+    """@task.branch: обе ветки по условию, задачи регресса не пропускаются"""
+    for flag, want in ((True, "systems"), (False, "report")):  # декорированному op_args обязателен
+        _branch(t, flag, want, python_callable=_pick, op_args=[], op_kwargs={"flag": flag})
+
+
+def task_branch_tpl(t: T):
+    """@task.branch шаблоном: условие из {{ }} — строка 'True'"""
+    _branch(t, "{{ 1 == 1 }}", "systems", python_callable=_pick, op_args=[], op_kwargs={"flag": "{{ 1 == 1 }}"})
+
+
+def _branch_sql(t: T, sql: str, want: str, **kw):
+    with _no_skip(t) as (m_all, _):
+        t.run(conn_id=t.pg_conn, sql=sql, follow_task_ids_if_true="systems", follow_task_ids_if_false="report", **kw)
+    asked = _ids(m_all.call_args.args[1]) if m_all.called else None
+    if asked != [want]:
+        raise AirflowFailException(f"{sql}: пропуск кроме {asked}, ждём {want}")
+
+
+def branch_sql_both(t: T):
+    """BranchSQLOperator: обе ветки по результату SQL с parameters на pg формы"""
+    src = t.full(t.pg_table("src", ROWS))
+    for n, want in ((_IDS[0], "systems"), (_IDS[0] - 1, "report")):
+        _branch_sql(t, f"SELECT count(*) FROM {src} WHERE id <= %(n)s", want, parameters={"n": n}, sessions=["main"])
+
+
+def branch_sql_tpl(t: T):
+    """BranchSQLOperator шаблоном: SQL из {{ }}"""
+    _branch_sql(t, "SELECT {{ 1 }}", "systems")
+
+
+# ─────────────────────────────── Тесты: стандартные — S3 ──────────────────────────
+def _s3_delete(t: T, **kw):
+    for n in ("del/a.csv", "del/b.csv"):
+        t.s3_put(n, b"x")
+    t.run(aws_conn_id=t.s3_conn, bucket=t.bucket, **kw)
+    if left := t.s3_keys("del/"):
+        raise AirflowFailException(f"не удалены: {left}")
+
+
+def s3_delete_keys(t: T):
+    """S3DeleteObjectsOperator: удаление списком keys"""
+    _s3_delete(t, keys=[t.s3_prefix + "del/a.csv", t.s3_prefix + "del/b.csv"])
+
+
+def s3_delete_prefix(t: T):
+    """S3DeleteObjectsOperator: удаление по prefix"""
+    _s3_delete(t, prefix=t.s3_prefix + "del/")
+
+
+def s3_delete_tpl(t: T):
+    """S3DeleteObjectsOperator шаблоном: prefix из {{ }}"""
+    _s3_delete(t, prefix=f"{{{{ {t.s3_prefix + 'del/'!r} }}}}")
+
+
+def s3_key_sensor_ok(t: T):
+    """S3KeySensor: ключ есть — выход за первый poke"""
+    key = t.s3_put("ready.csv", b"x")
+    _sensor_ok(t, aws_conn_id=t.s3_conn, bucket_name=t.bucket, bucket_key=key)
+
+
+def s3_key_sensor_timeout(t: T):
+    """S3KeySensor: ключа нет — падение по timeout"""
+    _sensor_timeout(t, aws_conn_id=t.s3_conn, bucket_name=t.bucket, bucket_key=t.s3_prefix + "absent.csv")
+
+
+def s3_key_sensor_tpl(t: T):
+    """S3KeySensor шаблоном: bucket_key из {{ }}"""
+    key = t.s3_put("ready.csv", b"x")
+    _sensor_ok(t, aws_conn_id=t.s3_conn, bucket_name=t.bucket, bucket_key=f"{{{{ {key!r} }}}}")
+
+
+def _s3_create_bucket(t: T, name):
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    with mock.patch.object(S3Hook, "create_bucket") as create:  # бакеты регресс не создаёт
+        t.run(aws_conn_id=t.s3_conn, bucket_name=name)
+    if create.called or not t.s3.check_for_bucket(t.bucket):
+        raise AirflowFailException(f"create_bucket вызван={create.called}: оператор не увидел бакет {t.bucket}")
+
+
+def s3_create_bucket_exists(t: T):
+    """S3CreateBucketOperator: бакет формы уже есть — без ошибки и без создания"""
+    _s3_create_bucket(t, t.bucket)
+
+
+def s3_create_bucket_tpl(t: T):
+    """S3CreateBucketOperator шаблоном: bucket_name из {{ }}"""
+    _s3_create_bucket(t, f"{{{{ {t.bucket!r} }}}}")
+
+
+def _s3_copy(t: T, dst: str):
+    src = t.s3_put("src.csv", b"id\n1\n")
+    t.run(aws_conn_id=t.s3_conn, source_bucket_name=t.bucket, source_bucket_key=src,
+          dest_bucket_name=t.bucket, dest_bucket_key=dst)
+    if (got := t.s3.read_key(t.s3_prefix + "dst.csv", t.bucket)) != "id\n1\n":
+        raise AirflowFailException(f"в копии {got!r}")
+
+
+def s3_copy_key(t: T):
+    """S3CopyObjectOperator: копия ключа теста в своей папке"""
+    _s3_copy(t, t.s3_prefix + "dst.csv")
+
+
+def s3_copy_tpl(t: T):
+    """S3CopyObjectOperator шаблоном: dest_bucket_key из {{ }}"""
+    _s3_copy(t, f"{{{{ {t.s3_prefix + 'dst.csv'!r} }}}}")
+
+
+def _s3_create_object(t: T, data, want):
+    key = t.s3_prefix + "obj.csv"
+    t.run(aws_conn_id=t.s3_conn, s3_bucket=t.bucket, s3_key=key, data=data, replace=True)
+    if (got := t.s3.read_key(key, t.bucket)) != want:
+        raise AirflowFailException(f"записано {got!r}, ждём {want!r}")
+
+
+def s3_create_object_data(t: T):
+    """S3CreateObjectOperator: ключ из data"""
+    # data — шаблонное поле: Jinja срезает завершающий перевод строки, без него — как в бою
+    _s3_create_object(t, "id\n1", "id\n1")
+
+
+def s3_create_object_tpl(t: T):
+    """S3CreateObjectOperator шаблоном: data из {{ }}"""
+    _s3_create_object(t, "{{ 40 + 2 }}", "42")
+
+
+# ─────────────────────────── Тесты: стандартные — TriggerDagRun ───────────────────
+DUMMY = "tools_dummy"
+
+
+def trigger_dagrun_conf(t: T):
+    """TriggerDagRunOperator шаблоном: ран tools_dummy с conf теста, без ожидания"""
+    import structlog
+    from airflow.sdk.exceptions import DagRunTriggerException
+    from airflow.sdk.execution_time.task_runner import _handle_trigger_dag_run
+
+    ti = t.context["ti"]
+    # ponytail: «нет ранов» = «нет дага» — tools_dummy ежечасный; точнее — запрос DagBag через API
+    if not ti.get_dr_count(dag_id=DUMMY):
+        raise AirflowSkipException(f"нет дага {DUMMY} (нет ни одного рана)")
+    run_id = f"{t.prefix}__{t.context['run_id']}__{ti.try_number}"[:250]
+    try:
+        t.run(trigger_dag_id=f"{{{{ {DUMMY!r} }}}}", trigger_run_id=run_id,
+              conf={"rg": "{{ ti.task_id }}"}, wait_for_completion=False)
+    except DagRunTriggerException as e:
+        drte = e
+    else:
+        raise AirflowFailException("оператор не бросил DagRunTriggerException")
+    if (drte.trigger_dag_id, drte.conf) != (DUMMY, {"rg": ti.task_id}):
+        raise AirflowFailException(f"запрошено {drte.trigger_dag_id} conf={drte.conf}")
+    # ран создаёт исполнитель задачи по исключению; при успехе — SUCCESS, при существующем ране — FAILED
+    _, state = _handle_trigger_dag_run(drte, t.context, ti, structlog.get_logger())
+    if state != "success" or ti.get_dr_count(dag_id=DUMMY, run_ids=[run_id]) != 1:
+        raise AirflowFailException(f"ран {DUMMY}/{run_id} не создан (state={state})")
+
+
+# ─────────────────────────────── Тесты: стандартные — HTTP ────────────────────────
+HTTP_CONN = "af_api"  # свой API контура; заводит ядро
+
+
+def _http(t: T, endpoint: str):
+    from airflow.sdk import BaseHook
+    try:
+        BaseHook.get_connection(HTTP_CONN)
+    except Exception:
+        raise AirflowSkipException(f"нет подключения {HTTP_CONN}") from None
+    import airflow
+    result, _ = t.run(http_conn_id=HTTP_CONN, method="GET", endpoint=endpoint, response_filter=lambda r: r.json())
+    if (result or {}).get("version") != airflow.__version__:
+        raise AirflowFailException(f"ответ {result}, ждём версию {airflow.__version__}")
+
+
+def http_version(t: T):
+    """HttpOperator: GET api/v2/version своего API, версия = версии рана"""
+    _http(t, "api/v2/version")
+
+
+def http_tpl(t: T):
+    """HttpOperator шаблоном: endpoint из {{ }}"""
+    _http(t, "{{ 'api/v2/version' }}")
+
+
 OPS = [
     # шаблонного случая у PG→PG нет: у оператора пустые template_fields
     Op("pg_to_pg", "postgres_to_postgres", "HrpPostgresToPostgresOperator", {"pg"},
@@ -1369,8 +1790,49 @@ OPS = [
        [s3_bucket_viewer_list, s3_bucket_viewer_tpl]),
     Op("lineage", "utils.lineage", "extract_lineage_from_sql", set(), [lineage_sql], policy=False),
 ]
+STD = "airflow.providers"  # стандартные операторы: классы из пакетов, которые импортируют даги контура
+STD_OPS = [
+    Op("empty", "standard.operators.empty", "EmptyOperator", set(), [empty_run], pkg=STD),
+    Op("python", "standard.operators.python", "PythonOperator", set(), [python_args, python_tpl], pkg=STD),
+    Op("task", "standard.decorators.python", "_PythonDecoratedOperator", set(), [task_args, task_tpl], pkg=STD),
+    Op("branch_python", "standard.operators.python", "BranchPythonOperator", set(),
+       [branch_python_both, branch_python_tpl], pkg=STD),
+    Op("short_circuit", "standard.operators.python", "ShortCircuitOperator", set(),
+       [short_circuit_both, short_circuit_tpl], pkg=STD),
+    Op("task_sensor", "standard.decorators.sensor", "DecoratedSensorOperator", set(),
+       [task_sensor_ok, task_sensor_timeout, task_sensor_tpl], pkg=STD),
+    Op("sql_execute", "common.sql.operators.sql", "SQLExecuteQueryOperator", {"pg"},
+       [sql_execute_select, sql_execute_tpl], pkg=STD),
+    Op("ch_operator", "operators.clickhouse", "ClickHouseOperator", {"ch"},
+       [ch_operator_rows, ch_operator_tpl], pkg="airflow_clickhouse_plugin"),
+    Op("ch_branch_sql", "operators.clickhouse_dbapi", "ClickHouseBranchSQLOperator", {"ch"},
+       [ch_branch_sql_both, ch_branch_sql_tpl], pkg="airflow_clickhouse_plugin"),
+    Op("ch_sensor", "sensors.clickhouse", "ClickHouseSensor", {"ch"},
+       [ch_sensor_ok, ch_sensor_timeout], pkg="airflow_clickhouse_plugin"),
+    Op("s3_delete", "amazon.aws.operators.s3", "S3DeleteObjectsOperator", {"s3"},
+       [s3_delete_keys, s3_delete_prefix, s3_delete_tpl], pkg=STD),
+    Op("s3_key_sensor", "amazon.aws.sensors.s3", "S3KeySensor", {"s3"},
+       [s3_key_sensor_ok, s3_key_sensor_timeout, s3_key_sensor_tpl], pkg=STD),
+    Op("s3_create_bucket", "amazon.aws.operators.s3", "S3CreateBucketOperator", {"s3"},
+       [s3_create_bucket_exists, s3_create_bucket_tpl], pkg=STD),
+    Op("trigger_dagrun", "standard.operators.trigger_dagrun", "TriggerDagRunOperator", set(),
+       [trigger_dagrun_conf], pkg=STD),
+    # замер сигмы dev за всё время (22.10)
+    Op("task_branch", "standard.decorators.branch_python", "_BranchPythonDecoratedOperator", set(),
+       [task_branch_both, task_branch_tpl], pkg=STD),
+    Op("branch_sql", "common.sql.operators.sql", "BranchSQLOperator", {"pg"}, [branch_sql_both, branch_sql_tpl], pkg=STD),
+    Op("ch_sql_execute", "operators.clickhouse_dbapi", "ClickHouseSQLExecuteQueryOperator", {"ch"},
+       [ch_sql_execute_select, ch_sql_execute_tpl], pkg="airflow_clickhouse_plugin"),
+    Op("s3_copy", "amazon.aws.operators.s3", "S3CopyObjectOperator", {"s3"}, [s3_copy_key, s3_copy_tpl], pkg=STD),
+    Op("s3_create_object", "amazon.aws.operators.s3", "S3CreateObjectOperator", {"s3"},
+       [s3_create_object_data, s3_create_object_tpl], pkg=STD),
+    Op("http", "http.operators.http", "HttpOperator", set(), [http_version, http_tpl], pkg=STD),
+]
 NOT_CREATED: dict[str, str] = {}  # группа → причина; заполняет разбор, читает report
-TESTS = "tests."  # группы операторов — внутри группы tests: task_id = tests.<группа>.<тест>
+# главные группы: Hrp-операторы и стандартные; task_id = <главная>.<группа>.<тест>
+TOPS = ("tests.", "test_standart.")
+# в verdict группа — без главной группы: имена обязаны не совпадать
+assert not {o.group for o in OPS} & {o.group for o in STD_OPS}, "имя группы в tests и test_standart"
 
 
 # ───────────────────────────────── systems ────────────────────────────────────
@@ -1507,9 +1969,13 @@ _S3_DEFAULT = log_bucket_path("test-operators") or "s3-archive://dataplatform-mo
                              description=f"Сохранить форму в Variable {PARAMS_VAR} как значения по умолчанию"),
         **{f"op_{op.group}": Param(SAVED.get(f"op_{op.group}", True), type="boolean", section="Операторы",
                                    description=op.cls) for op in OPS},
+        **{f"op_{op.group}": Param(SAVED.get(f"op_{op.group}", True), type="boolean",
+                                   section="Стандартные операторы", description=op.cls) for op in STD_OPS},
+        "op_skip_graph": Param(SAVED.get("op_skip_graph", True), type="boolean", section="Стандартные операторы",
+                               description="пропуск веток в графе"),
     },
     doc_md=__doc__,
-    description="Регресс операторов hrp_operators по группам: pg, ch, s3",
+    description="Регресс операторов hrp_operators и стандартных по группам: pg, ch, s3",
 )
 def test_hrp_operators_dag():
 
@@ -1575,6 +2041,17 @@ def test_hrp_operators_dag():
 
         return _test()
 
+    @task(task_id="check", trigger_rule=TriggerRule.ALL_DONE, retries=0,
+          doc_md="Пропуск веток в графе: Branch и ShortCircuit настоящими задачами, невыбранные ☮️")
+    def skip_graph_check(**context):
+        if not context["params"].get("op_skip_graph", True):
+            raise AirflowSkipException("skip_graph: выключен (op_skip_graph=False)")
+        ti, dr = context["ti"], context["dag_run"]
+        states = ti.get_task_states(dag_id=dr.dag_id, run_ids=[dr.run_id]).get(dr.run_id, {})
+        got = {x: states.get(SKIP_GRAPH + x) for x in GRAPH_WANT}
+        if got != GRAPH_WANT:
+            raise AirflowFailException(f"состояния {got}, ждём {GRAPH_WANT}")
+
     # retries=0: провал вердикта — итог, а не сбой, перезапуск ничего не изменит
     @task(task_id="report", trigger_rule=TriggerRule.ALL_DONE, retries=0)
     def report(**context):
@@ -1585,14 +2062,17 @@ def test_hrp_operators_dag():
         groups: dict = {}
         failed = []
         # по задачам дага, а не по ответу API: задача без строки в метабазе — ❌, а не пропажа из сводки
-        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TESTS))  # без systems и report
+        # без systems, report и служебных задач skip_graph
+        test_ids = sorted(tid for tid in dag_.task_ids if tid.startswith(TOPS) and tid not in GRAPH_TASKS)
+        full = {}  # <группа>.<тест> → task_id: в verdict без главной группы, как до группы tests
         for task_id in test_ids:
             state = states.get(task_id) or "no_status"
             icon = "✅" if state == "success" else "☮️" if state in ("skipped", "upstream_failed", "removed") else "❌"
-            g, case = task_id.removeprefix(TESTS).split(".", 1)
+            _, g, case = task_id.split(".", 2)
+            full[f"{g}.{case}"] = task_id
             groups.setdefault(g, {})[case] = icon
             if icon == "❌":
-                failed.append(task_id.removeprefix(TESTS))  # в verdict — <группа>.<тест>, как до группы tests
+                failed.append(f"{g}.{case}")
         pulled = ti.xcom_pull(task_ids=test_ids, key="not_cleaned") if test_ids else []
         if pulled and not isinstance(pulled, list):
             pulled = [pulled]
@@ -1607,10 +2087,16 @@ def test_hrp_operators_dag():
         icons = [i for cases in groups.values() for i in cases.values()]
         ok, skip = icons.count("✅"), icons.count("☮️")
         passed = not (failed or unavailable)
-        headline = (f"🧪 HRP operators {'✅ пройден' if passed else '❌ провален'}: "
+        headline = (f"🧪 Регресс операторов {'✅ пройден' if passed else '❌ провален'}: "
                     f"✅ {ok} / ❌ {len(failed)} / ☮️ {skip}")
-        lines = [f"❌ {tid} — {(dag_.get_task(TESTS + tid).doc_md or '').split(':')[0]}" for tid in failed]
-        lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items()) for g, cases in sorted(groups.items())]
+        lines = [f"❌ {tid} — {(dag_.get_task(full[tid]).doc_md or '').split(':')[0]}" for tid in failed]
+        std = {o.group for o in STD_OPS} | {SKIP_GRAPH.split(".")[1]}
+        lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items())
+                  for g, cases in sorted(groups.items()) if g not in std]
+        if std & groups.keys():
+            lines.append("Стандартные операторы:")
+            lines += [f"{g}: " + " ".join(f"{i}{c}" for c, i in cases.items())
+                      for g, cases in sorted(groups.items()) if g in std]
         if unavailable:
             lines.append("недоступны: " + ", ".join(unavailable))
         missing = sorted(g for g, r in NOT_CREATED.items() if r != "запрещён")
@@ -1641,24 +2127,42 @@ def test_hrp_operators_dag():
     systems_t = systems()
     leaves = [systems_t]
     NOT_CREATED.clear()  # процесс разбора живёт долго: без этого остаются группы прошлых разборов
-    with TaskGroup("tests", tooltip="Тесты операторов: группа на оператор"):
-        for op in OPS:
-            op.loaded, status, why = _load(op)
-            if status in ("missing", "forbidden"):
-                NOT_CREATED[op.group] = "запрещён" if status == "forbidden" else why
-                continue
-            with TaskGroup(op.group, tooltip=op.cls):
-                if status == "broken":
-                    imp = broken_import(op.group, why)
-                    systems_t >> imp
-                    leaves.append(imp)
+    for top, ops, tip in (("tests", OPS, "Тесты операторов: группа на оператор"),
+                          ("test_standart", STD_OPS, "Стандартные операторы Airflow и провайдеров")):
+        with TaskGroup(top, tooltip=tip):
+            for op in ops:
+                op.loaded, status, why = _load(op)
+                if status in ("missing", "forbidden"):
+                    NOT_CREATED[op.group] = "запрещён" if status == "forbidden" else why
                     continue
-                prev = systems_t
-                for case in op.cases:
-                    cur = make_test(op, case)
-                    prev >> cur
-                    prev = cur
-                leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
+                with TaskGroup(op.group, tooltip=op.cls):
+                    if status == "broken":
+                        imp = broken_import(op.group, why)
+                        systems_t >> imp
+                        leaves.append(imp)
+                        continue
+                    prev = systems_t
+                    for case in op.cases:
+                        cur = make_test(op, case)
+                        prev >> cur
+                        prev = cur
+                    leaves.append(prev)  # ALL_DONE по цепочке: последний тест группы выполняется после всех
+            # нет Branch или ShortCircuit — подгруппы нет молча: причина уже в строке их группы
+            if ops is STD_OPS and all(o.loaded for o in STD_OPS if o.group in ("branch_python", "short_circuit")):
+                with TaskGroup("skip_graph", tooltip="Пропуск веток настоящими задачами графа"):
+                    from airflow.providers.standard.operators.empty import EmptyOperator
+                    by = {o.group: o.loaded for o in STD_OPS}
+                    br = by["branch_python"](task_id="branch", python_callable=_graph_branch)
+                    # False: пропустить только прямого потомка, иначе ☮️ уйдут check и report
+                    sc = by["short_circuit"](task_id="short", python_callable=lambda: False,
+                                             ignore_downstream_trigger_rules=False)
+                    keep, drop, after = (EmptyOperator(task_id=x) for x in ("keep", "drop", "after"))
+                    chk = skip_graph_check()
+                    systems_t >> [br, sc]
+                    br >> [keep, drop]
+                    sc >> after
+                    [keep, drop, after] >> chk  # check — ALL_DONE: выполняется и после ☮️ веток
+                    leaves.append(chk)
     # report — единственный лист: ран краснеет через него
     leaves >> report()
 

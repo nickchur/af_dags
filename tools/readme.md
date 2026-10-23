@@ -131,6 +131,17 @@ S3 → S3, CH → S3 (native, native частями, table, query), CH → PG (�
 бакетов, `lineage`. Не покрыты: `ClickhouseToIdp`, `ClickhouseToDatacatalog`, LLM, эмбеддинги,
 OpenMetadata — их систем на стендах нет.
 
+**Стандартные операторы** — главная группа `test_standart` (`test_standart.<группа>.<тест>`), правила те же:
+20 операторов Airflow и провайдеров, которые даги сигмы используют (замер 22.10.2026) — `Empty`, `Python`,
+`@task`, `BranchPython`, `@task.branch`, `ShortCircuit`, `@task.sensor`, `SQLExecuteQuery`, `BranchSQL`,
+`ClickHouse`, `ClickHouseBranchSQL`, `ClickHouseSQLExecuteQuery`, `ClickHouseSensor`, `S3DeleteObjects`,
+`S3KeySensor`, `S3CreateBucket`, `S3CopyObject`, `S3CreateObject`, `TriggerDagRun`, `Http`. Шаблон — там, где у оператора есть
+`template_fields`: у сенсоров и `TriggerDagRun` он в основном тесте, отдельного `*.tpl` нет. Ветвление внутри теста
+проверяется без пропуска задач; настоящий пропуск веток — подгруппа `skip_graph` (задача `check` сверяет
+состояния). Бакеты не создаются (`S3CreateBucket` — только существующий бакет), `TriggerDagRun` создаёт ран
+`tools_dummy` без ожидания. `Http` ходит в свой API (`GET api/v2/version`) через подключение `af_api` —
+его нет, группа ☮️. Kafka — в своих дагах `test_kafka_*`.
+
 **Параметры формы**
 - `pg` — `conn_id.схема`: таблицы в схеме (нужны CREATE и DROP); только `conn_id` — временные таблицы
   сессии, в базе после рана ничего не остаётся. GP — так же, как PG.
@@ -138,7 +149,8 @@ OpenMetadata — их систем на стендах нет.
   логов. Папка у каждого теста своя: `<папка>/<группа>/<тест>/`.
 - `test_pg` / `test_ch` / `test_s3` — системы; тест идёт, только если включены все его системы,
   иначе ☮️. `ch_http` — операторы, которые ходят в ClickHouse по HTTP (на альфе DEV закрыт).
-- `op_<группа>` (секция «Операторы») — выключатель группы.
+- `op_<группа>` (секции «Операторы» и «Стандартные операторы») — выключатель группы; `op_skip_graph` —
+  проверка пропуска веток.
 - `run_cleanup` — `False` оставляет объекты для отладки; `save_params` пишет форму в Variable
   `tools_test_hrp_operators_params`, она становится значениями по умолчанию.
 
