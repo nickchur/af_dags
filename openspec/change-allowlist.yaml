@@ -1,0 +1,49 @@
+# Allowlist мелких изменений. PR идёт без изменения OpenSpec, только если каждый
+# изменённый путь (у переименованного файла оба пути) подходит под шаблон одного из
+# классов ниже. Пути промпт-слоя не проходят, даже если подходят под шаблон класса
+# (например, GIGACODE.md под **/*.md): каталоги openspec/, .gigacode/, .qwen/, .agents/,
+# .claude/, файлы OpenSpec других инструментов и файлы GIGACODE.md, AGENTS.md, CLAUDE.md,
+# QWEN.md на любой глубине.
+# Исключение — PR ручной установки или обновления SberPowers. В нём допустимы только
+# файлы skills/, agents/, commands/ и templates/openspec/ той же версии пакета по соответствующим путям проекта, блок правил
+# между <!-- sberpowers:begin --> и <!-- sberpowers:end --> в GIGACODE.md и строка
+# schema: в openspec/config.yaml (config.yml). Ревьюер сверяет файлы с шаблонами этой версии;
+# текст GIGACODE.md вне блока и остальные настройки не меняются. При удалении файла
+# нужна сверка с предыдущей версией, подтверждающая его принадлежность SberPowers.
+# Изменения сгенерированных файлов OpenSpec или файлов других инструментов ведут
+# изменением со skip_specs: true. Остальные PR и любой PR при сомнении ведут полным
+# циклом. '*' и '?' не пересекают '/', '**' — пересекает.
+# Этот файл также сверяют с шаблонами SberPowers.
+
+classes:
+  documentation:
+    - "docs/**"
+    - "**/*.md"
+  tests:
+    - "test/**"
+    - "tests/**"
+    - "**/__tests__/**"
+    - "**/*.test.*"
+    - "**/*.spec.*"
+  localization:
+    - "i18n/**"
+    - "locales/**"
+    - "**/locales/**"
+  dependencies:
+    - "package.json"
+    - "package-lock.json"
+    - "**/package.json"
+    - "**/package-lock.json"
+    - "pom.xml"
+    - "**/pom.xml"
+    - "build.gradle"
+    - "build.gradle.kts"
+    - "**/build.gradle"
+    - "**/build.gradle.kts"
+    - "gradle/libs.versions.toml"
+    - "requirements.txt"
+    - "**/requirements.txt"
+    - "poetry.lock"
+    - "pyproject.toml"
+    - "go.mod"
+    - "go.sum"
