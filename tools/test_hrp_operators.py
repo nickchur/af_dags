@@ -1,5 +1,5 @@
 """### 🧪 DAG: Регрессионный стенд операторов HRP
-*2026-10-23 09:01 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
+*2026-10-23 09:49 MSK · v2.7 · Nick Churkin · [NSChurkin@sber.ru](mailto:NSChurkin@sber.ru)*
 
 Регресс операторов `hrp_operators` на каждый релиз. Каждый оператор — своя группа задач внутри
 группы `tests`, каждый тест — одна задача: сам готовит вход (таблицу, файл в S3), выполняет оператор
@@ -1542,11 +1542,18 @@ def ch_sensor_timeout(t: T):
     _sensor_timeout(t, clickhouse_conn_id=t.ch_conn, sql="SELECT 0", is_success=lambda r: bool(r[0][0]))
 
 
+def _ch_last(result):
+    """Строки последнего запроса: ядро ставит перед SQL `SET log_comment=…;` (ClickHouseLogCommentMixin), строка
+    становится списком из двух запросов, и return_last не действует — даги платформы получают `[[], строки]`"""
+    return result[-1] if result and isinstance(result[0], list) else result
+
+
 def ch_sql_execute_select(t: T):
     """ClickHouseSQLExecuteQueryOperator: SELECT с parameters по таблице теста"""
     src = t.ch_table("src", rows=ROWS)
     result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, parameters={"n": _IDS[1]},
                       sql=f"SELECT id FROM {src} WHERE id <= %(n)s ORDER BY id")
+    result = _ch_last(result)
     if [int(r[0]) for r in result or []] != _IDS[:2]:
         raise AirflowFailException(f"получено {result}, ждём {_IDS[:2]}")
 
@@ -1554,6 +1561,7 @@ def ch_sql_execute_select(t: T):
 def ch_sql_execute_tpl(t: T):
     """ClickHouseSQLExecuteQueryOperator шаблоном: SQL из {{ }}"""
     result, _ = t.run(conn_id=t.ch_conn, database=t.ch_db, sql="SELECT {{ 40 + 2 }}")
+    result = _ch_last(result)
     if [tuple(r) for r in result or []] != [(42,)]:
         raise AirflowFailException(f"получено {result}")
 

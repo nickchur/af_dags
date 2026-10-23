@@ -1,5 +1,5 @@
 """### 🔌 DAG: Проверка Airflow Connections
-*2026-10-20 14:23 MSK · v3.18 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
+*2026-10-23 09:30 MSK · v3.19 · Чуркин Николай · [nschurkin@sber.ru](mailto:nschurkin@sber.ru)*
 
 Раз в сутки (23:15 MSK) проверяет все подключения из secret backend: `collect` снимает список
 (и обновляет Variable `local_connections`), адреса — в XCom `connections` и таблицей в логе,
@@ -65,6 +65,11 @@ _CONN_CONFIG: dict[str, str] = {
     "redis":       "Redis",
 }
 
+# Свой API Airflow (заводит ядро 3.0.3 по адресу Execution API): тип http, но не Kerberos — публичный
+# GET api/v2/version без входа
+AF_API = "af_api"
+
+
 def _map_type(conn_type: str) -> Optional[str]:
     """conn_type Airflow → тип проверки; None, если проверять нечем.
 
@@ -107,6 +112,8 @@ def _group(conn_id: str, conn_type: str) -> str:
         return "clickhouse"
     if conn_type == "aws":
         return "s3"
+    if conn_id == AF_API:
+        return "other"
     chk = _map_type(conn_type)
     if chk == "KerberosHttp":
         return "ctl"
@@ -213,7 +220,7 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     """Единая точка входа для проверки всех типов соединений.
 
     Postgres/S3/HTTP — через общую `chk_conn` из plugins.utils (типы ctl* маппятся на KerberosHttp);
-    ClickHouse/Kafka/Trino/Redis — напрямую.
+    ClickHouse/Kafka/Trino/Redis — напрямую; `af_api` (свой API) — `GET api/v2/version` без входа.
     Успех — `facts` о системе (тип, версия, `latency_ms`, …); в Variable их пишет `report`, а не проверка:
     проверки идут параллельно и перетёрли бы друг друга.
     """
@@ -231,8 +238,8 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
     ts = time.time()
 
     # 1. Маппинг типа
-    chk_type = _map_type(conn_type)
-    if chk_type is not None and conn_type not in _CONN_CONFIG:
+    chk_type = "AfApi" if conn_id == AF_API else _map_type(conn_type)
+    if chk_type not in (None, "AfApi") and conn_type not in _CONN_CONFIG:
         logger.info("Connection '%s' has host-like type '%s', mapping to '%s'", conn_id, conn_type, chk_type)
 
     if chk_type is None:
@@ -325,6 +332,14 @@ def _run_test(conn_id: str, conn_type: str, **context) -> dict:
                 logger.warning("Redis %s: INFO недоступен — %s", conn_id, err)
                 ver = None
             facts = {"kind": "Redis", "version": ver}
+
+        elif chk_type == "AfApi":
+            from airflow.providers.http.hooks.http import HttpHook  # type: ignore
+
+            # не-2xx HttpHook роняет сам; не JSON или без version — падение здесь же
+            result = HttpHook(method="GET", http_conn_id=conn_id).run(
+                "api/v2/version", extra_options={"timeout": 15}).json()
+            facts = {"kind": "Airflow", "version": result["version"]}
 
         else:
             raise AirflowFailException(f"Logic for {chk_type} not implemented in _run_test")
